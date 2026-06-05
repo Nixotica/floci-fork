@@ -5999,4 +5999,80 @@ class CloudFormationIntegrationTest {
             .body(containsString(igwId));
     }
 
+    @Test
+    void createStack_withEcsCapacityProvider_registersInEcsService() {
+        String stackName = "cfn-ecs-cp-stack";
+        String template = """
+            {
+              "Resources": {
+                "AsgCp": {
+                  "Type": "AWS::ECS::CapacityProvider",
+                  "Properties": {
+                    "Name": "cfn-asg-cp",
+                    "AutoScalingGroupProvider": {
+                      "AutoScalingGroupArn": "arn:aws:autoscaling:us-east-1:000000000000:autoScalingGroup:abc:autoScalingGroupName/cfn-asg",
+                      "ManagedTerminationProtection": "DISABLED",
+                      "ManagedScaling": {
+                        "Status": "ENABLED",
+                        "TargetCapacity": 80,
+                        "MinimumScalingStepSize": 1,
+                        "MaximumScalingStepSize": 10
+                      }
+                    },
+                    "Tags": [{ "Key": "team", "Value": "platform" }]
+                  }
+                }
+              },
+              "Outputs": {
+                "CpRef": { "Value": { "Ref": "AsgCp" } },
+                "CpArn": { "Value": { "Fn::GetAtt": ["AsgCp", "Arn"] } }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        String describeXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"))
+            .extract().asString();
+
+        String cpArn = "arn:aws:ecs:us-east-1:000000000000:capacity-provider/cfn-asg-cp";
+        assertThat(outputValue(describeXml, "CpRef"), equalTo("cfn-asg-cp"));
+        assertThat(outputValue(describeXml, "CpArn"), equalTo(cpArn));
+
+        // The provisioner must have registered the resource in the EcsService store, so
+        // DescribeCapacityProviders sees it. (The autoScalingGroupProvider field isn't
+        // currently serialized back by EcsJsonHandler#capacityProviderNode, so we only
+        // round-trip the observable name/ARN/status/tags here.)
+        given()
+            .header("X-Amz-Target", ECS_TARGET_PREFIX + "DescribeCapacityProviders")
+            .contentType(ECS_CONTENT_TYPE)
+            .body("{\"capacityProviders\": [\"cfn-asg-cp\"], \"include\": [\"TAGS\"]}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("capacityProviders[0].name", equalTo("cfn-asg-cp"))
+            .body("capacityProviders[0].capacityProviderArn", equalTo(cpArn))
+            .body("capacityProviders[0].status", equalTo("ACTIVE"))
+            .body("capacityProviders[0].tags[0].key", equalTo("team"))
+            .body("capacityProviders[0].tags[0].value", equalTo("platform"));
+    }
+
 }
