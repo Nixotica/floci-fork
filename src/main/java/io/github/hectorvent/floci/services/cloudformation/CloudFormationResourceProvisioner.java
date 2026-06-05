@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecr.model.Repository;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.CapacityProvider;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
 import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
@@ -215,6 +216,8 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::ECS::Cluster" -> provisionEcsCluster(resource, properties, engine, region, stackName);
                 case "AWS::ECS::TaskDefinition" -> provisionEcsTaskDefinition(resource, properties, engine, region, stackName);
                 case "AWS::ECS::Service" -> provisionEcsService(resource, properties, engine, region, stackName);
+                case "AWS::ECS::CapacityProvider" ->
+                        provisionEcsCapacityProvider(resource, properties, engine, region, stackName);
                 case "AWS::ElasticLoadBalancingV2::LoadBalancer" ->
                         provisionLoadBalancer(resource, properties, engine, region, stackName);
                 case "AWS::ElasticLoadBalancingV2::TargetGroup" ->
@@ -283,6 +286,7 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::ECS::Cluster" -> ecsService.deleteCluster(physicalId, region);
                 case "AWS::ECS::TaskDefinition" -> ecsService.deregisterTaskDefinition(physicalId, region);
                 case "AWS::ECS::Service" -> deleteEcsServiceSafe(physicalId, region);
+                case "AWS::ECS::CapacityProvider" -> ecsService.deleteCapacityProvider(physicalId);
                 case "AWS::ElasticLoadBalancingV2::LoadBalancer" -> elbV2Service.deleteLoadBalancer(region, physicalId);
                 case "AWS::ElasticLoadBalancingV2::TargetGroup" -> elbV2Service.deleteTargetGroup(region, physicalId);
                 case "AWS::ElasticLoadBalancingV2::Listener" -> elbV2Service.deleteListener(region, physicalId);
@@ -2105,6 +2109,27 @@ public class CloudFormationResourceProvisioner {
         r.setPhysicalId(svc.getServiceArn());
         r.getAttributes().put("Name", svc.getServiceName());
         r.getAttributes().put("ServiceArn", svc.getServiceArn());
+    }
+
+    private void provisionEcsCapacityProvider(StackResource r, JsonNode props,
+                                              CloudFormationTemplateEngine engine,
+                                              String region, String stackName) {
+        String name = resolveOptional(props, "Name", engine);
+        if (name == null || name.isBlank()) {
+            name = generatePhysicalName(stackName, r.getLogicalId(), 255, false);
+        }
+        Map<String, Object> asgProvider = Map.of();
+        if (props != null && props.has("AutoScalingGroupProvider")) {
+            JsonNode resolved = engine.resolveNode(props.get("AutoScalingGroupProvider"));
+            if (resolved != null && resolved.isObject()) {
+                asgProvider = jsonObjectToMap(resolved);
+            }
+        }
+        Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, engine);
+
+        CapacityProvider cp = ecsService.createCapacityProvider(name, asgProvider, tags, region);
+        r.setPhysicalId(cp.getName());
+        r.getAttributes().put("Arn", cp.getCapacityProviderArn());
     }
 
     private void deleteEcsServiceSafe(String serviceArn, String region) {
