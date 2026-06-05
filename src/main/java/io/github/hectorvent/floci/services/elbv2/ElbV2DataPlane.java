@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.elbv2;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
@@ -7,7 +9,11 @@ import io.github.hectorvent.floci.services.elbv2.model.Rule;
 import io.github.hectorvent.floci.services.elbv2.model.RuleCondition;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
+import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpServer;
@@ -19,7 +25,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,6 +57,12 @@ public class ElbV2DataPlane {
 
     @Inject
     EmulatorConfig config;
+
+    @Inject
+    LambdaService lambdaService;
+
+    @Inject
+    ObjectMapper objectMapper;
 
     private final Map<String, HttpServer> servers = new ConcurrentHashMap<>();
     private final Map<String, AtomicReference<List<CompiledRule>>> ruleChains = new ConcurrentHashMap<>();
@@ -90,8 +105,8 @@ public class ElbV2DataPlane {
 
         server.requestHandler(req -> handleRequest(req, listenerArn, region));
         server.listen()
-                .onSuccess(s -> LOG.infov("ELBv2 listener started on port {0} for {1}", listener.getPort(), listenerArn))
-                .onFailure(err -> LOG.warnv("ELBv2 listener failed to start on port {0}: {1}", listener.getPort(), err.getMessage()));
+                .onSuccess(s -> LOG.infov("ELBv2 listener started on port {0} for {1}", String.valueOf(listener.getPort()), listenerArn))
+                .onFailure(err -> LOG.warnv("ELBv2 listener failed to start on port {0}: {1}", String.valueOf(listener.getPort()), err.getMessage()));
 
         servers.put(listenerArn, server);
     }
@@ -152,6 +167,18 @@ public class ElbV2DataPlane {
             req.response().setStatusCode(502).end("Target group not found");
             return;
         }
+
+        if ("lambda".equals(tg.getTargetType())) {
+            List<TargetDescription> targets = tg.getTargets();
+            if (targets.isEmpty()) {
+                req.response().setStatusCode(503).end("No Lambda targets registered");
+                return;
+            }
+            String functionArn = targets.get(0).getId();
+            invokeLambdaTarget(req, functionArn, region);
+            return;
+        }
+
         List<TargetDescription> allTargets = tg.getTargets();
         List<TargetDescription> healthy = allTargets.stream()
                 .filter(t -> healthChecker.isHealthy(tgArn, t, ElbV2HealthChecker.effectivePort(t, tg)))
@@ -166,6 +193,132 @@ public class ElbV2DataPlane {
         TargetDescription target = candidates.get(idx);
         int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
         proxyRequest(req, target.getId(), targetPort);
+    }
+
+    private void invokeLambdaTarget(io.vertx.core.http.HttpServerRequest req, String functionArn, String region) {
+        req.bodyHandler(body -> {
+            Map<String, Object> event = buildAlbEvent(req, body);
+            // Lambda invocation is synchronous and may take seconds while a cold container
+            // boots and polls the Runtime API. The Runtime API itself runs on Vert.x event
+            // loops, so blocking the listener's event loop here would deadlock the runtime
+            // and the function would time out. Offload to a worker thread, same as WebSocket.
+            // ordered=false so independent ALB requests run in parallel on the worker pool.
+            vertx.<InvokeResult>executeBlocking(() -> {
+                byte[] payload = objectMapper.writeValueAsBytes(event);
+                return lambdaService.invoke(region, functionArn, payload, InvocationType.RequestResponse);
+            }, false).onSuccess(result -> {
+                try {
+                    writeLambdaResponse(req, result);
+                } catch (Exception e) {
+                    LOG.errorf(e, "Error writing Lambda response for %s", functionArn);
+                    req.response().setStatusCode(502).end("Lambda invocation error");
+                }
+            }).onFailure(e -> {
+                LOG.errorf(e, "Error invoking Lambda target %s", functionArn);
+                req.response().setStatusCode(502).end("Lambda invocation error");
+            });
+        });
+    }
+
+    private void writeLambdaResponse(io.vertx.core.http.HttpServerRequest req, InvokeResult result) throws java.io.IOException {
+        if (result.getFunctionError() != null) {
+            req.response().setStatusCode(502).end("Lambda function error: " + result.getFunctionError());
+            return;
+        }
+
+        if (result.getPayload() == null || result.getPayload().length == 0) {
+            req.response().setStatusCode(200).end();
+            return;
+        }
+
+        Map<String, Object> lambdaResp = objectMapper.readValue(result.getPayload(),
+                new TypeReference<Map<String, Object>>() {});
+
+        int statusCode = 200;
+        Object sc = lambdaResp.get("statusCode");
+        if (sc != null) {
+            statusCode = ((Number) sc).intValue();
+        }
+
+        req.response().setStatusCode(statusCode);
+
+        Object headers = lambdaResp.get("headers");
+        if (headers instanceof Map<?, ?> headerMap) {
+            for (Map.Entry<?, ?> entry : headerMap.entrySet()) {
+                req.response().putHeader(String.valueOf(entry.getKey()), String.valueOf(entry.getValue()));
+            }
+        }
+
+        Object multiValueHeaders = lambdaResp.get("multiValueHeaders");
+        if (multiValueHeaders instanceof Map<?, ?> mvh) {
+            for (Map.Entry<?, ?> entry : mvh.entrySet()) {
+                if (entry.getValue() instanceof List<?> values) {
+                    for (Object v : values) {
+                        req.response().putHeader(String.valueOf(entry.getKey()), String.valueOf(v));
+                    }
+                }
+            }
+        }
+
+        Object responseBody = lambdaResp.get("body");
+        Boolean isBase64 = (Boolean) lambdaResp.get("isBase64Encoded");
+        if (responseBody == null) {
+            req.response().end();
+        } else if (Boolean.TRUE.equals(isBase64)) {
+            byte[] decoded = Base64.getDecoder().decode(String.valueOf(responseBody));
+            req.response().end(Buffer.buffer(decoded));
+        } else {
+            req.response().end(String.valueOf(responseBody));
+        }
+    }
+
+    private Map<String, Object> buildAlbEvent(io.vertx.core.http.HttpServerRequest req, Buffer body) {
+        Map<String, Object> event = new HashMap<>();
+        event.put("requestContext", Map.of("elb", Map.of("targetGroupArn", "")));
+        event.put("httpMethod", req.method().name());
+        event.put("path", req.path() != null ? req.path() : "/");
+
+        Map<String, String> queryParams = new HashMap<>();
+        Map<String, List<String>> multiValueQueryParams = new HashMap<>();
+        String query = req.query();
+        if (query != null && !query.isEmpty()) {
+            for (String pair : query.split("&")) {
+                int eq = pair.indexOf('=');
+                String key = eq >= 0 ? pair.substring(0, eq) : pair;
+                String val = eq >= 0 ? pair.substring(eq + 1) : "";
+                queryParams.putIfAbsent(key, val);
+                multiValueQueryParams.computeIfAbsent(key, k -> new ArrayList<>()).add(val);
+            }
+        }
+        event.put("queryStringParameters", queryParams.isEmpty() ? null : queryParams);
+        event.put("multiValueQueryStringParameters", multiValueQueryParams.isEmpty() ? null : multiValueQueryParams);
+
+        Map<String, String> headers = new HashMap<>();
+        Map<String, List<String>> multiValueHeaders = new HashMap<>();
+        req.headers().forEach(entry -> {
+            String key = entry.getKey().toLowerCase();
+            headers.putIfAbsent(key, entry.getValue());
+            multiValueHeaders.computeIfAbsent(key, k -> new ArrayList<>()).add(entry.getValue());
+        });
+        event.put("headers", headers);
+        event.put("multiValueHeaders", multiValueHeaders);
+
+        boolean isBase64 = false;
+        String bodyStr = null;
+        if (body != null && body.length() > 0) {
+            String contentType = req.getHeader("Content-Type");
+            if (contentType != null && !contentType.startsWith("text/") && !contentType.contains("json")
+                    && !contentType.contains("xml") && !contentType.contains("form")) {
+                bodyStr = Base64.getEncoder().encodeToString(body.getBytes());
+                isBase64 = true;
+            } else {
+                bodyStr = body.toString(StandardCharsets.UTF_8);
+            }
+        }
+        event.put("body", bodyStr);
+        event.put("isBase64Encoded", isBase64);
+
+        return event;
     }
 
     private String resolveTgArn(Action action) {

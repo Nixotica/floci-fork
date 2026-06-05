@@ -2,8 +2,10 @@ package io.github.hectorvent.floci.services.autoscaling;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.autoscaling.model.*;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 import java.time.Instant;
 import java.util.*;
@@ -13,7 +15,8 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class AutoScalingService {
 
-    private static final String DEFAULT_ACCOUNT = "000000000000";
+    @Inject
+    RegionResolver regionResolver;
 
     // region :: name → resource
     private final Map<String, LaunchConfiguration> launchConfigs = new ConcurrentHashMap<>();
@@ -37,7 +40,7 @@ public class AutoScalingService {
         LaunchConfiguration lc = new LaunchConfiguration();
         lc.setLaunchConfigurationName(name);
         lc.setLaunchConfigurationArn(
-                AwsArnUtils.Arn.of("autoscaling", region, DEFAULT_ACCOUNT,
+                AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
                         "launchConfiguration:" + name).toString());
         lc.setImageId(imageId);
         lc.setInstanceType(instanceType != null ? instanceType : "t3.micro");
@@ -95,7 +98,7 @@ public class AutoScalingService {
         AutoScalingGroup asg = new AutoScalingGroup();
         asg.setAutoScalingGroupName(name);
         asg.setAutoScalingGroupArn(
-                AwsArnUtils.Arn.of("autoscaling", region, DEFAULT_ACCOUNT,
+                AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
                         "autoScalingGroup:" + name).toString());
         asg.setLaunchConfigurationName(launchConfigName);
         asg.setLaunchTemplateName(launchTemplateName);
@@ -324,7 +327,7 @@ public class AutoScalingService {
         String key = policyKey(region, asgName, policyName);
         ScalingPolicy policy = policies.computeIfAbsent(key, k -> new ScalingPolicy());
         policy.setPolicyName(policyName);
-        policy.setPolicyArn(AwsArnUtils.Arn.of("autoscaling", region, DEFAULT_ACCOUNT,
+        policy.setPolicyArn(AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
                 "scalingPolicy:" + asgName + ":" + policyName).toString());
         policy.setAutoScalingGroupName(asgName);
         policy.setPolicyType(policyType != null ? policyType : "SimpleScaling");

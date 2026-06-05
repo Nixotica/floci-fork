@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.services.eventbridge;
 
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.eventbridge.model.Archive;
@@ -100,9 +102,10 @@ public class EventBridgeService {
     @PostConstruct
     void init() {
         if (ruleScheduler != null) {
-            ruleStore.keys().forEach(key -> {
-                ruleStore.get(key).ifPresent(this::startSchedulerIfNeeded);
-            });
+            List<Rule> allRules = ruleStore instanceof AccountAwareStorageBackend<Rule> aware
+                    ? aware.scanAllAccounts()
+                    : ruleStore.scan(k -> true);
+            allRules.forEach(this::startSchedulerIfNeeded);
             LOG.infov("EventBridge initialized, {0} scheduler(s) restored", ruleScheduler.getActiveSchedulerCount());
         }
     }
@@ -148,14 +151,19 @@ public class EventBridgeService {
     }
 
     public void deleteEventBus(String name, String region) {
-        if ("default".equals(name)) {
+        // Validate input and handle both name and ARN format
+        if (name == null || name.isBlank()) {
+            throw new AwsException("ValidationException", "EventBus name is required.", 400);
+        }
+        String effectiveName = resolvedBusName(name);
+        if ("default".equals(effectiveName)) {
             throw new AwsException("ValidationException", "Cannot delete the default event bus.", 400);
         }
-        String key = busKey(region, name);
+        String key = busKey(region, effectiveName);
         busStore.get(key)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "EventBus not found: " + name, 404));
-        String rulePrefix = ruleKeyPrefix(region, name);
+                        "EventBus not found: " + effectiveName, 404));
+        String rulePrefix = ruleKeyPrefix(region, effectiveName);
         boolean hasRules = ruleStore.keys().stream().anyMatch(k -> k.startsWith(rulePrefix));
         if (hasRules) {
             throw new AwsException("ValidationException",
@@ -166,13 +174,60 @@ public class EventBridgeService {
     }
 
     public EventBus describeEventBus(String name, String region) {
-        String effectiveName = name == null || name.isBlank() ? "default" : name;
+        // Handle both name and ARN format
+        String effectiveName = (name == null || name.isBlank()) ? "default" : resolvedBusName(name);
         if ("default".equals(effectiveName)) {
             return getOrCreateDefaultBus(region);
         }
         return busStore.get(busKey(region, effectiveName))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "EventBus not found: " + effectiveName, 404));
+                        "EventBus not found: " + name, 404));
+    }
+
+    public EventBus updateEventBus(String name,
+                                   String description,
+                                   String kmsKeyIdentifier,
+                                   String deadLetterConfig,
+                                   String logConfig,
+                                   String region) {
+        // Name identifies the bus; never mutated (AWS does not support rename).
+        String effectiveName = name == null || name.isBlank() ? "default" : name;
+        EventBus bus = "default".equals(effectiveName)
+                ? getOrCreateDefaultBus(region)
+                : busStore.get(busKey(region, effectiveName))
+                        .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                                "EventBus not found: " + effectiveName, 404));
+
+        // Only mark dirty when a field is both non-blank AND different from
+        // the value currently on the bus — re-sending the same value is a no-op.
+        boolean dirty = false;
+        if (description != null && !description.isBlank()
+                && !description.equals(bus.getDescription())) {
+            bus.setDescription(description);
+            dirty = true;
+        }
+        if (kmsKeyIdentifier != null && !kmsKeyIdentifier.isBlank()
+                && !kmsKeyIdentifier.equals(bus.getKmsKeyIdentifier())) {
+            bus.setKmsKeyIdentifier(kmsKeyIdentifier);
+            dirty = true;
+        }
+        if (deadLetterConfig != null && !deadLetterConfig.isBlank()
+                && !deadLetterConfig.equals(bus.getDeadLetterConfig())) {
+            bus.setDeadLetterConfig(deadLetterConfig);
+            dirty = true;
+        }
+        if (logConfig != null && !logConfig.isBlank()
+                && !logConfig.equals(bus.getLogConfig())) {
+            bus.setLogConfig(logConfig);
+            dirty = true;
+        }
+
+        if (dirty) {
+            busStore.put(busKey(region, effectiveName), bus);
+            LOG.infov("Updated event bus: {0} (arn={1}) in region {2}",
+                    effectiveName, bus.getArn(), region);
+        }
+        return bus;
     }
 
     public List<EventBus> listEventBuses(String namePrefix, String region) {
@@ -197,6 +252,7 @@ public class EventBridgeService {
 
         String key = ruleKey(region, effectiveBus, name);
         Rule rule = ruleStore.get(key).orElse(new Rule());
+        rule.setAccountId(regionResolver.getAccountId());
         rule.setName(name);
         rule.setArn(buildRuleArn(region, effectiveBus, name));
         rule.setEventBusName(effectiveBus);
@@ -332,36 +388,23 @@ public class EventBridgeService {
     // ──────────────────────────── Tags ────────────────────────────
 
     public Map<String, String> listTagsForResource(String resourceArn, String region) {
-        // Check if it's an event bus ARN (contains "event-bus/")
-        if (resourceArn.contains("event-bus/")) {
-            String busName = resourceArn.substring(resourceArn.lastIndexOf("event-bus/") + "event-bus/".length());
+        String resource = AwsArnUtils.parse(resourceArn).resource();
+        if (resource.startsWith("event-bus/")) {
+            String busName = resource.substring("event-bus/".length());
             String key = busKey(region, busName);
             return busStore.get(key)
                     .map(EventBus::getTags)
                     .orElse(Map.of());
         }
-        // Check if it's a rule ARN (contains "rule/")
-        if (resourceArn.contains("rule/")) {
-            String afterRule = resourceArn.substring(resourceArn.lastIndexOf("rule/") + "rule/".length());
-            String busName;
-            String ruleName;
-            if (afterRule.contains("/")) {
-                // Custom bus: rule/{busName}/{ruleName}
-                int slashIdx = afterRule.indexOf('/');
-                busName = afterRule.substring(0, slashIdx);
-                ruleName = afterRule.substring(slashIdx + 1);
-            } else {
-                // Default bus: rule/{ruleName}
-                busName = "default";
-                ruleName = afterRule;
-            }
-            String key = ruleKey(region, busName, ruleName);
+        if (resource.startsWith("rule/")) {
+            RuleRef ref = parseRuleResource(resource);
+            String key = ruleKey(region, ref.busName(), ref.ruleName());
             return ruleStore.get(key)
                     .map(Rule::getTags)
                     .orElse(Map.of());
         }
-        if (resourceArn.contains("archive/")) {
-            String archiveName = resourceArn.substring(resourceArn.lastIndexOf("archive/") + "archive/".length());
+        if (resource.startsWith("archive/")) {
+            String archiveName = resource.substring("archive/".length());
             String key = archiveKey(region, archiveName);
             return archiveStore.get(key)
                     .map(Archive::getTags)
@@ -370,9 +413,24 @@ public class EventBridgeService {
         return Map.of();
     }
 
+    /** Resolves the bus and rule name from a {@code rule/...} ARN resource segment. */
+    private record RuleRef(String busName, String ruleName) {}
+
+    private static RuleRef parseRuleResource(String resource) {
+        String afterRule = resource.substring("rule/".length());
+        int slashIdx = afterRule.indexOf('/');
+        if (slashIdx >= 0) {
+            // Custom bus: rule/{busName}/{ruleName}
+            return new RuleRef(afterRule.substring(0, slashIdx), afterRule.substring(slashIdx + 1));
+        }
+        // Default bus: rule/{ruleName}
+        return new RuleRef("default", afterRule);
+    }
+
     public void tagResource(String resourceArn, Map<String, String> tags, String region) {
-        if (resourceArn.contains("archive/")) {
-            String archiveName = resourceArn.substring(resourceArn.lastIndexOf("archive/") + "archive/".length());
+        String resource = AwsArnUtils.parse(resourceArn).resource();
+        if (resource.startsWith("archive/")) {
+            String archiveName = resource.substring("archive/".length());
             String key = archiveKey(region, archiveName);
             Archive archive = archiveStore.get(key)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
@@ -381,8 +439,8 @@ public class EventBridgeService {
             archiveStore.put(key, archive);
             return;
         }
-        if (resourceArn.contains("event-bus/")) {
-            String busName = resourceArn.substring(resourceArn.lastIndexOf("event-bus/") + "event-bus/".length());
+        if (resource.startsWith("event-bus/")) {
+            String busName = resource.substring("event-bus/".length());
             String key = busKey(region, busName);
             EventBus bus = busStore.get(key)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
@@ -391,19 +449,9 @@ public class EventBridgeService {
             busStore.put(key, bus);
             return;
         }
-        if (resourceArn.contains("rule/")) {
-            String afterRule = resourceArn.substring(resourceArn.lastIndexOf("rule/") + "rule/".length());
-            String busName;
-            String ruleName;
-            if (afterRule.contains("/")) {
-                int slashIdx = afterRule.indexOf('/');
-                busName = afterRule.substring(0, slashIdx);
-                ruleName = afterRule.substring(slashIdx + 1);
-            } else {
-                busName = "default";
-                ruleName = afterRule;
-            }
-            String key = ruleKey(region, busName, ruleName);
+        if (resource.startsWith("rule/")) {
+            RuleRef ref = parseRuleResource(resource);
+            String key = ruleKey(region, ref.busName(), ref.ruleName());
             Rule rule = ruleStore.get(key)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                             "Resource not found: " + resourceArn, 404));
@@ -415,8 +463,9 @@ public class EventBridgeService {
     }
 
     public void untagResource(String resourceArn, List<String> tagKeys, String region) {
-        if (resourceArn.contains("archive/")) {
-            String archiveName = resourceArn.substring(resourceArn.lastIndexOf("archive/") + "archive/".length());
+        String resource = AwsArnUtils.parse(resourceArn).resource();
+        if (resource.startsWith("archive/")) {
+            String archiveName = resource.substring("archive/".length());
             String key = archiveKey(region, archiveName);
             Archive archive = archiveStore.get(key)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
@@ -425,8 +474,8 @@ public class EventBridgeService {
             archiveStore.put(key, archive);
             return;
         }
-        if (resourceArn.contains("event-bus/")) {
-            String busName = resourceArn.substring(resourceArn.lastIndexOf("event-bus/") + "event-bus/".length());
+        if (resource.startsWith("event-bus/")) {
+            String busName = resource.substring("event-bus/".length());
             String key = busKey(region, busName);
             EventBus bus = busStore.get(key)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
@@ -435,19 +484,9 @@ public class EventBridgeService {
             busStore.put(key, bus);
             return;
         }
-        if (resourceArn.contains("rule/")) {
-            String afterRule = resourceArn.substring(resourceArn.lastIndexOf("rule/") + "rule/".length());
-            String busName;
-            String ruleName;
-            if (afterRule.contains("/")) {
-                int slashIdx = afterRule.indexOf('/');
-                busName = afterRule.substring(0, slashIdx);
-                ruleName = afterRule.substring(slashIdx + 1);
-            } else {
-                busName = "default";
-                ruleName = afterRule;
-            }
-            String key = ruleKey(region, busName, ruleName);
+        if (resource.startsWith("rule/")) {
+            RuleRef ref = parseRuleResource(resource);
+            String key = ruleKey(region, ref.busName(), ref.ruleName());
             Rule rule = ruleStore.get(key)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                             "Resource not found: " + resourceArn, 404));
@@ -572,17 +611,36 @@ public class EventBridgeService {
     public record PutEventsResult(int failedCount, List<Map<String, String>> entries) {}
 
     public PutEventsResult putEvents(List<Map<String, Object>> entries, String region) {
+        return putEvents(entries, region, null);
+    }
+
+    private PutEventsResult putEvents(List<Map<String, Object>> entries, String region, String accountId) {
         int failed = 0;
         List<Map<String, String>> resultEntries = new ArrayList<>();
 
-        for (Map<String, Object> entry : entries) {
+        for (Map<String, Object> originalEntry : entries) {
+            // Defensive copy: callers may pass Map.of(...) (immutable) and we don't want to
+            // mutate caller state regardless. Normalize Region / Account from the PutEvents
+            // call context up front so matchesPattern, buildEventEnvelope, and the archive
+            // capture all see the same values — without this, a pattern's region/account
+            // filter would fall back to the resolver default in matchesPattern while the
+            // delivered envelope would correctly carry the call's region/account, giving an
+            // inconsistent observable.
+            Map<String, Object> entry = new HashMap<>(originalEntry);
+            if (isBlank(entry.get("Region"))) {
+                entry.put("Region", isBlank(region) ? regionResolver.getDefaultRegion() : region);
+            }
+            if (isBlank(entry.get("Account"))) {
+                entry.put("Account", isBlank(accountId) ? regionResolver.getAccountId() : accountId);
+            }
+
             String eventBusNameRaw = (String) entry.get("EventBusName");
             String effectiveBus = resolvedBusName(eventBusNameRaw);
             String busStoreKey = busKey(region, effectiveBus);
 
             if ("default".equals(effectiveBus)) {
                 getOrCreateDefaultBus(region);
-            } else if (busStore.get(busStoreKey).isEmpty()) {
+            } else if (accountGet(busStore, accountId, busStoreKey).isEmpty()) {
                 failed++;
                 Map<String, String> errorEntry = new HashMap<>();
                 errorEntry.put("ErrorCode", "InvalidArgument");
@@ -593,21 +651,23 @@ public class EventBridgeService {
 
             String eventId = UUID.randomUUID().toString();
             String rulePrefix = ruleKeyPrefix(region, effectiveBus);
-            List<Rule> matchedRules = ruleStore.scan(k ->
-                    k.startsWith(rulePrefix) && isRuleEnabled(k));
+            List<Rule> candidateRules = accountScan(ruleStore, accountId, k -> k.startsWith(rulePrefix));
 
-            for (Rule rule : matchedRules) {
+            for (Rule rule : candidateRules) {
+                if (rule.getState() != RuleState.ENABLED) {
+                    continue;
+                }
                 if (matchesPattern(entry, rule.getEventPattern())) {
                     String ruleKey = ruleKey(region, effectiveBus, rule.getName());
-                    List<Target> targets = targetStore.get(ruleKey).orElse(List.of());
-                    String eventJson = buildEventEnvelope(entry, effectiveBus, eventId);
+                    List<Target> targets = accountGet(targetStore, accountId, ruleKey).orElse(List.of());
+                    String eventJson = buildEventEnvelope(entry, effectiveBus, eventId, region, accountId);
                     for (Target target : targets) {
                         invoker.invokeTarget(target, eventJson, region);
                     }
                 }
             }
 
-            captureToArchives(entry, busStoreKey, eventId, region);
+            captureToArchives(entry, busStoreKey, eventId, region, accountId);
 
             Map<String, String> successEntry = new HashMap<>();
             successEntry.put("EventId", eventId);
@@ -619,12 +679,79 @@ public class EventBridgeService {
 
     // ──────────────────────────── Pattern Matching ────────────────────────────
 
+    /**
+     * Tests whether a sample event matches a given event pattern, without firing any
+     * targets. Mirrors the AWS {@code TestEventPattern} API: callers pass the full event
+     * envelope (lowercase {@code source} / {@code detail-type} / {@code detail} /
+     * {@code resources}) as JSON; we adapt it to the internal entry shape and delegate
+     * to {@link #matchesPattern(Map, String)}.
+     */
+    public boolean testEventPattern(String eventPattern, String eventJson) {
+        if (eventPattern == null || eventPattern.isBlank()) {
+            throw new AwsException("InvalidEventPatternException", "EventPattern is required.", 400);
+        }
+        if (eventJson == null || eventJson.isBlank()) {
+            throw new AwsException("InvalidEventPatternException", "Event is required.", 400);
+        }
+        try {
+            objectMapper.readTree(eventPattern);
+        } catch (Exception e) {
+            throw new AwsException("InvalidEventPatternException",
+                    "Event pattern is not valid JSON: " + e.getMessage(), 400);
+        }
+        JsonNode event;
+        try {
+            event = objectMapper.readTree(eventJson);
+        } catch (Exception e) {
+            throw new AwsException("InvalidEventPatternException",
+                    "Event is not valid JSON: " + e.getMessage(), 400);
+        }
+        if (event == null || !event.isObject()) {
+            throw new AwsException("InvalidEventPatternException",
+                    "Event must be a JSON object.", 400);
+        }
+        Map<String, Object> entry = new HashMap<>();
+        if (event.hasNonNull("source")) {
+            entry.put("Source", event.get("source").asText());
+        }
+        if (event.hasNonNull("detail-type")) {
+            entry.put("DetailType", event.get("detail-type").asText());
+        }
+        if (event.hasNonNull("detail")) {
+            JsonNode detail = event.get("detail");
+            entry.put("Detail", detail.isTextual() ? detail.asText() : detail.toString());
+        }
+        if (event.hasNonNull("resources") && event.get("resources").isArray()) {
+            entry.put("Resources", event.get("resources"));
+        }
+        if (event.hasNonNull("account")) {
+            entry.put("Account", event.get("account").asText());
+        }
+        if (event.hasNonNull("region")) {
+            entry.put("Region", event.get("region").asText());
+        }
+        return matchesPattern(entry, eventPattern);
+    }
+
     boolean matchesPattern(Map<String, Object> event, String eventPattern) {
         if (eventPattern == null || eventPattern.isBlank()) {
             return true;
         }
         try {
             JsonNode pattern = objectMapper.readTree(eventPattern);
+            JsonNode orClauses = pattern.get("$or");
+            if (orClauses != null && orClauses.isArray()) {
+                boolean anyMatches = false;
+                for (JsonNode subPattern : orClauses) {
+                    if (matchesPattern(event, objectMapper.writeValueAsString(subPattern))) {
+                        anyMatches = true;
+                        break;
+                    }
+                }
+                if (!anyMatches) {
+                    return false;
+                }
+            }
             JsonNode sourceField = pattern.get("source");
             if (sourceField != null && sourceField.isArray()) {
                 String eventSource = (String) event.get("Source");
@@ -641,14 +768,20 @@ public class EventBridgeService {
             }
             JsonNode accountField = pattern.get("account");
             if (accountField != null && accountField.isArray()) {
-                String eventAccount = regionResolver.getAccountId();
+                // Prefer the entry's Account (set by TestEventPattern from the
+                // supplied event envelope); fall back to the caller's account
+                // for PutEvents rule dispatch, where the event always belongs
+                // to the caller.
+                String eventAccount = (String) event.getOrDefault(
+                        "Account", regionResolver.getAccountId());
                 if (!matchesArrayField(accountField, eventAccount)) {
                     return false;
                 }
             }
             JsonNode regionField = pattern.get("region");
             if (regionField != null && regionField.isArray()) {
-                String eventRegion = regionResolver.getDefaultRegion();
+                String eventRegion = (String) event.getOrDefault(
+                        "Region", regionResolver.getDefaultRegion());
                 if (!matchesArrayField(regionField, eventRegion)) {
                     return false;
                 }
@@ -684,9 +817,25 @@ public class EventBridgeService {
     }
 
     private boolean matchesDetailNode(JsonNode actual, JsonNode pattern) {
+        JsonNode orClauses = pattern.get("$or");
+        if (orClauses != null && orClauses.isArray()) {
+            boolean anyMatches = false;
+            for (JsonNode subPattern : orClauses) {
+                if (matchesDetailNode(actual, subPattern)) {
+                    anyMatches = true;
+                    break;
+                }
+            }
+            if (!anyMatches) {
+                return false;
+            }
+        }
         var fields = pattern.fields();
         while (fields.hasNext()) {
             var field = fields.next();
+            if ("$or".equals(field.getKey())) {
+                continue;
+            }
             JsonNode expected = field.getValue();
             JsonNode actualField = actual.get(field.getKey());
             if (expected.isArray()) {
@@ -766,20 +915,35 @@ public class EventBridgeService {
     // ──────────────────────────── Target Routing ────────────────────────────
 
 
-    private String buildEventEnvelope(Map<String, Object> entry, String busName, String eventId) {
+    private String buildEventEnvelope(Map<String, Object> entry, String busName, String eventId,
+                                      String callRegion, String callAccountId) {
         try {
             String source = (String) entry.getOrDefault("Source", "");
             String detailType = (String) entry.getOrDefault("DetailType", "");
             String detail = (String) entry.getOrDefault("Detail", "{}");
             ArrayNode resources = (ArrayNode) entry.getOrDefault("Resources", objectMapper.createArrayNode());
+            // Envelope region/account precedence: entry-supplied "Region"/"Account" (set by
+            // archive replay paths and cross-region producers) wins; otherwise stamp the
+            // region/account the PutEvents call was made against. Only when neither is
+            // available do we fall back to the RegionResolver defaults. This keeps the
+            // envelope consistent with matchesPattern() which also reads entry.Region with
+            // the same fallback chain.
+            String envelopeRegion = (String) entry.get("Region");
+            if (isBlank(envelopeRegion)) {
+                envelopeRegion = isBlank(callRegion) ? regionResolver.getDefaultRegion() : callRegion;
+            }
+            String envelopeAccount = (String) entry.get("Account");
+            if (isBlank(envelopeAccount)) {
+                envelopeAccount = isBlank(callAccountId) ? regionResolver.getAccountId() : callAccountId;
+            }
             ObjectNode node = objectMapper.createObjectNode();
             node.put("version", "0");
             node.put("id", eventId);
             node.put("source", source);
             node.put("detail-type", detailType);
-            node.put("account", regionResolver.getAccountId());
+            node.put("account", envelopeAccount);
             node.put("time", Instant.now().toString());
-            node.put("region", regionResolver.getDefaultRegion());
+            node.put("region", envelopeRegion);
             node.putArray("resources").addAll(resources);
             node.set("detail", objectMapper.readTree(detail));
             node.put("event-bus-name", busName);
@@ -807,8 +971,37 @@ public class EventBridgeService {
                         "EventBus not found: " + busName, 404));
     }
 
+    private static boolean isBlank(Object value) {
+        return !(value instanceof String s) || s.isBlank();
+    }
+
     private static String resolvedBusName(String busName) {
-        return (busName == null || busName.isBlank()) ? "default" : busName;
+        if (busName == null || busName.isBlank()) {
+            return "default";
+        }
+        // Handle ARN format: arn:aws:events:region:account-id:event-bus/bus-name
+        if (busName.startsWith("arn:aws:events:")) {
+            try {
+                return extractBusNameFromArn(busName);
+            } catch (IllegalArgumentException e) {
+                throw new AwsException("ValidationException", "Invalid EventBridge event bus ARN: " + busName, 400);
+            }
+        }
+        return busName;
+    }
+
+    private static String extractBusNameFromArn(String arn) {
+        // ARN format: arn:aws:events:region:account-id:event-bus/bus-name
+        if (arn == null) return null;
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        if (!"events".equals(parsed.service())) {
+            throw new IllegalArgumentException("Expected EventBridge ARN but found service: " + parsed.service());
+        }
+        String prefix = "event-bus/";
+        if (parsed.resource() != null && parsed.resource().startsWith(prefix)) {
+            return parsed.resource().substring(prefix.length());
+        }
+        throw new IllegalArgumentException("Expected EventBridge event bus ARN but found resource: " + parsed.resource());
     }
 
     private static String busKey(String region, String name) {
@@ -913,16 +1106,16 @@ public class EventBridgeService {
     }
 
     private void captureToArchives(Map<String, Object> entry, String busStoreKey,
-                                   String eventId, String region) {
-        EventBus bus = busStore.get(busStoreKey).orElse(null);
+                                   String eventId, String region, String accountId) {
+        EventBus bus = accountGet(busStore, accountId, busStoreKey).orElse(null);
         if (bus == null) {
             return;
         }
         String busArn = bus.getArn();
         String archivePrefix = "archive:" + region + ":";
-        List<Archive> candidates = archiveStore.scan(k ->
+        List<Archive> candidates = accountScan(archiveStore, accountId, k ->
                 k.startsWith(archivePrefix)
-                        && archiveStore.get(k).map(a ->
+                        && accountGet(archiveStore, accountId, k).map(a ->
                         a.getState() == ArchiveState.ENABLED
                                 && busArn.equals(a.getEventSourceArn())).orElse(false));
 
@@ -930,7 +1123,7 @@ public class EventBridgeService {
             if (matchesPattern(entry, archive.getEventPattern())) {
                 String evKey = archivedEventKey(region, archive.getArchiveName());
                 List<ArchivedEvent> stored = new ArrayList<>(
-                        archivedEventStore.get(evKey).orElse(new ArrayList<>()));
+                        accountGet(archivedEventStore, accountId, evKey).orElse(new ArrayList<>()));
                 ArchivedEvent ae = new ArchivedEvent(
                         eventId,
                         Instant.now(),
@@ -940,9 +1133,9 @@ public class EventBridgeService {
                         busArn
                 );
                 stored.add(ae);
-                archivedEventStore.put(evKey, stored);
+                accountPut(archivedEventStore, accountId, evKey, stored);
                 archive.setEventCount(archive.getEventCount() + 1);
-                archiveStore.put(archiveKey(region, archive.getArchiveName()), archive);
+                accountPut(archiveStore, accountId, archiveKey(region, archive.getArchiveName()), archive);
             }
         }
     }
@@ -971,6 +1164,8 @@ public class EventBridgeService {
                 .get(archivedEventKey(region, archiveName))
                 .orElse(List.of());
 
+        String capturedAccountId = regionResolver.getAccountId();
+
         Replay replay = new Replay();
         replay.setReplayName(replayName);
         replay.setReplayArn(regionResolver.buildArn("events", region, "replay/" + replayName));
@@ -981,14 +1176,15 @@ public class EventBridgeService {
         replay.setEventEndTime(eventEndTime);
         replay.setState(ReplayState.STARTING);
         replay.setReplayStartTime(Instant.now());
+        replay.setAccountId(capturedAccountId);
         replayStore.put(key, replay);
 
         replayDispatcher.dispatch(
                 replay,
                 events,
-                entries -> putEvents(entries, region),
-                (name, state) -> updateReplayState(name, state, region),
-                time -> updateReplayLastReplayed(replayName, time, region)
+                entries -> putEvents(entries, region, capturedAccountId),
+                (name, state) -> updateReplayStateForAccount(capturedAccountId, name, state, region),
+                time -> updateReplayLastReplayedForAccount(capturedAccountId, replayName, time, region)
         );
 
         LOG.infov("Started replay: {0} from archive {1}", replayName, archiveName);
@@ -1045,23 +1241,33 @@ public class EventBridgeService {
     }
 
     void updateReplayState(String replayName, ReplayState state, String region) {
+        updateReplayStateForAccount(null, replayName, state, region);
+    }
+
+    private void updateReplayStateForAccount(String accountId, String replayName,
+                                             ReplayState state, String region) {
         String key = replayKey(region, replayName);
-        replayStore.get(key).ifPresent(r -> {
+        accountGet(replayStore, accountId, key).ifPresent(r -> {
             r.setState(state);
             if (state == ReplayState.COMPLETED || state == ReplayState.CANCELLED
                     || state == ReplayState.FAILED) {
                 r.setReplayEndTime(Instant.now());
             }
-            replayStore.put(key, r);
+            accountPut(replayStore, accountId, key, r);
             LOG.debugv("Replay {0} transitioned to {1}", replayName, state);
         });
     }
 
     void updateReplayLastReplayed(String replayName, Instant eventTime, String region) {
+        updateReplayLastReplayedForAccount(null, replayName, eventTime, region);
+    }
+
+    private void updateReplayLastReplayedForAccount(String accountId, String replayName,
+                                                    Instant eventTime, String region) {
         String key = replayKey(region, replayName);
-        replayStore.get(key).ifPresent(r -> {
+        accountGet(replayStore, accountId, key).ifPresent(r -> {
             r.setEventLastReplayedTime(eventTime);
-            replayStore.put(key, r);
+            accountPut(replayStore, accountId, key, r);
         });
     }
 
@@ -1092,15 +1298,39 @@ public class EventBridgeService {
                 && !rule.getScheduleExpression().isBlank()) {
             String region = rule.getRegion() != null ? rule.getRegion() : "us-east-1";
             String key = ruleKey(region, rule.getEventBusName(), rule.getName());
+            String accountId = rule.getAccountId();
             ruleScheduler.startScheduler(
                 rule.getArn(),
                 rule.getScheduleExpression(),
                 () -> {
-                    Rule r = ruleStore.get(key).orElse(null);
-                    List<Target> t = targetStore.get(key).orElse(List.of());
+                    Rule r = accountGet(ruleStore, accountId, key).orElse(null);
+                    List<Target> t = accountGet(targetStore, accountId, key).orElse(List.of());
                     return new RuleScheduler.ScheduleData(r, t);
                 }
             );
+        }
+    }
+
+    private <V> java.util.Optional<V> accountGet(StorageBackend<String, V> store, String accountId, String key) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<V> aware) {
+            return aware.getForAccount(accountId, key);
+        }
+        return store.get(key);
+    }
+
+    private <V> List<V> accountScan(StorageBackend<String, V> store, String accountId,
+                                    java.util.function.Predicate<String> filter) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<V> aware) {
+            return aware.scanForAccount(accountId, filter);
+        }
+        return store.scan(filter);
+    }
+
+    private <V> void accountPut(StorageBackend<String, V> store, String accountId, String key, V value) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<V> aware) {
+            aware.putForAccount(accountId, key, value);
+        } else {
+            store.put(key, value);
         }
     }
 

@@ -1,23 +1,67 @@
 package io.github.hectorvent.floci.services.ec2;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.services.ec2.model.*;
-import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.inject.Inject;
-import org.jboss.logging.Logger;
-
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.*;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+
+import org.jboss.logging.Logger;
+
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.ec2.model.Address;
+import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
+import io.github.hectorvent.floci.services.ec2.model.Image;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceAssociation;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceAttachment;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceListResult;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterfacePrivateIpAddress;
+import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
+import io.github.hectorvent.floci.services.ec2.model.InternetGatewayAttachment;
+import io.github.hectorvent.floci.services.ec2.model.IpPermission;
+import io.github.hectorvent.floci.services.ec2.model.IpRange;
+import io.github.hectorvent.floci.services.ec2.model.KeyPair;
+import io.github.hectorvent.floci.services.ec2.model.Placement;
+import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.ec2.model.Route;
+import io.github.hectorvent.floci.services.ec2.model.RouteTable;
+import io.github.hectorvent.floci.services.ec2.model.RouteTableAssociation;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
+import io.github.hectorvent.floci.services.ec2.model.Subnet;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.Volume;
+import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
+import io.github.hectorvent.floci.services.ec2.model.Vpc;
+import io.github.hectorvent.floci.services.ec2.model.VpcCidrBlockAssociation;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 @ApplicationScoped
 public class Ec2Service {
 
     private static final Logger LOG = Logger.getLogger(Ec2Service.class);
+    private static final DateTimeFormatter ISO_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+            .withZone(ZoneOffset.UTC);
 
     private final String accountId;
     private final EmulatorConfig config;
@@ -160,10 +204,7 @@ public class Ec2Service {
         // Resolve subnet
         Subnet subnet = null;
         if (subnetId != null && !subnetId.isEmpty()) {
-            subnet = subnets.get(key(region, subnetId));
-            if (subnet == null) {
-                throw new AwsException("InvalidSubnetID.NotFound", "The subnet ID '" + subnetId + "' does not exist", 400);
-            }
+            subnet = getRequiredSubnet(region, subnetId);
         } else {
             // Pick first default subnet
             subnet = subnets.values().stream()
@@ -180,10 +221,7 @@ public class Ec2Service {
         List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
         if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
             for (String sgId : securityGroupIds) {
-                SecurityGroup sg = securityGroups.get(key(region, sgId));
-                if (sg == null) {
-                    throw new AwsException("InvalidGroup.NotFound", "The security group '" + sgId + "' does not exist", 400);
-                }
+                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
                 sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
             }
         } else {
@@ -207,7 +245,7 @@ public class Ec2Service {
             Instance inst = new Instance();
             inst.setInstanceId(instanceId);
             inst.setImageId(imageId != null ? imageId : "ami-default");
-            inst.setState(InstanceState.running());
+            inst.setState(InstanceState.pending());
             inst.setInstanceType(instanceType != null ? instanceType : "t2.micro");
             inst.setPlacement(new Placement(az));
             inst.setSubnetId(finalSubnetId);
@@ -237,7 +275,30 @@ public class Ec2Service {
             eni.setPrivateIpAddress(privateIp);
             eni.setPrivateDnsName(inst.getPrivateDnsName());
             eni.setGroups(new ArrayList<>(sgIdentifiers));
+            eni.setAttachmentId("eni-attach-" + randomHex(17));
+            eni.setDeviceIndex(0);
             inst.getNetworkInterfaces().add(eni);
+
+            // Root EBS volume
+            String rootVolId = "vol-" + randomHex(17);
+            inst.setRootVolumeId(rootVolId);
+            Volume rootVol = new Volume();
+            rootVol.setVolumeId(rootVolId);
+            rootVol.setAvailabilityZone(az);
+            rootVol.setVolumeType("gp3");
+            rootVol.setSize(8);
+            rootVol.setState("in-use");
+            rootVol.setRegion(region);
+            rootVol.setCreateTime(Instant.now());
+            VolumeAttachment att = new VolumeAttachment();
+            att.setVolumeId(rootVolId);
+            att.setInstanceId(instanceId);
+            att.setDevice(inst.getRootDeviceName());
+            att.setState("attached");
+            att.setDeleteOnTermination(true);
+            att.setAttachTime(Instant.now());
+            rootVol.getAttachments().add(att);
+            volumes.put(key(region, rootVolId), rootVol);
 
             instances.put(key(region, instanceId), inst);
             reservation.getInstances().add(inst);
@@ -257,7 +318,15 @@ public class Ec2Service {
 
         return reservation;
     }
+    
+    private Subnet getRequiredSubnet(String region, String subnetId) {
+        Subnet subnet = subnets.get(key(region, subnetId));
+        if (subnet == null) 
+            throw new AwsException("InvalidSubnetID.NotFound", "The subnet ID '" + subnetId + "' does not exist", 400);
 
+        return subnet;
+    }
+    
     private String assignPrivateIp(String region, String subnetId) {
         if (subnetId == null) {
             return "172.31.0." + (10 + new Random().nextInt(200));
@@ -279,11 +348,14 @@ public class Ec2Service {
         ensureDefaultResources(region);
         if (!instanceIds.isEmpty()) {
             for (String id : instanceIds) {
-                if (instances.get(key(region, id)) == null) {
-                    throw new AwsException("InvalidInstanceID.NotFound",
-                            "The instance ID '" + id + "' does not exist", 400);
-                }
+                getRequiredInstance(region, id);
             }
+        }
+
+        if (config.services().ec2().mock()) {
+            instances.values().stream()
+                    .filter(i -> i.getRegion().equals(region) && "pending".equals(i.getState().getName()))
+                    .forEach(i -> i.setState(InstanceState.running()));
         }
         List<Instance> matched = instances.values().stream()
                 .filter(i -> i.getRegion().equals(region))
@@ -307,9 +379,10 @@ public class Ec2Service {
         ensureDefaultResources(region);
         List<Map<String, String>> result = new ArrayList<>();
         for (String id : instanceIds) {
-            Instance inst = instances.get(key(region, id));
-            if (inst == null) {
-                throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + id + "' does not exist", 400);
+            Instance inst = getRequiredInstance(region, id);
+            
+            if (config.services().ec2().mock() && "pending".equals(inst.getState().getName())) {
+                inst.setState(InstanceState.running());
             }
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
@@ -317,6 +390,10 @@ public class Ec2Service {
                 inst.setTerminatedAt(System.currentTimeMillis());
             } else {
                 containerManager.terminate(inst);
+            }
+            // Delete root volume if deleteOnTermination (matches real AWS behavior)
+            if (inst.getRootVolumeId() != null) {
+                volumes.remove(key(region, inst.getRootVolumeId()));
             }
             Map<String, String> entry = new LinkedHashMap<>();
             entry.put("instanceId", id);
@@ -333,9 +410,10 @@ public class Ec2Service {
         ensureDefaultResources(region);
         List<Map<String, String>> result = new ArrayList<>();
         for (String id : instanceIds) {
-            Instance inst = instances.get(key(region, id));
-            if (inst == null) {
-                throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + id + "' does not exist", 400);
+            Instance inst = getRequiredInstance(region, id);
+            
+            if (config.services().ec2().mock() && "pending".equals(inst.getState().getName())) {
+                inst.setState(InstanceState.running());
             }
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
@@ -358,10 +436,8 @@ public class Ec2Service {
         ensureDefaultResources(region);
         List<Map<String, String>> result = new ArrayList<>();
         for (String id : instanceIds) {
-            Instance inst = instances.get(key(region, id));
-            if (inst == null) {
-                throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + id + "' does not exist", 400);
-            }
+           Instance inst = getRequiredInstance(region, id);
+
             if ("terminated".equals(inst.getState().getName())) {
                 throw new AwsException("IncorrectInstanceState",
                         "The instance '" + id + "' is not in a state from which it can be started.", 400);
@@ -386,10 +462,8 @@ public class Ec2Service {
     public void rebootInstances(String region, List<String> instanceIds) {
         ensureDefaultResources(region);
         for (String id : instanceIds) {
-            Instance inst = instances.get(key(region, id));
-            if (inst == null) {
-                throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + id + "' does not exist", 400);
-            }
+            Instance inst = getRequiredInstance(region, id);
+
             if (!config.services().ec2().mock()) {
                 containerManager.reboot(inst);
             }
@@ -409,6 +483,12 @@ public class Ec2Service {
 
     public List<Instance> describeInstanceStatus(String region, List<String> instanceIds) {
         ensureDefaultResources(region);
+        if (config.services().ec2().mock()) {
+            instances.values().stream()
+                    .filter(i -> i.getRegion().equals(region) && "pending".equals(i.getState().getName()))
+                    .filter(i -> instanceIds.isEmpty() || instanceIds.contains(i.getInstanceId()))
+                    .forEach(i -> i.setState(InstanceState.running()));
+        }
         return instances.values().stream()
                 .filter(i -> i.getRegion().equals(region))
                 .filter(i -> instanceIds.isEmpty() || instanceIds.contains(i.getInstanceId()))
@@ -418,25 +498,29 @@ public class Ec2Service {
 
     public Instance describeInstanceAttribute(String region, String instanceId, String attribute) {
         ensureDefaultResources(region);
-        Instance inst = instances.get(key(region, instanceId));
-        if (inst == null) {
-            throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + instanceId + "' does not exist", 400);
-        }
+        Instance inst = getRequiredInstance(region, instanceId);
+
         return inst;
     }
 
     public void modifyInstanceAttribute(String region, String instanceId, String attribute, String value) {
         ensureDefaultResources(region);
-        Instance inst = instances.get(key(region, instanceId));
-        if (inst == null) {
-            throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + instanceId + "' does not exist", 400);
-        }
+        Instance inst = getRequiredInstance(region, instanceId);
+
         // basic attribute modifications
         switch (attribute) {
             case "instanceType" -> inst.setInstanceType(value);
             case "sourceDestCheck" -> inst.setSourceDestCheck(Boolean.parseBoolean(value));
             case "ebsOptimized" -> inst.setEbsOptimized(Boolean.parseBoolean(value));
         }
+    }
+
+    private Instance getRequiredInstance(String region, String instanceId) {
+        Instance inst = instances.get(key(region, instanceId));
+        if (inst == null) 
+            throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + instanceId + "' does not exist", 400);
+        
+        return inst;
     }
 
     // ─── VPCs ──────────────────────────────────────────────────────────────────
@@ -461,10 +545,7 @@ public class Ec2Service {
         ensureDefaultResources(region);
         if (!vpcIds.isEmpty()) {
             for (String id : vpcIds) {
-                if (vpcs.get(key(region, id)) == null) {
-                    throw new AwsException("InvalidVpcID.NotFound",
-                            "The vpc ID '" + id + "' does not exist", 400);
-                }
+                getRequiredVpc(region, id);
             }
         }
         return vpcs.values().stream()
@@ -476,19 +557,15 @@ public class Ec2Service {
 
     public void deleteVpc(String region, String vpcId) {
         ensureDefaultResources(region);
-        Vpc vpc = vpcs.get(key(region, vpcId));
-        if (vpc == null) {
-            throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
-        }
+        getRequiredVpc(region, vpcId);
+
         vpcs.remove(key(region, vpcId));
     }
 
     public void modifyVpcAttribute(String region, String vpcId, String attribute, String value) {
         ensureDefaultResources(region);
-        Vpc vpc = vpcs.get(key(region, vpcId));
-        if (vpc == null) {
-            throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
-        }
+        Vpc vpc = getRequiredVpc(region, vpcId);
+
         switch (attribute) {
             case "enableDnsSupport"                    -> vpc.setEnableDnsSupport(Boolean.parseBoolean(value));
             case "enableDnsHostnames"                  -> vpc.setEnableDnsHostnames(Boolean.parseBoolean(value));
@@ -499,10 +576,8 @@ public class Ec2Service {
 
     public Vpc describeVpcAttribute(String region, String vpcId, String attribute) {
         ensureDefaultResources(region);
-        Vpc vpc = vpcs.get(key(region, vpcId));
-        if (vpc == null) {
-            throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
-        }
+        Vpc vpc = getRequiredVpc(region, vpcId);
+
         return vpc;
     }
 
@@ -517,10 +592,8 @@ public class Ec2Service {
 
     public VpcCidrBlockAssociation associateVpcCidrBlock(String region, String vpcId, String cidrBlock) {
         ensureDefaultResources(region);
-        Vpc vpc = vpcs.get(key(region, vpcId));
-        if (vpc == null) {
-            throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
-        }
+        Vpc vpc = getRequiredVpc(region, vpcId);
+
         VpcCidrBlockAssociation assoc = new VpcCidrBlockAssociation(
                 "vpc-cidr-assoc-" + randomHex(8), cidrBlock);
         vpc.getCidrBlockAssociationSet().add(assoc);
@@ -540,10 +613,8 @@ public class Ec2Service {
 
     public Subnet createSubnet(String region, String vpcId, String cidrBlock, String availabilityZone) {
         ensureDefaultResources(region);
-        Vpc vpc = vpcs.get(key(region, vpcId));
-        if (vpc == null) {
-            throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
-        }
+        getRequiredVpc(region, vpcId);
+
         String subnetId = "subnet-" + randomHex(8);
         Subnet subnet = new Subnet();
         subnet.setSubnetId(subnetId);
@@ -578,12 +649,12 @@ public class Ec2Service {
 
     public void modifySubnetAttribute(String region, String subnetId, String attribute, String value) {
         ensureDefaultResources(region);
-        Subnet subnet = subnets.get(key(region, subnetId));
-        if (subnet == null) {
-            throw new AwsException("InvalidSubnetID.NotFound", "The subnet ID '" + subnetId + "' does not exist", 400);
-        }
-        if ("mapPublicIpOnLaunch".equals(attribute)) {
-            subnet.setMapPublicIpOnLaunch(Boolean.parseBoolean(value));
+        Subnet subnet = getRequiredSubnet(region, subnetId);
+        switch (attribute) {
+            case "mapPublicIpOnLaunch"           -> subnet.setMapPublicIpOnLaunch(Boolean.parseBoolean(value));
+            case "assignIpv6AddressOnCreation"   -> subnet.setAssignIpv6AddressOnCreation(Boolean.parseBoolean(value));
+            case "enableDns64"                   -> subnet.setEnableDns64(Boolean.parseBoolean(value));
+            case "mapCustomerOwnedIpOnLaunch"    -> subnet.setMapCustomerOwnedIpOnLaunch(Boolean.parseBoolean(value));
         }
     }
 
@@ -592,9 +663,7 @@ public class Ec2Service {
     public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId) {
         ensureDefaultResources(region);
         if (vpcId != null && !vpcId.isEmpty()) {
-            if (vpcs.get(key(region, vpcId)) == null) {
-                throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
-            }
+            getRequiredVpc(region, vpcId);
         } else {
             vpcId = "vpc-default";
         }
@@ -643,10 +712,8 @@ public class Ec2Service {
 
     public List<SecurityGroupRule> authorizeSecurityGroupIngress(String region, String groupId, List<IpPermission> permissions) {
         ensureDefaultResources(region);
-        SecurityGroup sg = securityGroups.get(key(region, groupId));
-        if (sg == null) {
-            throw new AwsException("InvalidGroup.NotFound", "The security group '" + groupId + "' does not exist", 400);
-        }
+        SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
+
         List<SecurityGroupRule> rules = new ArrayList<>();
         for (IpPermission perm : permissions) {
             sg.getIpPermissions().add(perm);
@@ -657,10 +724,8 @@ public class Ec2Service {
 
     public List<SecurityGroupRule> authorizeSecurityGroupEgress(String region, String groupId, List<IpPermission> permissions) {
         ensureDefaultResources(region);
-        SecurityGroup sg = securityGroups.get(key(region, groupId));
-        if (sg == null) {
-            throw new AwsException("InvalidGroup.NotFound", "The security group '" + groupId + "' does not exist", 400);
-        }
+        SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
+
         List<SecurityGroupRule> rules = new ArrayList<>();
         for (IpPermission perm : permissions) {
             sg.getIpPermissionsEgress().add(perm);
@@ -704,20 +769,24 @@ public class Ec2Service {
 
     public void revokeSecurityGroupIngress(String region, String groupId, List<IpPermission> permissions) {
         ensureDefaultResources(region);
-        SecurityGroup sg = securityGroups.get(key(region, groupId));
-        if (sg == null) {
-            throw new AwsException("InvalidGroup.NotFound", "The security group '" + groupId + "' does not exist", 400);
-        }
+        SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
+
         sg.getIpPermissions().removeIf(p -> matchesAnyPermission(p, permissions));
     }
 
     public void revokeSecurityGroupEgress(String region, String groupId, List<IpPermission> permissions) {
         ensureDefaultResources(region);
-        SecurityGroup sg = securityGroups.get(key(region, groupId));
-        if (sg == null) {
-            throw new AwsException("InvalidGroup.NotFound", "The security group '" + groupId + "' does not exist", 400);
-        }
+        SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
+
         sg.getIpPermissionsEgress().removeIf(p -> matchesAnyPermission(p, permissions));
+    }
+
+    private SecurityGroup getRequiredSecurityGroup(String region, String groupId) {
+        SecurityGroup sg = securityGroups.get(key(region, groupId));
+        if (sg == null)
+            throw new AwsException("InvalidGroup.NotFound", "The security group '" + groupId + "' does not exist", 400);
+        
+        return sg;
     }
 
     private boolean matchesAnyPermission(IpPermission existing, List<IpPermission> toRemove) {
@@ -1001,30 +1070,32 @@ public class Ec2Service {
 
     public void attachInternetGateway(String region, String igwId, String vpcId) {
         ensureDefaultResources(region);
-        InternetGateway igw = internetGateways.get(key(region, igwId));
-        if (igw == null) {
-            throw new AwsException("InvalidInternetGatewayID.NotFound", "The internet gateway '" + igwId + "' does not exist", 400);
-        }
+        InternetGateway igw = getRequiredInternetGateway(region, igwId);
+
         igw.getAttachments().add(new InternetGatewayAttachment(vpcId, "available"));
     }
 
     public void detachInternetGateway(String region, String igwId, String vpcId) {
         ensureDefaultResources(region);
-        InternetGateway igw = internetGateways.get(key(region, igwId));
-        if (igw == null) {
-            throw new AwsException("InvalidInternetGatewayID.NotFound", "The internet gateway '" + igwId + "' does not exist", 400);
-        }
+        InternetGateway igw = getRequiredInternetGateway(region, igwId);
+
         igw.getAttachments().removeIf(a -> a.getVpcId().equals(vpcId));
+    }
+
+    private InternetGateway getRequiredInternetGateway(String region, String igwId) {
+        InternetGateway igw = internetGateways.get(key(region, igwId));
+        if (igw == null) 
+            throw new AwsException("InvalidInternetGatewayID.NotFound", "The internet gateway '" + igwId + "' does not exist", 400);
+        
+        return igw; 
     }
 
     // ─── Route Tables ──────────────────────────────────────────────────────────
 
     public RouteTable createRouteTable(String region, String vpcId) {
         ensureDefaultResources(region);
-        Vpc vpc = vpcs.get(key(region, vpcId));
-        if (vpc == null) {
-            throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
-        }
+        Vpc vpc = getRequiredVpc(region, vpcId); 
+
         String rtId = "rtb-" + randomHex(8);
         RouteTable rt = new RouteTable();
         rt.setRouteTableId(rtId);
@@ -1035,6 +1106,14 @@ public class Ec2Service {
         routeTables.put(key(region, rtId), rt);
         return rt;
     }
+
+    private Vpc getRequiredVpc(String region, String vpcId) {
+        Vpc vpc = vpcs.get(key(region, vpcId));
+        if (vpc == null)
+            throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
+
+        return vpc;
+    }       
 
     public List<RouteTable> describeRouteTables(String region, List<String> routeTableIds, Map<String, List<String>> filters) {
         ensureDefaultResources(region);
@@ -1054,10 +1133,8 @@ public class Ec2Service {
 
     public RouteTableAssociation associateRouteTable(String region, String routeTableId, String subnetId) {
         ensureDefaultResources(region);
-        RouteTable rt = routeTables.get(key(region, routeTableId));
-        if (rt == null) {
-            throw new AwsException("InvalidRouteTableID.NotFound", "The route table '" + routeTableId + "' does not exist", 400);
-        }
+        RouteTable rt = getRequiredRouteTable(region, routeTableId);
+
         String assocId = "rtbassoc-" + randomHex(8);
         RouteTableAssociation assoc = new RouteTableAssociation();
         assoc.setRouteTableAssociationId(assocId);
@@ -1080,20 +1157,24 @@ public class Ec2Service {
 
     public void createRoute(String region, String routeTableId, String destinationCidrBlock, String gatewayId) {
         ensureDefaultResources(region);
-        RouteTable rt = routeTables.get(key(region, routeTableId));
-        if (rt == null) {
-            throw new AwsException("InvalidRouteTableID.NotFound", "The route table '" + routeTableId + "' does not exist", 400);
-        }
+        RouteTable rt = getRequiredRouteTable(region, routeTableId);
+
         rt.getRoutes().add(new Route(destinationCidrBlock, gatewayId, "CreateRoute"));
     }
 
     public void deleteRoute(String region, String routeTableId, String destinationCidrBlock) {
         ensureDefaultResources(region);
-        RouteTable rt = routeTables.get(key(region, routeTableId));
-        if (rt == null) {
-            throw new AwsException("InvalidRouteTableID.NotFound", "The route table '" + routeTableId + "' does not exist", 400);
-        }
+        RouteTable rt = getRequiredRouteTable(region, routeTableId);
+
         rt.getRoutes().removeIf(r -> r.getDestinationCidrBlock().equals(destinationCidrBlock));
+    }
+
+    private RouteTable getRequiredRouteTable(String region, String routeTableId) {
+        RouteTable rt = routeTables.get(key(region, routeTableId));
+        if (rt == null) 
+            throw new AwsException("InvalidRouteTableID.NotFound", "The route table '" + routeTableId + "' does not exist", 400);
+        
+        return rt;
     }
 
     // ─── Elastic IPs ───────────────────────────────────────────────────────────
@@ -1112,12 +1193,18 @@ public class Ec2Service {
 
     public Address associateAddress(String region, String allocationId, String instanceId) {
         ensureDefaultResources(region);
-        Address addr = addresses.get(key(region, allocationId));
-        if (addr == null) {
-            throw new AwsException("InvalidAllocationID.NotFound", "The allocation ID '" + allocationId + "' does not exist", 400);
-        }
+        Address addr = getRequiredAddress(region, allocationId);
+
         addr.setInstanceId(instanceId);
         addr.setAssociationId("eipassoc-" + randomHex(17));
+        return addr;
+    }
+
+    private Address getRequiredAddress(String region, String allocationId) {
+        Address addr = addresses.get(key(region, allocationId));
+        if (addr == null) 
+            throw new AwsException("InvalidAllocationID.NotFound", "The allocation ID '" + allocationId + "' does not exist", 400);
+        
         return addr;
     }
 
@@ -1211,6 +1298,52 @@ public class Ec2Service {
 
     // ─── Filter matching ───────────────────────────────────────────────────────
 
+    private boolean matchesValue(String resourceValue, List<String> filterValues) {
+        String normalizedResourceValue = Objects.toString(resourceValue, "");
+        return filterValues.stream()
+                .map(filterValue -> Objects.toString(filterValue, ""))
+                .anyMatch(filterValue -> normalizedResourceValue.matches(wildcardToRegex(filterValue)));
+    }
+
+    private String wildcardToRegex(String pattern) {
+        String normalizedPattern = Objects.toString(pattern, "");
+        StringBuilder regex = new StringBuilder("^");
+        for (int i = 0; i < normalizedPattern.length(); i++) {
+            char c = normalizedPattern.charAt(i);
+            switch (c) {
+                case '*':
+                    regex.append(".*");
+                    break;
+                case '?':
+                    regex.append(".");
+                    break;
+                case '.':
+                case '\\':
+                case '^':
+                case '$':
+                case '+':
+                case '{':
+                case '}':
+                case '[':
+                case ']':
+                case '(':
+                case ')':
+                case '|':
+                    regex.append("\\").append(c);
+                    break;
+                default:
+                    regex.append(c);
+            }
+        }
+        regex.append("$");
+        return regex.toString();
+    }
+
+    private boolean matchesValue(List<String> patterns, String value) {
+        return patterns.stream()
+                .anyMatch(pattern -> value.matches(wildcardToRegex(pattern)));
+    }
+
     private boolean matchesFilters(Object resource, Map<String, List<String>> filters, String region) {
         if (filters == null || filters.isEmpty()) {
             return true;
@@ -1230,83 +1363,102 @@ public class Ec2Service {
             String tagKey = filterName.substring(4);
             List<Tag> resourceTags = getResourceTags(resource);
             return resourceTags.stream()
-                    .anyMatch(t -> t.getKey().equals(tagKey) && values.contains(t.getValue()));
+                    .anyMatch(t -> t.getKey().equals(tagKey) && matchesValue(values, t.getValue()));
         }
         if ("tag-key".equals(filterName)) {
             List<Tag> resourceTags = getResourceTags(resource);
-            return resourceTags.stream().anyMatch(t -> values.contains(t.getKey()));
+            return resourceTags.stream().anyMatch(t -> matchesValue(values, t.getKey()));
         }
         if ("tag-value".equals(filterName)) {
             List<Tag> resourceTags = getResourceTags(resource);
-            return resourceTags.stream().anyMatch(t -> values.contains(t.getValue()));
+            return resourceTags.stream().anyMatch(t -> matchesValue(values, t.getValue()));
         }
         // Resource-specific field filters
         if (resource instanceof Vpc vpc) {
             return switch (filterName) {
-                case "vpc-id" -> values.contains(vpc.getVpcId());
-                case "state" -> values.contains(vpc.getState());
-                case "isDefault", "is-default" -> values.contains(String.valueOf(vpc.isDefault()));
-                case "cidr" -> values.contains(vpc.getCidrBlock());
+                case "vpc-id" -> matchesValue(values, vpc.getVpcId());
+                case "state" -> matchesValue(values, vpc.getState());
+                case "isDefault", "is-default" -> matchesValue(values, String.valueOf(vpc.isDefault()));
+                case "cidr" -> matchesValue(values, vpc.getCidrBlock());
                 default -> true;
             };
         }
         if (resource instanceof Subnet subnet) {
             return switch (filterName) {
-                case "subnet-id" -> values.contains(subnet.getSubnetId());
-                case "vpc-id" -> values.contains(subnet.getVpcId());
-                case "state" -> values.contains(subnet.getState());
-                case "availabilityZone", "availability-zone" -> values.contains(subnet.getAvailabilityZone());
+                case "subnet-id" -> matchesValue(values, subnet.getSubnetId());
+                case "vpc-id" -> matchesValue(values, subnet.getVpcId());
+                case "state" -> matchesValue(values, subnet.getState());
+                case "availabilityZone", "availability-zone" -> matchesValue(values, subnet.getAvailabilityZone());
                 default -> true;
             };
         }
         if (resource instanceof SecurityGroup sg) {
             return switch (filterName) {
-                case "group-id" -> values.contains(sg.getGroupId());
-                case "group-name" -> values.contains(sg.getGroupName());
-                case "vpc-id" -> values.contains(sg.getVpcId());
+                case "group-id" -> matchesValue(values, sg.getGroupId());
+                case "group-name" -> matchesValue(values, sg.getGroupName());
+                case "vpc-id" -> matchesValue(values, sg.getVpcId());
                 default -> true;
             };
         }
         if (resource instanceof Instance inst) {
             return switch (filterName) {
-                case "instance-id" -> values.contains(inst.getInstanceId());
-                case "instance-state-name" -> values.contains(inst.getState().getName());
-                case "instance-type" -> values.contains(inst.getInstanceType());
-                case "vpc-id" -> values.contains(inst.getVpcId());
-                case "subnet-id" -> values.contains(inst.getSubnetId());
+                case "instance-id" -> matchesValue(values, inst.getInstanceId());
+                case "instance-state-name" -> matchesValue(values, inst.getState().getName());
+                case "instance-type" -> matchesValue(values, inst.getInstanceType());
+                case "vpc-id" -> matchesValue(values, inst.getVpcId());
+                case "subnet-id" -> matchesValue(values, inst.getSubnetId());
                 default -> true;
             };
         }
         if (resource instanceof InternetGateway igw) {
             return switch (filterName) {
-                case "internet-gateway-id" -> values.contains(igw.getInternetGatewayId());
+                case "internet-gateway-id" -> matchesValue(values, igw.getInternetGatewayId());
                 case "attachment.vpc-id" -> igw.getAttachments().stream()
-                        .anyMatch(a -> values.contains(a.getVpcId()));
+                        .anyMatch(a -> matchesValue(values, a.getVpcId()));
                 default -> true;
             };
         }
         if (resource instanceof RouteTable rt) {
             return switch (filterName) {
-                case "route-table-id" -> values.contains(rt.getRouteTableId());
-                case "vpc-id" -> values.contains(rt.getVpcId());
+                case "route-table-id" -> matchesValue(values, rt.getRouteTableId());
+                case "vpc-id" -> matchesValue(values, rt.getVpcId());
                 case "association.route-table-association-id" -> rt.getAssociations().stream()
-                        .anyMatch(a -> values.contains(a.getRouteTableAssociationId()));
+                        .anyMatch(a -> matchesValue(values, a.getRouteTableAssociationId()));
                 case "association.subnet-id" -> rt.getAssociations().stream()
-                        .anyMatch(a -> a.getSubnetId() != null && values.contains(a.getSubnetId()));
+                        .anyMatch(a -> a.getSubnetId() != null && matchesValue(values, a.getSubnetId()));
                 case "association.gateway-id" -> rt.getAssociations().stream()
-                        .anyMatch(a -> a.getGatewayId() != null && values.contains(a.getGatewayId()));
+                        .anyMatch(a -> a.getGatewayId() != null && matchesValue(values, a.getGatewayId()));
                 case "association.main" -> rt.getAssociations().stream()
-                        .anyMatch(a -> values.contains(String.valueOf(a.isMain())));
+                        .anyMatch(a -> matchesValue(values, String.valueOf(a.isMain())));
                 default -> true;
             };
         }
         if (resource instanceof Volume vol) {
             return switch (filterName) {
-                case "volume-id" -> values.contains(vol.getVolumeId());
-                case "status" -> values.contains(vol.getState());
-                case "volume-type" -> values.contains(vol.getVolumeType());
-                case "availability-zone" -> values.contains(vol.getAvailabilityZone());
-                case "encrypted" -> values.contains(String.valueOf(vol.isEncrypted()));
+                case "volume-id" -> matchesValue(values, vol.getVolumeId());
+                case "status" -> matchesValue(values, vol.getState());
+                case "volume-type" -> matchesValue(values, vol.getVolumeType());
+                case "availability-zone" -> matchesValue(values, vol.getAvailabilityZone());
+                case "encrypted" -> matchesValue(values, String.valueOf(vol.isEncrypted()));
+                default -> true;
+            };
+        }
+        if (resource instanceof NetworkInterface ni) {
+            return switch (filterName) {
+                case "network-interface-id" -> matchesValue(values, ni.getNetworkInterfaceId());
+                case "subnet-id" -> matchesValue(values, ni.getSubnetId());
+                case "vpc-id" -> matchesValue(values, ni.getVpcId());
+                case "group-id" -> ni.getGroups().stream()
+                        .anyMatch(g -> matchesValue(values, g.getGroupId()));
+                case "status" -> matchesValue(values, ni.getStatus());
+                case "private-ip-address" ->
+                    matchesValue(values, ni.getPrivateIpAddress()) ||
+                    ni.getPrivateIpAddresses().stream()
+                        .anyMatch(ip -> matchesValue(values, ip.getPrivateIpAddress()));
+                case "description" -> matchesValue(values, ni.getDescription());
+                case "owner-id" -> matchesValue(values, ni.getOwnerId());
+                case "mac-address" -> matchesValue(values, ni.getMacAddress());
+                case "private-dns-name" -> matchesValue(values, ni.getPrivateDnsName());
                 default -> true;
             };
         }
@@ -1324,23 +1476,31 @@ public class Ec2Service {
         if (resource instanceof KeyPair kp) return kp.getTags();
         if (resource instanceof Address addr) return addr.getTags();
         if (resource instanceof Volume vol) return vol.getTags();
+        if (resource instanceof NetworkInterface ni) return ni.getTagSet();
         return Collections.emptyList();
     }
 
     // ─── Volumes ───────────────────────────────────────────────────────────────
 
     public Volume createVolume(String region, String availabilityZone, String volumeType,
-                               int size, boolean encrypted, int iops, String snapshotId,
-                               List<Tag> volumeTags) {
+                               int size, boolean encrypted, int iops, Integer throughput,
+                               String snapshotId, List<Tag> volumeTags) {
         ensureDefaultResources(region);
         String volumeId = "vol-" + randomHex(17);
+        String effectiveType = volumeType != null ? volumeType : "gp2";
         Volume vol = new Volume();
         vol.setVolumeId(volumeId);
         vol.setAvailabilityZone(availabilityZone != null ? availabilityZone : region + "a");
-        vol.setVolumeType(volumeType != null ? volumeType : "gp2");
+        vol.setVolumeType(effectiveType);
         vol.setSize(size > 0 ? size : 8);
         vol.setEncrypted(encrypted);
         vol.setIops(iops > 0 ? iops : (volumeType != null && volumeType.startsWith("io") ? iops : 0));
+        // Throughput is a gp3-only attribute; AWS reports 125 MiB/s by default for gp3.
+        if ("gp3".equals(effectiveType)) {
+            vol.setThroughput(throughput != null && throughput > 0 ? throughput : 125);
+        } else {
+            vol.setThroughput(throughput);
+        }
         vol.setSnapshotId(snapshotId);
         vol.setCreateTime(Instant.now());
         vol.setState("available");
@@ -1372,5 +1532,152 @@ public class Ec2Service {
             throw new AwsException("InvalidVolume.NotFound",
                     "The volume '" + volumeId + "' does not exist.", 400);
         }
+    }
+
+    // ─── Network Interfaces ─────────────────────────────────────────────────────
+
+    public NetworkInterfaceListResult describeNetworkInterfaces(String region, List<String> networkInterfaceIds,
+                                                                   Map<String, List<String>> filters,
+                                                                   int maxResults, String nextToken) {
+        // Validate pagination parameters
+        if (maxResults > 0 && !networkInterfaceIds.isEmpty()) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The parameter NetworkInterfaceId cannot be used with the parameter MaxResults.", 400);
+        }
+        if (maxResults > 0 && (maxResults < 5 || maxResults > 1000)) {
+            throw new AwsException("InvalidMaxResults",
+                    "Value (" + maxResults + ") for parameter MaxResults is invalid. "
+                            + "Expecting a value between 5 and 1000.", 400);
+        }
+        int offset = decodeToken(nextToken);
+
+        // Phase 6: validate NetworkInterfaceId format
+        for (String id : networkInterfaceIds) {
+            if (!id.startsWith("eni-")) {
+                throw new AwsException("InvalidNetworkInterfaceID.Malformed",
+                        "Invalid id: \"" + id + "\" (expecting \"eni-...\")", 400);
+            }
+        }
+
+        ensureDefaultResources(region);
+        List<NetworkInterface> result = new ArrayList<>();
+        Set<String> foundIds = new HashSet<>();
+        for (Instance inst : instances.values()) {
+            if (!inst.getRegion().equals(region)) continue;
+            if (inst.getState() != null
+                    && inst.getState().getName() != null
+                    && "terminated".equals(inst.getState().getName())) {
+                continue;
+            }
+            for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
+                if (!networkInterfaceIds.isEmpty()
+                        && !networkInterfaceIds.contains(eni.getNetworkInterfaceId())) {
+                    continue;
+                }
+                foundIds.add(eni.getNetworkInterfaceId());
+                NetworkInterface ni = new NetworkInterface();
+                ni.setNetworkInterfaceId(eni.getNetworkInterfaceId());
+                ni.setSubnetId(eni.getSubnetId());
+                ni.setVpcId(eni.getVpcId());
+                ni.setDescription(eni.getDescription());
+                ni.setOwnerId(eni.getOwnerId());
+                ni.setStatus(eni.getStatus());
+                ni.setMacAddress(eni.getMacAddress());
+                ni.setPrivateIpAddress(eni.getPrivateIpAddress());
+                ni.setPrivateDnsName(eni.getPrivateDnsName());
+                ni.setSourceDestCheck(eni.isSourceDestCheck());
+                ni.setGroups(new ArrayList<>(eni.getGroups()));
+                // Phase 3: availability zone, tags, interface type
+                if (inst.getPlacement() != null) {
+                    ni.setAvailabilityZone(inst.getPlacement().getAvailabilityZone());
+                }
+                ni.getTagSet().addAll(inst.getTags());
+
+                NetworkInterfaceAttachment att = new NetworkInterfaceAttachment();
+                att.setAttachmentId(eni.getAttachmentId());
+                att.setDeviceIndex(eni.getDeviceIndex());
+                att.setStatus("attached");
+                att.setInstanceId(inst.getInstanceId());
+                att.setInstanceOwnerId(eni.getOwnerId());
+                // Phase 3: attachTime from instance launchTime, deleteOnTermination
+                if (inst.getLaunchTime() != null) {
+                    att.setAttachTime(ISO_FMT.format(inst.getLaunchTime()));
+                }
+                att.setDeleteOnTermination(true);
+                ni.setAttachment(att);
+
+                // Phase 3: privateIpAddressesSet — primary IP
+                NetworkInterfacePrivateIpAddress primaryIp = new NetworkInterfacePrivateIpAddress();
+                primaryIp.setPrivateIpAddress(eni.getPrivateIpAddress());
+                primaryIp.setPrivateDnsName(eni.getPrivateDnsName());
+                primaryIp.setPrimary(true);
+                // Look up EIP association for this instance
+                addressForInstance(inst.getInstanceId()).ifPresent(addr -> {
+                    NetworkInterfaceAssociation assoc = new NetworkInterfaceAssociation();
+                    assoc.setPublicIp(addr.getPublicIp());
+                    assoc.setAllocationId(addr.getAllocationId());
+                    assoc.setAssociationId(addr.getAssociationId());
+                    assoc.setIpOwnerId(eni.getOwnerId());
+                    primaryIp.setAssociation(assoc);
+                });
+                ni.getPrivateIpAddresses().add(primaryIp);
+
+                // Phase 4: apply filters
+                if (!matchesFilters(ni, filters, region)) {
+                    continue;
+                }
+
+                result.add(ni);
+            }
+        }
+
+        // Phase 6: validate requested IDs exist
+        for (String id : networkInterfaceIds) {
+            if (!foundIds.contains(id)) {
+                throw new AwsException("InvalidNetworkInterfaceID.NotFound",
+                        "The network interface ID '" + id + "' does not exist", 400);
+            }
+        }
+
+        // Phase 5: pagination
+        if (maxResults > 0) {
+            int total = result.size();
+            int toIndex = Math.min(offset + maxResults, total);
+            List<NetworkInterface> page = (offset < total)
+                    ? result.subList(offset, toIndex)
+                    : Collections.emptyList();
+            String newNextToken = (toIndex < total)
+                    ? encodeToken(toIndex)
+                    : null;
+            return new NetworkInterfaceListResult(new ArrayList<>(page), newNextToken);
+        }
+
+        return new NetworkInterfaceListResult(result, null);
+    }
+
+    // ─── Pagination token encoding / decoding ──────────────────────────────────
+
+    private String encodeToken(int offset) {
+        String json = "{\"offset\":" + offset + "}";
+        return Base64.getEncoder().encodeToString(json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private int decodeToken(String token) {
+        if (token == null || token.isEmpty()) return 0;
+        try {
+            String json = new String(Base64.getDecoder().decode(token), StandardCharsets.UTF_8);
+            int start = json.indexOf("\"offset\":") + 9;
+            int end = json.indexOf('}', start);
+            return Integer.parseInt(json.substring(start, end));
+        } catch (Exception e) {
+            throw new AwsException("InvalidParameterValue",
+                    "Invalid NextToken", 400);
+        }
+    }
+
+    private Optional<Address> addressForInstance(String instanceId) {
+        return addresses.values().stream()
+                .filter(a -> instanceId.equals(a.getInstanceId()) && a.getAssociationId() != null)
+                .findFirst();
     }
 }

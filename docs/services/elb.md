@@ -107,13 +107,6 @@ aws elbv2 delete-target-group \
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    elbv2:
-      enabled: true   # default: true
-```
-
 | Environment variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_ELBV2_ENABLED` | `true` | Enable or disable the ELBv2 service |

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
@@ -33,12 +34,35 @@ public class EsmStore {
         backend.put(esm.getUuid(), esm);
     }
 
+    public void saveForAccount(String accountId, EventSourceMapping esm) {
+        if (backend instanceof AccountAwareStorageBackend<EventSourceMapping> aware) {
+            aware.putForAccount(accountId, esm.getUuid(), esm);
+        } else {
+            backend.put(esm.getUuid(), esm);
+        }
+    }
+
     public Optional<EventSourceMapping> get(String uuid) {
         return backend.get(uuid);
     }
 
     public List<EventSourceMapping> list() {
         return backend.scan(k -> true);
+    }
+
+    /** Returns all ESMs across all accounts — for use at startup outside request scope. */
+    public List<EventSourceMapping> listAll() {
+        if (backend instanceof AccountAwareStorageBackend<EventSourceMapping> aware) {
+            return aware.scanAllAccounts();
+        }
+        return backend.scan(k -> true);
+    }
+
+    public Optional<EventSourceMapping> getForAccount(String accountId, String uuid) {
+        if (backend instanceof AccountAwareStorageBackend<EventSourceMapping> aware) {
+            return aware.getForAccount(accountId, uuid);
+        }
+        return backend.get(uuid);
     }
 
     public List<EventSourceMapping> listByFunction(String functionKey) {

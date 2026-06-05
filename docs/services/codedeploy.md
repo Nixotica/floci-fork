@@ -189,12 +189,9 @@ For `computePlatform: Lambda`, `CreateDeployment` performs real traffic shifting
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    codedeploy:
-      enabled: true   # default
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_CODEDEPLOY_ENABLED` | `true` | Enable or disable the service |
 
 ## CLI Examples
 

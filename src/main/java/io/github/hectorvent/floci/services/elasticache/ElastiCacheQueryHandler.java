@@ -2,10 +2,12 @@ package io.github.hectorvent.floci.services.elasticache;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
+import io.github.hectorvent.floci.services.elasticache.model.CacheCluster;
 import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUser;
 import io.github.hectorvent.floci.services.elasticache.model.Endpoint;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroup;
@@ -32,11 +34,17 @@ public class ElastiCacheQueryHandler {
 
     private final SigV4Validator sigV4Validator;
     private final ElastiCacheService service;
+    private final ElastiCacheMemcachedService memcachedService;
+    private final RegionResolver regionResolver;
 
     @Inject
-    public ElastiCacheQueryHandler(SigV4Validator sigV4Validator, ElastiCacheService service) {
+    public ElastiCacheQueryHandler(SigV4Validator sigV4Validator, ElastiCacheService service,
+                                   ElastiCacheMemcachedService memcachedService,
+                                   RegionResolver regionResolver) {
         this.sigV4Validator = sigV4Validator;
         this.service = service;
+        this.memcachedService = memcachedService;
+        this.regionResolver = regionResolver;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params) {
@@ -51,6 +59,9 @@ public class ElastiCacheQueryHandler {
             case "DescribeUsers"              -> handleDescribeUsers(params);
             case "ModifyUser"                 -> handleModifyUser(params);
             case "DeleteUser"                 -> handleDeleteUser(params);
+            case "CreateCacheCluster"         -> handleCreateCacheCluster(params);
+            case "DescribeCacheClusters"      -> handleDescribeCacheClusters(params);
+            case "DeleteCacheCluster"         -> handleDeleteCacheCluster(params);
             default -> AwsQueryResponse.error("UnsupportedOperation",
                     "Operation " + action + " is not supported.", AwsNamespaces.EC, 400);
         };
@@ -215,6 +226,58 @@ public class ElastiCacheQueryHandler {
         }
     }
 
+    // ── Cache Clusters (Memcached) ────────────────────────────────────────────
+
+    private Response handleCreateCacheCluster(MultivaluedMap<String, String> params) {
+        String clusterId = params.getFirst("CacheClusterId");
+        String engine = params.getFirst("Engine");
+
+        if (clusterId == null || clusterId.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue",
+                    "CacheClusterId is required.", AwsNamespaces.EC, 400);
+        }
+        if (!"memcached".equalsIgnoreCase(engine)) {
+            return AwsQueryResponse.error("InvalidParameterValue",
+                    "Engine must be 'memcached'. For Redis/Valkey use CreateReplicationGroup.", AwsNamespaces.EC, 400);
+        }
+
+        try {
+            CacheCluster cluster = memcachedService.createCacheCluster(clusterId);
+            return Response.ok(AwsQueryResponse.envelope("CreateCacheCluster", AwsNamespaces.EC, cacheClusterXml(cluster))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
+        }
+    }
+
+    private Response handleDescribeCacheClusters(MultivaluedMap<String, String> params) {
+        String filterId = params.getFirst("CacheClusterId");
+        try {
+            Collection<CacheCluster> clusterList = memcachedService.listCacheClusters(filterId);
+            var xml = new XmlBuilder().start("CacheClusters");
+            for (CacheCluster c : clusterList) {
+                xml.raw(cacheClusterXml(c));
+            }
+            xml.end("CacheClusters").start("Marker").end("Marker");
+            return Response.ok(AwsQueryResponse.envelope("DescribeCacheClusters", AwsNamespaces.EC, xml.build())).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
+        }
+    }
+
+    private Response handleDeleteCacheCluster(MultivaluedMap<String, String> params) {
+        String clusterId = params.getFirst("CacheClusterId");
+        if (clusterId == null || clusterId.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue",
+                    "CacheClusterId is required.", AwsNamespaces.EC, 400);
+        }
+        try {
+            CacheCluster cluster = memcachedService.deleteCacheCluster(clusterId);
+            return Response.ok(AwsQueryResponse.envelope("DeleteCacheCluster", AwsNamespaces.EC, cacheClusterXml(cluster))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
+        }
+    }
+
     // ── IAM Token Validation ──────────────────────────────────────────────────
 
     private Response handleValidateIamAuthToken(MultivaluedMap<String, String> params) {
@@ -245,6 +308,23 @@ public class ElastiCacheQueryHandler {
     }
 
     // ── XML helpers ───────────────────────────────────────────────────────────
+
+    private String cacheClusterXml(CacheCluster c) {
+        Endpoint ep = c.getConfigurationEndpoint();
+        var xml = new XmlBuilder()
+                .start("CacheCluster")
+                  .elem("CacheClusterId", c.getCacheClusterId())
+                  .elem("CacheClusterStatus", c.getCacheClusterStatus().name().toLowerCase())
+                  .elem("Engine", c.getEngine())
+                  .elem("EngineVersion", c.getEngineVersion());
+        if (ep != null) {
+            xml.start("ConfigurationEndpoint")
+               .elem("Address", ep.address())
+               .elem("Port", (long) ep.port())
+               .end("ConfigurationEndpoint");
+        }
+        return xml.end("CacheCluster").build();
+    }
 
     private String replicationGroupXml(ReplicationGroup g) {
         Endpoint ep = g.getConfigurationEndpoint();
@@ -289,7 +369,7 @@ public class ElastiCacheQueryHandler {
                 .elem("Engine", "redis")
                 .elem("MinimumEngineVersion", "6.0")
                 .start("UserGroupIds").end("UserGroupIds")
-                .elem("ARN", AwsArnUtils.Arn.of("elasticache", "us-east-1", "000000000000", "user:" + u.getUserId()).toString())
+                .elem("ARN", AwsArnUtils.Arn.of("elasticache", regionResolver.getDefaultRegion(), regionResolver.getAccountId(), "user:" + u.getUserId()).toString())
                 .build();
     }
 

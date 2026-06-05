@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 @TestProfile(StorageFactoryServiceCatalogIntegrationTest.AcmPersistentStorageProfile.class)
@@ -26,7 +27,7 @@ class StorageFactoryServiceCatalogIntegrationTest {
                 new TypeReference<Map<String, String>>() {}
         );
 
-        assertInstanceOf(PersistentStorage.class, backend);
+        assertInstanceOf(AccountAwareStorageBackend.class, backend);
     }
 
     public static final class AcmPersistentStorageProfile implements QuarkusTestProfile {

@@ -22,18 +22,12 @@
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    ssm:
-      enabled: true
-      max-parameter-history: 5   # Versions retained per parameter
-  storage:
-    services:
-      ssm:
-        mode: memory
-        flush-interval-ms: 5000
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_SSM_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_SSM_MAX_PARAMETER_HISTORY` | `5` | Number of parameter versions retained per parameter |
+| `FLOCI_STORAGE_SERVICES_SSM_MODE` | *(global default)* | Storage mode override for SSM (`memory`, `persistent`, `hybrid`, `wal`) |
+| `FLOCI_STORAGE_SERVICES_SSM_FLUSH_INTERVAL_MS` | `5000` | Flush interval for `hybrid`/`wal` storage modes (milliseconds) |
 
 ## Examples
 

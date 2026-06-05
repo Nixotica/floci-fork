@@ -7,7 +7,9 @@ import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
@@ -49,6 +51,7 @@ public class EcrRegistryManager {
     private final ContainerLifecycleManager lifecycleManager;
     private final ContainerLogStreamer logStreamer;
     private final ContainerDetector containerDetector;
+    private final CurrentContainerNetworkResolver currentContainerNetworkResolver;
     private final PortAllocator portAllocator;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
@@ -65,6 +68,7 @@ public class EcrRegistryManager {
                               ContainerLifecycleManager lifecycleManager,
                               ContainerLogStreamer logStreamer,
                               ContainerDetector containerDetector,
+                              CurrentContainerNetworkResolver currentContainerNetworkResolver,
                               PortAllocator portAllocator,
                               EmulatorConfig config,
                               RegionResolver regionResolver) {
@@ -72,6 +76,7 @@ public class EcrRegistryManager {
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
         this.containerDetector = containerDetector;
+        this.currentContainerNetworkResolver = currentContainerNetworkResolver;
         this.portAllocator = portAllocator;
         this.config = config;
         this.regionResolver = regionResolver;
@@ -106,6 +111,10 @@ public class EcrRegistryManager {
 
     /** Returns a {@link RegistryHttpClient} bound to the current registry endpoint. */
     public RegistryHttpClient httpClient() {
+        if (containerDetector.isRunningInContainer()) {
+            return new RegistryHttpClient("http://" + config.services().ecr().registryContainerName()
+                    + ":" + CONTAINER_INTERNAL_PORT);
+        }
         return new RegistryHttpClient("http://localhost:" + effectivePort());
     }
 
@@ -141,74 +150,66 @@ public class EcrRegistryManager {
                 config.services().ecr().registryBasePort(),
                 config.services().ecr().registryMaxPort());
 
-        String image = config.services().ecr().registryImage();
-
-        // Build environment variables
-        List<String> env = new ArrayList<>(List.of(
-                "REGISTRY_STORAGE_DELETE_ENABLED=true",
-                "REGISTRY_HTTP_ADDR=0.0.0.0:" + CONTAINER_INTERNAL_PORT
-        ));
-
-        // Build container spec
-        ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
-                .withName(name)
-                .withEnv(env)
-                .withPortBinding(CONTAINER_INTERNAL_PORT, chosenPort)
-                .withDockerNetwork(config.services().ecr().dockerNetwork())
-                .withLogRotation();
-
-        // Handle persistence mounting based on storage configuration
-        addPersistenceMounts(specBuilder, env);
-
-        ContainerSpec spec = specBuilder.build();
-
         try {
+            String image = config.services().ecr().registryImage();
+
+            // Build environment variables
+            List<String> env = new ArrayList<>(List.of(
+                    "REGISTRY_STORAGE_DELETE_ENABLED=true",
+                    "REGISTRY_HTTP_ADDR=0.0.0.0:" + CONTAINER_INTERNAL_PORT
+            ));
+
+            // Build container spec
+            ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
+                    .withName(name)
+                    .withEnv(env)
+                    .withPortBinding(CONTAINER_INTERNAL_PORT, chosenPort)
+                    .withDockerNetwork(resolveRegistryDockerNetwork())
+                    .withLogRotation();
+
+            // Handle persistence mounting based on storage configuration
+            addPersistenceMounts(specBuilder, env);
+
+            ContainerSpec spec = specBuilder.build();
+
             ContainerInfo info = lifecycleManager.createAndStart(spec);
             this.containerId = info.containerId();
             this.hostPort = chosenPort;
             this.started = true;
-            LOG.infov("Started ECR backing registry {0} on host port {1}", name, chosenPort);
+            LOG.infov("Started ECR backing registry {0} on host port {1}", name, String.valueOf(chosenPort));
 
             // Attach log streaming (new feature)
             attachLogStream();
         } catch (Exception e) {
+            // Release the reserved port unless the container actually started, so a
+            // failed start (e.g. Docker unreachable) does not permanently exhaust the
+            // registry port pool across retries.
+            if (!started) {
+                portAllocator.release(chosenPort);
+            }
             throw new RuntimeException("Failed to start ECR backing registry container: " + e.getMessage(), e);
         }
         runReconcileOnce();
     }
 
     private void addPersistenceMounts(ContainerBuilder.Builder specBuilder, List<String> env) {
-        String hostPersistentPath = config.storage().hostPersistentPath();
-        boolean inContainer = containerDetector.isRunningInContainer();
-        boolean isExplicitVolume = lifecycleManager.volumeExists(hostPersistentPath);
-        boolean isRelativeDefault = hostPersistentPath.startsWith(".");
-
-        if (inContainer && isRelativeDefault) {
-            // Zero-config fallback for in-container Floci
+        if (ContainerStorageHelper.isNamedVolumeMode(config)) {
+            lifecycleManager.ensureVolume(NAMED_VOLUME);
             specBuilder.withNamedVolume(NAMED_VOLUME, "/var/lib/registry");
-            LOG.infov("Floci in container with relative host-persistent-path ({0}); "
-                    + "using named volume {1} for ECR registry data",
-                    hostPersistentPath, NAMED_VOLUME);
-        } else if (isExplicitVolume) {
-            // User set hostPersistentPath to a Docker named-volume name
-            String internalMountPath = "/app/data";
-            specBuilder.withNamedVolume(hostPersistentPath, internalMountPath);
-            env.add("REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=" + internalMountPath + "/ecr/registry");
-        } else {
-            // Host path bind-mount.
-            // normalize() eliminates any "./" segments produced by toAbsolutePath() on a
-            // relative config path (e.g. "./data/ecr" → "/app/./data/ecr") so the
-            // replace() matches reliably.
-            String dataPath = Paths.get(config.services().ecr().dataPath(), "registry")
-                    .toAbsolutePath().normalize().toString();
-            String persistentPath = Paths.get(config.storage().persistentPath())
-                    .toAbsolutePath().normalize().toString();
-            String hostDataPath = dataPath.replace(persistentPath, hostPersistentPath);
-            if (!inContainer) {
-                ensureDataDir();
-            }
-            specBuilder.withBind(hostDataPath, "/var/lib/registry");
+            return;
         }
+
+        // Legacy host-path mode: host-persistent-path is an absolute path
+        boolean inContainer = containerDetector.isRunningInContainer();
+        String dataPath = Paths.get(config.services().ecr().dataPath(), "registry")
+                .toAbsolutePath().normalize().toString();
+        String persistentPath = Paths.get(config.storage().persistentPath())
+                .toAbsolutePath().normalize().toString();
+        String hostDataPath = dataPath.replace(persistentPath, config.storage().hostPersistentPath());
+        if (!inContainer) {
+            ensureDataDir();
+        }
+        specBuilder.withBind(hostDataPath, "/var/lib/registry");
     }
 
     private void attachLogStream() {
@@ -219,6 +220,17 @@ public class EcrRegistryManager {
 
         this.logStream = logStreamer.attach(
                 containerId, logGroup, logStreamName, region, "ecr:registry");
+    }
+
+    private java.util.Optional<String> resolveRegistryDockerNetwork() {
+        java.util.Optional<String> configured = config.services().ecr().dockerNetwork();
+        if (configured.isPresent() && !configured.get().isBlank()) {
+            return configured;
+        }
+        if (containerDetector.isRunningInContainer()) {
+            return currentContainerNetworkResolver.resolveNetworkName();
+        }
+        return java.util.Optional.empty();
     }
 
     private void runReconcileOnce() {
@@ -331,7 +343,7 @@ public class EcrRegistryManager {
             }
             this.started = true;
             LOG.infov("Adopted existing ECR registry container {0} on host port {1}",
-                    containerId, hostPort);
+                    containerId, String.valueOf(hostPort));
 
             // Attach log streaming to adopted container
             attachLogStream();

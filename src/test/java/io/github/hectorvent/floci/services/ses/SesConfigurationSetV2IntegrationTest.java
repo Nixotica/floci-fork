@@ -9,6 +9,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasSize;
 
 /**
  * Integration tests for SES V2 ConfigurationSet endpoints under /v2/email/configuration-sets.
@@ -283,5 +284,40 @@ class SesConfigurationSetV2IntegrationTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("BadRequestException"));
+    }
+
+    @Test
+    @Order(16)
+    void listTagsForResource_returnsTagsSetAtCreation() {
+        // Tags supplied to CreateConfigurationSet must also be reachable through
+        // the ListTagsForResource endpoint, not just GET configuration-sets/{name}.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                  "ConfigurationSetName": "v2-cs-tag-roundtrip",
+                  "Tags": [
+                    {"Key": "team", "Value": "platform"},
+                    {"Key": "env", "Value": "stg"}
+                  ]
+                }
+                """)
+        .when()
+            .post("/v2/email/configuration-sets")
+        .then()
+            .statusCode(200);
+
+        String arn = "arn:aws:ses:us-east-1:000000000000:configuration-set/v2-cs-tag-roundtrip";
+        given()
+            .header("Authorization", AUTH_HEADER)
+            .queryParam("ResourceArn", arn)
+        .when()
+            .get("/v2/email/tags")
+        .then()
+            .statusCode(200)
+            .body("Tags", hasSize(2))
+            .body("Tags.find { it.Key == 'team' }.Value", equalTo("platform"))
+            .body("Tags.find { it.Key == 'env' }.Value", equalTo("stg"));
     }
 }

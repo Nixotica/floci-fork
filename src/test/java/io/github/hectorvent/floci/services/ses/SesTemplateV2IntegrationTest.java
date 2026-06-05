@@ -551,6 +551,88 @@ class SesTemplateV2IntegrationTest {
             .statusCode(200);
     }
 
+    @Test
+    @Order(21)
+    void createEmailTemplate_withTags_visibleViaGet() {
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                  "TemplateName": "tpl-with-tags",
+                  "TemplateContent": {
+                    "Subject": "S",
+                    "Text": "T"
+                  },
+                  "Tags": [
+                    {"Key": "env", "Value": "stg"},
+                    {"Key": "team", "Value": "platform"}
+                  ]
+                }
+                """)
+        .when()
+            .post("/v2/email/templates")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/templates/tpl-with-tags")
+        .then()
+            .statusCode(200)
+            .body("TemplateName", equalTo("tpl-with-tags"))
+            .body("Tags.find { it.Key == 'env' }.Value", equalTo("stg"))
+            .body("Tags.find { it.Key == 'team' }.Value", equalTo("platform"));
+    }
+
+    @Test
+    @Order(22)
+    void createEmailTemplate_withTags_visibleViaListTagsForResource() {
+        // tpl-with-tags is created in @Order(21) above
+        String arn = "arn:aws:ses:us-east-1:000000000000:template/tpl-with-tags";
+        given()
+            .header("Authorization", AUTH_HEADER)
+            .queryParam("ResourceArn", arn)
+        .when()
+            .get("/v2/email/tags")
+        .then()
+            .statusCode(200)
+            .body("Tags.find { it.Key == 'env' }.Value", equalTo("stg"))
+            .body("Tags.find { it.Key == 'team' }.Value", equalTo("platform"));
+    }
+
+    @Test
+    @Order(23)
+    void updateEmailTemplate_preservesTags() {
+        // tpl-with-tags has 2 tags from @Order(21)
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                  "TemplateContent": {
+                    "Subject": "S2",
+                    "Text": "T2"
+                  }
+                }
+                """)
+        .when()
+            .put("/v2/email/templates/tpl-with-tags")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/templates/tpl-with-tags")
+        .then()
+            .statusCode(200)
+            .body("TemplateContent.Subject", equalTo("S2"))
+            .body("Tags.find { it.Key == 'env' }.Value", equalTo("stg"))
+            .body("Tags.find { it.Key == 'team' }.Value", equalTo("platform"));
+    }
+
     @ParameterizedTest(name = "{0}")
     @MethodSource("malformedSendEmailBodies")
     @Order(50)

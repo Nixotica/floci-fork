@@ -126,13 +126,19 @@ cfg, err := config.LoadDefaultConfig(context.TODO(),
 )
 ```
 
-## Default Account ID
+## Account ID
 
-Floci uses account ID `000000000000` in all ARNs and queue URLs. For example:
+Floci uses account ID `000000000000` in all ARNs and queue URLs by default:
 
 ```
 arn:aws:sqs:us-east-1:000000000000:my-queue
 http://localhost:4566/000000000000/my-queue
 ```
 
-This can be changed via the `FLOCI_DEFAULT_ACCOUNT_ID` environment variable.
+Change the default with `FLOCI_DEFAULT_ACCOUNT_ID`:
+
+```bash
+FLOCI_DEFAULT_ACCOUNT_ID=123456789012
+```
+
+**Multi-account isolation** is also supported: if your access key ID is exactly 12 digits, Floci uses it directly as the account ID and fully isolates that account's resources from all others. See [Multi-Account Isolation](../configuration/multi-account.md) for details.

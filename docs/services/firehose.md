@@ -22,6 +22,12 @@ Floci emulates Amazon Data Firehose for streaming data ingestion and delivery to
 2. **Automatic Flush**: Floci automatically flushes the buffer to S3 after every 5 records for immediate local feedback.
 3. **Format**: Records are flushed as raw NDJSON (newline-delimited JSON) to the `floci-firehose-results` bucket.
 
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_FIREHOSE_ENABLED` | `true` | Enable or disable the service |
+
 ## Example
 
 ```bash

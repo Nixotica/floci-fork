@@ -175,6 +175,21 @@ public class ContainerLifecycleManager {
     }
 
     /**
+     * Creates a named volume if it does not already exist. Idempotent — safe to call on every
+     * container start. Labels the volume {@code floci=true} so
+     * {@code docker volume prune --filter label=floci} works.
+     */
+    public void ensureVolume(String volumeName) {
+        if (!volumeExists(volumeName)) {
+            dockerClient.createVolumeCmd()
+                    .withName(volumeName)
+                    .withLabels(Map.of("floci", "true"))
+                    .exec();
+            LOG.debugv("Created volume {0}", volumeName);
+        }
+    }
+
+    /**
      * Removes a named Docker volume, ignoring errors if it does not exist or is still in use.
      */
     public void removeVolume(String volumeName) {
@@ -370,7 +385,7 @@ public class ContainerLifecycleManager {
                 }
 
                 ports.bind(ExposedPort.tcp(containerPort), Ports.Binding.bindPort(hostPort));
-                LOG.debugv("Port binding: {0} -> {1}", containerPort, hostPort);
+                LOG.debugv("Port binding: {0} -> {1}", String.valueOf(containerPort), String.valueOf(hostPort));
             }
             hostConfig.withPortBindings(ports);
         }

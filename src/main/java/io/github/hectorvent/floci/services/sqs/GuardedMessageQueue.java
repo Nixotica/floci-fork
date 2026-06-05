@@ -86,6 +86,9 @@ class GuardedMessageQueue {
                              String deadLetterTargetArn, List<Message> claimed,
                              List<Message> dlqCandidates) {
         msg.setReceiveCount(msg.getReceiveCount() + 1);
+        if (msg.getFirstReceiveTimestamp() == null) {
+            msg.setFirstReceiveTimestamp(Instant.now());
+        }
 
         if (maxReceiveCount > 0 && deadLetterTargetArn != null
                 && msg.getReceiveCount() > maxReceiveCount) {
@@ -112,10 +115,12 @@ class GuardedMessageQueue {
     private void claimFifo(int maxMessages, int effectiveTimeout,
                            int maxReceiveCount, String deadLetterTargetArn,
                            List<Message> claimed, List<Message> dlqCandidates) {
-        Set<String> groupsWithInFlight;
-        Set<String> groupsDelivered = new HashSet<>();
-
-        groupsWithInFlight =
+        // Cross-call group locking: a group that already has an in-flight
+        // message from a previous ReceiveMessage call is blocked until that
+        // message is deleted or its visibility expires. Within a single call
+        // we may return multiple messages from the same group (preserving
+        // insertion order), up to MaxNumberOfMessages.
+        Set<String> groupsWithInFlight =
                 messages.stream().filter(msg -> !msg.isVisible() && msg.getMessageGroupId() != null)
                         .map(Message::getMessageGroupId).collect(Collectors.toSet());
 
@@ -125,12 +130,8 @@ class GuardedMessageQueue {
 
             String groupId = msg.getMessageGroupId();
             if (groupId != null && groupsWithInFlight.contains(groupId)) continue;
-            if (groupId != null && groupsDelivered.contains(groupId)) continue;
 
-            if (tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates)
-                    && groupId != null) {
-                groupsDelivered.add(groupId);
-            }
+            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates);
         }
     }
 
@@ -188,6 +189,20 @@ class GuardedMessageQueue {
         }
     }
 
+    /** Remove and return the first message in insertion order, or null if empty.
+     *  Used by the message-move-task worker so the source queue stays observably
+     *  populated for the duration of a rate-limited move. */
+    Message drainOne() {
+        try (var _ = hold()) {
+            if (messages.isEmpty()) {
+                return null;
+            }
+            Message head = messages.remove(0);
+            persist();
+            return head;
+        }
+    }
+
     record MessageCounts(long visible, long inFlight) {
     }
 
@@ -216,8 +231,15 @@ class GuardedMessageQueue {
     }
 
     Message findByDeduplicationId(String dedupId) {
+        return findByDeduplicationId(dedupId, null);
+    }
+
+    Message findByDeduplicationId(String dedupId, String messageGroupId) {
         try (var _ = hold()) {
-            return messages.stream().filter(msg -> dedupId.equals(msg.getMessageDeduplicationId()))
+            return messages.stream()
+                    .filter(msg -> dedupId.equals(msg.getMessageDeduplicationId()))
+                    .filter(msg -> messageGroupId == null
+                            || messageGroupId.equals(msg.getMessageGroupId()))
                     .findFirst().orElse(null);
         }
     }

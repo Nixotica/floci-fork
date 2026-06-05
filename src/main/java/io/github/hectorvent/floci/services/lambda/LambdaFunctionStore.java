@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
@@ -34,7 +35,10 @@ public class LambdaFunctionStore {
     }
 
     private void loadIndex() {
-        backend.scan(key -> true).forEach(this::indexFunction);
+        List<LambdaFunction> all = backend instanceof AccountAwareStorageBackend<LambdaFunction> aware
+                ? aware.scanAllAccounts()
+                : backend.scan(key -> true);
+        all.forEach(this::indexFunction);
     }
 
     private void indexFunction(LambdaFunction fn) {
@@ -78,6 +82,13 @@ public class LambdaFunctionStore {
 
     public Optional<LambdaFunction> get(String region, String functionName, String version) {
         return backend.get(regionKey(region, functionName, version));
+    }
+
+    public Optional<LambdaFunction> getForAccount(String accountId, String region, String functionName) {
+        if (backend instanceof AccountAwareStorageBackend<LambdaFunction> aware) {
+            return aware.getForAccount(accountId, regionKey(region, functionName, "$LATEST"));
+        }
+        return backend.get(regionKey(region, functionName, "$LATEST"));
     }
 
     public Optional<LambdaFunction> getByUrlId(String urlId) {

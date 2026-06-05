@@ -69,12 +69,10 @@ Setting `enforcement-enabled: true` activates the policy evaluator as a JAX-RS r
 FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true
 ```
 
-**application.yml:**
+Docker Compose:
 ```yaml
-floci:
-  services:
-    iam:
-      enforcement-enabled: true
+environment:
+  FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED: "true"
 ```
 
 ### Evaluation rules
@@ -145,6 +143,13 @@ aws iam attach-user-policy --user-name alice --policy-arn $POLICY_ARN
 AWS_ACCESS_KEY_ID=$AKID AWS_SECRET_ACCESS_KEY=$SECRET \
   aws s3 ls
 ```
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_IAM_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` | `false` | Enforce IAM policies on all inbound requests |
 
 ## Examples
 

@@ -6,16 +6,15 @@ import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.services.opensearch.model.Domain;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URI;
-import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
@@ -48,44 +47,42 @@ public class OpenSearchDomainManager {
     }
 
     public void startDomain(Domain domain) {
-        String image = config.services().opensearch().defaultImage();
+        String image = resolveImage(domain.getEngineVersion());
         String containerName = "floci-opensearch-" + domain.getDomainName();
 
-        LOG.infov("Starting OpenSearch container for domain: {0} using image {1}",
-                domain.getDomainName(), image);
+        LOG.infov("Starting OpenSearch container for domain: {0} (version={1}, image={2})",
+                domain.getDomainName(), domain.getEngineVersion(), image);
 
         int hostPort = portAllocator.allocate(
                 config.services().opensearch().proxyBasePort(),
                 config.services().opensearch().proxyMaxPort());
 
-        Path dataPath = Path.of(config.services().opensearch().dataPath(), domain.getDomainName());
-        try {
-            Files.createDirectories(dataPath);
-        } catch (IOException e) {
-            LOG.warnv("Could not create OpenSearch data directory {0}: {1}", dataPath, e.getMessage());
-        }
-
         lifecycleManager.removeIfExists(containerName);
 
-        String hostDataPath;
-        String hostPersistentPath = config.storage().hostPersistentPath();
-        if (hostPersistentPath.startsWith("/")) {
-            String dataPathStr = dataPath.toAbsolutePath().normalize().toString();
-            String persistentPathStr = Path.of(config.storage().persistentPath()).toAbsolutePath().normalize().toString();
-            hostDataPath = dataPathStr.replace(persistentPathStr, hostPersistentPath);
-        } else {
-            hostDataPath = "floci-opensearch-" + domain.getDomainName();
-        }
-
-        ContainerSpec spec = containerBuilder.newContainer(image)
+        ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
                 .withName(containerName)
                 .withEnv("discovery.type", "single-node")
-                .withEnv("DISABLE_SECURITY_PLUGIN", "true")
                 .withPortBinding(OPENSEARCH_PORT, hostPort)
-                .withBind(hostDataPath, "/usr/share/opensearch/data")
                 .withDockerNetwork(config.services().dockerNetwork())
-                .withLogRotation()
-                .build();
+                .withLogRotation();
+
+        applyEngineEnv(specBuilder, domain.getEngineVersion());
+
+        if (ContainerStorageHelper.isNamedVolumeMode(config)) {
+            ContainerStorageHelper.applyStorage(specBuilder, lifecycleManager,
+                    "opensearch", domain.getVolumeId(), domain.getDomainName(),
+                    "/usr/share/opensearch/data");
+        } else {
+            // Legacy host-path mode: host-persistent-path is an absolute path
+            Path dataPath = Path.of(config.services().opensearch().dataPath(), domain.getDomainName());
+            ContainerStorageHelper.ensureHostDir(dataPath.toString());
+            String dataPathStr = dataPath.toAbsolutePath().normalize().toString();
+            String persistentPathStr = Path.of(config.storage().persistentPath()).toAbsolutePath().normalize().toString();
+            String hostDataPath = dataPathStr.replace(persistentPathStr, config.storage().hostPersistentPath());
+            specBuilder.withBind(hostDataPath, "/usr/share/opensearch/data");
+        }
+
+        ContainerSpec spec = specBuilder.build();
 
         ContainerInfo info = lifecycleManager.createAndStart(spec);
         domain.setContainerId(info.containerId());
@@ -97,7 +94,7 @@ public class OpenSearchDomainManager {
         }
 
         LOG.infov("OpenSearch container {0} started for domain {1} on port {2}",
-                info.containerId(), domain.getDomainName(), hostPort);
+                info.containerId(), domain.getDomainName(), String.valueOf(hostPort));
     }
 
     public boolean isReady(Domain domain) {
@@ -133,5 +130,57 @@ public class OpenSearchDomainManager {
         }
         lifecycleManager.stopAndRemove(domain.getContainerId(), null);
         LOG.infov("Stopped OpenSearch container for domain {0}", domain.getDomainName());
+    }
+
+    public void removeDomainStorage(Domain domain) {
+        ContainerStorageHelper.removeStorage(config, lifecycleManager,
+                "opensearch", domain.getVolumeId(), domain.getDomainName());
+    }
+
+    private String resolveImage(String engineVersion) {
+        return OpenSearchVersions.resolveImage(
+                config.services().opensearch().defaultImage(), engineVersion);
+    }
+
+    /**
+     * Engine env that differs between OpenSearch lines and Elasticsearch. Both
+     * the security-plugin disable flag and the v2.12+ initial admin password
+     * are baked here rather than the call site so the {@link #startDomain}
+     * builder chain stays linear.
+     */
+    private void applyEngineEnv(ContainerBuilder.Builder specBuilder, String engineVersion) {
+        if (engineVersion != null && engineVersion.startsWith("Elasticsearch")) {
+            // The OSS distribution of Elasticsearch ships without x-pack, so
+            // any xpack.* setting is rejected as unknown and the node refuses
+            // to boot. The default OSS build has no security plugin to disable
+            // — leave the env empty and let the image use its bare defaults.
+            return;
+        }
+        specBuilder.withEnv("DISABLE_SECURITY_PLUGIN", "true");
+        // OpenSearch 2.12+ refuses to start without an initial admin password
+        // even when the security plugin is disabled (the bootstrap check fires
+        // before plugin config). Provide a fixed value — the security plugin
+        // is off so this isn't a real credential.
+        if (requiresInitialAdminPassword(engineVersion)) {
+            specBuilder.withEnv("OPENSEARCH_INITIAL_ADMIN_PASSWORD", "FlociAdmin1!");
+        }
+    }
+
+    private boolean requiresInitialAdminPassword(String engineVersion) {
+        if (engineVersion == null || !engineVersion.startsWith("OpenSearch_")) {
+            return false;
+        }
+        String numeric = engineVersion.substring("OpenSearch_".length());
+        int dot = numeric.indexOf('.');
+        if (dot < 0) {
+            return false;
+        }
+        try {
+            int major = Integer.parseInt(numeric.substring(0, dot));
+            int minor = Integer.parseInt(numeric.substring(dot + 1));
+            return major > 2 || (major == 2 && minor >= 12);
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 }

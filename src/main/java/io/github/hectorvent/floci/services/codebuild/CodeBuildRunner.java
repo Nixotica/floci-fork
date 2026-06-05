@@ -5,6 +5,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -66,6 +67,7 @@ public class CodeBuildRunner {
     private final SecretsManagerService secretsManagerService;
     private final EmulatorConfig config;
     private final ContainerDetector containerDetector;
+    private final RegionResolver regionResolver;
 
     private final ConcurrentHashMap<String, String> runningContainers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicBoolean> stopFlags = new ConcurrentHashMap<>();
@@ -79,7 +81,8 @@ public class CodeBuildRunner {
                            SsmService ssmService,
                            SecretsManagerService secretsManagerService,
                            EmulatorConfig config,
-                           ContainerDetector containerDetector) {
+                           ContainerDetector containerDetector,
+                           RegionResolver regionResolver) {
         this.dockerClient = dockerClient;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -89,6 +92,7 @@ public class CodeBuildRunner {
         this.secretsManagerService = secretsManagerService;
         this.config = config;
         this.containerDetector = containerDetector;
+        this.regionResolver = regionResolver;
     }
 
     public void startBuild(String region, Build build, Project project, String buildspecOverride) {
@@ -181,7 +185,7 @@ public class CodeBuildRunner {
             Map<String, Object> logsMap = new java.util.HashMap<>();
             logsMap.put("groupName", logGroup);
             logsMap.put("streamName", logStream);
-            logsMap.put("cloudWatchLogsArn", AwsArnUtils.Arn.of("logs", region, config.defaultAccountId(), "log-group:" + logGroup + ":log-stream:" + logStream).toString());
+            logsMap.put("cloudWatchLogsArn", AwsArnUtils.Arn.of("logs", region, regionResolver.getAccountId(), "log-group:" + logGroup + ":log-stream:" + logStream).toString());
             build.setLogs(logsMap);
 
             List<String> envList = buildEnvList(region, build, project, buildspec, logStream);
@@ -312,6 +316,26 @@ public class CodeBuildRunner {
             build.setBuildComplete(true);
             build.setBuildStatus("FAULT");
             build.setCurrentPhase("COMPLETED");
+            if (build.getPhases() == null) {
+                build.setPhases(new ArrayList<>());
+            }
+            boolean hasCompleted = build.getPhases().stream()
+                    .anyMatch(p -> "COMPLETED".equals(p.getPhaseType()));
+            if (!hasCompleted) {
+                BuildPhase completedPhase = new BuildPhase();
+                completedPhase.setPhaseType("COMPLETED");
+                completedPhase.setPhaseStatus("FAILED");
+                completedPhase.setStartTime(System.currentTimeMillis() / 1000.0);
+                completedPhase.setEndTime(System.currentTimeMillis() / 1000.0);
+                completedPhase.setDurationInSeconds(0L);
+                if (e.getMessage() != null) {
+                    completedPhase.setContexts(List.of(Map.of(
+                            "statusCode", "FAULT_ERROR",
+                            "message", e.getMessage()
+                    )));
+                }
+                build.getPhases().add(completedPhase);
+            }
         } finally {
             stopFlags.remove(buildId);
             if (containerId != null) {

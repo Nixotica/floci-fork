@@ -53,6 +53,15 @@ public class Cluster {
     @JsonIgnore
     private String containerId;
 
+    @JsonIgnore
+    private String accountId;
+
+    @JsonIgnore
+    private String internalEndpoint;
+
+    @JsonIgnore
+    private int hostPort;
+
     public Cluster() {}
 
     public String getName() { return name; }
@@ -93,4 +102,13 @@ public class Cluster {
 
     public String getContainerId() { return containerId; }
     public void setContainerId(String containerId) { this.containerId = containerId; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
+
+    public String getInternalEndpoint() { return internalEndpoint; }
+    public void setInternalEndpoint(String internalEndpoint) { this.internalEndpoint = internalEndpoint; }
+
+    public int getHostPort() { return hostPort; }
+    public void setHostPort(int hostPort) { this.hostPort = hostPort; }
 }

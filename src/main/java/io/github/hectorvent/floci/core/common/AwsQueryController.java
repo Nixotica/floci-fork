@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.neptune.NeptuneQueryHandler;
+import io.github.hectorvent.floci.services.neptune.NeptuneService;
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingQueryHandler;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler;
 import io.github.hectorvent.floci.services.ec2.Ec2QueryHandler;
@@ -155,13 +157,18 @@ public class AwsQueryController {
             "CreateRouteTable", "DescribeRouteTables", "DeleteRouteTable",
             "AssociateRouteTable", "DisassociateRouteTable", "CreateRoute", "DeleteRoute",
             "AllocateAddress", "AssociateAddress", "DisassociateAddress", "ReleaseAddress", "DescribeAddresses",
+            "DescribeAddressesAttribute",
+            "DescribeIamInstanceProfileAssociations",
             "DescribeAvailabilityZones", "DescribeRegions", "DescribeAccountAttributes",
-            "DescribeInstanceTypes"
+            "DescribeInstanceTypes",
+            "DescribeNetworkInterfaces"
     );
 
     private final CloudFormationQueryHandler cloudFormationQueryHandler;
     private final ElastiCacheQueryHandler elastiCacheQueryHandler;
     private final RdsQueryHandler rdsQueryHandler;
+    private final NeptuneQueryHandler neptuneQueryHandler;
+    private final NeptuneService neptuneService;
     private final SqsQueryHandler sqsQueryHandler;
     private final SnsQueryHandler snsQueryHandler;
     private final SesQueryHandler sesQueryHandler;
@@ -179,6 +186,8 @@ public class AwsQueryController {
     public AwsQueryController(CloudFormationQueryHandler cloudFormationQueryHandler,
                               ElastiCacheQueryHandler elastiCacheQueryHandler,
                               RdsQueryHandler rdsQueryHandler,
+                              NeptuneQueryHandler neptuneQueryHandler,
+                              NeptuneService neptuneService,
                               SqsQueryHandler sqsQueryHandler, SnsQueryHandler snsQueryHandler,
                               SesQueryHandler sesQueryHandler,
                               IamQueryHandler iamQueryHandler, StsQueryHandler stsQueryHandler,
@@ -192,6 +201,8 @@ public class AwsQueryController {
         this.cloudFormationQueryHandler = cloudFormationQueryHandler;
         this.elastiCacheQueryHandler = elastiCacheQueryHandler;
         this.rdsQueryHandler = rdsQueryHandler;
+        this.neptuneQueryHandler = neptuneQueryHandler;
+        this.neptuneService = neptuneService;
         this.sqsQueryHandler = sqsQueryHandler;
         this.snsQueryHandler = snsQueryHandler;
         this.sesQueryHandler = sesQueryHandler;
@@ -230,7 +241,21 @@ public class AwsQueryController {
             case "iam" -> iamQueryHandler.handle(action, formParams);
             case "sts" -> stsQueryHandler.handle(action, formParams);
             case "elasticache" -> elastiCacheQueryHandler.handle(action, formParams);
-            case "rds" -> rdsQueryHandler.handle(action, formParams);
+            case "rds" -> {
+                // Neptune signs requests with "rds" credential scope (same wire protocol).
+                // Route to Neptune when Engine=neptune (create ops) or when the cluster/instance
+                // already exists in Neptune storage (describe/modify/delete ops).
+                String engine = formParams.getFirst("Engine");
+                String clusterId = formParams.getFirst("DBClusterIdentifier");
+                String instanceId = formParams.getFirst("DBInstanceIdentifier");
+                if ("neptune".equalsIgnoreCase(engine)
+                        || neptuneService.hasCluster(clusterId)
+                        || neptuneService.hasInstance(instanceId)) {
+                    yield neptuneQueryHandler.handle(action, formParams);
+                }
+                yield rdsQueryHandler.handle(action, formParams);
+            }
+            case "neptune" -> neptuneQueryHandler.handle(action, formParams);
             case "email" -> sesQueryHandler.handle(action, formParams, region);
             case "monitoring" -> cloudWatchMetricsQueryHandler.handle(action, formParams, region);
             case "cloudformation" -> cloudFormationQueryHandler.handle(action, formParams, region);
@@ -307,7 +332,10 @@ public class AwsQueryController {
             "ListTemplates", "SendTemplatedEmail", "SendBulkTemplatedEmail",
             "TestRenderTemplate",
             "CreateConfigurationSet", "DescribeConfigurationSet",
-            "ListConfigurationSets", "DeleteConfigurationSet"
+            "ListConfigurationSets", "DeleteConfigurationSet",
+            "CreateConfigurationSetEventDestination",
+            "UpdateConfigurationSetEventDestination",
+            "DeleteConfigurationSetEventDestination"
     );
 
     private static final Set<String> COGNITO_ACTIONS = Set.of(

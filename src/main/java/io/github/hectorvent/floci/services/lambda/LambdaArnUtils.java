@@ -161,4 +161,41 @@ public final class LambdaArnUtils {
     private static AwsException invalid(String message) {
         return new AwsException("InvalidParameterValueException", message, 400);
     }
+
+    /**
+     * Extracts the Lambda function name from an API Gateway integration URI.
+     * Handles formats like:
+     * <ul>
+     *   <li>{@code arn:aws:lambda:us-east-1:000000000000:function:myFn/invocations}</li>
+     *   <li>{@code arn:aws:lambda:us-east-1:000000000000:function:myFn}</li>
+     *   <li>{@code myFn} (bare function name)</li>
+     * </ul>
+     *
+     * @param uri the integration URI (may be null)
+     * @return the extracted function name, or null if the URI is null or unparseable
+     */
+    public static String extractFunctionNameFromUri(String uri) {
+        if (uri == null) {
+            return null;
+        }
+        try {
+            // Parse as a full ARN — resource is "function:myFn" or "function:myFn/invocations"
+            String resource = AwsArnUtils.parse(uri).resource();
+            String[] parts = resource.split("/");
+            // API Gateway v1 style: resource is "path/2015-03-31/functions/{lambdaArn}/invocations"
+            // In this case recurse on the embedded Lambda ARN
+            if (parts.length >= 4 && "path".equals(parts[0]) && "functions".equals(parts[2])) {
+                // parts[3] onwards is the embedded Lambda ARN
+                String embeddedArn = String.join("/", java.util.Arrays.copyOfRange(parts, 3, parts.length));
+                return extractFunctionNameFromUri(embeddedArn);
+            }
+            // Standard Lambda ARN: parts[0] is "function:myFn", strip the "function:" prefix
+            String functionPart = parts[0];
+            int colon = functionPart.lastIndexOf(':');
+            return colon >= 0 ? functionPart.substring(colon + 1) : functionPart;
+        } catch (IllegalArgumentException e) {
+            // Not a valid ARN — treat the entire URI as the function name
+            return uri;
+        }
+    }
 }

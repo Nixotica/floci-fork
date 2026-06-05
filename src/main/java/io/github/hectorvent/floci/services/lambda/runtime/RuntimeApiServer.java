@@ -49,6 +49,7 @@ public class RuntimeApiServer {
 
     private volatile HttpServer httpServer;
     private volatile boolean stopped;
+    private volatile CompletableFuture<Void> closeFuture;
 
     RuntimeApiServer(Vertx vertx, int port) {
         this.vertx = vertx;
@@ -128,28 +129,55 @@ public class RuntimeApiServer {
 
         // POST /runtime/init/error — runtime initialization failure
         router.post(INIT_ERROR_PATH).handler(ctx -> {
-            LOG.warnv("Lambda runtime reported init error on port {0}", port);
+            LOG.warnv("Lambda runtime reported init error on port {0}", String.valueOf(port));
             ctx.response().setStatusCode(202).end();
         });
 
-        httpServer = vertx.createHttpServer(new HttpServerOptions()
-                .setMaxFormAttributeSize(-1));
-        httpServer.requestHandler(router).listen(port, "0.0.0.0", result -> {
-            if (result.succeeded()) {
-                LOG.debugv("RuntimeApiServer started on port {0}", port);
-                started.complete(null);
-            } else {
-                started.completeExceptionally(result.cause());
-            }
-        });
+        long deadline = System.currentTimeMillis() + 5000;
+        tryListen(started, router, deadline);
 
         return started;
     }
 
-    public void stop() {
+    private void tryListen(CompletableFuture<Void> started, Router router, long deadline) {
+        if (started.isDone()) return;
+        httpServer = vertx.createHttpServer(new HttpServerOptions()
+                .setMaxFormAttributeSize(-1));
+        httpServer.requestHandler(router).listen(port, "0.0.0.0", result -> {
+            if (result.succeeded()) {
+                LOG.infov("RuntimeApiServer started on port {0}", String.valueOf(port));
+                started.complete(null);
+            } else {
+                if (System.currentTimeMillis() < deadline) {
+                    LOG.debugv("RuntimeApiServer failed to bind on port {0}, retrying in 100ms...", String.valueOf(port));
+                    httpServer.close(ar -> vertx.setTimer(100, id -> tryListen(started, router, deadline)));
+                } else {
+                    LOG.errorv(result.cause(), "RuntimeApiServer failed to bind on port {0}", String.valueOf(port));
+                    started.completeExceptionally(result.cause());
+                }
+            }
+        });
+    }
+
+    public synchronized CompletableFuture<Void> stop() {
+        if (closeFuture != null) {
+            return closeFuture;
+        }
         stopped = true;
+        CompletableFuture<Void> closed = new CompletableFuture<>();
+        closeFuture = closed;
         if (httpServer != null) {
-            httpServer.close();
+            httpServer.close(ar -> {
+                if (ar.succeeded()) {
+                    LOG.debugv("RuntimeApiServer on port {0} closed", String.valueOf(port));
+                    closed.complete(null);
+                } else {
+                    LOG.warnv(ar.cause(), "RuntimeApiServer on port {0} failed to close cleanly", String.valueOf(port));
+                    closed.completeExceptionally(ar.cause());
+                }
+            });
+        } else {
+            closed.complete(null);
         }
 
         // Wake any parked /next pollers with 204 (container shutting down — runtime will exit).
@@ -175,6 +203,8 @@ public class RuntimeApiServer {
                 inv.getResultFuture().complete(
                         new InvokeResult(200, "Unhandled", CONTAINER_STOPPED_PAYLOAD, null, inv.getRequestId())));
         inFlight.clear();
+
+        return closed;
     }
 
     public CompletableFuture<InvokeResult> enqueue(PendingInvocation invocation) {

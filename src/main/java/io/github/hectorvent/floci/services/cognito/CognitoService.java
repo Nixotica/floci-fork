@@ -130,6 +130,55 @@ public class CognitoService {
         return pool;
     }
 
+    public void addCustomAttributes(String userPoolId, List<Map<String, Object>> customAttributes) {
+        UserPool pool = describeUserPool(userPoolId);
+        List<Map<String, Object>> schema = pool.getSchemaAttributes();
+        if (schema == null) {
+            schema = new ArrayList<>();
+        }
+        for (Map<String, Object> attr : customAttributes) {
+            attr = new HashMap<>(attr);
+            String name = (String) attr.get("Name");
+            if (name == null || name.isEmpty()) {
+                throw new AwsException("InvalidParameterException", "Attribute name is required.", 400);
+            }
+
+            // Strip prefix to validate name length and pattern
+            String strippedName = name;
+            if (strippedName.startsWith("custom:")) {
+                strippedName = strippedName.substring("custom:".length());
+            } else if (strippedName.startsWith("dev:")) {
+                strippedName = strippedName.substring("dev:".length());
+            }
+
+            if (strippedName.isEmpty() || strippedName.length() > 20) {
+                throw new AwsException("InvalidParameterException", "Attribute name length must be between 1 and 20 characters.", 400);
+            }
+
+            if (!strippedName.matches("[\\p{L}\\p{M}\\p{S}\\p{N}\\p{P}]+")) {
+                throw new AwsException("InvalidParameterException", "Attribute name contains invalid characters.", 400);
+            }
+
+            boolean developerOnly = Boolean.TRUE.equals(attr.get("DeveloperOnlyAttribute"));
+            String prefix = developerOnly ? "dev:" : "custom:";
+            if (!name.startsWith("custom:") && !name.startsWith("dev:")) {
+                attr.put("Name", prefix + name);
+            }
+
+            String finalName = (String) attr.get("Name");
+            boolean exists = schema.stream().anyMatch(existing -> finalName.equals(existing.get("Name")));
+            if (exists) {
+                throw new AwsException("InvalidParameterException", "Attribute already exists in schema: " + finalName, 400);
+            }
+
+            schema.add(attr);
+        }
+        pool.setSchemaAttributes(schema);
+        pool.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        poolStore.put(userPoolId, pool);
+        LOG.infov("Added custom attributes to User Pool: {0}", userPoolId);
+    }
+
     @SuppressWarnings("unchecked")
     private void populateUserPool(UserPool pool, Map<String, Object> request) {
         if (request.containsKey("Policies")) pool.setPolicies((Map<String, Object>) request.get("Policies"));
@@ -276,6 +325,11 @@ public class CognitoService {
 
     public List<UserPoolClient> listUserPoolClients(String userPoolId) {
         return clientStore.scan(k -> clientStore.get(k).map(c -> c.getUserPoolId().equals(userPoolId)).orElse(false));
+    }
+
+    public void deleteUserPoolClient(String clientId) {
+        clientStore.get(clientId).orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool client not found", 404));
+        clientStore.delete(clientId);
     }
 
     public void deleteUserPoolClient(String userPoolId, String clientId) {
@@ -437,8 +491,41 @@ public class CognitoService {
 
     public CognitoUser adminCreateUser(String userPoolId, String username, Map<String, String> attributes,
                                        String temporaryPassword) {
+        return adminCreateUser(userPoolId, username, attributes, temporaryPassword, null);
+    }
+
+    /**
+     * AdminCreateUser with optional MessageAction.
+     *
+     * <p>{@code messageAction = "RESEND"} resends the invitation for an existing
+     * user in {@code FORCE_CHANGE_PASSWORD} status without recreating it; floci
+     * has no email transport, so this only refreshes {@code lastModifiedDate}.
+     * {@code "SUPPRESS"} or {@code null} retain the default create behavior.</p>
+     */
+    public CognitoUser adminCreateUser(String userPoolId,
+                                       String username,
+                                       Map<String, String> attributes,
+                                       String temporaryPassword,
+                                       String messageAction) {
         describeUserPool(userPoolId);
         String key = userKey(userPoolId, username);
+        boolean resend = "RESEND".equalsIgnoreCase(messageAction);
+
+        if (resend) {
+            CognitoUser existing = userStore.get(key)
+                    .orElseThrow(() -> new AwsException("UserNotFoundException", "User not found", 404));
+            if (!"FORCE_CHANGE_PASSWORD".equals(existing.getUserStatus())) {
+                final String userStateExceptionMessage = """
+                        User is in %s state and cannot be resent an invitation.
+                        """.formatted(existing.getUserStatus());
+                throw new AwsException("UnsupportedUserStateException", userStateExceptionMessage, 400);
+            }
+            existing.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            userStore.put(key, existing);
+            LOG.infov("Resent invitation for user {0} in pool {1}", username, userPoolId);
+            return existing;
+        }
+
         if (userStore.get(key).isPresent()) {
             throw new AwsException("UsernameExistsException", "User already exists", 400);
         }
@@ -538,6 +625,16 @@ public class CognitoService {
         user.getAttributes().putAll(attributes);
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         userStore.put(userKey(userPoolId, user.getUsername()), user);
+    }
+
+    public void adminDeleteUserAttributes(String userPoolId, String username, List<String> attributeNames) {
+        CognitoUser user = adminGetUser(userPoolId, username);
+        for (String attrName : attributeNames) {
+            user.getAttributes().remove(attrName);
+        }
+        user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        userStore.put(userKey(userPoolId, user.getUsername()), user);
+        LOG.infov("Deleted attributes {0} for user {1} in pool {2}", attributeNames, username, userPoolId);
     }
 
     public void adminEnableUser(String userPoolId, String username) {
@@ -659,6 +756,25 @@ public class CognitoService {
         LOG.infov("Deleted Cognito group: {0} from pool {1}", groupName, userPoolId);
     }
 
+    public CognitoGroup updateGroup(String userPoolId, String groupName, String description,
+                                     Integer precedence, String roleArn) {
+        CognitoGroup group = getGroup(userPoolId, groupName);
+        if (description != null) group.setDescription(description);
+        if (precedence != null) group.setPrecedence(precedence);
+        if (roleArn != null) group.setRoleArn(roleArn);
+        group.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        groupStore.put(groupKey(userPoolId, groupName), group);
+        LOG.infov("Updated Cognito group: {0} in pool {1}", groupName, userPoolId);
+        return group;
+    }
+
+    public List<CognitoUser> listUsersInGroup(String userPoolId, String groupName) {
+        CognitoGroup group = getGroup(userPoolId, groupName);
+        return group.getUserNames().stream()
+                .flatMap(username -> userStore.get(userKey(userPoolId, username)).stream())
+                .toList();
+    }
+
     public void adminAddUserToGroup(String userPoolId, String groupName, String username) {
         CognitoGroup group = getGroup(userPoolId, groupName);
         CognitoUser user = adminGetUser(userPoolId, username);
@@ -702,7 +818,7 @@ public class CognitoService {
         UserPoolClient client = clientStore.get(clientId)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found", 404));
         String userPoolId = client.getUserPoolId();
-        describeUserPool(userPoolId);
+        UserPool pool = describeUserPool(userPoolId);
 
         String key = userKey(userPoolId, username);
         if (userStore.get(key).isPresent()) {
@@ -718,13 +834,34 @@ public class CognitoService {
             user.getAttributes().putAll(attributes);
         }
 
-        // Ensure sub attribute is present
+        // Ensure sub attribute is present (required by PreSignUp event)
         if (!user.getAttributes().containsKey("sub")) {
             user.getAttributes().put("sub", UUID.randomUUID().toString());
         }
 
+        // Fire PreSignUp BEFORE persisting — allows the trigger to block signup
+        // (via lambda error) or auto-confirm/auto-verify the user (via response).
+        CognitoAuthFlowHandler.PreSignUpResponse preSignUp = authFlowHandler.firePreSignUp(
+                pool, client, user, Map.of(), Map.of(), "PreSignUp_SignUp");
+        if (preSignUp.autoConfirmUser()) {
+            user.setUserStatus("CONFIRMED");
+        }
+        if (preSignUp.autoVerifyEmail()) {
+            user.getAttributes().put("email_verified", "true");
+        }
+        if (preSignUp.autoVerifyPhone()) {
+            user.getAttributes().put("phone_number_verified", "true");
+        }
+
         userStore.put(key, user);
-        LOG.infov("Signed up user {0} in pool {1}", username, userPoolId);
+        LOG.infov("Signed up user {0} in pool {1} (status={2})",
+                username, userPoolId, user.getUserStatus());
+
+        // When PreSignUp auto-confirms, AWS Cognito also fires PostConfirmation.
+        // See: docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-sign-up.html
+        if (preSignUp.autoConfirmUser()) {
+            authFlowHandler.firePostConfirmation(pool, client, user, Map.of(), "PostConfirmation_ConfirmSignUp");
+        }
         return user;
     }
 
@@ -735,6 +872,18 @@ public class CognitoService {
         user.setUserStatus("CONFIRMED");
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         userStore.put(userKey(client.getUserPoolId(), user.getUsername()), user);
+
+        UserPool pool = poolStore.get(client.getUserPoolId())
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool not found", 404));
+        authFlowHandler.firePostConfirmation(pool, client, user, Map.of(), "PostConfirmation_ConfirmSignUp");
+    }
+
+    public void adminConfirmSignUp(String userPoolId, String username) {
+        CognitoUser user = adminGetUser(userPoolId, username);
+        user.setUserStatus("CONFIRMED");
+        user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        userStore.put(userKey(userPoolId, user.getUsername()), user);
+        LOG.infov("Admin confirmed sign up for user {0} in pool {1}", username, userPoolId);
     }
 
     // ──────────────────────────── Auth ────────────────────────────
@@ -841,6 +990,15 @@ public class CognitoService {
         adminUpdateUserAttributes(poolId, username, attributes);
     }
 
+    public void deleteUserAttributes(String accessToken, List<String> attributeNames) {
+        String username = extractUsernameFromToken(accessToken);
+        String poolId = extractPoolIdFromToken(accessToken);
+        if (username == null || poolId == null) {
+            throw new AwsException("NotAuthorizedException", "Invalid access token", 400);
+        }
+        adminDeleteUserAttributes(poolId, username, attributeNames);
+    }
+
     public Map<String, Object> issueClientCredentialsToken(String clientId, String clientSecret, String scope) {
         UserPoolClient client = clientStore.get(clientId)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found", 404));
@@ -892,6 +1050,10 @@ public class CognitoService {
 
     public String getTokenEndpoint() {
         return baseUrl + "/cognito-idp/oauth2/token";
+    }
+
+    public String getUserInfoEndpoint() {
+        return baseUrl + "/cognito-idp/oauth2/userInfo";
     }
 
     // ──────────────────────────── Private helpers ────────────────────────────
@@ -963,10 +1125,33 @@ public class CognitoService {
         if (!user.getGroupNames().isEmpty()) {
             claims.put("cognito:groups", new ArrayList<>(user.getGroupNames()));
         }
+        if ("id".equals(type)) {
+            addUserAttributeClaims(claims, user);
+        }
 
         applyClaimsOverride(claims, override, type);
 
         return signJwt(header, encodeJsonBase64Url(claims), getSigningPrivateKey(pool));
+    }
+
+    private static void addUserAttributeClaims(Map<String, Object> claims, CognitoUser user) {
+        for (Map.Entry<String, String> e : user.getAttributes().entrySet()) {
+            String name = e.getKey();
+            String value = e.getValue();
+            if (name == null || name.isEmpty() || value == null) continue;
+            if (claims.containsKey(name)) continue;
+            switch (name) {
+                case "email_verified", "phone_number_verified" -> claims.put(name, Boolean.parseBoolean(value));
+                case "updated_at" -> {
+                    try {
+                        claims.put(name, Long.parseLong(value));
+                    } catch (NumberFormatException _) {
+                        // OIDC requires updated_at to be a JSON number; omit invalid values.
+                    }
+                }
+                default -> claims.put(name, value);
+            }
+        }
     }
 
     private static void applyClaimsOverride(Map<String, Object> claims, ClaimsOverride override, String tokenType) {

@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.sns;
 
 import io.github.hectorvent.floci.core.common.*;
+import io.github.hectorvent.floci.services.sns.model.PlatformApplication;
+import io.github.hectorvent.floci.services.sns.model.PlatformEndpoint;
 import io.github.hectorvent.floci.services.sns.model.Subscription;
 import io.github.hectorvent.floci.services.sns.model.Topic;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
@@ -11,6 +13,7 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -52,6 +55,16 @@ public class SnsQueryHandler {
             case "TagResource" -> handleTagResource(params, region);
             case "UntagResource" -> handleUntagResource(params, region);
             case "ListTagsForResource" -> handleListTagsForResource(params, region);
+            case "CreatePlatformApplication" -> handleCreatePlatformApplication(params, region);
+            case "DeletePlatformApplication" -> handleDeletePlatformApplication(params, region);
+            case "GetPlatformApplicationAttributes" -> handleGetPlatformApplicationAttributes(params, region);
+            case "SetPlatformApplicationAttributes" -> handleSetPlatformApplicationAttributes(params, region);
+            case "ListPlatformApplications" -> handleListPlatformApplications(region);
+            case "CreatePlatformEndpoint" -> handleCreatePlatformEndpoint(params, region);
+            case "DeleteEndpoint" -> handleDeleteEndpoint(params, region);
+            case "GetEndpointAttributes" -> handleGetEndpointAttributes(params, region);
+            case "SetEndpointAttributes" -> handleSetEndpointAttributes(params, region);
+            case "ListEndpointsByPlatformApplication" -> handleListEndpointsByPlatformApplication(params, region);
             default -> AwsQueryResponse.error("UnsupportedOperation",
                     "Operation " + action + " is not supported by SNS.", AwsNamespaces.SNS, 400);
         };
@@ -180,21 +193,20 @@ public class SnsQueryHandler {
         String phoneNumber = getParam(params, "PhoneNumber");
         String message = getParam(params, "Message");
         String subject = getParam(params, "Subject");
+        String messageStructure = getParam(params, "MessageStructure");
         String messageGroupId = getParam(params, "MessageGroupId");
         String messageDeduplicationId = getParam(params, "MessageDeduplicationId");
 
-        Map<String, MessageAttributeValue> attributes = new HashMap<>();
-        for (int i = 1; ; i++) {
-            String name = params.getFirst("MessageAttributes.entry." + i + ".Name");
-            if (name == null) break;
-            String value = params.getFirst("MessageAttributes.entry." + i + ".Value.StringValue");
-            String dataType = params.getFirst("MessageAttributes.entry." + i + ".Value.DataType");
-            if (value != null) attributes.put(name, new MessageAttributeValue(value, dataType != null ? dataType : "String"));
+        Map<String, MessageAttributeValue> attributes;
+        try {
+            attributes = parseMessageAttributes(params, "MessageAttributes.entry.");
+        } catch (AwsException e) {
+            return xmlErrorResponse(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
         }
 
         try {
             String messageId = snsService.publish(topicArn, targetArn, phoneNumber, message, subject,
-                    attributes, messageGroupId, messageDeduplicationId, region);
+                    messageStructure, attributes, messageGroupId, messageDeduplicationId, region);
 
             String result = new XmlBuilder().elem("MessageId", messageId).build();
             return Response.ok(AwsQueryResponse.envelope("Publish", AwsNamespaces.SNS, result)).build();
@@ -203,18 +215,155 @@ public class SnsQueryHandler {
         }
     }
 
+    private Response handleCreatePlatformApplication(MultivaluedMap<String, String> params, String region) {
+        String name = getParam(params, "Name");
+        String platform = getParam(params, "Platform");
+        Map<String, String> attributes = extractSnsAttributes(params, "Attributes");
+        try {
+            PlatformApplication app = snsService.createPlatformApplication(name, platform, attributes, region);
+            String result = new XmlBuilder().elem("PlatformApplicationArn", app.getArn()).build();
+            return Response.ok(AwsQueryResponse.envelope("CreatePlatformApplication", AwsNamespaces.SNS, result)).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+        }
+    }
+
+    private Response handleDeletePlatformApplication(MultivaluedMap<String, String> params, String region) {
+        String arn = getParam(params, "PlatformApplicationArn");
+        snsService.deletePlatformApplication(arn, region);
+        return Response.ok(AwsQueryResponse.envelopeNoResult("DeletePlatformApplication", AwsNamespaces.SNS)).build();
+    }
+
+    private Response handleGetPlatformApplicationAttributes(MultivaluedMap<String, String> params, String region) {
+        String arn = getParam(params, "PlatformApplicationArn");
+        try {
+            Map<String, String> attrs = snsService.getPlatformApplicationAttributes(arn, region);
+            var xml = new XmlBuilder().start("Attributes");
+            for (var entry : attrs.entrySet()) {
+                xml.start("entry").elem("key", entry.getKey()).elem("value", entry.getValue()).end("entry");
+            }
+            xml.end("Attributes");
+            return Response.ok(AwsQueryResponse.envelope("GetPlatformApplicationAttributes", AwsNamespaces.SNS, xml.build())).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+        }
+    }
+
+    private Response handleSetPlatformApplicationAttributes(MultivaluedMap<String, String> params, String region) {
+        String arn = getParam(params, "PlatformApplicationArn");
+        Map<String, String> attrs = extractSnsAttributes(params, "Attributes");
+        try {
+            snsService.setPlatformApplicationAttributes(arn, attrs, region);
+            return Response.ok(AwsQueryResponse.envelopeNoResult("SetPlatformApplicationAttributes", AwsNamespaces.SNS)).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+        }
+    }
+
+    private Response handleListPlatformApplications(String region) {
+        List<PlatformApplication> apps = snsService.listPlatformApplications(region);
+        var xml = new XmlBuilder().start("PlatformApplications");
+        for (PlatformApplication app : apps) {
+            xml.start("member").elem("PlatformApplicationArn", app.getArn()).start("Attributes");
+            for (var entry : app.getAttributes().entrySet()) {
+                xml.start("entry").elem("key", entry.getKey()).elem("value", entry.getValue()).end("entry");
+            }
+            xml.end("Attributes").end("member");
+        }
+        xml.end("PlatformApplications");
+        return Response.ok(AwsQueryResponse.envelope("ListPlatformApplications", AwsNamespaces.SNS, xml.build())).build();
+    }
+
+    private Response handleCreatePlatformEndpoint(MultivaluedMap<String, String> params, String region) {
+        String appArn = getParam(params, "PlatformApplicationArn");
+        String token = getParam(params, "Token");
+        String customUserData = getParam(params, "CustomUserData");
+        Map<String, String> attrs = extractSnsAttributes(params, "Attributes");
+        try {
+            PlatformEndpoint endpoint = snsService.createPlatformEndpoint(appArn, token, customUserData, attrs, region);
+            String result = new XmlBuilder().elem("EndpointArn", endpoint.getArn()).build();
+            return Response.ok(AwsQueryResponse.envelope("CreatePlatformEndpoint", AwsNamespaces.SNS, result)).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+        }
+    }
+
+    private Response handleDeleteEndpoint(MultivaluedMap<String, String> params, String region) {
+        String arn = getParam(params, "EndpointArn");
+        snsService.deleteEndpoint(arn, region);
+        return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteEndpoint", AwsNamespaces.SNS)).build();
+    }
+
+    private Response handleGetEndpointAttributes(MultivaluedMap<String, String> params, String region) {
+        String arn = getParam(params, "EndpointArn");
+        try {
+            Map<String, String> attrs = snsService.getEndpointAttributes(arn, region);
+            var xml = new XmlBuilder().start("Attributes");
+            for (var entry : attrs.entrySet()) {
+                xml.start("entry").elem("key", entry.getKey()).elem("value", entry.getValue()).end("entry");
+            }
+            xml.end("Attributes");
+            return Response.ok(AwsQueryResponse.envelope("GetEndpointAttributes", AwsNamespaces.SNS, xml.build())).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+        }
+    }
+
+    private Response handleSetEndpointAttributes(MultivaluedMap<String, String> params, String region) {
+        String arn = getParam(params, "EndpointArn");
+        Map<String, String> attrs = extractSnsAttributes(params, "Attributes");
+        try {
+            snsService.setEndpointAttributes(arn, attrs, region);
+            return Response.ok(AwsQueryResponse.envelopeNoResult("SetEndpointAttributes", AwsNamespaces.SNS)).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+        }
+    }
+
+    private Response handleListEndpointsByPlatformApplication(MultivaluedMap<String, String> params, String region) {
+        String appArn = getParam(params, "PlatformApplicationArn");
+        try {
+            List<PlatformEndpoint> endpoints = snsService.listEndpointsByPlatformApplication(appArn, region);
+            var xml = new XmlBuilder().start("Endpoints");
+            for (PlatformEndpoint ep : endpoints) {
+                xml.start("member").elem("EndpointArn", ep.getArn()).start("Attributes");
+                for (var entry : ep.getAttributes().entrySet()) {
+                    xml.start("entry").elem("key", entry.getKey()).elem("value", entry.getValue()).end("entry");
+                }
+                xml.end("Attributes").end("member");
+            }
+            xml.end("Endpoints");
+            return Response.ok(AwsQueryResponse.envelope("ListEndpointsByPlatformApplication", AwsNamespaces.SNS, xml.build())).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+        }
+    }
+
     private Response handlePublishBatch(MultivaluedMap<String, String> params, String region) {
         String topicArn = getParam(params, "TopicArn");
         List<Map<String, Object>> entries = new ArrayList<>();
+        List<String[]> entryAttributeFailures = new ArrayList<>();
         for (int i = 1; ; i++) {
-            String id = getParam(params, "PublishBatchRequestEntries.member." + i + ".Id");
+            String entryPrefix = "PublishBatchRequestEntries.member." + i;
+            String id = getParam(params, entryPrefix + ".Id");
             if (id == null) break;
             Map<String, Object> entry = new java.util.HashMap<>();
             entry.put("Id", id);
-            entry.put("Message", getParam(params, "PublishBatchRequestEntries.member." + i + ".Message"));
-            entry.put("Subject", getParam(params, "PublishBatchRequestEntries.member." + i + ".Subject"));
-            entry.put("MessageGroupId", getParam(params, "PublishBatchRequestEntries.member." + i + ".MessageGroupId"));
-            entry.put("MessageDeduplicationId", getParam(params, "PublishBatchRequestEntries.member." + i + ".MessageDeduplicationId"));
+            entry.put("Message", getParam(params, entryPrefix + ".Message"));
+            entry.put("Subject", getParam(params, entryPrefix + ".Subject"));
+            entry.put("MessageGroupId", getParam(params, entryPrefix + ".MessageGroupId"));
+            entry.put("MessageDeduplicationId", getParam(params, entryPrefix + ".MessageDeduplicationId"));
+
+            Map<String, MessageAttributeValue> attributes;
+            try {
+                attributes = parseMessageAttributes(params, entryPrefix + ".MessageAttributes.entry.");
+            } catch (AwsException e) {
+                // Real AWS SNS surfaces per-entry attribute errors as Failed entries
+                // and keeps processing the rest of the batch, instead of aborting.
+                entryAttributeFailures.add(new String[]{id, e.getErrorCode(), e.getMessage(), "true"});
+                continue;
+            }
+            if (!attributes.isEmpty()) entry.put("MessageAttributes", attributes);
             entries.add(entry);
         }
         try {
@@ -225,7 +374,9 @@ public class SnsQueryHandler {
                 xml.start("member").elem("Id", s[0]).elem("MessageId", s[1]).end("member");
             }
             xml.end("Successful").start("Failed");
-            for (String[] f : result.failed()) {
+            List<String[]> allFailed = new ArrayList<>(result.failed());
+            allFailed.addAll(entryAttributeFailures);
+            for (String[] f : allFailed) {
                 xml.start("member").elem("Id", f[0]).elem("Code", f[1])
                    .elem("Message", f[2]).elem("SenderFault", f[3]).end("member");
             }
@@ -347,6 +498,31 @@ public class SnsQueryHandler {
 
     private String getParam(MultivaluedMap<String, String> params, String name) {
         return params.getFirst(name);
+    }
+
+    private Map<String, MessageAttributeValue> parseMessageAttributes(
+            MultivaluedMap<String, String> params, String prefix) {
+        Map<String, MessageAttributeValue> attributes = new HashMap<>();
+        for (int i = 1; ; i++) {
+            String name = params.getFirst(prefix + i + ".Name");
+            if (name == null) break;
+            String value = params.getFirst(prefix + i + ".Value.StringValue");
+            String binaryValueBase64 = params.getFirst(prefix + i + ".Value.BinaryValue");
+            String dataType = params.getFirst(prefix + i + ".Value.DataType");
+            if (binaryValueBase64 != null) {
+                byte[] binaryValue;
+                try {
+                    binaryValue = Base64.getDecoder().decode(binaryValueBase64);
+                } catch (IllegalArgumentException e) {
+                    throw new AwsException("InvalidParameterValue",
+                            "Invalid binary value for message attribute '" + name + "': not valid base64.", 400);
+                }
+                attributes.put(name, new MessageAttributeValue(binaryValue, dataType != null ? dataType : "Binary"));
+            } else if (value != null) {
+                attributes.put(name, new MessageAttributeValue(value, dataType != null ? dataType : "String"));
+            }
+        }
+        return attributes;
     }
 
     Response xmlErrorResponse(String code, String message, int status) {

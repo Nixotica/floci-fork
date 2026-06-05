@@ -14,11 +14,11 @@ import java.util.List;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 
@@ -36,6 +36,11 @@ class ElastiCacheIntegrationTest {
     private static final String GROUP_AUTH_TOKEN = "group-auth-token";
     private static final String CROSS_GROUP_ID = "it-ec-group-cross";
     private static final String CROSS_GROUP_AUTH_TOKEN = "cross-group-token";
+
+    /** Per-read timeout; ElastiCache tests talk to Docker-backed Valkey and can stall under load. */
+    private static final int SOCKET_TIMEOUT_MS = 10_000;
+    /** Retries only when no bytes were read yet for the line (safe: no partial-line corruption). */
+    private static final int READ_LINE_MAX_ATTEMPTS = 3;
 
     private static int firstProxyPort;
     private static int crossGroupPort;
@@ -345,7 +350,7 @@ class ElastiCacheIntegrationTest {
 
     private static Socket openSocket(int port) throws IOException {
         Socket socket = new Socket("localhost", port);
-        socket.setSoTimeout(5000);
+        socket.setSoTimeout(SOCKET_TIMEOUT_MS);
         return socket;
     }
 
@@ -363,11 +368,40 @@ class ElastiCacheIntegrationTest {
     }
 
     private static String readLine(Socket socket) throws IOException {
+        for (int attempt = 1; attempt <= READ_LINE_MAX_ATTEMPTS; attempt++) {
+            try {
+                return readLineOnce(socket);
+            } catch (SocketTimeoutException e) {
+                if (attempt == READ_LINE_MAX_ATTEMPTS) {
+                    throw new IOException(
+                            "Redis response timed out after " + READ_LINE_MAX_ATTEMPTS + " attempts ("
+                                    + SOCKET_TIMEOUT_MS + "ms read timeout each). "
+                                    + "Confirm Docker is running, Valkey containers are healthy (docker ps), "
+                                    + "and the host is not CPU/memory starved; re-run this test in isolation if needed.",
+                            e);
+                }
+            }
+        }
+        throw new AssertionError("unreachable");
+    }
+
+    private static String readLineOnce(Socket socket) throws IOException {
         InputStream in = socket.getInputStream();
         byte[] buffer = new byte[256];
         int offset = 0;
         while (offset < buffer.length) {
-            int read = in.read();
+            int read;
+            try {
+                read = in.read();
+            } catch (SocketTimeoutException e) {
+                if (offset == 0) {
+                    throw e;
+                }
+                throw new IOException(
+                        "Incomplete Redis line (" + offset + " bytes) before read timeout; proxy or backend "
+                                + "returned partial data.",
+                        e);
+            }
             if (read == -1) {
                 break;
             }

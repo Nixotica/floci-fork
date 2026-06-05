@@ -9,6 +9,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
+import java.net.BindException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -19,9 +21,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RuntimeApiServerTest {
@@ -45,8 +51,8 @@ class RuntimeApiServerTest {
     }
 
     @AfterEach
-    void tearDown() {
-        server.stop();
+    void tearDown() throws Exception {
+        server.stop().get(5, TimeUnit.SECONDS);
         scheduler.shutdownNow();
         vertx.close();
     }
@@ -221,6 +227,51 @@ class RuntimeApiServerTest {
         InvokeResult result = invocation.getResultFuture().get(0, TimeUnit.SECONDS);
         assertEquals("Unhandled", result.getFunctionError());
         assertTrue(new String(result.getPayload()).contains("ContainerStopped"));
+    }
+
+    @Test
+    @Timeout(10)
+    void stopReleasesPortSynchronously() throws Exception {
+        server.stop().get(5, TimeUnit.SECONDS);
+        boolean bound = false;
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline) {
+            try (ServerSocket s = new ServerSocket()) {
+                s.setReuseAddress(true);
+                s.bind(new InetSocketAddress(port));
+                bound = true;
+                break;
+            } catch (IOException e) {
+                Thread.sleep(100);
+            }
+        }
+        assertTrue(bound, "Should be able to bind to the port after stop()");
+    }
+
+    @Test
+    @Timeout(10)
+    void newServerOnSamePortAcceptsTrafficAfterStop() throws Exception {
+        server.stop().get(5, TimeUnit.SECONDS);
+
+        // Try to start a new server, retrying if it fails to bind due to temporary port conflicts
+        boolean started = false;
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                server = new RuntimeApiServer(vertx, port);
+                server.start().get(5, TimeUnit.SECONDS);
+                started = true;
+                break;
+            } catch (Exception e) {
+                Thread.sleep(100);
+            }
+        }
+        assertTrue(started, "New server should start successfully on the same port");
+
+        HttpResponse<String> resp = httpClient.send(
+                HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/x")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(404, resp.statusCode());
     }
 
     private static int findFreePort() throws IOException {

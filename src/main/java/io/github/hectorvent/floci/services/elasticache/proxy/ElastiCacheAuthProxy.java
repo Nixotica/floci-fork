@@ -58,7 +58,7 @@ public class ElastiCacheAuthProxy {
         running = true;
         Thread.ofVirtual().name("ec-proxy-accept-" + groupId).start(this::acceptLoop);
         LOG.infov("ElastiCache proxy started for group {0} on port {1} → {2}:{3}",
-                groupId, proxyPort, backendHost, backendPort);
+                groupId, String.valueOf(proxyPort), backendHost, String.valueOf(backendPort));
     }
 
     public void stop() {
@@ -159,10 +159,15 @@ public class ElastiCacheAuthProxy {
         };
     }
 
+    /**
+     * Relay I/O runs on platform daemon threads (not virtual threads). A parent virtual thread
+     * from {@code handleConnection} blocks in {@code join} here; scheduling nested virtual-thread
+     * relays under load can stall delivery of backend responses (e.g. PING/PONG) to the client.
+     */
     private void bridge(Socket client, Socket backend) {
-        Thread t1 = Thread.ofVirtual().name("ec-relay-c2b-" + groupId)
+        Thread t1 = Thread.ofPlatform().daemon(true).name("ec-relay-c2b-" + groupId)
                 .start(() -> relay(client, backend));
-        Thread t2 = Thread.ofVirtual().name("ec-relay-b2c-" + groupId)
+        Thread t2 = Thread.ofPlatform().daemon(true).name("ec-relay-b2c-" + groupId)
                 .start(() -> relay(backend, client));
         try {
             t1.join();

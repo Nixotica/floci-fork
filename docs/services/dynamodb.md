@@ -47,6 +47,14 @@ DynamoDB Streams are supported via a separate target (`DynamoDBStreams_20120810`
 | `GetShardIterator` | Get a shard iterator |
 | `GetRecords` | Read stream records from a shard |
 
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_DYNAMODB_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_STORAGE_SERVICES_DYNAMODB_MODE` | *(global default)* | Storage mode override for DynamoDB (`memory`, `persistent`, `hybrid`, `wal`) |
+| `FLOCI_STORAGE_SERVICES_DYNAMODB_FLUSH_INTERVAL_MS` | `5000` | Flush interval for `hybrid`/`wal` storage modes (milliseconds) |
+
 ## Examples
 
 ```bash

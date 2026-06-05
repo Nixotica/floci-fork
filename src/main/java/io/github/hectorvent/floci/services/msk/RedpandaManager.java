@@ -9,16 +9,15 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.C
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.msk.model.MskCluster;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.Closeable;
-import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URI;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -61,14 +60,6 @@ public class RedpandaManager {
 
         String containerName = "floci-msk-" + cluster.getClusterName();
 
-        // Ensure internal persistence path exists
-        Path dataPath = Path.of(config.storage().persistentPath(), "msk", cluster.getClusterName());
-        try {
-            Files.createDirectories(dataPath);
-        } catch (IOException e) {
-            LOG.errorv("Failed to create MSK data directory: {0}", dataPath, e);
-        }
-
         // Cleanup stale container
         lifecycleManager.removeIfExists(containerName);
 
@@ -92,19 +83,15 @@ public class RedpandaManager {
         }
 
         // Handle persistence mounting
-        String hostPersistentPath = config.storage().hostPersistentPath();
-        boolean isVolume = !hostPersistentPath.startsWith("/") && !hostPersistentPath.startsWith(".");
-
-        if (isVolume) {
-            // Volume mode: mount the whole volume and point Redpanda to the subdirectory
-            String internalMountPath = "/app/data";
-            specBuilder.withBind(hostPersistentPath, internalMountPath);
-            cmd.add("--data-dir");
-            cmd.add(internalMountPath + "/msk/" + cluster.getClusterName());
+        if (ContainerStorageHelper.isNamedVolumeMode(config)) {
+            ContainerStorageHelper.applyStorage(specBuilder, lifecycleManager,
+                    "msk", cluster.getVolumeId(), cluster.getClusterName(),
+                    "/var/lib/redpanda/data");
         } else {
-            // Directory mode: mount the specific subdirectory directly
-            String hostDataPath = Path.of(hostPersistentPath, "msk", cluster.getClusterName())
+            // Legacy host-path mode: host-persistent-path is an absolute path
+            String hostDataPath = Path.of(config.storage().hostPersistentPath(), "msk", cluster.getClusterName())
                     .toAbsolutePath().toString();
+            ContainerStorageHelper.ensureHostDir(hostDataPath);
             specBuilder.withBind(hostDataPath, "/var/lib/redpanda/data");
         }
 
@@ -180,5 +167,10 @@ public class RedpandaManager {
 
         lifecycleManager.stopAndRemove(cluster.getContainerId(), logHandle);
         LOG.infov("Redpanda container {0} stopped and removed", cluster.getContainerId());
+    }
+
+    public void removeClusterStorage(MskCluster cluster) {
+        ContainerStorageHelper.removeStorage(config, lifecycleManager,
+                "msk", cluster.getVolumeId(), cluster.getClusterName());
     }
 }

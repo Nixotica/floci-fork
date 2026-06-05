@@ -525,6 +525,50 @@ class CognitoServiceTest {
     }
 
     @Test
+    void adminCreateUserResendRefreshesExistingForceChangePasswordUser() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        CognitoUser created = service.adminCreateUser(pool.getId(),
+                "alice",
+                Map.of("email", "alice@example.com"),
+                "TempPass1!");
+
+        // Backdate lastModifiedDate so RESEND's refresh is unambiguously observable
+        // without relying on wall-clock sleep (lastModifiedDate has 1s precision).
+        long backdated = (System.currentTimeMillis() / 1000L) - 60;
+        created.setLastModifiedDate(backdated);
+
+        CognitoUser resent = service.adminCreateUser(pool.getId(), "alice",
+                Map.of("email", "alice@example.com"), null, "RESEND");
+
+        assertEquals(created.getAttributes().get("sub"), resent.getAttributes().get("sub"),
+                "RESEND must not recreate the user");
+        assertEquals("FORCE_CHANGE_PASSWORD", resent.getUserStatus());
+        assertTrue(resent.getLastModifiedDate() > backdated,
+                "RESEND should refresh lastModifiedDate");
+    }
+
+    @Test
+    void adminCreateUserResendThrowsUserNotFoundForMissingUser() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.adminCreateUser(pool.getId(), "ghost",
+                        Map.of("email", "g@example.com"), null, "RESEND"));
+        assertEquals("UserNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
+    void adminCreateUserResendThrowsUnsupportedStateForConfirmedUser() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        service.adminCreateUser(pool.getId(), "bob", Map.of("email", "bob@example.com"), "TempPass1!");
+        service.adminSetUserPassword(pool.getId(), "bob", "Permanent1!", true);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.adminCreateUser(pool.getId(), "bob",
+                        Map.of("email", "bob@example.com"), null, "RESEND"));
+        assertEquals("UnsupportedUserStateException", ex.getErrorCode());
+    }
+
+    @Test
     void signUpAutoGeneratesSub() {
         UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
         UserPoolClient client = service.createUserPoolClient(pool.getId(), "test-client",

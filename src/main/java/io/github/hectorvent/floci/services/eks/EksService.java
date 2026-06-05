@@ -3,7 +3,9 @@ package io.github.hectorvent.floci.services.eks;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.TagHandler;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
@@ -35,14 +37,17 @@ public class EksService implements TagHandler {
 
     private final StorageBackend<String, Cluster> storage;
     private final EmulatorConfig config;
+    private final RegionResolver regionResolver;
     private final EksClusterManager clusterManager;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
 
     @Inject
-    public EksService(StorageFactory storageFactory, EmulatorConfig config, EksClusterManager clusterManager) {
+    public EksService(StorageFactory storageFactory, EmulatorConfig config,
+                      RegionResolver regionResolver, EksClusterManager clusterManager) {
         this.storage = storageFactory.create("eks", "eks-clusters.json",
                 new TypeReference<Map<String, Cluster>>() {});
         this.config = config;
+        this.regionResolver = regionResolver;
         this.clusterManager = clusterManager;
     }
 
@@ -57,7 +62,7 @@ public class EksService implements TagHandler {
     public void shutdown() {
         poller.shutdownNow();
         if (!config.services().eks().mock()) {
-            for (Cluster cluster : storage.scan(k -> true)) {
+            for (Cluster cluster : allClusters()) {
                 clusterManager.stopCluster(cluster);
             }
         }
@@ -74,12 +79,13 @@ public class EksService implements TagHandler {
         }
 
         String region = config.defaultRegion();
-        String accountId = config.defaultAccountId();
+        String accountId = regionResolver.getAccountId();
         String arn = AwsArnUtils.Arn.of("eks", region, accountId, "cluster/" + name).toString();
 
         Cluster cluster = new Cluster();
         cluster.setName(name);
         cluster.setArn(arn);
+        cluster.setAccountId(accountId);
         cluster.setCreatedAt(Instant.now());
         cluster.setVersion(request.getVersion() != null ? request.getVersion() : "1.29");
         cluster.setRoleArn(request.getRoleArn());
@@ -94,7 +100,12 @@ public class EksService implements TagHandler {
             cluster.setStatus(ClusterStatus.ACTIVE);
             cluster.setEndpoint("https://localhost:" + config.services().eks().apiServerBasePort());
         } else {
-            clusterManager.startCluster(cluster);
+            try {
+                clusterManager.startCluster(cluster);
+            } catch (Exception e) {
+                LOG.errorv("Failed to start k3s container for cluster {0}: {1}", name, e.getMessage());
+                cluster.setStatus(ClusterStatus.FAILED);
+            }
         }
 
         storage.put(name, cluster);
@@ -225,13 +236,13 @@ public class EksService implements TagHandler {
     private void startReadinessPoller() {
         poller.scheduleAtFixedRate(() -> {
             try {
-                for (Cluster cluster : storage.scan(k -> true)) {
+                for (Cluster cluster : allClusters()) {
                     if (cluster.getStatus() == ClusterStatus.CREATING) {
                         if (clusterManager.isReady(cluster)) {
                             LOG.infov("EKS cluster {0} is now ACTIVE", cluster.getName());
                             clusterManager.finalizeCluster(cluster);
                             cluster.setStatus(ClusterStatus.ACTIVE);
-                            storage.put(cluster.getName(), cluster);
+                            putCluster(cluster);
                         }
                     }
                 }
@@ -239,5 +250,20 @@ public class EksService implements TagHandler {
                 LOG.error("Error in EKS readiness poller", e);
             }
         }, 2, 3, TimeUnit.SECONDS);
+    }
+
+    private List<Cluster> allClusters() {
+        if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
+            return aware.scanAllAccounts();
+        }
+        return storage.scan(k -> true);
+    }
+
+    private void putCluster(Cluster cluster) {
+        if (cluster.getAccountId() != null && storage instanceof AccountAwareStorageBackend<Cluster> aware) {
+            aware.putForAccount(cluster.getAccountId(), cluster.getName(), cluster);
+        } else {
+            storage.put(cluster.getName(), cluster);
+        }
     }
 }

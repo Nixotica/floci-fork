@@ -63,4 +63,16 @@ else
     export FLOCI_DNS_EXTRA_SUFFIXES="${_parity_suffixes}"
 fi
 
+# TLS — USE_SSL=1 → FLOCI_TLS_ENABLED=true
+if [ "${USE_SSL:-0}" = "1" ]; then
+    export FLOCI_TLS_ENABLED="${FLOCI_TLS_ENABLED:-true}"
+fi
+
+# TLS — CUSTOM_SSL_CERT_PATH → FLOCI_TLS_CERT_PATH + FLOCI_TLS_KEY_PATH
+# LocalStack uses a single combined PEM (cert+key). Floci accepts it in both fields.
+if [ -n "${CUSTOM_SSL_CERT_PATH:-}" ]; then
+    export FLOCI_TLS_CERT_PATH="${FLOCI_TLS_CERT_PATH:-${CUSTOM_SSL_CERT_PATH}}"
+    export FLOCI_TLS_KEY_PATH="${FLOCI_TLS_KEY_PATH:-${CUSTOM_SSL_CERT_PATH}}"
+fi
+
 # SERVICES — intentionally ignored; Floci starts all 41 services in ~24ms.

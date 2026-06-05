@@ -10,6 +10,7 @@ public class Replay {
     private String replayName;
     private String replayArn;
     private String description;
+    private String accountId;
     private String eventSourceArn;
     private String destinationArn;
     private Instant eventStartTime;
@@ -57,4 +58,7 @@ public class Replay {
 
     public Instant getReplayEndTime() { return replayEndTime; }
     public void setReplayEndTime(Instant replayEndTime) { this.replayEndTime = replayEndTime; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 }

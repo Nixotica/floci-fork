@@ -62,7 +62,7 @@ public class KinesisEventSourcePoller {
     }
 
     public void startPersistedPollers() {
-        List<EventSourceMapping> esms = esmStore.list();
+        List<EventSourceMapping> esms = esmStore.listAll();
         for (EventSourceMapping esm : esms) {
             if (esm.isEnabled() && esm.getEventSourceArn().contains(":kinesis:")) {
                 startPolling(esm);
@@ -80,8 +80,9 @@ public class KinesisEventSourcePoller {
     public void startPolling(EventSourceMapping esm) {
         if (timerIds.containsKey(esm.getUuid())) return;
         String uuid = esm.getUuid();
+        String accountId = esm.getAccountId();
         long timerId = vertx.setPeriodic(pollIntervalMs, id -> {
-            esmStore.get(uuid).ifPresent(latest -> {
+            esmStore.getForAccount(accountId, uuid).ifPresent(latest -> {
                 if (latest.isEnabled()) pollAndInvoke(latest);
             });
         });
@@ -98,7 +99,7 @@ public class KinesisEventSourcePoller {
         if (activePolls.putIfAbsent(esm.getUuid(), Boolean.TRUE) != null) return;
         pollExecutor.submit(() -> {
             try {
-                LambdaFunction fn = functionStore.get(esm.getRegion(), esm.getFunctionName()).orElse(null);
+                LambdaFunction fn = functionStore.getForAccount(esm.getAccountId(), esm.getRegion(), esm.getFunctionName()).orElse(null);
                 if (fn == null) return;
 
                 String streamName = streamNameFromArn(esm.getEventSourceArn());
@@ -133,7 +134,7 @@ public class KinesisEventSourcePoller {
                         if (invokeResult.getFunctionError() == null) {
                             String newestSeq = records.get(records.size() - 1).getSequenceNumber();
                             esm.getShardSequenceNumbers().put(shard.getShardId(), newestSeq);
-                            esmStore.save(esm);
+                            esmStore.saveForAccount(esm.getAccountId(), esm);
                         }
                     }
                 }
@@ -162,7 +163,7 @@ public class KinesisEventSourcePoller {
                 record.put("eventVersion", "1.0");
                 record.put("eventID", shardId + ":" + rec.getSequenceNumber());
                 record.put("eventName", "aws:kinesis:record");
-                record.put("invokeIdentityArn", AwsArnUtils.Arn.of("iam", "", "000000000000", "role/lambda-role").toString());
+                record.put("invokeIdentityArn", AwsArnUtils.Arn.of("iam", "", esm.getAccountId(), "role/lambda-role").toString());
                 record.put("awsRegion", esm.getRegion());
                 record.put("eventSourceARN", esm.getEventSourceArn());
                 recordsArray.add(record);

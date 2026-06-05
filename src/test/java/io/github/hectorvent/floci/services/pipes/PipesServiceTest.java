@@ -1,7 +1,7 @@
 package io.github.hectorvent.floci.services.pipes;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.pipes.model.DesiredState;
@@ -28,11 +28,10 @@ class PipesServiceTest {
         when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
                 .thenReturn(new InMemoryStorage<>());
 
-        EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        when(config.defaultAccountId()).thenReturn("000000000000");
+        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
 
         PipesPoller poller = Mockito.mock(PipesPoller.class);
-        pipesService = new PipesService(storageFactory, config, poller);
+        pipesService = new PipesService(storageFactory, regionResolver, poller);
     }
 
     @Test

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.scheduler;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.scheduler.model.Schedule;
@@ -199,6 +200,7 @@ public class SchedulerService {
         schedule.setKmsKeyArn(req.getKmsKeyArn());
         schedule.setCreationDate(now);
         schedule.setLastModificationDate(now);
+        schedule.setAccountId(regionResolver.getAccountId());
 
         scheduleStore.put(key, schedule);
         LOG.infov("Created schedule: {0} in group {1}, region {2}", req.getName(), effectiveGroup, region);
@@ -257,12 +259,26 @@ public class SchedulerService {
     }
 
     /**
-     * Return every persisted schedule across all regions and groups. Used by
-     * {@link ScheduleDispatcher} to evaluate due schedules; other callers should
-     * prefer {@link #listSchedules}.
+     * Return every persisted schedule across all regions, groups, and accounts.
+     * Used by {@link ScheduleDispatcher} to evaluate due schedules; other callers
+     * should prefer {@link #listSchedules}.
      */
     public List<Schedule> listAllSchedules() {
+        if (scheduleStore instanceof AccountAwareStorageBackend<Schedule> aware) {
+            return aware.scanAllAccounts();
+        }
         return scheduleStore.scan(k -> k.startsWith("schedule:"));
+    }
+
+    public void deleteScheduleForAccount(String accountId, String name, String groupName, String region) {
+        String effectiveGroup = resolveAndValidateGroup(groupName);
+        String key = scheduleKey(region, effectiveGroup, name);
+        if (scheduleStore instanceof AccountAwareStorageBackend<Schedule> aware) {
+            aware.deleteForAccount(accountId, key);
+        } else {
+            scheduleStore.delete(key);
+        }
+        LOG.infov("Deleted schedule: {0} in group {1}", name, effectiveGroup);
     }
 
     public List<Schedule> listSchedules(String groupName, String namePrefix, String state, String region) {

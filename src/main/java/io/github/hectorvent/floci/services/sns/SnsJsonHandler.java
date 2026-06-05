@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.sns;
 
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.sns.model.PlatformApplication;
+import io.github.hectorvent.floci.services.sns.model.PlatformEndpoint;
 import io.github.hectorvent.floci.services.sns.model.Subscription;
 import io.github.hectorvent.floci.services.sns.model.Topic;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
@@ -13,6 +16,7 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -52,6 +56,16 @@ public class SnsJsonHandler {
             case "TagResource" -> handleTagResource(request, region);
             case "UntagResource" -> handleUntagResource(request, region);
             case "ListTagsForResource" -> handleListTagsForResource(request, region);
+            case "CreatePlatformApplication" -> handleCreatePlatformApplication(request, region);
+            case "DeletePlatformApplication" -> handleDeletePlatformApplication(request, region);
+            case "GetPlatformApplicationAttributes" -> handleGetPlatformApplicationAttributes(request, region);
+            case "SetPlatformApplicationAttributes" -> handleSetPlatformApplicationAttributes(request, region);
+            case "ListPlatformApplications" -> handleListPlatformApplications(region);
+            case "CreatePlatformEndpoint" -> handleCreatePlatformEndpoint(request, region);
+            case "DeleteEndpoint" -> handleDeleteEndpoint(request, region);
+            case "GetEndpointAttributes" -> handleGetEndpointAttributes(request, region);
+            case "SetEndpointAttributes" -> handleSetEndpointAttributes(request, region);
+            case "ListEndpointsByPlatformApplication" -> handleListEndpointsByPlatformApplication(request, region);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
@@ -155,18 +169,12 @@ public class SnsJsonHandler {
         String phoneNumber = request.path("PhoneNumber").asText(null);
         String message = request.path("Message").asText(null);
         String subject = request.path("Subject").asText(null);
+        String messageStructure = request.path("MessageStructure").asText(null);
 
-        Map<String, MessageAttributeValue> attributes = new HashMap<>();
-        JsonNode attrsNode = request.path("MessageAttributes");
-        if (attrsNode.isObject()) {
-            attrsNode.fields().forEachRemaining(entry -> {
-                String dataType = entry.getValue().path("DataType").asText("String");
-                String stringValue = entry.getValue().path("StringValue").asText();
-                attributes.put(entry.getKey(), new MessageAttributeValue(stringValue, dataType));
-            });
-        }
+        Map<String, MessageAttributeValue> attributes = parseMessageAttributes(request.path("MessageAttributes"));
 
-        String messageId = snsService.publish(topicArn, targetArn, phoneNumber, message, subject, attributes, region);
+        String messageId = snsService.publish(topicArn, targetArn, phoneNumber, message, subject,
+                messageStructure, attributes, null, null, region);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("MessageId", messageId);
         return Response.ok(response).build();
@@ -215,12 +223,14 @@ public class SnsJsonHandler {
     private Response handlePublishBatch(JsonNode request, String region) {
         String topicArn = request.path("TopicArn").asText(null);
         List<Map<String, Object>> entries = new ArrayList<>();
+        List<String[]> entryAttributeFailures = new ArrayList<>();
 
         JsonNode entriesNode = request.path("PublishBatchRequestEntries");
         if (entriesNode.isArray()) {
             for (JsonNode entryNode : entriesNode) {
+                String id = entryNode.path("Id").asText(null);
                 Map<String, Object> entry = new HashMap<>();
-                entry.put("Id", entryNode.path("Id").asText(null));
+                entry.put("Id", id);
                 entry.put("Message", entryNode.path("Message").asText(null));
                 entry.put("Subject", entryNode.path("Subject").asText(null));
                 entry.put("MessageGroupId", entryNode.path("MessageGroupId").asText(null));
@@ -228,11 +238,14 @@ public class SnsJsonHandler {
 
                 JsonNode attrsNode = entryNode.path("MessageAttributes");
                 if (attrsNode.isObject()) {
-                    Map<String, String> messageAttributes = new HashMap<>();
-                    attrsNode.fields().forEachRemaining(field ->
-                        messageAttributes.put(field.getKey(), field.getValue().path("StringValue").asText())
-                    );
-                    entry.put("MessageAttributes", messageAttributes);
+                    try {
+                        entry.put("MessageAttributes", parseMessageAttributes(attrsNode));
+                    } catch (AwsException e) {
+                        // Real AWS SNS surfaces per-entry attribute errors as Failed entries
+                        // and keeps processing the rest of the batch, instead of aborting.
+                        entryAttributeFailures.add(new String[]{id, e.getErrorCode(), e.getMessage(), "true"});
+                        continue;
+                    }
                 }
 
                 entries.add(entry);
@@ -250,7 +263,9 @@ public class SnsJsonHandler {
             successful.add(item);
         }
         ArrayNode failed = response.putArray("Failed");
-        for (String[] f : result.failed()) {
+        List<String[]> allFailed = new ArrayList<>(result.failed());
+        allFailed.addAll(entryAttributeFailures);
+        for (String[] f : allFailed) {
             ObjectNode item = objectMapper.createObjectNode();
             item.put("Id", f[0]);
             item.put("Code", f[1]);
@@ -298,6 +313,135 @@ public class SnsJsonHandler {
         node.put("Endpoint", s.getEndpoint() != null ? s.getEndpoint() : "");
         node.put("Owner", s.getOwner() != null ? s.getOwner() : "");
         return node;
+    }
+
+    private Map<String, MessageAttributeValue> parseMessageAttributes(JsonNode attrsNode) {
+        Map<String, MessageAttributeValue> attributes = new HashMap<>();
+        if (!attrsNode.isObject()) {
+            return attributes;
+        }
+        attrsNode.fields().forEachRemaining(entry -> {
+            JsonNode valueNode = entry.getValue();
+            String binaryValueBase64 = valueNode.path("BinaryValue").asText(null);
+            String defaultDataType = binaryValueBase64 != null ? "Binary" : "String";
+            String dataType = valueNode.path("DataType").asText(defaultDataType);
+            if (binaryValueBase64 != null) {
+                byte[] binaryValue;
+                try {
+                    binaryValue = Base64.getDecoder().decode(binaryValueBase64);
+                } catch (IllegalArgumentException e) {
+                    throw new AwsException("InvalidParameterValue",
+                            "Invalid binary value for message attribute '" + entry.getKey() + "': not valid base64.", 400);
+                }
+                attributes.put(entry.getKey(), new MessageAttributeValue(binaryValue, dataType));
+            } else {
+                String stringValue = valueNode.path("StringValue").asText();
+                attributes.put(entry.getKey(), new MessageAttributeValue(stringValue, dataType));
+            }
+        });
+        return attributes;
+    }
+
+    private Response handleCreatePlatformApplication(JsonNode request, String region) {
+        String name = request.path("Name").asText(null);
+        String platform = request.path("Platform").asText(null);
+        Map<String, String> attributes = jsonNodeToMap(request.path("Attributes"));
+        PlatformApplication app = snsService.createPlatformApplication(name, platform, attributes, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("PlatformApplicationArn", app.getArn());
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeletePlatformApplication(JsonNode request, String region) {
+        String arn = request.path("PlatformApplicationArn").asText(null);
+        snsService.deletePlatformApplication(arn, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleGetPlatformApplicationAttributes(JsonNode request, String region) {
+        String arn = request.path("PlatformApplicationArn").asText(null);
+        Map<String, String> attrs = snsService.getPlatformApplicationAttributes(arn, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        ObjectNode attrsNode = response.putObject("Attributes");
+        for (var entry : attrs.entrySet()) {
+            attrsNode.put(entry.getKey(), entry.getValue());
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleSetPlatformApplicationAttributes(JsonNode request, String region) {
+        String arn = request.path("PlatformApplicationArn").asText(null);
+        Map<String, String> attrs = jsonNodeToMap(request.path("Attributes"));
+        snsService.setPlatformApplicationAttributes(arn, attrs, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleListPlatformApplications(String region) {
+        List<PlatformApplication> apps = snsService.listPlatformApplications(region);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode arr = response.putArray("PlatformApplications");
+        for (PlatformApplication app : apps) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("PlatformApplicationArn", app.getArn());
+            ObjectNode attrsNode = node.putObject("Attributes");
+            for (var entry : app.getAttributes().entrySet()) {
+                attrsNode.put(entry.getKey(), entry.getValue());
+            }
+            arr.add(node);
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleCreatePlatformEndpoint(JsonNode request, String region) {
+        String appArn = request.path("PlatformApplicationArn").asText(null);
+        String token = request.path("Token").asText(null);
+        String customUserData = request.path("CustomUserData").asText(null);
+        Map<String, String> attributes = jsonNodeToMap(request.path("Attributes"));
+        PlatformEndpoint endpoint = snsService.createPlatformEndpoint(appArn, token, customUserData, attributes, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("EndpointArn", endpoint.getArn());
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeleteEndpoint(JsonNode request, String region) {
+        String arn = request.path("EndpointArn").asText(null);
+        snsService.deleteEndpoint(arn, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleGetEndpointAttributes(JsonNode request, String region) {
+        String arn = request.path("EndpointArn").asText(null);
+        Map<String, String> attrs = snsService.getEndpointAttributes(arn, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        ObjectNode attrsNode = response.putObject("Attributes");
+        for (var entry : attrs.entrySet()) {
+            attrsNode.put(entry.getKey(), entry.getValue());
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleSetEndpointAttributes(JsonNode request, String region) {
+        String arn = request.path("EndpointArn").asText(null);
+        Map<String, String> attrs = jsonNodeToMap(request.path("Attributes"));
+        snsService.setEndpointAttributes(arn, attrs, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleListEndpointsByPlatformApplication(JsonNode request, String region) {
+        String appArn = request.path("PlatformApplicationArn").asText(null);
+        List<PlatformEndpoint> endpoints = snsService.listEndpointsByPlatformApplication(appArn, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode arr = response.putArray("Endpoints");
+        for (PlatformEndpoint ep : endpoints) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("EndpointArn", ep.getArn());
+            ObjectNode attrsNode = node.putObject("Attributes");
+            for (var entry : ep.getAttributes().entrySet()) {
+                attrsNode.put(entry.getKey(), entry.getValue());
+            }
+            arr.add(node);
+        }
+        return Response.ok(response).build();
     }
 
     private Map<String, String> jsonNodeToMap(JsonNode node) {

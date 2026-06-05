@@ -21,6 +21,12 @@ public class ConfigurationSet {
     @JsonProperty("Tags")
     private List<Tag> tags = new ArrayList<>();
 
+    @JsonProperty("EventDestinations")
+    private List<EventDestination> eventDestinations = new ArrayList<>();
+
+    @JsonProperty("SuppressionOptions")
+    private SuppressionOptions suppressionOptions;
+
     public ConfigurationSet() {}
 
     public ConfigurationSet(String name) {
@@ -37,9 +43,13 @@ public class ConfigurationSet {
     public List<Tag> getTags() { return tags; }
     public void setTags(List<Tag> tags) { this.tags = tags != null ? tags : new ArrayList<>(); }
 
-    @RegisterForReflection
-    public record Tag(
-            @JsonProperty("Key") String key,
-            @JsonProperty("Value") String value) {
+    public List<EventDestination> getEventDestinations() { return eventDestinations; }
+    public void setEventDestinations(List<EventDestination> eventDestinations) {
+        this.eventDestinations = eventDestinations != null ? eventDestinations : new ArrayList<>();
+    }
+
+    public SuppressionOptions getSuppressionOptions() { return suppressionOptions; }
+    public void setSuppressionOptions(SuppressionOptions suppressionOptions) {
+        this.suppressionOptions = suppressionOptions;
     }
 }

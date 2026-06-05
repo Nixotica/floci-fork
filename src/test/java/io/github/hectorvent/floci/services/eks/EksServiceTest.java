@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.eks;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
@@ -38,10 +39,10 @@ class EksServiceTest {
         when(eksConfig.mock()).thenReturn(true);
         when(eksConfig.apiServerBasePort()).thenReturn(6500);
         when(config.defaultRegion()).thenReturn("us-east-1");
-        when(config.defaultAccountId()).thenReturn("000000000000");
 
         clusterManager = Mockito.mock(EksClusterManager.class);
-        eksService = new EksService(storageFactory, config, clusterManager);
+        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
+        eksService = new EksService(storageFactory, config, regionResolver, clusterManager);
     }
 
     @Test

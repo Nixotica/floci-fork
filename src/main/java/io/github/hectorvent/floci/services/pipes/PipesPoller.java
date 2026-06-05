@@ -214,17 +214,20 @@ public class PipesPoller {
     private void pollKinesis(Pipe pipe, String region) {
         String pipeKey = pipeKey(pipe);
         String streamName = extractResourceName(pipe.getSource());
+        String pipeAccountId = pipe.getAccountId();
         int batchSize = getBatchSize(pipe, "KinesisStreamParameters");
         String iterator = kinesisIterators.get(pipeKey);
         if (iterator == null) {
-            iterator = initKinesisIterator(streamName, region);
+            iterator = initKinesisIterator(streamName, region, pipeAccountId);
             if (iterator == null) {
                 return;
             }
         }
         try {
             @SuppressWarnings("unchecked")
-            Map<String, Object> result = kinesisService.getRecords(iterator, batchSize, region);
+            Map<String, Object> result = (pipeAccountId != null)
+                    ? kinesisService.getRecordsForAccount(pipeAccountId, iterator, batchSize, region)
+                    : kinesisService.getRecords(iterator, batchSize, region);
             String nextIterator = (String) result.get("NextShardIterator");
             if (nextIterator != null) {
                 kinesisIterators.put(pipeKey, nextIterator);
@@ -254,10 +257,13 @@ public class PipesPoller {
         }
     }
 
-    private String initKinesisIterator(String streamName, String region) {
+    private String initKinesisIterator(String streamName, String region, String accountId) {
         try {
-            return kinesisService.getShardIterator(
-                    streamName, "shardId-000000000000", "TRIM_HORIZON", null, null, region);
+            return (accountId != null)
+                    ? kinesisService.getShardIteratorForAccount(
+                            accountId, streamName, "shardId-000000000000", "TRIM_HORIZON", null, region)
+                    : kinesisService.getShardIterator(
+                            streamName, "shardId-000000000000", "TRIM_HORIZON", null, null, region);
         } catch (Exception e) {
             LOG.warnv("Failed to get Kinesis shard iterator for {0}: {1}", streamName, e.getMessage());
             return null;
@@ -349,7 +355,7 @@ public class PipesPoller {
         }
         try {
             String queueUrl = AwsArnUtils.arnToQueueUrl(dlqArn, baseUrl);
-            sqsService.sendMessage(queueUrl, payload, 0);
+            sqsService.sendMessage(queueUrl, payload, 0, region);
             LOG.infov("Pipe {0}: sent failed records to DLQ {1}", pipe.getName(), dlqArn);
             return true;
         } catch (Exception e) {

@@ -5,11 +5,13 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import java.time.Instant;
 import java.util.List;
+import java.util.ArrayList;
 
 @RegisterForReflection
 public class DeliveryStreamDescription {
     @JsonProperty("DeliveryStreamName")
     private String deliveryStreamName;
+    private String accountId;
     @JsonProperty("DeliveryStreamARN")
     private String deliveryStreamARN;
     @JsonProperty("DeliveryStreamStatus")
@@ -19,6 +21,8 @@ public class DeliveryStreamDescription {
     private Instant createTimestamp;
     @JsonProperty("Destinations")
     private List<Destination> destinations;
+    @JsonProperty("Tags")
+    private List<Tag> tags = new ArrayList<>();
 
     public DeliveryStreamDescription() {}
     public DeliveryStreamDescription(String name, String arn, S3Destination s3) {
@@ -31,6 +35,9 @@ public class DeliveryStreamDescription {
 
     public String getDeliveryStreamName() { return deliveryStreamName; }
     public void setDeliveryStreamName(String deliveryStreamName) { this.deliveryStreamName = deliveryStreamName; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
     public String getDeliveryStreamARN() { return deliveryStreamARN; }
     public void setDeliveryStreamARN(String deliveryStreamARN) { this.deliveryStreamARN = deliveryStreamARN; }
     public DeliveryStreamStatus getDeliveryStreamStatus() { return deliveryStreamStatus; }
@@ -94,5 +101,29 @@ public class DeliveryStreamDescription {
         public void setSizeInMBs(int sizeInMBs) { this.sizeInMBs = sizeInMBs; }
         public int getIntervalInSeconds() { return intervalInSeconds; }
         public void setIntervalInSeconds(int intervalInSeconds) { this.intervalInSeconds = intervalInSeconds; }
+    }
+
+    public List<Tag> getTags() {
+        if (tags == null) tags = new ArrayList<>();
+        return tags;
+    }
+    public void setTags(List<Tag> tags) { this.tags = tags; }
+
+    @RegisterForReflection
+    public static class Tag {
+        @JsonProperty("Key")
+        private String key;
+        @JsonProperty("Value")
+        private String value;
+
+        public Tag() {}
+        public Tag(String key, String value) {
+            this.key = key;
+            this.value = value;
+        }
+        public String getKey() { return key; }
+        public void setKey(String key) { this.key = key; }
+        public String getValue() { return value; }
+        public void setValue(String value) { this.value = value; }
     }
 }

@@ -81,7 +81,13 @@ The following environment variables are set in both the standard and compat imag
 | `AWS_DEFAULT_REGION` | `us-east-1` |
 | `AWS_ACCESS_KEY_ID` | `test` |
 | `AWS_SECRET_ACCESS_KEY` | `test` |
-| `AWS_CONFIG_FILE` | `/etc/floci/aws/config` (sets `endpoint_url = http://localhost:4566`) |
+| `AWS_CONFIG_FILE` | `/etc/floci/aws/config` |
+
+The compat image additionally sets:
+
+| Variable | Value |
+|---|---|
+| `AWS_ENDPOINT_URL` | `http://localhost:4566` |
 
 Override any of them at runtime via `docker run -e` or the Compose `environment` block.
 

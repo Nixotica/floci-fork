@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -14,7 +15,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 @ApplicationScoped
 public class StepFunctionsJsonHandler {
@@ -34,6 +37,7 @@ public class StepFunctionsJsonHandler {
             case "DescribeStateMachine" -> handleDescribeStateMachine(request);
             case "ListStateMachines" -> handleListStateMachines(request, region);
             case "DeleteStateMachine" -> handleDeleteStateMachine(request);
+            case "ValidateStateMachineDefinition" -> handleValidateStateMachineDefinition(request);
             case "StartExecution" -> handleStartExecution(request, region);
             case "StartSyncExecution" -> handleStartSyncExecution(request, region);
             case "DescribeExecution" -> handleDescribeExecution(request);
@@ -48,6 +52,9 @@ public class StepFunctionsJsonHandler {
             case "DescribeActivity" -> handleDescribeActivity(request);
             case "ListActivities" -> handleListActivities(request, region);
             case "GetActivityTask" -> handleGetActivityTask(request);
+            case "ListTagsForResource" -> handleListTagsForResource(request);
+            case "TagResource" -> handleTagResource(request);
+            case "UntagResource" -> handleUntagResource(request);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
@@ -60,7 +67,8 @@ public class StepFunctionsJsonHandler {
                 request.path("definition").asText(),
                 request.path("roleArn").asText(),
                 request.path("type").asText(null),
-                region
+                region,
+                parseTagsArray(request.path("tags"))
         );
         ObjectNode response = objectMapper.createObjectNode();
         response.put("stateMachineArn", sm.getStateMachineArn());
@@ -98,6 +106,32 @@ public class StepFunctionsJsonHandler {
     private Response handleDeleteStateMachine(JsonNode request) {
         service.deleteStateMachine(request.path("stateMachineArn").asText());
         return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleValidateStateMachineDefinition(JsonNode request) {
+        String definition = request.path("definition").asText(null);
+        String type = request.path("type").asText(null);
+        String severity = request.path("severity").asText(null);
+        Integer maxResults = parseOptionalInt(request, "maxResults");
+
+        StepFunctionsService.ValidationResult result =
+                service.validateStateMachineDefinition(definition, type, severity, maxResults);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("result", result.valid() ? "OK" : "FAIL");
+        ArrayNode diags = response.putArray("diagnostics");
+        for (StepFunctionsService.Diagnostic d : result.diagnostics()) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("severity", d.severity());
+            node.put("code", d.code());
+            node.put("message", d.message());
+            if (d.location() != null) {
+                node.put("location", d.location());
+            }
+            diags.add(node);
+        }
+        response.put("truncated", result.truncated());
+        return Response.ok(response).build();
     }
 
     private Response handleStartExecution(JsonNode request, String region) {
@@ -214,7 +248,7 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleCreateActivity(JsonNode request, String region) {
-        Activity activity = service.createActivity(request.path("name").asText(), region);
+        Activity activity = service.createActivity(request.path("name").asText(), region, parseTagsArray(request.path("tags")));
         ObjectNode response = objectMapper.createObjectNode();
         response.put("activityArn", activity.getActivityArn());
         response.put("creationDate", activity.getCreationDate());
@@ -258,6 +292,76 @@ public class StepFunctionsJsonHandler {
             response.put("input", task.getInput());
         }
         return Response.ok(response).build();
+    }
+
+    private Response handleListTagsForResource(JsonNode request) {
+        java.util.Map<String, String> tags = service.listTags(request.path("resourceArn").asText());
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode array = response.putArray("tags");
+        tags.forEach((k, v) -> {
+            ObjectNode entry = array.addObject();
+            entry.put("key", k);
+            entry.put("value", v);
+        });
+        return Response.ok(response).build();
+    }
+
+    private Response handleTagResource(JsonNode request) {
+        String arn = request.path("resourceArn").asText();
+        JsonNode tagsNode = request.path("tags");
+        if (!tagsNode.isArray()) {
+            return Response.status(400)
+                    .entity(new AwsErrorResponse("ValidationException", "Parameter 'tags' must be a list"))
+                    .build();
+        }
+        service.tagResource(arn, parseTagsArray(tagsNode));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleUntagResource(JsonNode request) {
+        String arn = request.path("resourceArn").asText();
+        JsonNode keysNode = request.path("tagKeys");
+        if (!keysNode.isArray()) {
+            return Response.status(400)
+                    .entity(new AwsErrorResponse("ValidationException", "Parameter 'tagKeys' must be a list"))
+                    .build();
+        }
+        java.util.List<String> tagKeys = new java.util.ArrayList<>();
+        for (JsonNode key : keysNode) {
+            tagKeys.add(key.asText());
+        }
+        service.untagResource(arn, tagKeys);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Map<String, String> parseTagsArray(JsonNode tagsNode) {
+        Map<String, String> tags = new HashMap<>();
+        if (tagsNode != null && tagsNode.isArray()) {
+            for (JsonNode entry : tagsNode) {
+                tags.put(entry.path("key").asText(), entry.path("value").asText());
+            }
+        }
+        return tags;
+    }
+
+    /**
+     * Reads an optional integer field from the JSON request, rejecting wrong types
+     * with a typed ValidationException. JsonNode.asInt() silently coerces strings,
+     * fractional numbers, and explicit nulls to 0, which would let invalid payloads
+     * slip through as 0 (and thus be treated as "use default" by the service).
+     * Returns null when the field is absent or explicitly null in the JSON.
+     */
+    private static Integer parseOptionalInt(JsonNode request, String fieldName) {
+        JsonNode node = request.get(fieldName);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isIntegralNumber()) {
+            throw new AwsException("ValidationException",
+                    "Value '" + node + "' at '" + fieldName
+                            + "' failed to satisfy constraint: Member must be an integer.", 400);
+        }
+        return node.intValue();
     }
 
 }

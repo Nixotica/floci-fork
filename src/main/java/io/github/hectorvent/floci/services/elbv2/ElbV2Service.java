@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.elbv2.model.*;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -20,8 +21,10 @@ public class ElbV2Service {
     @Inject
     ElbV2HealthChecker healthChecker;
 
+    @Inject
+    RegionResolver regionResolver;
+
     private static final String CANONICAL_HOSTED_ZONE_ID = "Z35SXDOTRQ7X7K";
-    private static final String DEFAULT_ACCOUNT = "000000000000";
 
     // region → ARN → resource
     private final Map<String, Map<String, LoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
@@ -57,7 +60,7 @@ public class ElbV2Service {
         String ipType = ipAddressType != null ? ipAddressType : "ipv4";
         String typePrefix = lbTypePrefix(lbType);
         String id = randomHex16();
-        String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, DEFAULT_ACCOUNT, "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
+        String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
         String dnsName = name + "-" + id + ".elb.localhost";
 
         LoadBalancer lb = new LoadBalancer();
@@ -142,6 +145,18 @@ public class ElbV2Service {
         lb.getAttributes().putAll(newAttrs);
     }
 
+    /** Capacity reservation status for a load balancer. All fields are {@code null} when no
+     *  capacity is reserved, which is always the case in Floci (capacity cannot be reserved). */
+    public record CapacityReservation(Integer decreaseRequestsRemaining,
+                                      Integer minimumCapacityUnits,
+                                      Instant lastModifiedTime) {}
+
+    public CapacityReservation describeCapacityReservation(String region, String arn) {
+        requireLoadBalancer(region, arn);
+        // Floci does not reserve load balancer capacity, so there is never a reservation to report.
+        return new CapacityReservation(null, null, null);
+    }
+
     public void setSecurityGroups(String region, String arn, List<String> sgIds) {
         LoadBalancer lb = requireLoadBalancer(region, arn);
         lb.setSecurityGroups(new ArrayList<>(sgIds));
@@ -177,7 +192,7 @@ public class ElbV2Service {
         }
 
         String id = randomHex16();
-        String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, DEFAULT_ACCOUNT, "targetgroup/" + name + "/" + id).toString();
+        String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "targetgroup/" + name + "/" + id).toString();
 
         TargetGroup tg = new TargetGroup();
         tg.setTargetGroupArn(arn);
@@ -223,13 +238,16 @@ public class ElbV2Service {
         if (tgArns != null && !tgArns.isEmpty()) {
             Set<String> arnSet = new HashSet<>(tgArns);
             result = result.stream().filter(tg -> arnSet.contains(tg.getTargetGroupArn())).collect(Collectors.toList());
-            if (result.isEmpty()) {
+            if (result.size() != arnSet.size()) {
                 throw new AwsException("TargetGroupNotFound", "One or more target groups not found.", 400);
             }
         }
         if (names != null && !names.isEmpty()) {
             Set<String> nameSet = new HashSet<>(names);
             result = result.stream().filter(tg -> nameSet.contains(tg.getTargetGroupName())).collect(Collectors.toList());
+            if (result.size() != nameSet.size()) {
+                throw new AwsException("TargetGroupNotFound", "One or more target groups not found.", 400);
+            }
         }
         return result;
     }
@@ -301,7 +319,7 @@ public class ElbV2Service {
         String typePrefix = lbTypePrefix(lbType);
         String lbId = arnId(lbArn);
         String listenerId = randomHex16();
-        String listenerArn = AwsArnUtils.Arn.of("elasticloadbalancing", region, DEFAULT_ACCOUNT, "listener/" + typePrefix + "/" + lb.getLoadBalancerName() + "/" + lbId + "/" + listenerId).toString();
+        String listenerArn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "listener/" + typePrefix + "/" + lb.getLoadBalancerName() + "/" + lbId + "/" + listenerId).toString();
 
         Listener listener = new Listener();
         listener.setListenerArn(listenerArn);
@@ -344,6 +362,16 @@ public class ElbV2Service {
         return result;
     }
 
+    public Map<String, String> describeListenerAttributes(String region, String arn) {
+        Listener listener = requireListener(region, arn);
+        return new LinkedHashMap<>(listener.getAttributes());
+    }
+
+    public void modifyListenerAttributes(String region, String arn, Map<String, String> newAttrs) {
+        Listener listener = requireListener(region, arn);
+        listener.getAttributes().putAll(newAttrs);
+    }
+
     public void deleteListener(String region, String listenerArn) {
         Map<String, Listener> regionListeners = listeners.getOrDefault(region, Map.of());
         Listener listener = regionListeners.remove(listenerArn);
@@ -359,6 +387,7 @@ public class ElbV2Service {
             ruleArns.forEach(regionRules::remove);
         }
         tags.remove(listenerArn);
+        unlinkUnreferencedTargetGroups(region, listener.getLoadBalancerArn());
     }
 
     public Listener modifyListener(String region, String listenerArn, String protocol, Integer port,
@@ -423,7 +452,7 @@ public class ElbV2Service {
         String lbId = arnId(listener.getLoadBalancerArn());
         String listenerId = arnId(listenerArn);
         String ruleId = randomHex16();
-        String ruleArn = AwsArnUtils.Arn.of("elasticloadbalancing", region, DEFAULT_ACCOUNT, "listener-rule/" + typePrefix + "/" + lb.getLoadBalancerName() + "/" + lbId + "/" + listenerId + "/" + ruleId).toString();
+        String ruleArn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "listener-rule/" + typePrefix + "/" + lb.getLoadBalancerName() + "/" + lbId + "/" + listenerId + "/" + ruleId).toString();
 
         Rule rule = new Rule();
         rule.setRuleArn(ruleArn);
@@ -481,6 +510,10 @@ public class ElbV2Service {
         regionRules.remove(ruleArn);
         listenerToRules.getOrDefault(listenerArn, List.of()).remove(ruleArn);
         tags.remove(ruleArn);
+        Listener listener = listeners.getOrDefault(region, Map.of()).get(listenerArn);
+        if (listener != null) {
+            unlinkUnreferencedTargetGroups(region, listener.getLoadBalancerArn());
+        }
         dataPlane.recompileRules(listenerArn, getListenerRules(region, listenerArn));
     }
 
@@ -562,9 +595,15 @@ public class ElbV2Service {
         List<TargetDescription> candidates = filterTargets != null && !filterTargets.isEmpty()
                 ? filterTargets : tg.getTargets();
 
+        boolean isLambdaTg = "lambda".equals(tg.getTargetType());
         return candidates.stream().map(t -> {
             TargetHealth th = new TargetHealth();
             th.setTarget(t);
+            if (isLambdaTg) {
+                th.setHealthCheckPort("N/A");
+                th.setState("healthy");
+                return th;
+            }
             int port = ElbV2HealthChecker.effectivePort(t, tg);
             th.setHealthCheckPort(String.valueOf(port));
             String state = healthChecker.getState(tgArn, t.getId(), port);
@@ -759,7 +798,7 @@ public class ElbV2Service {
         String lbType = lb.getType() != null ? lb.getType() : "application";
         String typePrefix = lbTypePrefix(lbType);
         String ruleId = randomHex16();
-        String ruleArn = AwsArnUtils.Arn.of("elasticloadbalancing", region, DEFAULT_ACCOUNT, "listener-rule/" + typePrefix + "/" + lb.getLoadBalancerName() + "/" + lbId + "/" + listenerId + "/" + ruleId).toString();
+        String ruleArn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "listener-rule/" + typePrefix + "/" + lb.getLoadBalancerName() + "/" + lbId + "/" + listenerId + "/" + ruleId).toString();
 
         Rule rule = new Rule();
         rule.setRuleArn(ruleArn);
@@ -780,6 +819,44 @@ public class ElbV2Service {
                 if (t.getTargetGroupArn() != null) {
                     tgToLbs.computeIfAbsent(t.getTargetGroupArn(), k -> ConcurrentHashMap.newKeySet()).add(lbArn);
                 }
+            }
+        }
+    }
+
+    /**
+     * Drops {@code lbArn} from every target group that is no longer referenced by any of the
+     * load balancer's remaining listeners or rules. Called after a listener or rule is removed
+     * so a target group can be deleted once nothing routes to it (avoids a stale "in use" guard
+     * during teardown).
+     */
+    private void unlinkUnreferencedTargetGroups(String region, String lbArn) {
+        Set<String> referenced = new HashSet<>();
+        Map<String, Listener> regionListeners = listeners.getOrDefault(region, Map.of());
+        for (Listener listener : regionListeners.values()) {
+            if (lbArn.equals(listener.getLoadBalancerArn())) {
+                listener.getDefaultActions().forEach(a -> collectActionTargetGroups(a, referenced));
+            }
+        }
+        for (Rule rule : rules.getOrDefault(region, Map.of()).values()) {
+            Listener listener = regionListeners.get(rule.getListenerArn());
+            if (listener != null && lbArn.equals(listener.getLoadBalancerArn())) {
+                rule.getActions().forEach(a -> collectActionTargetGroups(a, referenced));
+            }
+        }
+        tgToLbs.forEach((tgArn, lbSet) -> {
+            if (!referenced.contains(tgArn)) {
+                lbSet.remove(lbArn);
+            }
+        });
+    }
+
+    private static void collectActionTargetGroups(Action action, Set<String> out) {
+        if (action.getTargetGroupArn() != null) {
+            out.add(action.getTargetGroupArn());
+        }
+        for (Action.TargetGroupTuple t : action.getTargetGroups()) {
+            if (t.getTargetGroupArn() != null) {
+                out.add(t.getTargetGroupArn());
             }
         }
     }

@@ -16,10 +16,20 @@ import java.util.Base64;
  * Exposes Cognito well-known endpoints.
  * The JWKS endpoint allows downstream services to verify JWTs issued by Floci Cognito pools.
  * Path mirrors real AWS: /{userPoolId}/.well-known/jwks.json
+ *
+ * <p>The {@code poolId} path parameter is constrained to {@link #POOL_ID_PATTERN}
+ * so that S3 object keys like {@code /<bucket>/.well-known/jwks.json} do not
+ * collide with this route. Real Cognito UserPool IDs always contain an
+ * underscore (region prefix + {@code _} + random suffix, e.g.
+ * {@code us-east-1_AbC123XyZ}), while AWS S3 bucket names forbid underscores
+ * — using {@code _} as the discriminator routes S3 traffic correctly without
+ * needing a wider request filter.
  */
 @Path("/")
 @Produces(MediaType.APPLICATION_JSON)
 public class CognitoWellKnownController {
+
+    private static final String POOL_ID_PATTERN = "[^/_]+_[^/]+";
 
     private final CognitoService cognitoService;
 
@@ -29,7 +39,7 @@ public class CognitoWellKnownController {
     }
 
     @GET
-    @Path("/{poolId}/.well-known/jwks.json")
+    @Path("/{poolId:" + POOL_ID_PATTERN + "}/.well-known/jwks.json")
     public Response getJwks(@PathParam("poolId") String poolId) {
         UserPool pool = cognitoService.describeUserPool(poolId);
         String kid = cognitoService.getSigningKeyId(pool);
@@ -44,16 +54,17 @@ public class CognitoWellKnownController {
     }
 
     @GET
-    @Path("/{poolId}/.well-known/openid-configuration")
+    @Path("/{poolId:" + POOL_ID_PATTERN + "}/.well-known/openid-configuration")
     public Response getOpenIdConfiguration(@PathParam("poolId") String poolId) {
         UserPool pool = cognitoService.describeUserPool(poolId);
         String issuer = cognitoService.getIssuer(pool.getId());
         String jwksUri = cognitoService.getJwksUri(pool.getId());
         String tokenEndpoint = cognitoService.getTokenEndpoint();
+        String userInfoEndpoint = cognitoService.getUserInfoEndpoint();
 
         String body = """
-                {"issuer":"%s","jwks_uri":"%s","token_endpoint":"%s","subject_types_supported":["public"],"response_types_supported":[],"grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post"],"id_token_signing_alg_values_supported":["RS256"]}
-                """.formatted(issuer, jwksUri, tokenEndpoint).strip();
+                {"issuer":"%s","jwks_uri":"%s","token_endpoint":"%s","userinfo_endpoint":"%s","subject_types_supported":["public"],"response_types_supported":[],"grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post"],"id_token_signing_alg_values_supported":["RS256"]}
+                """.formatted(issuer, jwksUri, tokenEndpoint, userInfoEndpoint).strip();
         return Response.ok(body).build();
     }
 

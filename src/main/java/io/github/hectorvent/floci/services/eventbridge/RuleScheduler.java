@@ -26,7 +26,7 @@ public class RuleScheduler {
 
     private final Vertx vertx;
     private final ObjectMapper objectMapper;
-    private final String accountId;
+    private final String defaultAccountId;
     private final EventBridgeInvoker invoker;
     private final ConcurrentHashMap<String, ScheduleContext> scheduleContexts = new ConcurrentHashMap<>();
 
@@ -37,7 +37,7 @@ public class RuleScheduler {
                           EventBridgeInvoker invoker) {
         this.vertx = vertx;
         this.objectMapper = objectMapper;
-        this.accountId = config.defaultAccountId();
+        this.defaultAccountId = config.defaultAccountId();
         this.invoker = invoker;
     }
 
@@ -150,7 +150,7 @@ public class RuleScheduler {
             node.put("id", UUID.randomUUID().toString());
             node.put("source", "aws.events");
             node.put("detail-type", "Scheduled Event");
-            node.put("account", accountId);
+            node.put("account", rule.getAccountId() != null ? rule.getAccountId() : defaultAccountId);
             node.put("time", now.toInstant().toString());
             node.put("region", region);
             node.putArray("resources").add(rule.getArn());

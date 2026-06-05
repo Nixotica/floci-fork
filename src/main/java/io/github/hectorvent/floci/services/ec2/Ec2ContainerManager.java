@@ -167,7 +167,7 @@ public class Ec2ContainerManager {
 
                 instance.setState(InstanceState.running());
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
-                        instanceId, containerId, sshHostPort);
+                        instanceId, containerId, String.valueOf(sshHostPort));
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -240,6 +240,7 @@ public class Ec2ContainerManager {
     public void terminate(Instance instance) {
         String containerId = instance.getDockerContainerId();
         String containerIp = instance.getContainerBridgeIp();
+        int sshHostPort = instance.getSshHostPort();
         instance.setState(InstanceState.shuttingDown());
         executor.submit(() -> {
             if (containerId != null) {
@@ -250,6 +251,15 @@ public class Ec2ContainerManager {
                 } catch (Exception e) {
                     LOG.warnv("Error removing EC2 container {0}: {1}", containerId, e.getMessage());
                 }
+                try {
+                    // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.
+                    Thread.sleep(500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            if (sshHostPort > 0) {
+                portAllocator.release(sshHostPort);
             }
             metadataServer.unregisterContainer(containerIp);
             instance.setState(InstanceState.terminated());

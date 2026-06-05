@@ -136,6 +136,37 @@ class ElbV2IntegrationTest {
                         equalTo("deletion_protection.enabled"));
     }
 
+    @Test
+    @Order(7)
+    void describeCapacityReservationReturnsEmptyForLbWithoutReservation() {
+        given()
+                .formParam("Action", "DescribeCapacityReservation")
+                .formParam("LoadBalancerArn", lbArn)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .contentType("application/xml")
+                .body("DescribeCapacityReservationResponse.ResponseMetadata.RequestId",
+                        not(emptyOrNullString()));
+    }
+
+    @Test
+    @Order(8)
+    void describeCapacityReservationUnknownLbThrows() {
+        given()
+                .formParam("Action", "DescribeCapacityReservation")
+                .formParam("LoadBalancerArn",
+                        "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/missing/0123456789abcdef")
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("LoadBalancerNotFound"));
+    }
+
     // ── Target Groups ─────────────────────────────────────────────────────────
 
     @Test
@@ -213,6 +244,35 @@ class ElbV2IntegrationTest {
                 .statusCode(200)
                 .body("ModifyTargetGroupAttributesResponse.ModifyTargetGroupAttributesResult.Attributes.member.Key",
                         equalTo("deregistration_delay.timeout_seconds"));
+    }
+
+    @Test
+    @Order(14)
+    void describeTargetGroupsByMissingNameThrows() {
+        given()
+                .formParam("Action", "DescribeTargetGroups")
+                .formParam("Names.member.1", "target-group-that-does-not-exist")
+                .header("Authorization", AUTH)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("TargetGroupNotFound"));
+    }
+
+    @Test
+    @Order(15)
+    void describeTargetGroupsByMissingArnThrows() {
+        given()
+                .formParam("Action", "DescribeTargetGroups")
+                .formParam("TargetGroupArns.member.1",
+                        "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/missing/0123456789abcdef")
+                .header("Authorization", AUTH)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("TargetGroupNotFound"));
     }
 
     // ── Targets ───────────────────────────────────────────────────────────────
@@ -309,6 +369,55 @@ class ElbV2IntegrationTest {
             .then()
                 .statusCode(400)
                 .body("ErrorResponse.Error.Code", equalTo("DuplicateListener"));
+    }
+
+    @Test
+    @Order(33)
+    void modifyListenerAttributes() {
+        given()
+                .formParam("Action", "ModifyListenerAttributes")
+                .formParam("ListenerArn", listenerArn)
+                .formParam("Attributes.member.1.Key", "tcp.idle_timeout.seconds")
+                .formParam("Attributes.member.1.Value", "400")
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("ModifyListenerAttributesResponse.ModifyListenerAttributesResult.Attributes.member.Key",
+                        equalTo("tcp.idle_timeout.seconds"))
+                .body("ModifyListenerAttributesResponse.ModifyListenerAttributesResult.Attributes.member.Value",
+                        equalTo("400"));
+    }
+
+    @Test
+    @Order(34)
+    void describeListenerAttributes() {
+        given()
+                .formParam("Action", "DescribeListenerAttributes")
+                .formParam("ListenerArn", listenerArn)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeListenerAttributesResponse.DescribeListenerAttributesResult.Attributes.member.Key",
+                        equalTo("tcp.idle_timeout.seconds"));
+    }
+
+    @Test
+    @Order(35)
+    void describeListenerAttributesUnknownListenerThrows() {
+        given()
+                .formParam("Action", "DescribeListenerAttributes")
+                .formParam("ListenerArn",
+                        "arn:aws:elasticloadbalancing:us-east-1:000000000000:listener/app/missing/0123456789abcdef/0123456789abcdef")
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("ListenerNotFound"));
     }
 
     // ── Rules ─────────────────────────────────────────────────────────────────

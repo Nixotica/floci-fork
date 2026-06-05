@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ecr;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -39,26 +40,30 @@ public class EcrService {
     private final StorageBackend<String, ImageMetadata> imageMetaStore;
     private final EcrRegistryManager registryManager;
     private final EmulatorConfig config;
+    private final RegionResolver regionResolver;
 
     @Inject
     public EcrService(StorageFactory factory,
                       EcrRegistryManager registryManager,
-                      EmulatorConfig config) {
+                      EmulatorConfig config,
+                      RegionResolver regionResolver) {
         this(factory.create("ecr", "repositories.json",
                         new TypeReference<Map<String, Repository>>() {}),
                 factory.create("ecr", "image-metadata.json",
                         new TypeReference<Map<String, ImageMetadata>>() {}),
-                registryManager, config);
+                registryManager, config, regionResolver);
     }
 
     EcrService(StorageBackend<String, Repository> repoStore,
                StorageBackend<String, ImageMetadata> imageMetaStore,
                EcrRegistryManager registryManager,
-               EmulatorConfig config) {
+               EmulatorConfig config,
+               RegionResolver regionResolver) {
         this.repoStore = repoStore;
         this.imageMetaStore = imageMetaStore;
         this.registryManager = registryManager;
         this.config = config;
+        this.regionResolver = regionResolver;
         this.registryManager.setReconcileHook(this::reconcileFromCatalog);
     }
 
@@ -520,7 +525,7 @@ public class EcrService {
         if (registryId != null && !registryId.isBlank()) {
             return registryId;
         }
-        return config.defaultAccountId();
+        return regionResolver.getAccountId();
     }
 
     private static void validateRepoName(String name) {

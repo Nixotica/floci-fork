@@ -1,15 +1,18 @@
 package io.github.hectorvent.floci.services.rds;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerHandle;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerManager;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
+import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
 import io.github.hectorvent.floci.services.rds.model.DbEndpoint;
 import io.github.hectorvent.floci.services.rds.model.DbInstance;
 import io.github.hectorvent.floci.services.rds.model.DbInstanceStatus;
@@ -19,10 +22,12 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -38,11 +43,11 @@ public class RdsService {
     private final StorageBackend<String, DbInstance> instances;
     private final StorageBackend<String, DbCluster> clusters;
     private final StorageBackend<String, DbParameterGroup> parameterGroups;
+    private final StorageBackend<String, DbClusterParameterGroup> clusterParameterGroups;
     private final RdsContainerManager containerManager;
     private final RdsProxyManager proxyManager;
     private final RegionResolver regionResolver;
     private final EmulatorConfig config;
-    private final ServiceConfigAccess serviceConfigAccess;
     private final Set<Integer> usedPorts = ConcurrentHashMap.newKeySet();
 
     @Inject
@@ -50,15 +55,42 @@ public class RdsService {
                       RdsProxyManager proxyManager,
                       RegionResolver regionResolver,
                       EmulatorConfig config,
-                      ServiceConfigAccess serviceConfigAccess) {
+                      StorageFactory storageFactory) {
         this.containerManager = containerManager;
         this.proxyManager = proxyManager;
         this.regionResolver = regionResolver;
         this.config = config;
-        this.serviceConfigAccess = serviceConfigAccess;
-        this.instances = new InMemoryStorage<>();
-        this.clusters = new InMemoryStorage<>();
-        this.parameterGroups = new InMemoryStorage<>();
+        this.instances = storageFactory.create("rds", "rds-instances.json",
+                new TypeReference<Map<String, DbInstance>>() {});
+        this.clusters = storageFactory.create("rds", "rds-clusters.json",
+                new TypeReference<Map<String, DbCluster>>() {});
+        this.parameterGroups = storageFactory.create("rds", "rds-parameter-groups.json",
+                new TypeReference<Map<String, DbParameterGroup>>() {});
+        this.clusterParameterGroups = storageFactory.create("rds", "rds-cluster-parameter-groups.json",
+                new TypeReference<Map<String, DbClusterParameterGroup>>() {});
+    }
+
+    RdsService(RdsContainerManager containerManager,
+               RdsProxyManager proxyManager,
+               RegionResolver regionResolver,
+               EmulatorConfig config,
+               StorageBackend<String, DbInstance> instances,
+               StorageBackend<String, DbCluster> clusters,
+               StorageBackend<String, DbParameterGroup> parameterGroups,
+               StorageBackend<String, DbClusterParameterGroup> clusterParameterGroups) {
+        this.containerManager = containerManager;
+        this.proxyManager = proxyManager;
+        this.regionResolver = regionResolver;
+        this.config = config;
+        this.instances = instances;
+        this.clusters = clusters;
+        this.parameterGroups = parameterGroups;
+        this.clusterParameterGroups = clusterParameterGroups;
+    }
+
+    public void restorePersistedRuntime() {
+        restoreClusters();
+        restoreInstances();
     }
 
     // ── DB Instances ──────────────────────────────────────────────────────────
@@ -81,6 +113,8 @@ public class RdsService {
         String containerId = null;
         String containerHost = null;
         int containerPort = 0;
+        String instanceVolumeId = null;
+        String instanceDockerVolumeName = null;
 
         if (dbClusterIdentifier != null && !dbClusterIdentifier.isBlank()) {
             // Cluster member — share the cluster's container
@@ -92,15 +126,20 @@ public class RdsService {
             containerId = cluster.getContainerId();
             containerHost = cluster.getContainerHost();
             containerPort = cluster.getContainerPort();
+            instanceDockerVolumeName = cluster.getDockerVolumeName() != null
+                    ? cluster.getDockerVolumeName()
+                    : volumeName(cluster.getVolumeId(), cluster.getDbClusterIdentifier());
         } else {
             // Standalone instance — start its own container
             String image = imageForEngine(engine);
-            RdsContainerHandle handle = containerManager.start(id, engine, image, masterUsername, masterPassword, dbName);
+            instanceVolumeId = String.format("%06x", new SecureRandom().nextInt(0xFFFFFF));
+            RdsContainerHandle handle = containerManager.start(id, instanceVolumeId, engine, image, masterUsername, masterPassword, dbName);
             backendHost = handle.getHost();
             backendPort = handle.getPort();
             containerId = handle.getContainerId();
             containerHost = handle.getHost();
             containerPort = handle.getPort();
+            instanceDockerVolumeName = volumeName(instanceVolumeId, id);
         }
 
         DbEndpoint endpoint = new DbEndpoint("localhost", proxyPort);
@@ -110,9 +149,8 @@ public class RdsService {
         instance.setContainerId(containerId);
         instance.setContainerHost(containerHost);
         instance.setContainerPort(containerPort);
-        if (dbClusterIdentifier == null || dbClusterIdentifier.isBlank()) {
-            instance.setDockerVolumeName(isInMemory() ? null : "floci-rds-" + id);
-        }
+        instance.setVolumeId(instanceVolumeId);
+        instance.setDockerVolumeName(instanceDockerVolumeName);
 
         String region = regionResolver.getDefaultRegion();
         instance.setDbiResourceId("db-" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 24).toUpperCase());
@@ -132,7 +170,7 @@ public class RdsService {
         }
 
         instances.put(id, instance);
-        LOG.infov("DB instance {0} created, engine={1}, endpoint=localhost:{2}", id, engine, proxyPort);
+        LOG.infov("DB instance {0} created, engine={1}, endpoint=localhost:{2}", id, engine, String.valueOf(proxyPort));
         return instance;
     }
 
@@ -180,7 +218,7 @@ public class RdsService {
                 LOG.warnv("Error stopping container during reboot of {0}: {1}", id, e.getMessage());
             }
             String image = imageForEngine(instance.getEngine());
-            RdsContainerHandle handle = containerManager.start(id, instance.getEngine(), image,
+            RdsContainerHandle handle = containerManager.start(id, instance.getVolumeId(), instance.getEngine(), image,
                     instance.getMasterUsername(), instance.getMasterPassword(), instance.getDbName());
             instance.setContainerId(handle.getContainerId());
             instance.setContainerHost(handle.getHost());
@@ -222,9 +260,7 @@ public class RdsService {
             if (instance.getContainerId() != null) {
                 containerManager.stop(buildHandle(instance));
             }
-            if (instance.getDockerVolumeName() != null) {
-                containerManager.removeVolume(instance.getDbInstanceIdentifier());
-            }
+            containerManager.removeVolume(instance.getDbInstanceIdentifier(), instance.getVolumeId());
         } else {
             // Cluster member — remove from cluster's member list
             DbCluster cluster = clusters.get(clusterId).orElse(null);
@@ -253,8 +289,9 @@ public class RdsService {
         DatabaseEngine engine = resolveEngine(engineParam);
         int proxyPort = allocateProxyPort();
         String image = imageForEngine(engine);
+        String clusterVolumeId = String.format("%06x", new SecureRandom().nextInt(0xFFFFFF));
 
-        RdsContainerHandle handle = containerManager.start(id, engine, image, masterUsername, masterPassword, databaseName);
+        RdsContainerHandle handle = containerManager.start(id, clusterVolumeId, engine, image, masterUsername, masterPassword, databaseName);
 
         DbEndpoint endpoint = new DbEndpoint("localhost", proxyPort);
         DbCluster cluster = new DbCluster(id, engine, engineVersion, masterUsername, masterPassword,
@@ -263,7 +300,8 @@ public class RdsService {
         cluster.setContainerId(handle.getContainerId());
         cluster.setContainerHost(handle.getHost());
         cluster.setContainerPort(handle.getPort());
-        cluster.setDockerVolumeName(isInMemory() ? null : "floci-rds-" + id);
+        cluster.setVolumeId(clusterVolumeId);
+        cluster.setDockerVolumeName(volumeName(clusterVolumeId, id));
 
         String region = regionResolver.getDefaultRegion();
         cluster.setDbClusterResourceId("cluster-" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 24).toUpperCase());
@@ -275,7 +313,7 @@ public class RdsService {
                 (user, pw) -> validateDbClusterPassword(id, user, pw));
 
         clusters.put(id, cluster);
-        LOG.infov("DB cluster {0} created, engine={1}, endpoint=localhost:{2}", id, engine, proxyPort);
+        LOG.infov("DB cluster {0} created, engine={1}, endpoint=localhost:{2}", id, engine, String.valueOf(proxyPort));
         return cluster;
     }
 
@@ -323,9 +361,7 @@ public class RdsService {
         if (cluster.getContainerId() != null) {
             containerManager.stop(buildClusterHandle(cluster));
         }
-        if (cluster.getDockerVolumeName() != null) {
-            containerManager.removeVolume(id);
-        }
+        containerManager.removeVolume(id, cluster.getVolumeId());
 
         releaseProxyPort(cluster.getProxyPort());
         clusters.delete(id);
@@ -375,6 +411,49 @@ public class RdsService {
         return group;
     }
 
+    // ── Cluster Parameter Groups ──────────────────────────────────────────────
+
+    public DbClusterParameterGroup createDbClusterParameterGroup(String name, String family, String description) {
+        if (clusterParameterGroups.get(name).isPresent()) {
+            throw new AwsException("DBParameterGroupAlreadyExists",
+                    "DB cluster parameter group " + name + " already exists.", 400);
+        }
+        DbClusterParameterGroup group = new DbClusterParameterGroup(name, family, description);
+        clusterParameterGroups.put(name, group);
+        return group;
+    }
+
+    public DbClusterParameterGroup getDbClusterParameterGroup(String name) {
+        return clusterParameterGroups.get(name).orElseThrow(() ->
+                new AwsException("DBParameterGroupNotFound",
+                        "DB cluster parameter group " + name + " not found.", 404));
+    }
+
+    public Collection<DbClusterParameterGroup> listDbClusterParameterGroups(String filterName) {
+        if (filterName != null && !filterName.isBlank()) {
+            return clusterParameterGroups.get(filterName).map(List::of).orElse(List.of());
+        }
+        return clusterParameterGroups.scan(k -> true);
+    }
+
+    public void deleteDbClusterParameterGroup(String name) {
+        if (clusterParameterGroups.get(name).isEmpty()) {
+            throw new AwsException("DBParameterGroupNotFound",
+                    "DB cluster parameter group " + name + " not found.", 404);
+        }
+        clusterParameterGroups.delete(name);
+    }
+
+    public DbClusterParameterGroup modifyDbClusterParameterGroup(String name,
+                                                                  java.util.Map<String, String> parameters) {
+        DbClusterParameterGroup group = getDbClusterParameterGroup(name);
+        if (parameters != null) {
+            group.getParameters().putAll(parameters);
+        }
+        clusterParameterGroups.put(name, group);
+        return group;
+    }
+
     // ── Password validation callbacks ─────────────────────────────────────────
 
     public boolean validateDbPassword(String instanceId, String clientUser, String password) {
@@ -400,10 +479,6 @@ public class RdsService {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private boolean isInMemory() {
-        return "memory".equals(serviceConfigAccess.storageMode("rds"));
-    }
 
     private DatabaseEngine resolveEngine(String engineParam) {
         if (engineParam == null) {
@@ -440,6 +515,127 @@ public class RdsService {
 
     private void releaseProxyPort(int port) {
         usedPorts.remove(port);
+    }
+
+    private void restoreClusters() {
+        for (DbCluster cluster : allClusters()) {
+            if (cluster.getStatus() == DbInstanceStatus.DELETING) {
+                continue;
+            }
+            int proxyPort = reserveOrAllocateProxyPort(cluster.getProxyPort());
+            cluster.setProxyPort(proxyPort);
+            cluster.setEndpoint(new DbEndpoint("localhost", proxyPort));
+            cluster.setReaderEndpoint(new DbEndpoint("localhost", proxyPort));
+            if (cluster.getDockerVolumeName() == null) {
+                cluster.setDockerVolumeName(volumeName(cluster.getVolumeId(), cluster.getDbClusterIdentifier()));
+            }
+            try {
+                String image = imageForEngine(cluster.getEngine());
+                RdsContainerHandle handle = containerManager.start(cluster.getDbClusterIdentifier(),
+                        cluster.getVolumeId(), cluster.getEngine(), image,
+                        cluster.getMasterUsername(), cluster.getMasterPassword(), cluster.getDatabaseName());
+                cluster.setContainerId(handle.getContainerId());
+                cluster.setContainerHost(handle.getHost());
+                cluster.setContainerPort(handle.getPort());
+
+                String effectiveMasterUser = cluster.getMasterUsername() != null
+                        ? cluster.getMasterUsername() : "root";
+                proxyManager.startProxy(cluster.getDbClusterIdentifier(), cluster.getEngine(),
+                        cluster.isIamDatabaseAuthenticationEnabled(), proxyPort,
+                        handle.getHost(), handle.getPort(), effectiveMasterUser,
+                        cluster.getMasterPassword(), cluster.getDatabaseName(),
+                        (user, pw) -> validateDbClusterPassword(cluster.getDbClusterIdentifier(), user, pw));
+                cluster.setStatus(DbInstanceStatus.AVAILABLE);
+            } catch (Exception e) {
+                releaseProxyPort(proxyPort);
+                LOG.warnv(e, "Failed to restore RDS cluster {0}", cluster.getDbClusterIdentifier());
+            }
+        }
+    }
+
+    private void restoreInstances() {
+        for (DbInstance instance : allInstances()) {
+            if (instance.getStatus() == DbInstanceStatus.DELETING) {
+                continue;
+            }
+            int proxyPort = reserveOrAllocateProxyPort(instance.getProxyPort());
+            instance.setProxyPort(proxyPort);
+            instance.setEndpoint(new DbEndpoint("localhost", proxyPort));
+            try {
+                String backendHost;
+                int backendPort;
+                String clusterId = instance.getDbClusterIdentifier();
+                if (clusterId != null && !clusterId.isBlank()) {
+                    DbCluster cluster = clusters.get(clusterId).orElseThrow(() ->
+                            new AwsException("DBClusterNotFoundFault",
+                                    "DB cluster " + clusterId + " not found.", 404));
+                    backendHost = cluster.getContainerHost();
+                    backendPort = cluster.getContainerPort();
+                    if (backendHost == null || backendPort <= 0) {
+                        throw new AwsException("InvalidDBClusterStateFault",
+                                "DB cluster " + clusterId + " runtime is not available.", 400);
+                    }
+                    instance.setContainerId(cluster.getContainerId());
+                    instance.setContainerHost(cluster.getContainerHost());
+                    instance.setContainerPort(cluster.getContainerPort());
+                    if (instance.getDockerVolumeName() == null) {
+                        instance.setDockerVolumeName(cluster.getDockerVolumeName() != null
+                                ? cluster.getDockerVolumeName()
+                                : volumeName(cluster.getVolumeId(), cluster.getDbClusterIdentifier()));
+                    }
+                } else {
+                    if (instance.getDockerVolumeName() == null) {
+                        instance.setDockerVolumeName(volumeName(instance.getVolumeId(), instance.getDbInstanceIdentifier()));
+                    }
+                    String image = imageForEngine(instance.getEngine());
+                    RdsContainerHandle handle = containerManager.start(instance.getDbInstanceIdentifier(),
+                            instance.getVolumeId(), instance.getEngine(), image,
+                            instance.getMasterUsername(), instance.getMasterPassword(), instance.getDbName());
+                    backendHost = handle.getHost();
+                    backendPort = handle.getPort();
+                    instance.setContainerId(handle.getContainerId());
+                    instance.setContainerHost(handle.getHost());
+                    instance.setContainerPort(handle.getPort());
+                }
+
+                String effectiveMasterUser = instance.getMasterUsername() != null
+                        ? instance.getMasterUsername() : "root";
+                proxyManager.startProxy(instance.getDbInstanceIdentifier(), instance.getEngine(),
+                        instance.isIamDatabaseAuthenticationEnabled(), proxyPort,
+                        backendHost, backendPort, effectiveMasterUser,
+                        instance.getMasterPassword(), instance.getDbName(),
+                        (user, pw) -> validateDbPassword(instance.getDbInstanceIdentifier(), user, pw));
+                instance.setStatus(DbInstanceStatus.AVAILABLE);
+            } catch (Exception e) {
+                releaseProxyPort(proxyPort);
+                LOG.warnv(e, "Failed to restore RDS instance {0}", instance.getDbInstanceIdentifier());
+            }
+        }
+    }
+
+    private Collection<DbCluster> allClusters() {
+        if (clusters instanceof AccountAwareStorageBackend<DbCluster> aware) {
+            return aware.scanAllAccounts();
+        }
+        return clusters.scan(k -> true);
+    }
+
+    private Collection<DbInstance> allInstances() {
+        if (instances instanceof AccountAwareStorageBackend<DbInstance> aware) {
+            return aware.scanAllAccounts();
+        }
+        return instances.scan(k -> true);
+    }
+
+    private int reserveOrAllocateProxyPort(int persistedPort) {
+        if (persistedPort > 0 && usedPorts.add(persistedPort)) {
+            return persistedPort;
+        }
+        return allocateProxyPort();
+    }
+
+    private String volumeName(String volumeId, String fallbackId) {
+        return ContainerStorageHelper.resourceName("rds", volumeId, fallbackId);
     }
 
     private RdsContainerHandle buildHandle(DbInstance instance) {

@@ -37,6 +37,14 @@ window are skipped. The dispatcher ticks every
 
 Supported target types: SQS, Lambda, SNS, EventBridge `PutEvents`.
 
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_SCHEDULER_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_SCHEDULER_INVOCATION_ENABLED` | `true` | Run the background dispatcher that fires scheduled targets (`false` = CRUD-only) |
+| `FLOCI_SERVICES_SCHEDULER_TICK_INTERVAL_SECONDS` | `10` | How often the dispatcher scans for due schedules (seconds) |
+
 ## Not Yet Supported
 
 - `RetryPolicy` and `DeadLetterConfig` on failed invocations (stored but not honored)

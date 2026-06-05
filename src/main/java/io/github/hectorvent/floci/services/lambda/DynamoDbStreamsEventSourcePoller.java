@@ -59,7 +59,7 @@ public class DynamoDbStreamsEventSourcePoller {
     }
 
     public void startPersistedPollers() {
-        for (EventSourceMapping esm : esmStore.list()) {
+        for (EventSourceMapping esm : esmStore.listAll()) {
             if (esm.isEnabled() && esm.getEventSourceArn().contains(":dynamodb:")) {
                 startPolling(esm);
             }
@@ -79,8 +79,9 @@ public class DynamoDbStreamsEventSourcePoller {
             return;
         }
         String uuid = esm.getUuid();
+        String accountId = esm.getAccountId();
         long timerId = vertx.setPeriodic(pollIntervalMs, id ->
-                esmStore.get(uuid).ifPresent(latest -> {
+                esmStore.getForAccount(accountId, uuid).ifPresent(latest -> {
                     if (latest.isEnabled()) {
                         pollAndInvoke(latest);
                     }
@@ -103,7 +104,7 @@ public class DynamoDbStreamsEventSourcePoller {
         }
         pollExecutor.submit(() -> {
             try {
-                LambdaFunction fn = functionStore.get(esm.getRegion(), esm.getFunctionName()).orElse(null);
+                LambdaFunction fn = functionStore.getForAccount(esm.getAccountId(), esm.getRegion(), esm.getFunctionName()).orElse(null);
                 if (fn == null) {
                     LOG.warnv("DynamoDB Streams ESM {0}: function {1} not found, skipping",
                             esm.getUuid(), esm.getFunctionName());
@@ -144,7 +145,7 @@ public class DynamoDbStreamsEventSourcePoller {
                 if (invokeResult.getFunctionError() == null) {
                     String newestSeq = records.get(records.size() - 1).getSequenceNumber();
                     esm.getShardSequenceNumbers().put(shardId, newestSeq);
-                    esmStore.save(esm);
+                    esmStore.saveForAccount(esm.getAccountId(), esm);
                 } else {
                     LOG.warnv("DynamoDB Streams ESM {0}: Lambda returned error [{1}], records will be retried",
                             esm.getUuid(), invokeResult.getFunctionError());

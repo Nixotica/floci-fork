@@ -122,19 +122,6 @@ ECS emulates clusters, task definitions, tasks, and services. In the default con
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    ecs:
-      enabled: true
-      mock: false           # Set true to skip Docker and run tasks as in-process stubs
-      docker-network: ""    # Docker network for task containers
-      default-memory-mb: 512
-      default-cpu-units: 256
-```
-
-### Environment Variables
-
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_ECS_ENABLED` | `true` | Enable or disable the ECS service |

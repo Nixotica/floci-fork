@@ -8,7 +8,11 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import io.restassured.config.DecoderConfig;
 import io.restassured.config.RestAssuredConfig;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Base64;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -16,6 +20,12 @@ import static org.hamcrest.Matchers.*;
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class S3IntegrationTest {
+    private static final String SSE_CUSTOMER_KEY = Base64.getEncoder().encodeToString("0123456789abcdef0123456789abcdef".getBytes(StandardCharsets.UTF_8));
+    private static final String SSE_CUSTOMER_KEY_MD5 = customerKeyMd5(SSE_CUSTOMER_KEY);
+    private static final String WRONG_SSE_CUSTOMER_KEY = Base64.getEncoder().encodeToString("abcdef0123456789abcdef0123456789".getBytes(StandardCharsets.UTF_8));
+    private static final String WRONG_SSE_CUSTOMER_KEY_MD5 = customerKeyMd5(WRONG_SSE_CUSTOMER_KEY);
+    private static final String SHORT_SSE_CUSTOMER_KEY = Base64.getEncoder().encodeToString("short-key".getBytes(StandardCharsets.UTF_8));
+    private static final String SHORT_SSE_CUSTOMER_KEY_MD5 = customerKeyMd5(SHORT_SSE_CUSTOMER_KEY);
 
     @Test
     @Order(1)
@@ -30,13 +40,13 @@ class S3IntegrationTest {
 
     @Test
     @Order(2)
-    void createDuplicateBucketFails() {
+    void createDuplicateBucketInUsEast1IsIdempotent() {
         given()
         .when()
             .put("/test-bucket")
         .then()
-            .statusCode(409)
-            .body(containsString("BucketAlreadyOwnedByYou"));
+            .statusCode(200)
+            .header("Location", equalTo("/test-bucket"));
     }
 
     @Test
@@ -77,7 +87,7 @@ class S3IntegrationTest {
             .header("Content-Length", notNullValue())
             .header("x-amz-meta-owner", equalTo("team-a"))
             .header("x-amz-storage-class", equalTo("STANDARD_IA"))
-            .header("x-amz-checksum-sha256", notNullValue())
+            .header("x-amz-checksum-crc64nvme", notNullValue())
             .body(equalTo("Hello World from S3!"));
     }
 
@@ -93,7 +103,7 @@ class S3IntegrationTest {
             .body(containsString("<GetObjectAttributesResponse"))
             .body(containsString("<StorageClass>STANDARD_IA</StorageClass>"))
             .body(containsString("<ObjectSize>20</ObjectSize>"))
-            .body(containsString("<ChecksumSHA256>"));
+            .body(containsString("<ChecksumCRC64NVME>"));
     }
 
     @Test
@@ -108,7 +118,7 @@ class S3IntegrationTest {
             .header("Content-Length", notNullValue())
             .header("x-amz-meta-owner", equalTo("team-a"))
             .header("x-amz-storage-class", equalTo("STANDARD_IA"))
-            .header("x-amz-checksum-sha256", notNullValue());
+            .header("x-amz-checksum-crc64nvme", notNullValue());
     }
 
     @Test
@@ -573,6 +583,53 @@ class S3IntegrationTest {
     }
 
     @Test
+    @Order(40)
+    void getObjectRangeOmitsWholeObjectChecksum() {
+        // greeting.txt has a stored whole-object CRC64NVME checksum (see getObject).
+        // A 206 partial response must NOT carry that checksum: it is computed over the
+        // full object, so SDKs that validate it against the received range bytes fail.
+        // Real S3 omits whole-object checksum headers on ranged responses.
+        given()
+            .header("Range", "bytes=4-7")
+        .when()
+            .get("/test-bucket/greeting.txt")
+        .then()
+            .statusCode(206)
+            .header("Content-Range", equalTo("bytes 4-7/20"))
+            .body(equalTo("o Wo"))
+            .header("x-amz-checksum-crc64nvme", nullValue());
+    }
+
+    @Test
+    @Order(41)
+    void getObjectWithSuffixRangeForEmptyObject() {
+        given()
+            .header("x-amz-meta-kind", "empty")
+            .body(new byte[0])
+        .when()
+            .put("/test-bucket/empty.txt")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Range", "bytes=-13")
+        .when()
+            .get("/test-bucket/empty.txt")
+        .then()
+            .statusCode(200)
+            .header("Content-Length", equalTo("0"))
+            .header("Accept-Ranges", equalTo("bytes"))
+            .header("x-amz-meta-kind", equalTo("empty"))
+            .body(equalTo(""));
+
+        given()
+        .when()
+            .delete("/test-bucket/empty.txt")
+        .then()
+            .statusCode(204);
+    }
+
+    @Test
     @Order(50)
     void getObjectIfNoneMatchReturns304() {
         String eTag = given()
@@ -817,7 +874,10 @@ class S3IntegrationTest {
             .put("/encoding-test-bucket/encoded.txt")
         .then()
             .statusCode(200)
-            .header("ETag", notNullValue());
+            .header("ETag", notNullValue())
+            .header("Content-Encoding", nullValue())
+            .header("Content-Disposition", nullValue())
+            .header("Cache-Control", nullValue());
     }
 
     @Test
@@ -1184,9 +1244,222 @@ class S3IntegrationTest {
 
     @Test
     @Order(141)
+    void putObjectWithSseCustomerKey() {
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+            .body("sse-c-content")
+        .when()
+            .put("/sse-bucket/sse-c.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption-customer-algorithm", equalTo("AES256"))
+            .header("x-amz-server-side-encryption-customer-key-MD5", equalTo(SSE_CUSTOMER_KEY_MD5));
+    }
+
+    @Test
+    @Order(142)
+    void getObjectWithSseCustomerKeyRequiresMatchingKey() {
+        given()
+        .when()
+            .get("/sse-bucket/sse-c.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidRequest"));
+
+        given()
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", WRONG_SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", WRONG_SSE_CUSTOMER_KEY_MD5)
+        .when()
+            .get("/sse-bucket/sse-c.txt")
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
+
+        given()
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+        .when()
+            .get("/sse-bucket/sse-c.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption-customer-algorithm", equalTo("AES256"))
+            .header("x-amz-server-side-encryption-customer-key-MD5", equalTo(SSE_CUSTOMER_KEY_MD5))
+            .body(equalTo("sse-c-content"));
+    }
+
+    @Test
+    @Order(143)
+    void headObjectWithSseCustomerKeyRequiresMatchingKey() {
+        given()
+        .when()
+            .head("/sse-bucket/sse-c.txt")
+        .then()
+            .statusCode(400);
+
+        given()
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+        .when()
+            .head("/sse-bucket/sse-c.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption-customer-algorithm", equalTo("AES256"))
+            .header("x-amz-server-side-encryption-customer-key-MD5", equalTo(SSE_CUSTOMER_KEY_MD5));
+    }
+
+    @Test
+    @Order(144)
+    void copyObjectWithSseCustomerKeyRequiresSourceKeyAndSupportsDestinationKey() {
+        given()
+            .header("x-amz-copy-source", "/sse-bucket/sse-c.txt")
+        .when()
+            .put("/sse-bucket/sse-c-copy.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidRequest"));
+
+        given()
+            .header("x-amz-copy-source", "/sse-bucket/sse-c.txt")
+            .header("x-amz-copy-source-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-copy-source-server-side-encryption-customer-key", WRONG_SSE_CUSTOMER_KEY)
+            .header("x-amz-copy-source-server-side-encryption-customer-key-MD5", WRONG_SSE_CUSTOMER_KEY_MD5)
+        .when()
+            .put("/sse-bucket/sse-c-copy.txt")
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
+
+        given()
+            .header("x-amz-copy-source", "/sse-bucket/sse-c.txt")
+            .header("x-amz-copy-source-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-copy-source-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-copy-source-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+        .when()
+            .put("/sse-bucket/sse-c-copy.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption-customer-algorithm", equalTo("AES256"))
+            .header("x-amz-server-side-encryption-customer-key-MD5", equalTo(SSE_CUSTOMER_KEY_MD5));
+
+        given()
+        .when()
+            .get("/sse-bucket/sse-c-copy.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidRequest"));
+
+        given()
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+        .when()
+            .get("/sse-bucket/sse-c-copy.txt")
+        .then()
+            .statusCode(200)
+            .body(equalTo("sse-c-content"));
+    }
+
+    @Test
+    @Order(145)
+    void putObjectRejectsInvalidSseCustomerKeyMd5() {
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", WRONG_SSE_CUSTOMER_KEY_MD5)
+            .body("bad sse-c")
+        .when()
+            .put("/sse-bucket/sse-c-invalid.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidDigest"));
+    }
+
+    @Test
+    @Order(146)
+    void putObjectRejectsUnsupportedSseCustomerAlgorithm() {
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption-customer-algorithm", "aws:kms")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+            .body("bad sse-c")
+        .when()
+            .put("/sse-bucket/sse-c-invalid-algorithm.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("Unsupported x-amz-server-side-encryption-customer-algorithm value"));
+    }
+
+    @Test
+    @Order(147)
+    void putObjectRejectsInvalidSseCustomerKeyBase64() {
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", "not-base64")
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+            .body("bad sse-c")
+        .when()
+            .put("/sse-bucket/sse-c-invalid-key.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("not valid base64"));
+    }
+
+    @Test
+    @Order(148)
+    void putObjectRejectsInvalidSseCustomerKeyLength() {
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SHORT_SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SHORT_SSE_CUSTOMER_KEY_MD5)
+            .body("bad sse-c")
+        .when()
+            .put("/sse-bucket/sse-c-invalid-length.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("256-bit key"));
+    }
+
+    @Test
+    @Order(149)
+    void putObjectRejectsConflictingServerSideEncryption() {
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption", "AES256")
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+            .body("bad sse-c")
+        .when()
+            .put("/sse-bucket/sse-c-conflicting-encryption.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidRequest"))
+            .body(containsString("SSE-C cannot be combined"));
+    }
+
+    @Test
+    @Order(153)
     void cleanupSseBucket() {
         given().delete("/sse-bucket/encrypted.txt");
         given().delete("/sse-bucket/encrypted-copy.txt");
+        given().delete("/sse-bucket/sse-c.txt");
+        given().delete("/sse-bucket/sse-c-copy.txt");
         given().delete("/sse-bucket");
     }
 
@@ -1343,6 +1616,72 @@ class S3IntegrationTest {
 
     @Test
     @Order(94)
+    void notificationDeliveredToQueueInDifferentRegion() {
+        String sqsAuth = "Credential=AKID/20260507/ap-southeast-2/s3/aws4_request";
+
+        String queueUrl = given()
+            .header("Authorization", sqsAuth)
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", "notif-test-queue")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            given()
+                .contentType("application/xml")
+                .queryParam("notification", "")
+                .body("""
+                    <NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <QueueConfiguration>
+                            <Id>sqs-notif</Id>
+                            <Queue>arn:aws:sqs:ap-southeast-2:000000000000:notif-test-queue</Queue>
+                            <Event>s3:ObjectCreated:*</Event>
+                        </QueueConfiguration>
+                    </NotificationConfiguration>
+                """)
+            .when()
+                .put("/notif-test-bucket")
+            .then()
+                .statusCode(200);
+
+            given()
+                .contentType("text/plain")
+                .body("hello")
+            .when()
+                .put("/notif-test-bucket/file.txt")
+            .then()
+                .statusCode(200);
+
+            given()
+                .header("Authorization", sqsAuth)
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", queueUrl)
+                .formParam("MaxNumberOfMessages", "1")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(
+                    "ReceiveMessageResponse.ReceiveMessageResult.Message.Body",
+                    allOf(containsString("notif-test-bucket"), containsString("file.txt"))
+                );
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", sqsAuth)
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", queueUrl)
+                .post("/");
+        }
+    }
+
+    @Test
+    @Order(95)
     void cleanupNotificationBucket() {
         given().delete("/notif-test-bucket");
     }
@@ -1558,5 +1897,54 @@ class S3IntegrationTest {
         .then()
                 .statusCode(400)
                 .body(containsString("InvalidKey"));
+    }
+
+    @Test
+    @Order(150)
+    void putObjectRejectsMismatchedCRC32() {
+        given()
+            .body("hello")
+            .header("x-amz-checksum-crc32", "INVALID==")
+        .when()
+            .put("/test-bucket/checksum-crc32-test.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("BadDigest"));
+    }
+
+    @Test
+    @Order(151)
+    void putObjectRejectsMismatchedCRC32C() {
+        given()
+            .body("hello")
+            .header("x-amz-checksum-crc32c", "INVALID==")
+        .when()
+            .put("/test-bucket/checksum-crc32c-test.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("BadDigest"));
+    }
+
+    @Test
+    @Order(152)
+    void putObjectRejectsMismatchedCRC64NVME() {
+        given()
+            .body("hello")
+            .header("x-amz-checksum-crc64nvme", "INVALID==")
+        .when()
+            .put("/test-bucket/checksum-crc64nvme-test.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("BadDigest"));
+    }
+
+    private static String customerKeyMd5(String customerKey) {
+        try {
+            byte[] md5 = MessageDigest.getInstance("MD5").digest(Base64.getDecoder().decode(customerKey));
+            return Base64.getEncoder().encodeToString(md5);
+        }
+        catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 is not available", e);
+        }
     }
 }

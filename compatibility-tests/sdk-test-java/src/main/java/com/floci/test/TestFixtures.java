@@ -17,6 +17,7 @@ import software.amazon.awssdk.http.Protocol;
 import software.amazon.awssdk.services.kms.KmsClient;
 import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.opensearch.OpenSearchClient;
+import software.amazon.awssdk.services.neptune.NeptuneClient;
 import software.amazon.awssdk.services.rds.RdsClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.endpoints.Endpoint;
@@ -48,7 +49,9 @@ import software.amazon.awssdk.services.eks.EksClient;
 import software.amazon.awssdk.services.scheduler.SchedulerClient;
 import software.amazon.awssdk.services.appconfig.AppConfigClient;
 import software.amazon.awssdk.services.appconfigdata.AppConfigDataClient;
+import software.amazon.awssdk.services.backup.BackupClient;
 import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
+import software.amazon.awssdk.services.appsync.AppSyncClient;
 
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.services.lambda.model.CreateFunctionRequest;
@@ -240,6 +243,64 @@ public final class TestFixtures {
     }
 
     /**
+     * S3 client using virtual-hosted style addressing (no forcePathStyle).
+     *
+     * <p>The endpoint base is resolved in priority order:
+     * <ol>
+     *   <li>{@code FLOCI_S3_VHOST_ENDPOINT} env var — set this to {@code http://floci:4566}
+     *       in Docker test environments and point the test container's DNS at the Floci
+     *       container so that {@code <bucket>.floci} resolves via Floci's embedded DNS.</li>
+     *   <li>{@code s3.localhost.floci.io} — Floci's own public wildcard DNS, resolves to 127.0.0.1.</li>
+     *   <li>{@code s3.localhost.localstack.cloud} — LocalStack's public wildcard DNS, fallback.</li>
+     * </ol>
+     */
+    public static S3Client s3VirtualHostClient() {
+        URI virtualHostEndpoint;
+        String vhostEndpoint = System.getenv("FLOCI_S3_VHOST_ENDPOINT");
+        if (vhostEndpoint != null && !vhostEndpoint.trim().isEmpty()) {
+            virtualHostEndpoint = URI.create(vhostEndpoint);
+        } else {
+            int port = ENDPOINT.getPort() > 0 ? ENDPOINT.getPort() : 80;
+            String host = resolveVirtualHostBase(port);
+            virtualHostEndpoint = URI.create("http://" + host + ":" + port);
+        }
+        return S3Client.builder()
+                .endpointOverride(virtualHostEndpoint)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    /**
+     * Returns true when the S3 virtual-host endpoint is resolvable.
+     * When {@code FLOCI_S3_VHOST_ENDPOINT} is set the environment is
+     * assumed to have working DNS (e.g. --dns pointing at Floci).
+     */
+    public static boolean isS3VirtualHostResolvable() {
+        String vhostEndpoint = System.getenv("FLOCI_S3_VHOST_ENDPOINT");
+        if (vhostEndpoint != null && !vhostEndpoint.trim().isEmpty()) {
+            return true;
+        }
+        return isDnsResolvable("s3.localhost.floci.io") || isDnsResolvable("s3.localhost.localstack.cloud");
+    }
+
+    private static String resolveVirtualHostBase(int port) {
+        if (isDnsResolvable("s3.localhost.floci.io")) {
+            return "s3.localhost.floci.io";
+        }
+        return "s3.localhost.localstack.cloud";
+    }
+
+    private static boolean isDnsResolvable(String hostname) {
+        try {
+            java.net.InetAddress.getByName(hostname);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
      * S3 Control client for the S3 Control API (/v20180820/...).
      * Host prefix injection (account-ID prepended to host) is disabled so requests
      * go to the configured endpoint directly rather than 000000000000.localhost:4566.
@@ -425,6 +486,14 @@ public final class TestFixtures {
                 .build();
     }
 
+    public static NeptuneClient neptuneClient() {
+        return NeptuneClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
     public static ElastiCacheClient elastiCacheClient() {
         return ElastiCacheClient.builder()
                 .endpointOverride(ENDPOINT)
@@ -547,6 +616,22 @@ public final class TestFixtures {
 
     public static CodeDeployClient codeDeployClient() {
         return CodeDeployClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static BackupClient backupClient() {
+        return BackupClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static AppSyncClient appSyncClient() {
+        return AppSyncClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)

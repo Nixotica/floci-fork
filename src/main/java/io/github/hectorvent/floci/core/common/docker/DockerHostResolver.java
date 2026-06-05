@@ -24,11 +24,18 @@ public class DockerHostResolver {
     private final AtomicBoolean ufwHintLogged = new AtomicBoolean(false);
 
     private final ContainerDetector containerDetector;
+    private final CurrentContainerNetworkResolver currentContainerNetworkResolver;
 
     @Inject
-    public DockerHostResolver(EmulatorConfig config, ContainerDetector containerDetector) {
+    public DockerHostResolver(EmulatorConfig config, ContainerDetector containerDetector,
+                              CurrentContainerNetworkResolver currentContainerNetworkResolver) {
         this.config = config;
         this.containerDetector = containerDetector;
+        this.currentContainerNetworkResolver = currentContainerNetworkResolver;
+    }
+
+    public DockerHostResolver(EmulatorConfig config, ContainerDetector containerDetector) {
+        this(config, containerDetector, null);
     }
 
     public String resolve() {
@@ -39,6 +46,15 @@ public class DockerHostResolver {
         }
 
         if (containerDetector.isRunningInContainer()) {
+            if (currentContainerNetworkResolver != null) {
+                java.util.Optional<String> currentNetworkIp = currentContainerNetworkResolver.resolveContainerIp();
+                if (currentNetworkIp.isPresent()) {
+                    LOG.infov("Running in Docker — using current network IP for Runtime API: {0}",
+                            currentNetworkIp.get());
+                    return currentNetworkIp.get();
+                }
+            }
+
             // Use this container's own IP so Lambda containers on the same network
             // can reach the Runtime API server bound to all interfaces inside this container.
             try {

@@ -65,6 +65,9 @@ public class Pipe {
     @JsonProperty("StateReason")
     private String stateReason;
 
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String accountId;
+
     public Pipe() {}
 
     public String getName() { return name; }
@@ -114,4 +117,7 @@ public class Pipe {
 
     public String getStateReason() { return stateReason; }
     public void setStateReason(String stateReason) { this.stateReason = stateReason; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 }

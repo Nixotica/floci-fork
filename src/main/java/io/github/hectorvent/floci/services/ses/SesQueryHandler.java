@@ -6,9 +6,15 @@ import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntry;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntryResult;
+import io.github.hectorvent.floci.services.ses.model.CloudWatchDestination;
+import io.github.hectorvent.floci.services.ses.model.CloudWatchDimensionConfiguration;
 import io.github.hectorvent.floci.services.ses.model.ConfigurationSet;
 import io.github.hectorvent.floci.services.ses.model.EmailTemplate;
+import io.github.hectorvent.floci.services.ses.model.EventDestination;
 import io.github.hectorvent.floci.services.ses.model.Identity;
+import io.github.hectorvent.floci.services.ses.model.KinesisFirehoseDestination;
+import io.github.hectorvent.floci.services.ses.model.MessageTag;
+import io.github.hectorvent.floci.services.ses.model.SnsDestination;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -54,6 +60,7 @@ public class SesQueryHandler {
                 case "GetSendQuota" -> handleGetSendQuota(region);
                 case "GetSendStatistics" -> handleGetSendStatistics(region);
                 case "GetAccountSendingEnabled" -> handleGetAccountSendingEnabled(region);
+                case "UpdateAccountSendingEnabled" -> handleUpdateAccountSendingEnabled(params, region);
                 case "ListVerifiedEmailAddresses" -> handleListVerifiedEmailAddresses(region);
                 case "DeleteVerifiedEmailAddress" -> handleDeleteVerifiedEmailAddress(params, region);
                 case "SetIdentityNotificationTopic" -> handleSetIdentityNotificationTopic(params, region);
@@ -75,6 +82,12 @@ public class SesQueryHandler {
                 case "DescribeConfigurationSet" -> handleDescribeConfigurationSet(params, region);
                 case "ListConfigurationSets" -> handleListConfigurationSets(region);
                 case "DeleteConfigurationSet" -> handleDeleteConfigurationSet(params, region);
+                case "CreateConfigurationSetEventDestination" ->
+                        handleCreateConfigurationSetEventDestination(params, region);
+                case "UpdateConfigurationSetEventDestination" ->
+                        handleUpdateConfigurationSetEventDestination(params, region);
+                case "DeleteConfigurationSetEventDestination" ->
+                        handleDeleteConfigurationSetEventDestination(params, region);
                 default -> AwsQueryResponse.error("UnsupportedOperation",
                         "Operation " + action + " is not supported by SES.", AwsNamespaces.SES, 400);
             };
@@ -157,9 +170,12 @@ public class SesQueryHandler {
         String subject = getParam(params, "Message.Subject.Data");
         String bodyText = getParam(params, "Message.Body.Text.Data");
         String bodyHtml = getParam(params, "Message.Body.Html.Data");
+        String configurationSetName = getParam(params, "ConfigurationSetName");
+        List<MessageTag> emailTags = extractMessageTags(params, "Tags");
 
         String messageId = sesService.sendEmail(source, toAddresses, ccAddresses, bccAddresses,
-                replyToAddresses, subject, bodyText, bodyHtml, region);
+                replyToAddresses, subject, bodyText, bodyHtml, configurationSetName,
+                emailTags, List.of(), region);
 
         String result = new XmlBuilder().elem("MessageId", messageId).build();
         return Response.ok(AwsQueryResponse.envelope("SendEmail", AwsNamespaces.SES, result)).build();
@@ -173,8 +189,11 @@ public class SesQueryHandler {
         String source = getParam(params, "Source");
         List<String> destinations = extractMembers(params, "Destinations");
         String rawMessage = getParam(params, "RawMessage.Data");
+        String configurationSetName = getParam(params, "ConfigurationSetName");
+        List<MessageTag> emailTags = extractMessageTags(params, "Tags");
 
-        String messageId = sesService.sendRawEmail(source, destinations, rawMessage, region);
+        String messageId = sesService.sendRawEmail(source, destinations, rawMessage,
+                configurationSetName, emailTags, region);
 
         String result = new XmlBuilder().elem("MessageId", messageId).build();
         return Response.ok(AwsQueryResponse.envelope("SendRawEmail", AwsNamespaces.SES, result)).build();
@@ -208,6 +227,12 @@ public class SesQueryHandler {
         boolean enabled = sesService.isAccountSendingEnabled(region);
         String result = new XmlBuilder().elem("Enabled", String.valueOf(enabled)).build();
         return Response.ok(AwsQueryResponse.envelope("GetAccountSendingEnabled", AwsNamespaces.SES, result)).build();
+    }
+
+    private Response handleUpdateAccountSendingEnabled(MultivaluedMap<String, String> params, String region) {
+        boolean enabled = parseOptionalBoolean(params, "Enabled", false);
+        sesService.setAccountSendingEnabled(region, enabled);
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult("UpdateAccountSendingEnabled", AwsNamespaces.SES)).build();
     }
 
     private Response handleListVerifiedEmailAddresses(String region) {
@@ -320,6 +345,18 @@ public class SesQueryHandler {
         return Boolean.parseBoolean(raw);
     }
 
+    private static boolean parseOptionalBoolean(MultivaluedMap<String, String> params, String name, boolean defaultValue) {
+        String raw = params.getFirst(name);
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+        if (!"true".equalsIgnoreCase(raw) && !"false".equalsIgnoreCase(raw)) {
+            throw new AwsException("InvalidParameterValue",
+                    name + " must be \"true\" or \"false\".", 400);
+        }
+        return Boolean.parseBoolean(raw);
+    }
+
     private Response handleGetIdentityMailFromDomainAttributes(MultivaluedMap<String, String> params, String region) {
         List<String> identities = extractMembers(params, "Identities");
         var xml = new XmlBuilder().start("MailFromDomainAttributes");
@@ -417,8 +454,11 @@ public class SesQueryHandler {
         String resolvedName = hasName ? templateName : SesService.templateNameFromArn(templateArn);
 
         JsonNode templateData = parseTemplateData(templateDataRaw);
+        String configurationSetName = getParam(params, "ConfigurationSetName");
+        List<MessageTag> emailTags = extractMessageTags(params, "Tags");
         String messageId = sesService.sendTemplatedEmail(source, toAddresses, ccAddresses,
-                bccAddresses, replyToAddresses, resolvedName, templateData, region);
+                bccAddresses, replyToAddresses, resolvedName, templateData,
+                configurationSetName, emailTags, List.of(), region);
 
         String result = new XmlBuilder().elem("MessageId", messageId).build();
         return Response.ok(AwsQueryResponse.envelope("SendTemplatedEmail", AwsNamespaces.SES, result)).build();
@@ -466,19 +506,25 @@ public class SesQueryHandler {
             List<String> cc = extractMembers(params, destPrefix + ".Destination.CcAddresses");
             List<String> bcc = extractMembers(params, destPrefix + ".Destination.BccAddresses");
             String replacementRaw = getParam(params, destPrefix + ".ReplacementTemplateData");
-            if (to.isEmpty() && cc.isEmpty() && bcc.isEmpty() && replacementRaw == null) {
+            List<MessageTag> replacementTags = extractMessageTags(params, destPrefix + ".ReplacementTags");
+            if (to.isEmpty() && cc.isEmpty() && bcc.isEmpty()
+                    && replacementRaw == null && replacementTags.isEmpty()) {
                 break;
             }
-            entries.add(new BulkEmailEntry(to, cc, bcc, parseTemplateData(replacementRaw)));
+            entries.add(new BulkEmailEntry(to, cc, bcc,
+                    parseTemplateData(replacementRaw), replacementTags, List.of()));
         }
         if (entries.isEmpty()) {
             throw new AwsException("InvalidParameterValue",
                     "At least one destination is required.", 400);
         }
 
+        String configurationSetName = getParam(params, "ConfigurationSetName");
+        List<MessageTag> defaultEmailTags = extractMessageTags(params, "DefaultTags");
         List<BulkEmailEntryResult> results = sesService.sendBulkTemplatedEmail(source, replyToAddresses,
                 template.getSubject(), template.getTextPart(), template.getHtmlPart(),
-                defaultTemplateData, entries, region);
+                defaultTemplateData, entries, configurationSetName,
+                defaultEmailTags, List.of(), region);
 
         XmlBuilder xml = new XmlBuilder().start("Status");
         for (BulkEmailEntryResult result : results) {
@@ -510,12 +556,84 @@ public class SesQueryHandler {
             throw new AwsException("InvalidParameterValue", "ConfigurationSetName is required.", 400);
         }
         ConfigurationSet cs = sesService.getConfigurationSet(name, region);
-        String result = new XmlBuilder()
+        List<String> attrs = extractMembers(params, "ConfigurationSetAttributeNames");
+        XmlBuilder xml = new XmlBuilder()
                 .start("ConfigurationSet")
                     .elem("Name", cs.getName())
-                .end("ConfigurationSet")
-                .build();
-        return Response.ok(AwsQueryResponse.envelope("DescribeConfigurationSet", AwsNamespaces.SES, result)).build();
+                .end("ConfigurationSet");
+        if (attrs.contains("eventDestinations")) {
+            xml.start("EventDestinations");
+            List<EventDestination> destinations = cs.getEventDestinations();
+            if (destinations != null) {
+                for (EventDestination ed : destinations) {
+                    xml.start("member");
+                    writeEventDestination(xml, ed);
+                    xml.end("member");
+                }
+            }
+            xml.end("EventDestinations");
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeConfigurationSet",
+                AwsNamespaces.SES, xml.build())).build();
+    }
+
+    /**
+     * Render an {@link EventDestination} into the V1 SES XML shape. V1 wire names use the
+     * uppercase {@code ARN}/{@code NS} suffix variants (e.g., {@code SNSDestination},
+     * {@code TopicARN}, {@code IAMRoleARN}, {@code DeliveryStreamARN}). Skips destination
+     * blocks for which no configuration is present.
+     */
+    private static void writeEventDestination(XmlBuilder xml, EventDestination ed) {
+        xml.elem("Name", ed.getName())
+           .elem("Enabled", String.valueOf(ed.isEnabled()));
+        xml.start("MatchingEventTypes");
+        if (ed.getMatchingEventTypes() != null) {
+            for (String t : ed.getMatchingEventTypes()) {
+                xml.elem("member", INTERNAL_EVENT_TYPE_TO_V1.getOrDefault(t, t));
+            }
+        }
+        xml.end("MatchingEventTypes");
+        if (ed.getSnsDestination() != null
+                && ed.getSnsDestination().getTopicArn() != null
+                && !ed.getSnsDestination().getTopicArn().isBlank()) {
+            xml.start("SNSDestination")
+               .elem("TopicARN", ed.getSnsDestination().getTopicArn())
+               .end("SNSDestination");
+        }
+        if (ed.getKinesisFirehoseDestination() != null
+                && ed.getKinesisFirehoseDestination().getIamRoleArn() != null
+                && !ed.getKinesisFirehoseDestination().getIamRoleArn().isBlank()
+                && ed.getKinesisFirehoseDestination().getDeliveryStreamArn() != null
+                && !ed.getKinesisFirehoseDestination().getDeliveryStreamArn().isBlank()) {
+            xml.start("KinesisFirehoseDestination")
+               .elem("IAMRoleARN", ed.getKinesisFirehoseDestination().getIamRoleArn())
+               .elem("DeliveryStreamARN", ed.getKinesisFirehoseDestination().getDeliveryStreamArn())
+               .end("KinesisFirehoseDestination");
+        }
+        if (ed.getCloudWatchDestination() != null
+                && ed.getCloudWatchDestination().getDimensionConfigurations() != null) {
+            List<CloudWatchDimensionConfiguration> validDims = new ArrayList<>();
+            for (CloudWatchDimensionConfiguration dim
+                    : ed.getCloudWatchDestination().getDimensionConfigurations()) {
+                if (dim != null
+                        && dim.getDimensionName() != null && !dim.getDimensionName().isBlank()
+                        && dim.getDimensionValueSource() != null && !dim.getDimensionValueSource().isBlank()
+                        && dim.getDefaultDimensionValue() != null && !dim.getDefaultDimensionValue().isBlank()) {
+                    validDims.add(dim);
+                }
+            }
+            if (!validDims.isEmpty()) {
+                xml.start("CloudWatchDestination").start("DimensionConfigurations");
+                for (CloudWatchDimensionConfiguration dim : validDims) {
+                    xml.start("member")
+                       .elem("DimensionName", dim.getDimensionName())
+                       .elem("DimensionValueSource", dim.getDimensionValueSource())
+                       .elem("DefaultDimensionValue", dim.getDefaultDimensionValue())
+                       .end("member");
+                }
+                xml.end("DimensionConfigurations").end("CloudWatchDestination");
+            }
+        }
     }
 
     private Response handleListConfigurationSets(String region) {
@@ -535,6 +653,131 @@ public class SesQueryHandler {
         }
         sesService.deleteConfigurationSet(name, region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult("DeleteConfigurationSet", AwsNamespaces.SES)).build();
+    }
+
+    private Response handleCreateConfigurationSetEventDestination(MultivaluedMap<String, String> params,
+                                                                  String region) {
+        String configSet = requireParam(params, "ConfigurationSetName");
+        String edName = requireParam(params, "EventDestination.Name");
+        EventDestination dest = readEventDestination(params, "EventDestination");
+        sesService.createConfigurationSetEventDestination(configSet, edName, dest, region);
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult(
+                "CreateConfigurationSetEventDestination", AwsNamespaces.SES)).build();
+    }
+
+    private Response handleUpdateConfigurationSetEventDestination(MultivaluedMap<String, String> params,
+                                                                  String region) {
+        String configSet = requireParam(params, "ConfigurationSetName");
+        String edName = requireParam(params, "EventDestination.Name");
+        EventDestination dest = readEventDestination(params, "EventDestination");
+        sesService.updateConfigurationSetEventDestination(configSet, edName, dest, region);
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult(
+                "UpdateConfigurationSetEventDestination", AwsNamespaces.SES)).build();
+    }
+
+    private Response handleDeleteConfigurationSetEventDestination(MultivaluedMap<String, String> params,
+                                                                  String region) {
+        String configSet = requireParam(params, "ConfigurationSetName");
+        String edName = requireParam(params, "EventDestinationName");
+        sesService.deleteConfigurationSetEventDestination(configSet, edName, region);
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult(
+                "DeleteConfigurationSetEventDestination", AwsNamespaces.SES)).build();
+    }
+
+    /**
+     * AWS V1 SES uses lowercased event-type names on the wire (e.g. {@code send},
+     * {@code complaint}, {@code renderingFailure}) while V2 uses
+     * {@code SCREAMING_SNAKE_CASE} (e.g. {@code SEND}, {@code RENDERING_FAILURE}).
+     * Floci stores the V2 canonical form internally, so the V1 handler translates
+     * in both directions.
+     */
+    private static final java.util.Map<String, String> V1_EVENT_TYPE_TO_INTERNAL =
+            java.util.Map.ofEntries(
+                    java.util.Map.entry("send", "SEND"),
+                    java.util.Map.entry("reject", "REJECT"),
+                    java.util.Map.entry("bounce", "BOUNCE"),
+                    java.util.Map.entry("complaint", "COMPLAINT"),
+                    java.util.Map.entry("delivery", "DELIVERY"),
+                    java.util.Map.entry("open", "OPEN"),
+                    java.util.Map.entry("click", "CLICK"),
+                    java.util.Map.entry("renderingFailure", "RENDERING_FAILURE"),
+                    java.util.Map.entry("deliveryDelay", "DELIVERY_DELAY"),
+                    java.util.Map.entry("subscription", "SUBSCRIPTION"));
+
+    private static final java.util.Map<String, String> INTERNAL_EVENT_TYPE_TO_V1;
+    static {
+        java.util.Map<String, String> reverse = new java.util.HashMap<>();
+        for (var e : V1_EVENT_TYPE_TO_INTERNAL.entrySet()) {
+            reverse.put(e.getValue(), e.getKey());
+        }
+        INTERNAL_EVENT_TYPE_TO_V1 = java.util.Map.copyOf(reverse);
+    }
+
+    /**
+     * Parse a V1 SES Query {@code EventDestination.*} parameter group into an
+     * {@link EventDestination}. V1 wire names use uppercase {@code ARN} / {@code NS}
+     * suffixes ({@code SNSDestination.TopicARN}, {@code KinesisFirehoseDestination.IAMRoleARN}
+     * / {@code DeliveryStreamARN}) which are mapped onto the model's Title-cased fields,
+     * and the lowercase event-type wire forms are normalized to the V2 canonical form
+     * via {@link #V1_EVENT_TYPE_TO_INTERNAL}.
+     */
+    private EventDestination readEventDestination(MultivaluedMap<String, String> params, String prefix) {
+        EventDestination dest = new EventDestination();
+        dest.setName(getParam(params, prefix + ".Name"));
+        dest.setEnabled(parseOptionalBoolean(params, prefix + ".Enabled", false));
+        List<String> rawTypes = extractMembers(params, prefix + ".MatchingEventTypes");
+        List<String> normalizedTypes = new ArrayList<>(rawTypes.size());
+        for (String t : rawTypes) {
+            normalizedTypes.add(V1_EVENT_TYPE_TO_INTERNAL.getOrDefault(t, t));
+        }
+        dest.setMatchingEventTypes(normalizedTypes);
+
+        String topicArn = getParam(params, prefix + ".SNSDestination.TopicARN");
+        if (topicArn != null) {
+            SnsDestination sns = new SnsDestination();
+            sns.setTopicArn(topicArn);
+            dest.setSnsDestination(sns);
+        }
+
+        String firehoseIam = getParam(params, prefix + ".KinesisFirehoseDestination.IAMRoleARN");
+        String firehoseStream = getParam(params, prefix + ".KinesisFirehoseDestination.DeliveryStreamARN");
+        if (firehoseIam != null || firehoseStream != null) {
+            KinesisFirehoseDestination fh = new KinesisFirehoseDestination();
+            fh.setIamRoleArn(firehoseIam);
+            fh.setDeliveryStreamArn(firehoseStream);
+            dest.setKinesisFirehoseDestination(fh);
+        }
+
+        List<CloudWatchDimensionConfiguration> cwDims = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String dimPrefix = prefix + ".CloudWatchDestination.DimensionConfigurations.member." + i;
+            String name = getParam(params, dimPrefix + ".DimensionName");
+            String source = getParam(params, dimPrefix + ".DimensionValueSource");
+            String def = getParam(params, dimPrefix + ".DefaultDimensionValue");
+            if (name == null && source == null && def == null) {
+                break;
+            }
+            CloudWatchDimensionConfiguration dim = new CloudWatchDimensionConfiguration();
+            dim.setDimensionName(name);
+            dim.setDimensionValueSource(source);
+            dim.setDefaultDimensionValue(def);
+            cwDims.add(dim);
+        }
+        if (!cwDims.isEmpty()) {
+            CloudWatchDestination cw = new CloudWatchDestination();
+            cw.setDimensionConfigurations(cwDims);
+            dest.setCloudWatchDestination(cw);
+        }
+
+        return dest;
+    }
+
+    private static String requireParam(MultivaluedMap<String, String> params, String name) {
+        String v = params.getFirst(name);
+        if (v == null || v.isBlank()) {
+            throw new AwsException("InvalidParameterValue", name + " is required.", 400);
+        }
+        return v;
     }
 
     private EmailTemplate readTemplateParams(MultivaluedMap<String, String> params) {
@@ -573,6 +816,26 @@ public class SesQueryHandler {
             members.add(value);
         }
         return members;
+    }
+
+    /**
+     * Parse a V1 SES {@code MessageTag} list ({@code <prefix>.member.N.Name} /
+     * {@code .Value}) into a list of {@link MessageTag} records. Returns an empty list when
+     * no members are present.
+     */
+    private List<MessageTag> extractMessageTags(MultivaluedMap<String, String> params, String prefix) {
+        List<MessageTag> tags = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String name = getParam(params, prefix + ".member." + i + ".Name");
+            String value = getParam(params, prefix + ".member." + i + ".Value");
+            if (name == null && value == null) break;
+            if (name == null || name.isBlank()) {
+                throw new AwsException("InvalidParameterValue",
+                        "The tag name must be specified.", 400);
+            }
+            tags.add(new MessageTag(name, value));
+        }
+        return tags;
     }
 
     private String getParam(MultivaluedMap<String, String> params, String name) {

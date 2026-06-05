@@ -43,6 +43,12 @@ aws kinesis describe-stream --stream-name events --endpoint-url $AWS_ENDPOINT_UR
 aws kinesis describe-stream --stream-arn arn:aws:kinesis:us-east-1:000000000000:stream/events --endpoint-url $AWS_ENDPOINT_URL
 ```
 
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_KINESIS_ENABLED` | `true` | Enable or disable the service |
+
 ## Examples
 
 ## Enhanced Fan-Out (EFO)

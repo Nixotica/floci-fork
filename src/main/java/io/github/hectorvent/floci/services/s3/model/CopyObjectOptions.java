@@ -5,12 +5,20 @@ import java.util.Map;
 public class CopyObjectOptions {
     private String metadataDirective;
     private Map<String, String> replacementMetadata;
+    private String taggingDirective;
+    private Map<String, String> replacementTagging;
     private String storageClass;
     private String contentType;
     private String contentEncoding;
     private String contentDisposition;
     private String cacheControl;
     private String serverSideEncryption;
+    private String sseCustomerAlgorithm;
+    private String sseCustomerKey;
+    private String sseCustomerKeyMd5;
+    private String copySourceSseCustomerAlgorithm;
+    private String copySourceSseCustomerKey;
+    private String copySourceSseCustomerKeyMd5;
     private String acl;
 
     public String getMetadataDirective() { return metadataDirective; }
@@ -18,6 +26,12 @@ public class CopyObjectOptions {
 
     public Map<String, String> getReplacementMetadata() { return replacementMetadata; }
     public CopyObjectOptions withReplacementMetadata(Map<String, String> replacementMetadata) { this.replacementMetadata = replacementMetadata; return this; }
+
+    public String getTaggingDirective() { return taggingDirective; }
+    public CopyObjectOptions withTaggingDirective(String taggingDirective) { this.taggingDirective = taggingDirective; return this; }
+
+    public Map<String, String> getReplacementTagging() { return replacementTagging; }
+    public CopyObjectOptions withReplacementTagging(Map<String, String> replacementTagging) { this.replacementTagging = replacementTagging; return this; }
 
     public String getStorageClass() { return storageClass; }
     public CopyObjectOptions withStorageClass(String storageClass) { this.storageClass = storageClass; return this; }
@@ -36,6 +50,24 @@ public class CopyObjectOptions {
 
     public String getServerSideEncryption() { return serverSideEncryption; }
     public CopyObjectOptions withServerSideEncryption(String serverSideEncryption) { this.serverSideEncryption = serverSideEncryption; return this; }
+
+    public String getSseCustomerAlgorithm() { return sseCustomerAlgorithm; }
+    public CopyObjectOptions withSseCustomerAlgorithm(String sseCustomerAlgorithm) { this.sseCustomerAlgorithm = sseCustomerAlgorithm; return this; }
+
+    public String getSseCustomerKey() { return sseCustomerKey; }
+    public CopyObjectOptions withSseCustomerKey(String sseCustomerKey) { this.sseCustomerKey = sseCustomerKey; return this; }
+
+    public String getSseCustomerKeyMd5() { return sseCustomerKeyMd5; }
+    public CopyObjectOptions withSseCustomerKeyMd5(String sseCustomerKeyMd5) { this.sseCustomerKeyMd5 = sseCustomerKeyMd5; return this; }
+
+    public String getCopySourceSseCustomerAlgorithm() { return copySourceSseCustomerAlgorithm; }
+    public CopyObjectOptions withCopySourceSseCustomerAlgorithm(String copySourceSseCustomerAlgorithm) { this.copySourceSseCustomerAlgorithm = copySourceSseCustomerAlgorithm; return this; }
+
+    public String getCopySourceSseCustomerKey() { return copySourceSseCustomerKey; }
+    public CopyObjectOptions withCopySourceSseCustomerKey(String copySourceSseCustomerKey) { this.copySourceSseCustomerKey = copySourceSseCustomerKey; return this; }
+
+    public String getCopySourceSseCustomerKeyMd5() { return copySourceSseCustomerKeyMd5; }
+    public CopyObjectOptions withCopySourceSseCustomerKeyMd5(String copySourceSseCustomerKeyMd5) { this.copySourceSseCustomerKeyMd5 = copySourceSseCustomerKeyMd5; return this; }
 
     public String getAcl() { return acl; }
     public CopyObjectOptions withAcl(String acl) { this.acl = acl; return this; }

@@ -178,6 +178,60 @@ class GlueServiceTest {
         }
     }
 
+    @Test
+    void updateTableReplacesExistingDefinitionAndPreservesCreateTime() {
+        Table table = new Table();
+        table.setName("plain");
+        StorageDescriptor sd = new StorageDescriptor();
+        sd.setColumns(java.util.List.of(new Column("a", "string")));
+        table.setStorageDescriptor(sd);
+        glueService.createTable("db1", table);
+
+        Table created = glueService.getTable("db1", "plain");
+        Table replacement = new Table();
+        replacement.setName("plain");
+        StorageDescriptor replacementSd = new StorageDescriptor();
+        replacementSd.setColumns(java.util.List.of(new Column("b", "bigint")));
+        replacement.setStorageDescriptor(replacementSd);
+
+        glueService.updateTable("db1", replacement);
+
+        Table fetched = glueService.getTable("db1", "plain");
+        assertEquals(created.getCreateTime(), fetched.getCreateTime());
+        assertNotNull(fetched.getUpdateTime());
+        assertEquals(1, fetched.getStorageDescriptor().getColumns().size());
+        assertEquals("b", fetched.getStorageDescriptor().getColumns().get(0).getName());
+    }
+
+    @Test
+    void getTableReturnsViewFieldsUnchanged() {
+        Table table = new Table();
+        table.setName("view");
+        table.setOwner("test-owner");
+        table.setTableType("VIRTUAL_VIEW");
+        table.setViewOriginalText("SELECT 1 AS x");
+        table.setViewExpandedText("SELECT 1 AS x");
+        table.setParameters(Map.of("presto_view", "true"));
+        StorageDescriptor storageDescriptor = new StorageDescriptor();
+        storageDescriptor.setColumns(java.util.List.of(new Column("x", "int")));
+        table.setStorageDescriptor(storageDescriptor);
+
+        glueService.createTable("db1", table);
+
+        Table fetched = glueService.getTable("db1", "view");
+
+        assertEquals("test-owner", fetched.getOwner());
+        assertEquals("VIRTUAL_VIEW", fetched.getTableType());
+        assertEquals("SELECT 1 AS x", fetched.getViewOriginalText());
+        assertEquals("SELECT 1 AS x", fetched.getViewExpandedText());
+        assertEquals("true", fetched.getParameters().get("presto_view"));
+    }
+
+    @Test
+    void getTableVersionsReturnsEmptyListForAthenaCompatibility() {
+        assertTrue(glueService.getTableVersions().isEmpty());
+    }
+
     private Table tableReferencing(String registryName, String schemaName, Long versionNumber, String versionId) {
         Table table = new Table();
         table.setName("withref");
@@ -198,9 +252,9 @@ class GlueServiceTest {
         }
 
         @Override
-        public <K, V> StorageBackend<K, V> create(String serviceName,
-                                                  String fileName,
-                                                  TypeReference<Map<K, V>> typeReference) {
+        public <V> StorageBackend<String, V> create(String serviceName,
+                                                     String fileName,
+                                                     TypeReference<Map<String, V>> typeReference) {
             return new InMemoryStorage<>();
         }
     }

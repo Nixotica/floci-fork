@@ -14,6 +14,12 @@
 | `GetFederationToken` | Get temporary credentials for a federated user |
 | `DecodeAuthorizationMessage` | Decode an encoded authorization failure message |
 
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_STS_ENABLED` | `true` | Enable or disable the service |
+
 ## Examples
 
 ```bash

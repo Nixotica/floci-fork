@@ -26,6 +26,8 @@ public class Subscription {
     @JsonProperty("Owner")
     private String owner;
 
+    private String accountId;
+
     @JsonProperty("Attributes")
     private Map<String, String> attributes = new HashMap<>();
 
@@ -50,6 +52,9 @@ public class Subscription {
 
     public String getEndpoint() { return endpoint; }
     public void setEndpoint(String endpoint) { this.endpoint = endpoint; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 
     public String getOwner() { return owner; }
     public void setOwner(String owner) { this.owner = owner; }

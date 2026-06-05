@@ -27,17 +27,14 @@ Floci manages real PostgreSQL, MySQL, and MariaDB Docker containers and proxies 
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    rds:
-      enabled: true
-      proxy-base-port: 7001
-      proxy-max-port: 7099
-      default-postgres-image: "postgres:16-alpine"
-      default-mysql-image: "mysql:8.0"
-      default-mariadb-image: "mariadb:11"
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_RDS_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_RDS_PROXY_BASE_PORT` | `7000` | First host port in the RDS proxy range |
+| `FLOCI_SERVICES_RDS_PROXY_MAX_PORT` | `7099` | Last host port in the RDS proxy range |
+| `FLOCI_SERVICES_RDS_DEFAULT_POSTGRES_IMAGE` | `postgres:16-alpine` | Docker image for PostgreSQL instances |
+| `FLOCI_SERVICES_RDS_DEFAULT_MYSQL_IMAGE` | `mysql:8.0` | Docker image for MySQL instances |
+| `FLOCI_SERVICES_RDS_DEFAULT_MARIADB_IMAGE` | `mariadb:11` | Docker image for MariaDB instances |
 
 ### Docker Compose
 
@@ -107,21 +104,34 @@ Override the image per-instance with the `--engine-version` flag or globally via
 
 ## Persistence
 
-By default, each DB instance or cluster gets its own named Docker volume (`floci-rds-<id>`). The volume is created when the instance is created and removed when the instance is deleted.
+Each DB instance and cluster gets its own named Docker volume (`floci-rds-{volumeId}`) created
+automatically. No configuration is required.
 
-Set `FLOCI_STORAGE_SERVICES_RDS_MODE=memory` (or set the global `FLOCI_STORAGE_MODE=memory`) to disable volume creation entirely — DB containers become ephemeral and data is lost on restart. This is the recommended setting for CI.
+| Scenario | Volume behavior |
+|---|---|
+| `memory` mode (default) | Volume is removed automatically when the instance is deleted |
+| `persistent` / `hybrid` / `wal` | Volume is retained after delete — data survives for manual recovery |
 
 ```bash
-# CI — no volumes, fastest startup
-FLOCI_STORAGE_SERVICES_RDS_MODE=memory
+# CI — ephemeral, volumes cleaned up on each delete
+FLOCI_STORAGE_MODE=memory
 
-# Local dev — persist DB data across Floci restarts
-FLOCI_STORAGE_SERVICES_RDS_MODE=hybrid
+# Local dev — retain DB data across Floci restarts
+FLOCI_STORAGE_MODE=hybrid
+
+# Local dev — also remove volumes immediately on delete
+FLOCI_STORAGE_MODE=hybrid
+FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE=true
+```
+
+To use a host bind mount instead of a named volume (advanced), set an absolute path:
+
+```bash
 FLOCI_STORAGE_HOST_PERSISTENT_PATH=/absolute/host/path/data
 ```
 
 !!! note "Docker Desktop on macOS"
-    Floci uses named Docker volumes (not bind mounts) for RDS persistence. This works correctly on Docker Desktop for macOS where bind-mounting paths inside the Floci container is not supported.
+    Named volumes work correctly on Docker Desktop for macOS. Bind mounts to paths inside the Floci container are not supported — use named volumes (the default).
 
 ## Authentication
 

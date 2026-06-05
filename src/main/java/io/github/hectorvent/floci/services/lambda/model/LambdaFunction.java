@@ -15,6 +15,7 @@ public class LambdaFunction {
 
     private String functionName;
     private String functionArn;
+    private String accountId;
     private String runtime;
     private String role;
     private String handler;
@@ -61,6 +62,9 @@ public class LambdaFunction {
 
     public String getFunctionName() { return functionName; }
     public void setFunctionName(String functionName) { this.functionName = functionName; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 
     public String getFunctionArn() { return functionArn; }
     public void setFunctionArn(String functionArn) { this.functionArn = functionArn; }

@@ -14,6 +14,7 @@ public class Queue {
 
     private String queueName;
     private String queueUrl;
+    private String accountId;
     private Map<String, String> attributes;
     private Map<String, String> tags;
     private Instant createdTimestamp;
@@ -38,6 +39,9 @@ public class Queue {
 
     public String getQueueUrl() { return queueUrl; }
     public void setQueueUrl(String queueUrl) { this.queueUrl = queueUrl; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 
     public Map<String, String> getAttributes() { return attributes; }
     public void setAttributes(Map<String, String> attributes) { this.attributes = attributes; }

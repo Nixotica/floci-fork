@@ -21,15 +21,12 @@ Floci manages real Valkey/Redis Docker containers and proxies TCP connections to
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    elasticache:
-      enabled: true
-      proxy-base-port: 6379
-      proxy-max-port: 6399
-      default-image: "valkey/valkey:8"
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_ELASTICACHE_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_ELASTICACHE_PROXY_BASE_PORT` | `6379` | First host port in the ElastiCache proxy range |
+| `FLOCI_SERVICES_ELASTICACHE_PROXY_MAX_PORT` | `6399` | Last host port in the ElastiCache proxy range |
+| `FLOCI_SERVICES_ELASTICACHE_DEFAULT_IMAGE` | `valkey/valkey:8` | Docker image for Redis/Valkey containers |
 
 ### Docker Compose
 

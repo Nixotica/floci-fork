@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.core.storage;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -13,7 +15,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Factory that creates StorageBackend instances based on configuration.
+ * Factory that creates {@link AccountAwareStorageBackend} instances based on configuration.
+ * Every backend is wrapped in an account-aware decorator so resources are automatically
+ * namespaced by the account ID of the calling credential.
  * Tracks all created backends for lifecycle management.
  */
 @ApplicationScoped
@@ -28,28 +32,34 @@ public class StorageFactory {
     private final List<WalStorage<?, ?>> walBackends = new ArrayList<>();
 
     @Inject
+    Instance<RequestContext> requestContextInstance;
+
+    @Inject
     public StorageFactory(EmulatorConfig config, ServiceConfigAccess serviceConfigAccess) {
         this.config = config;
         this.serviceConfigAccess = serviceConfigAccess;
     }
 
     /**
-     * Create a storage backend for the given service.
+     * Create an account-aware storage backend for the given service.
+     * All keys are automatically prefixed with the current account ID derived from
+     * the request credential. Async workers should use the {@code *ForAccount} overloads
+     * on {@link AccountAwareStorageBackend} with the account ID stored on the resource model.
      *
-     * @param serviceName   the service name (ssm, sqs, s3)
+     * @param serviceName   the service name (ssm, sqs, s3, …)
      * @param fileName      the JSON file name for persistent storage
      * @param typeReference Jackson type reference for deserialization
      */
-    public <K, V> StorageBackend<K, V> create(String serviceName, String fileName,
-                                               TypeReference<Map<K, V>> typeReference) {
+    public <V> StorageBackend<String, V> create(String serviceName, String fileName,
+                                                 TypeReference<Map<String, V>> typeReference) {
         String mode = resolveMode(serviceName);
         long flushInterval = resolveFlushInterval(serviceName);
         Path basePath = Path.of(config.storage().persistentPath());
         Path filePath = basePath.resolve(fileName);
 
-        LOG.infov("Creating {0} storage for service {1} (file: {2})", mode, serviceName, filePath);
+        LOG.debugv("Creating {0} storage for service {1} (file: {2})", mode, serviceName, filePath);
 
-        StorageBackend<K, V> backend = switch (mode) {
+        StorageBackend<String, V> inner = switch (mode) {
             case "memory" -> new InMemoryStorage<>();
             case "persistent" -> new PersistentStorage<>(filePath, typeReference);
             case "hybrid" -> {
@@ -68,9 +78,10 @@ public class StorageFactory {
             default -> throw new IllegalArgumentException("Unknown storage mode: " + mode);
         };
 
-        // load because loadAll() may run before the service is initialized
-        backend.load();
+        inner.load();
 
+        AccountAwareStorageBackend<V> backend = new AccountAwareStorageBackend<>(
+                inner, requestContextInstance, config.defaultAccountId());
         allBackends.add(backend);
         return backend;
     }

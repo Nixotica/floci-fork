@@ -7,20 +7,20 @@ edit_uri: edit/main/docs/
 
 theme:
   name: material
-  logo: assets/floci.png
-  favicon: assets/floci.png
+  logo: assets/floci-header.svg
+  favicon: assets/floci.svg
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
@@ -61,12 +61,16 @@ nav:
     - AWS CLI & SDK Setup: getting-started/aws-setup.md
     - Migrate from LocalStack: getting-started/migrate-from-localstack.md
   - Configuration:
+    - Environment Variables: configuration/environment-variables.md
     - Docker Images: configuration/docker-images.md
     - Docker Compose: configuration/docker-compose.md
     - Ports Reference: configuration/ports.md
-    - application.yml Reference: configuration/application-yml.md
+    - Multi-Account Isolation: configuration/multi-account.md
     - Storage Modes: configuration/storage.md
+    - TLS / HTTPS: configuration/tls.md
     - Initialization Hooks: configuration/initialization-hooks.md
+    - Advanced:
+      - application.yml Reference: configuration/advanced/application-yml.md
   - Services:
     - Overview: services/index.md
     - SSM Parameter Store: services/ssm.md
@@ -89,19 +93,31 @@ nav:
     - RDS: services/rds.md
     - MSK (Kafka): services/msk.md
     - Glue: services/glue.md
+    - Neptune: services/neptune.md
     - Athena: services/athena.md
     - Data Firehose: services/firehose.md
     - EventBridge: services/eventbridge.md
+    - EventBridge Pipes: services/pipes.md
     - EventBridge Scheduler: services/scheduler.md
     - CloudWatch: services/cloudwatch.md
     - ACM: services/acm.md
     - ECS: services/ecs.md
     - ECR: services/ecr.md
+    - Resource Groups Tagging API: services/resource-groups-tagging.md
     - EKS: services/eks.md
     - OpenSearch: services/opensearch.md
     - EC2: services/ec2.md
     - AppConfig: services/appconfig.md
     - Bedrock Runtime: services/bedrock-runtime.md
+    - ELB v2: services/elb.md
+    - Auto Scaling: services/autoscaling.md
+    - CodeBuild: services/codebuild.md
+    - CodeDeploy: services/codedeploy.md
+    - AWS Backup: services/backup.md
+    - CloudFront: services/cloudfront.md
+    - Route53: services/route53.md
+    - AppSync: services/appsync.md
+    - Transfer Family: services/transfer.md
   - Testcontainers:
     - Overview: testcontainers/index.md
     - Java: testcontainers/java.md

@@ -133,7 +133,8 @@ public class ScheduleDispatcher {
 
         if (kind == Kind.AT && isDeleteAfterCompletion(schedule)) {
             try {
-                schedulerService.deleteSchedule(schedule.getName(), schedule.getGroupName(), regionOf(schedule));
+                schedulerService.deleteScheduleForAccount(
+                        schedule.getAccountId(), schedule.getName(), schedule.getGroupName(), regionOf(schedule));
                 lastFireByArn.remove(schedule.getArn());
                 firedOnceByArn.remove(schedule.getArn());
             } catch (Exception e) {

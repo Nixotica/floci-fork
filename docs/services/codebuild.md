@@ -86,12 +86,9 @@ When `artifacts.type=S3`, collected files are uploaded to the configured S3 buck
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    codebuild:
-      enabled: true   # default
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_CODEBUILD_ENABLED` | `true` | Enable or disable the service |
 
 ## CLI Examples
 

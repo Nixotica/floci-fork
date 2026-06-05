@@ -173,7 +173,275 @@ class SqsJsonProtocolTest {
     }
 
     @Test
+    @Order(6)
+    void sendMessageBatchExceedingQueueMaximumMessageSizeReturnsBatchRequestTooLong() {
+        // Default queue MaximumMessageSize is 262144 bytes. Each entry is well under the
+        // per-message limit; the sum is what trips the batch-level check.
+        String bigBody = "x".repeat(100_000);
+        String body = "{\"QueueUrl\":\"" + queueUrl + "\","
+                + "\"Entries\":["
+                + "{\"Id\":\"a\",\"MessageBody\":\"" + bigBody + "\"},"
+                + "{\"Id\":\"b\",\"MessageBody\":\"" + bigBody + "\"},"
+                + "{\"Id\":\"c\",\"MessageBody\":\"" + bigBody + "\"}"
+                + "]}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.SendMessageBatch")
+            .body(body)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", containsString("BatchRequestTooLong"));
+    }
+
+    @Test
+    @Order(6)
+    void sendMessageBatchPersistsAwsTraceHeaderPerEntry() {
+        String traceQueueName = "json-batch-trace-queue";
+        String createBody = "{\"QueueName\":\"" + traceQueueName + "\"}";
+        String traceQueueUrl = given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.CreateQueue")
+            .body(createBody)
+        .when().post("/").then().statusCode(200)
+            .extract().jsonPath().getString("QueueUrl");
+
+        String batchBody = "{\"QueueUrl\":\"" + traceQueueUrl + "\","
+                + "\"Entries\":["
+                + "{\"Id\":\"a\",\"MessageBody\":\"first\","
+                + "\"MessageSystemAttributes\":{"
+                + "\"AWSTraceHeader\":{\"DataType\":\"String\",\"StringValue\":\"Root=1-aaa\"}}},"
+                + "{\"Id\":\"b\",\"MessageBody\":\"second\","
+                + "\"MessageSystemAttributes\":{"
+                + "\"AWSTraceHeader\":{\"DataType\":\"String\",\"StringValue\":\"Root=1-bbb\"}}}"
+                + "]}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.SendMessageBatch")
+            .body(batchBody)
+        .when().post("/").then().statusCode(200)
+            .body("Successful", hasSize(2));
+
+        String receiveBody = "{\"QueueUrl\":\"" + traceQueueUrl + "\","
+                + "\"MaxNumberOfMessages\":10,"
+                + "\"MessageSystemAttributeNames\":[\"AWSTraceHeader\"]}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+            .body(receiveBody)
+        .when().post("/").then().statusCode(200)
+            .body("Messages", hasSize(2))
+            .body("Messages.Attributes.AWSTraceHeader", hasItems("Root=1-aaa", "Root=1-bbb"));
+    }
+
+    @Test
     @Order(7)
+    void receiveMessageOnEmptyQueueOmitsMessagesField() {
+        // AWS omits the Messages field entirely when no messages are available.
+        // The .NET SDK with InitializeCollections=false then leaves the
+        // response collection as null. Floci previously returned "Messages": []
+        // which broke parity tests asserting null.
+        String emptyQueueName = QUEUE_NAME + "-empty";
+        String createBody = "{\"QueueName\":\"" + emptyQueueName + "\"}";
+        String emptyQueueUrl = given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.CreateQueue")
+            .body(createBody)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("QueueUrl");
+
+        String body = "{\"QueueUrl\":\"" + emptyQueueUrl + "\",\"MaxNumberOfMessages\":1}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+            .body(body)
+        .when()
+            .post("/" + ACCOUNT_ID + "/" + emptyQueueName)
+        .then()
+            .statusCode(200)
+            .body("$", not(hasKey("Messages")));
+    }
+
+    @Test
+    @Order(7)
+    void receiveMessage_messageSystemAttributeNamesFiltersOutput() {
+        String filterQueueName = QUEUE_NAME + "-filter";
+        String filterQueueUrl = given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.CreateQueue")
+            .body("{\"QueueName\":\"" + filterQueueName + "\"}")
+        .when().post("/").then().statusCode(200)
+            .extract().jsonPath().getString("QueueUrl");
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.SendMessage")
+            .body("{\"QueueUrl\":\"" + filterQueueUrl + "\",\"MessageBody\":\"hi\"}")
+        .when().post("/").then().statusCode(200);
+
+        // Empty filter: no system attributes returned
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+            .body("{\"QueueUrl\":\"" + filterQueueUrl + "\","
+                    + "\"MaxNumberOfMessages\":1,"
+                    + "\"VisibilityTimeout\":0,"
+                    + "\"MessageSystemAttributeNames\":[]}")
+        .when().post("/").then().statusCode(200)
+            .body("Messages", hasSize(1))
+            .body("Messages[0]", not(hasKey("Attributes")));
+
+        // Only SenderId requested: returns only SenderId
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+            .body("{\"QueueUrl\":\"" + filterQueueUrl + "\","
+                    + "\"MaxNumberOfMessages\":1,"
+                    + "\"VisibilityTimeout\":0,"
+                    + "\"MessageSystemAttributeNames\":[\"SenderId\"]}")
+        .when().post("/").then().statusCode(200)
+            .body("Messages[0].Attributes.SenderId", equalTo(ACCOUNT_ID))
+            .body("Messages[0].Attributes", not(hasKey("SentTimestamp")))
+            .body("Messages[0].Attributes", not(hasKey("ApproximateReceiveCount")));
+
+        // All: returns SenderId, SentTimestamp, ApproximateReceiveCount,
+        // ApproximateFirstReceiveTimestamp
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+            .body("{\"QueueUrl\":\"" + filterQueueUrl + "\","
+                    + "\"MaxNumberOfMessages\":1,"
+                    + "\"VisibilityTimeout\":0,"
+                    + "\"MessageSystemAttributeNames\":[\"All\"]}")
+        .when().post("/").then().statusCode(200)
+            .body("Messages[0].Attributes.SenderId", equalTo(ACCOUNT_ID))
+            .body("Messages[0].Attributes.SentTimestamp", notNullValue())
+            .body("Messages[0].Attributes.ApproximateReceiveCount", notNullValue())
+            .body("Messages[0].Attributes.ApproximateFirstReceiveTimestamp", notNullValue());
+
+        // Legacy AttributeNames parameter (pre-2023 SDKs): SenderId-only filter
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+            .body("{\"QueueUrl\":\"" + filterQueueUrl + "\","
+                    + "\"MaxNumberOfMessages\":1,"
+                    + "\"VisibilityTimeout\":0,"
+                    + "\"AttributeNames\":[\"SenderId\"]}")
+        .when().post("/").then().statusCode(200)
+            .body("Messages[0].Attributes.SenderId", equalTo(ACCOUNT_ID))
+            .body("Messages[0].Attributes", not(hasKey("SentTimestamp")))
+            .body("Messages[0].Attributes", not(hasKey("ApproximateReceiveCount")));
+
+        // Legacy AttributeNames=["All"]: same expansion as MessageSystemAttributeNames
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+            .body("{\"QueueUrl\":\"" + filterQueueUrl + "\","
+                    + "\"MaxNumberOfMessages\":1,"
+                    + "\"VisibilityTimeout\":0,"
+                    + "\"AttributeNames\":[\"All\"]}")
+        .when().post("/").then().statusCode(200)
+            .body("Messages[0].Attributes.SenderId", equalTo(ACCOUNT_ID))
+            .body("Messages[0].Attributes.SentTimestamp", notNullValue())
+            .body("Messages[0].Attributes.ApproximateReceiveCount", notNullValue())
+            .body("Messages[0].Attributes.ApproximateFirstReceiveTimestamp", notNullValue());
+    }
+
+    @Test
+    @Order(7)
+    void tagQueueWithJsonNullValueIsRejected() {
+        String tagBody = "{\"QueueUrl\":\"" + queueUrl + "\","
+                + "\"Tags\":{\"NullTag\":null,\"RealTag\":\"value\"}}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.TagQueue")
+            .body(tagBody)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidParameterValue"))
+            .body("message", equalTo("the parameter 'value' may not be null"));
+
+        String listBody = "{\"QueueUrl\":\"" + queueUrl + "\"}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.ListQueueTags")
+            .body(listBody)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Tags.NullTag", nullValue())
+            .body("Tags.RealTag", nullValue());
+    }
+
+    @Test
+    @Order(7)
+    void createQueueWithJsonNullTagValueIsRejected() {
+        String body = "{\"QueueName\":\"" + QUEUE_NAME + "-null-tag\","
+                + "\"tags\":{\"NullTag\":null}}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.CreateQueue")
+            .body(body)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidParameterValue"))
+            .body("message", equalTo("the parameter 'value' may not be null"));
+    }
+
+    @Test
+    @Order(7)
+    void createQueueWithJsonNullAttributeValueIsRejected() {
+        String body = "{\"QueueName\":\"" + QUEUE_NAME + "-null-attr\","
+                + "\"Attributes\":{\"DelaySeconds\":null}}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.CreateQueue")
+            .body(body)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidParameterValue"))
+            .body("message", equalTo("the parameter 'value' may not be null"));
+    }
+
+    @Test
+    @Order(7)
+    void setQueueAttributesWithJsonNullValueIsRejected() {
+        String body = "{\"QueueUrl\":\"" + queueUrl + "\","
+                + "\"Attributes\":{\"DelaySeconds\":null}}";
+
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.SetQueueAttributes")
+            .body(body)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidParameterValue"))
+            .body("message", equalTo("the parameter 'value' may not be null"));
+    }
+
+    @Test
+    @Order(8)
     void deleteQueueViaQueueUrlPath() {
         String body = "{\"QueueUrl\":\"" + queueUrl + "\"}";
 

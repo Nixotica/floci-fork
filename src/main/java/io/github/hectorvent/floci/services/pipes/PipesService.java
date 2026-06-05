@@ -1,9 +1,10 @@
 package io.github.hectorvent.floci.services.pipes;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.TagHandler;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.pipes.model.DesiredState;
@@ -27,19 +28,22 @@ public class PipesService implements TagHandler {
     private static final Logger LOG = Logger.getLogger(PipesService.class);
 
     private final StorageBackend<String, Pipe> storage;
-    private final EmulatorConfig config;
+    private final RegionResolver regionResolver;
     private final PipesPoller poller;
 
     @Inject
-    public PipesService(StorageFactory storageFactory, EmulatorConfig config, PipesPoller poller) {
+    public PipesService(StorageFactory storageFactory, RegionResolver regionResolver, PipesPoller poller) {
         this.storage = storageFactory.create("pipes", "pipes.json",
                 new TypeReference<Map<String, Pipe>>() {});
-        this.config = config;
+        this.regionResolver = regionResolver;
         this.poller = poller;
     }
 
     public void startPersistedPollers() {
-        List<Pipe> runningPipes = storage.scan(key -> true).stream()
+        List<Pipe> allPipes = storage instanceof AccountAwareStorageBackend<Pipe> aware
+                ? aware.scanAllAccounts()
+                : storage.scan(key -> true);
+        List<Pipe> runningPipes = allPipes.stream()
                 .filter(pipe -> pipe.getCurrentState() == PipeState.RUNNING)
                 .toList();
         for (Pipe pipe : runningPipes) {
@@ -74,8 +78,7 @@ public class PipesService implements TagHandler {
                     "Pipe " + name + " already exists.", 409);
         }
 
-        String accountId = config.defaultAccountId();
-        String arn = AwsArnUtils.Arn.of("pipes", region, accountId, "pipe/" + name).toString();
+        String arn = regionResolver.buildArn("pipes", region, "pipe/" + name);
         Instant now = Instant.now();
 
         Pipe pipe = new Pipe();
@@ -95,6 +98,7 @@ public class PipesService implements TagHandler {
         pipe.setTags(tags != null ? new HashMap<>(tags) : new HashMap<>());
         pipe.setCreationTime(now);
         pipe.setLastModifiedTime(now);
+        pipe.setAccountId(regionResolver.getAccountId());
 
         storage.put(key, pipe);
         LOG.infov("Created pipe: {0}", name);

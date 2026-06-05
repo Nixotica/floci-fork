@@ -1,15 +1,16 @@
 package io.github.hectorvent.floci.services.athena;
 
 import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
-import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.CsvParser;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.athena.model.*;
+import io.github.hectorvent.floci.services.glue.model.Column;
+import io.github.hectorvent.floci.services.floci.FlociDuckClient;
 import io.github.hectorvent.floci.services.glue.GlueService;
+import io.github.hectorvent.floci.services.glue.model.Database;
 import io.github.hectorvent.floci.services.glue.model.Table;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
@@ -21,10 +22,6 @@ import org.jboss.logging.Logger;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.InputStreamReader;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
@@ -33,40 +30,30 @@ import java.util.*;
 public class AthenaService {
 
     private static final Logger LOG = Logger.getLogger(AthenaService.class);
+    public static final String DEFAULT_CATALOG = "AwsDataCatalog";
     private static final String DEFAULT_OUTPUT_BUCKET = "floci-athena-results";
 
     private final StorageBackend<String, QueryExecution> queryStore;
-    private final FlociDuckManager duckManager;
+    private final FlociDuckClient duckClient;
     private final GlueService glueService;
     private final S3Service s3Service;
     private final EmulatorConfig config;
     private final Vertx vertx;
-    private final ObjectMapper mapper;
-    private final HttpClient httpClient;
-    private final DockerHostResolver dockerHostResolver;
-    private final EmbeddedDnsServer embeddedDnsServer;
 
     @Inject
     public AthenaService(StorageFactory storageFactory,
-                         FlociDuckManager duckManager,
+                         FlociDuckClient duckClient,
                          GlueService glueService,
                          S3Service s3Service,
                          EmulatorConfig config,
-                         Vertx vertx,
-                         ObjectMapper mapper,
-                         DockerHostResolver dockerHostResolver,
-                         EmbeddedDnsServer embeddedDnsServer) {
+                         Vertx vertx) {
         this.queryStore = storageFactory.create("athena", "queries.json",
-                new TypeReference<Map<String, QueryExecution>>() {});
-        this.duckManager = duckManager;
+                new TypeReference<>() {});
+        this.duckClient = duckClient;
         this.glueService = glueService;
         this.s3Service = s3Service;
         this.config = config;
         this.vertx = vertx;
-        this.mapper = mapper;
-        this.httpClient = HttpClient.newHttpClient();
-        this.dockerHostResolver = dockerHostResolver;
-        this.embeddedDnsServer = embeddedDnsServer;
     }
 
     public String startQueryExecution(String query,
@@ -75,12 +62,17 @@ public class AthenaService {
                                       ResultConfiguration resultConfiguration) {
         String id = UUID.randomUUID().toString();
         String database = context != null && context.getDatabase() != null ? context.getDatabase() : "default";
+        QueryExecutionContext resolvedContext = context != null ? context : new QueryExecutionContext();
+        resolvedContext.setDatabase(database);
+        if (resolvedContext.getCatalog() == null || resolvedContext.getCatalog().isBlank()) {
+            resolvedContext.setCatalog(DEFAULT_CATALOG);
+        }
 
         // Ensure output location has a trailing slash so floci-duck writes into the prefix
         String outputLocation = resolveOutputLocation(resultConfiguration, id);
         ResultConfiguration resolvedResult = new ResultConfiguration(outputLocation);
 
-        QueryExecution execution = new QueryExecution(id, query, workGroup, resolvedResult, context);
+        QueryExecution execution = new QueryExecution(id, query, workGroup, resolvedResult, resolvedContext);
         execution.getStatus().setState(QueryExecutionState.RUNNING);
         queryStore.put(id, execution);
 
@@ -93,11 +85,10 @@ public class AthenaService {
         }
 
         // Submit async — caller gets the ID immediately while execution runs in background
-        String finalDatabase = database;
         vertx.executeBlocking(() -> {
-            String duckUrl = duckManager.ensureReady();
-            String setupDdl = buildGlueDdl(finalDatabase);
-            callDuck(duckUrl, query, setupDdl, outputLocation, id);
+            String setupDdl = buildGlueDdl(database);
+            ensureOutputBucket(outputLocation);
+            duckClient.execute(query, setupDdl, outputLocation + "results.csv");
             return null;
         }).onSuccess(v -> {
             execution.getStatus().setState(QueryExecutionState.SUCCEEDED);
@@ -122,6 +113,61 @@ public class AthenaService {
 
     public List<QueryExecution> listQueryExecutions() {
         return queryStore.scan(k -> true);
+    }
+
+    public void stopQueryExecution(String id) {
+        QueryExecution execution = getQueryExecution(id);
+        execution.getStatus().setState(QueryExecutionState.CANCELLED);
+        execution.getStatus().setCompletionDateTime(Instant.now());
+        queryStore.put(id, execution);
+    }
+
+    public Map<String, Object> getWorkGroup(String name) {
+        return Map.of(
+                "Name", name == null || name.isBlank() ? "primary" : name,
+                "State", "ENABLED",
+                "Configuration", Map.of(
+                        "EngineVersion", Map.of(
+                                "SelectedEngineVersion", "Athena engine version 3",
+                                "EffectiveEngineVersion", "Athena engine version 3"
+                        ),
+                        "ResultConfiguration", Map.of("OutputLocation", "s3://" + DEFAULT_OUTPUT_BUCKET + "/results/"),
+                        "EnforceWorkGroupConfiguration", false,
+                        "PublishCloudWatchMetricsEnabled", false,
+                        "RequesterPaysEnabled", false
+                )
+        );
+    }
+
+    public List<Map<String, Object>> listWorkGroups() {
+        return List.of(Map.of("Name", "primary", "State", "ENABLED"));
+    }
+
+    public List<Map<String, Object>> listDataCatalogs() {
+        return List.of(Map.of("CatalogName", DEFAULT_CATALOG, "Type", "GLUE"));
+    }
+
+    public Map<String, Object> getDataCatalog(String name) {
+        return Map.of("Name", name == null || name.isBlank() ? DEFAULT_CATALOG : name, "Type", "GLUE");
+    }
+
+    public List<Map<String, Object>> listDatabases(String catalog) {
+        return glueService.getDatabases().stream()
+                .map(Database::getName)
+                .sorted()
+                .map(name -> Map.<String, Object>of("Name", name))
+                .toList();
+    }
+
+    public List<Map<String, Object>> listTableMetadata(String catalog, String database) {
+        return glueService.getTables(database).stream()
+                .sorted(Comparator.comparing(Table::getName))
+                .map(table -> tableMetadata(catalog, database, table))
+                .toList();
+    }
+
+    public Map<String, Object> getTableMetadata(String catalog, String database, String tableName) {
+        return tableMetadata(catalog, database, glueService.getTable(database, tableName));
     }
 
     public ResultSet getQueryResults(String id) {
@@ -159,13 +205,21 @@ public class AthenaService {
                 sb.append("CREATE OR REPLACE VIEW \"")
                   .append(table.getName())
                   .append("\" AS SELECT * FROM ")
-                  .append(readFn)
-                  .append("('").append(normalizedLocation).append("/**');\n");
+                  .append(readExpression(readFn, normalizedLocation))
+                  .append(";\n");
             }
         } catch (Exception e) {
             LOG.debugv("Could not inject Glue DDL for database {0}: {1}", database, e.getMessage());
         }
         return sb.toString();
+    }
+
+    private String readExpression(String readFn, String normalizedLocation) {
+        String glob = normalizedLocation + "/**";
+        if ("read_parquet".equals(readFn)) {
+            return "read_parquet('" + glob + "', union_by_name = true)";
+        }
+        return readFn + "('" + glob + "')";
     }
 
     private String inferReadFunction(Table table) {
@@ -197,56 +251,12 @@ public class AthenaService {
         return base.endsWith("/") ? base + queryId + "/" : base + "/" + queryId + "/";
     }
 
-    private void callDuck(String duckUrl, String sql, String setupDdl, String outputS3Path, String queryId) {
-        try {
-            // Ensure the output bucket exists
-            String bucket = extractBucket(outputS3Path);
-            if (bucket != null) {
-                try {
-                    s3Service.createBucket(bucket, config.defaultRegion());
-                } catch (Exception ignored) {}
-            }
-
-            // Floci endpoint reachable from inside the floci-duck container.
-            // When the embedded DNS server is active, floci-duck containers already have it wired as their
-            // resolver and can reach Floci by the configured hostname (or the default DNS suffix).
-            // Fall back to the raw Docker host IP when the embedded DNS is not running (local dev mode).
-            int flociPort = URI.create(config.baseUrl()).getPort();
-            String flociHostname = embeddedDnsServer.getServerIp().isPresent()
-                    ? config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX)
-                    : dockerHostResolver.resolve();
-            String flociEndpoint = "http://" + flociHostname + ":" + flociPort;
-
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("sql", sql);
-            if (setupDdl != null && !setupDdl.isBlank()) {
-                body.put("setup_sql", setupDdl);
-            }
-            body.put("s3_endpoint", flociEndpoint);
-            body.put("s3_region", config.defaultRegion());
-            body.put("s3_access_key", "test");
-            body.put("s3_secret_key", "test");
-            body.put("s3_url_style", "path");
-            body.put("output_s3_path", outputS3Path + "results.csv");
-
-            String json = mapper.writeValueAsString(body);
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(duckUrl + "/execute"))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(json))
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-            if (response.statusCode() != 200) {
-                throw new RuntimeException("floci-duck returned HTTP " + response.statusCode()
-                        + ": " + response.body());
-            }
-        } catch (RuntimeException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to call floci-duck for query " + queryId + ": " + e.getMessage(), e);
+    private void ensureOutputBucket(String s3Path) {
+        String bucket = extractBucket(s3Path);
+        if (bucket != null) {
+            try {
+                s3Service.createBucket(bucket, config.defaultRegion());
+            } catch (Exception ignored) {}
         }
     }
 
@@ -287,9 +297,9 @@ public class AthenaService {
                 return emptyResultSet();
             }
 
-            String[] headers = splitCsv(headerLine);
+            String[] headers = CsvParser.parseLine(headerLine).toArray(String[]::new);
             for (String h : headers) {
-                columns.add(new ResultSet.ColumnInfo(h, "varchar"));
+                columns.add(new ResultSet.ColumnInfo(DEFAULT_CATALOG, "", "", h, "varchar"));
             }
 
             // Header row is included in GetQueryResults per AWS spec
@@ -297,7 +307,7 @@ public class AthenaService {
 
             String line;
             while ((line = reader.readLine()) != null) {
-                rows.add(toRow(splitCsv(line)));
+                rows.add(toRow(CsvParser.parseLine(line).toArray(String[]::new)));
             }
         } catch (Exception e) {
             LOG.debugv("CSV parse error: {0}", e.getMessage());
@@ -306,37 +316,44 @@ public class AthenaService {
         return new ResultSet(rows, new ResultSet.ResultSetMetadata(columns));
     }
 
+    private Map<String, Object> tableMetadata(String catalog, String database, Table table) {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("Name", table.getName());
+        metadata.put("CreateTime", table.getCreateTime() != null ? table.getCreateTime() : Instant.now());
+        metadata.put("LastAccessTime", table.getLastAccessTime() != null ? table.getLastAccessTime() : Instant.now());
+        metadata.put("TableType", table.getTableType() != null ? table.getTableType() : "EXTERNAL_TABLE");
+        metadata.put("Columns", athenaColumns(table));
+        metadata.put("Parameters", table.getParameters() != null ? table.getParameters() : Map.of());
+        return metadata;
+    }
+
+    private List<Map<String, String>> athenaColumns(Table table) {
+        if (table.getStorageDescriptor() == null || table.getStorageDescriptor().getColumns() == null) {
+            return List.of();
+        }
+        return table.getStorageDescriptor().getColumns().stream()
+                .map(column -> Map.of(
+                        "Name", column.getName(),
+                        "Type", glueTypeToAthena(column)
+                ))
+                .toList();
+    }
+
+    private String glueTypeToAthena(Column column) {
+        String type = column.getType() == null ? "string" : column.getType().toLowerCase(Locale.ROOT);
+        if (type.equals("string") || type.equals("char") || type.equals("varchar")
+                || type.startsWith("struct<") || type.startsWith("array<") || type.startsWith("map<")) {
+            return "varchar";
+        }
+        return type;
+    }
+
     private ResultSet.Row toRow(String[] values) {
         List<ResultSet.Datum> data = new ArrayList<>();
         for (String v : values) {
             data.add(new ResultSet.Datum(v));
         }
         return new ResultSet.Row(data);
-    }
-
-    /** Minimal CSV split — handles quoted fields. */
-    private String[] splitCsv(String line) {
-        List<String> fields = new ArrayList<>();
-        StringBuilder sb = new StringBuilder();
-        boolean inQuotes = false;
-        for (int i = 0; i < line.length(); i++) {
-            char c = line.charAt(i);
-            if (c == '"') {
-                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
-                    sb.append('"');
-                    i++;
-                } else {
-                    inQuotes = !inQuotes;
-                }
-            } else if (c == ',' && !inQuotes) {
-                fields.add(sb.toString());
-                sb.setLength(0);
-            } else {
-                sb.append(c);
-            }
-        }
-        fields.add(sb.toString());
-        return fields.toArray(new String[0]);
     }
 
     private String extractBucket(String s3Path) {

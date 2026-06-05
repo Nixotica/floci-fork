@@ -16,6 +16,7 @@ import java.util.Set;
 public class KinesisStream {
     private String streamName;
     private String streamArn;
+    private String accountId;
     private String streamStatus;
     private List<KinesisShard> shards = new ArrayList<>();
     private int retentionPeriodHours = 24;
@@ -40,6 +41,9 @@ public class KinesisStream {
 
     public String getStreamArn() { return streamArn; }
     public void setStreamArn(String streamArn) { this.streamArn = streamArn; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 
     public String getStreamStatus() { return streamStatus; }
     public void setStreamStatus(String streamStatus) { this.streamStatus = streamStatus; }

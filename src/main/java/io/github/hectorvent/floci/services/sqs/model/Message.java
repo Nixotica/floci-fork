@@ -17,6 +17,7 @@ public class Message {
     private String body;
     private Map<String, MessageAttributeValue> messageAttributes;
     private Instant sentTimestamp;
+    private Instant firstReceiveTimestamp;
     private int receiveCount;
     private String md5OfBody;
     private String md5OfMessageAttributes;
@@ -25,6 +26,17 @@ public class Message {
     private String messageGroupId;
     private String messageDeduplicationId;
     private long sequenceNumber;
+
+    // When this message was relocated to a DLQ via the redrive policy, the URL of the
+    // queue it came from. Consumed by StartMessageMoveTask with no DestinationArn so
+    // we can return each message to where it originated. Not part of any AWS-visible
+    // surface.
+    private String originalSourceQueueUrl;
+
+    // Caller-supplied system attribute (the only entry AWS allows under
+    // MessageSystemAttributes on SendMessage). Returned under Attributes.AWSTraceHeader
+    // on ReceiveMessage when requested.
+    private String awsTraceHeader;
 
     // Transient fields for visibility timeout tracking
     @JsonIgnore
@@ -57,6 +69,9 @@ public class Message {
     public Instant getSentTimestamp() { return sentTimestamp; }
     public void setSentTimestamp(Instant sentTimestamp) { this.sentTimestamp = sentTimestamp; }
 
+    public Instant getFirstReceiveTimestamp() { return firstReceiveTimestamp; }
+    public void setFirstReceiveTimestamp(Instant firstReceiveTimestamp) { this.firstReceiveTimestamp = firstReceiveTimestamp; }
+
     public int getReceiveCount() { return receiveCount; }
     public void setReceiveCount(int receiveCount) { this.receiveCount = receiveCount; }
 
@@ -80,6 +95,12 @@ public class Message {
 
     public long getSequenceNumber() { return sequenceNumber; }
     public void setSequenceNumber(long sequenceNumber) { this.sequenceNumber = sequenceNumber; }
+
+    public String getOriginalSourceQueueUrl() { return originalSourceQueueUrl; }
+    public void setOriginalSourceQueueUrl(String originalSourceQueueUrl) { this.originalSourceQueueUrl = originalSourceQueueUrl; }
+
+    public String getAwsTraceHeader() { return awsTraceHeader; }
+    public void setAwsTraceHeader(String awsTraceHeader) { this.awsTraceHeader = awsTraceHeader; }
 
     @JsonIgnore
     public boolean isVisible() {

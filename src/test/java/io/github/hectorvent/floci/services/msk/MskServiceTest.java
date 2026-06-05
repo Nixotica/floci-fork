@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.msk;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.msk.model.ClusterState;
@@ -33,10 +34,12 @@ class MskServiceTest {
         
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.msk()).thenReturn(mskConfig);
-        when(mskConfig.mock()).thenReturn(true); // Mock mode for unit tests
+        when(mskConfig.mock()).thenReturn(true);
+        when(config.defaultRegion()).thenReturn("us-east-1");
 
         redpandaManager = Mockito.mock(RedpandaManager.class);
-        mskService = new MskService(storageFactory, config, redpandaManager);
+        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
+        mskService = new MskService(storageFactory, config, regionResolver, redpandaManager);
     }
 
     @Test

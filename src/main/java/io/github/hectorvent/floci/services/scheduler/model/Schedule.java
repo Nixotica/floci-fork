@@ -10,6 +10,7 @@ public class Schedule {
     private String name;
     private String arn;
     private String groupName;
+    private String accountId;
     private String state;
     private String scheduleExpression;
     private String scheduleExpressionTimezone;
@@ -27,6 +28,9 @@ public class Schedule {
 
     public String getName() { return name; }
     public void setName(String name) { this.name = name; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 
     public String getArn() { return arn; }
     public void setArn(String arn) { this.arn = arn; }

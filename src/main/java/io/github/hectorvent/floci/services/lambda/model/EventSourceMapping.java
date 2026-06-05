@@ -15,6 +15,7 @@ public class EventSourceMapping {
     private String uuid;
     private String functionArn;
     private String functionName;
+    private String accountId;
     private String eventSourceArn;
     private String queueUrl;
     private String region;
@@ -37,6 +38,9 @@ public class EventSourceMapping {
 
     public String getFunctionName() { return functionName; }
     public void setFunctionName(String functionName) { this.functionName = functionName; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 
     public String getEventSourceArn() { return eventSourceArn; }
     public void setEventSourceArn(String eventSourceArn) { this.eventSourceArn = eventSourceArn; }

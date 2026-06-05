@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.kms.model.KmsAlias;
+import io.github.hectorvent.floci.services.kms.model.KmsGrant;
 import io.github.hectorvent.floci.services.kms.model.KmsKey;
 import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -30,8 +31,11 @@ import org.bouncycastle.jce.ECNamedCurveTable;
 import org.bouncycastle.jce.spec.ECNamedCurveParameterSpec;
 import org.jboss.logging.Logger;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.spec.*;
@@ -46,7 +50,9 @@ public class KmsService {
 
     private final StorageBackend<String, KmsKey> keyStore;
     private final StorageBackend<String, KmsAlias> aliasStore;
+    private final StorageBackend<String, KmsGrant> grantStore;
     private final RegionResolver regionResolver;
+    private final SecureRandom secureRandom;
 
     @Inject
     public KmsService(StorageFactory storageFactory, RegionResolver regionResolver) {
@@ -54,21 +60,47 @@ public class KmsService {
                         new TypeReference<Map<String, KmsKey>>() {}),
                 storageFactory.create("kms", "kms-aliases.json",
                         new TypeReference<Map<String, KmsAlias>>() {}),
+                storageFactory.create("kms", "kms-grants.json",
+                        new TypeReference<Map<String, KmsGrant>>() {}),
                 regionResolver);
     }
 
     KmsService(StorageBackend<String, KmsKey> keyStore,
                StorageBackend<String, KmsAlias> aliasStore,
+               StorageBackend<String, KmsGrant> grantStore,
                RegionResolver regionResolver) {
-        this.keyStore = keyStore;
-        this.aliasStore = aliasStore;
-        this.regionResolver = regionResolver;
+        this(keyStore, aliasStore, grantStore, regionResolver, new SecureRandom());
     }
 
-    private static final String DEFAULT_KEY_POLICY =
-            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"Enable IAM User Permissions\"," +
-            "\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:root\"}," +
-            "\"Action\":\"kms:*\",\"Resource\":\"*\"}]}";
+    KmsService(StorageBackend<String, KmsKey> keyStore,
+               StorageBackend<String, KmsAlias> aliasStore,
+               StorageBackend<String, KmsGrant> grantStore,
+               RegionResolver regionResolver,
+               SecureRandom secureRandom) {
+        this.keyStore = keyStore;
+        this.aliasStore = aliasStore;
+        this.grantStore = grantStore;
+        this.regionResolver = regionResolver;
+        this.secureRandom = secureRandom;
+    }
+
+    public byte[] generateRandom(int numberOfBytes) {
+        if (numberOfBytes < 1 || numberOfBytes > 1024) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value '" + numberOfBytes + "' at 'numberOfBytes' failed to satisfy constraint: Member must have value greater than or equal to 1 and less than or equal to 1024",
+                    400);
+        }
+        byte[] bytes = new byte[numberOfBytes];
+        secureRandom.nextBytes(bytes);
+        return bytes;
+    }
+
+    private String buildDefaultKeyPolicy() {
+        String account = regionResolver.getAccountId();
+        return "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"Enable IAM User Permissions\"," +
+               "\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::" + account + ":root\"}," +
+               "\"Action\":\"kms:*\",\"Resource\":\"*\"}]}";
+    }
 
     public KmsKey createKey(String description, String region) {
         return createKey(description, "ENCRYPT_DECRYPT", "SYMMETRIC_DEFAULT", null, Map.of(), region);
@@ -95,7 +127,7 @@ public class KmsService {
         key.setDescription(description);
         key.setKeyUsage(effectiveUsage);
         key.setCustomerMasterKeySpec(effectiveSpec);
-        key.setPolicy(policy != null ? policy : DEFAULT_KEY_POLICY);
+        key.setPolicy(policy != null ? policy : buildDefaultKeyPolicy());
         key.getTags().putAll(ReservedTags.stripReservedTags(tags));
 
         generateKeyMaterial(key);
@@ -229,6 +261,205 @@ public class KmsService {
         return keyStore.scan(k -> k.startsWith(prefix));
     }
 
+    public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations, String region) {
+        return createGrant(keyId, granteePrincipal, operations, null, region);
+    }
+
+    public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations,
+                                String retiringPrincipal, String region) {
+        if (keyId == null || keyId.isBlank()) {
+            throw new AwsException("ValidationException", "KeyId is required", 400);
+        }
+        if (granteePrincipal == null || granteePrincipal.isBlank()) {
+            throw new AwsException("ValidationException", "GranteePrincipal is required", 400);
+        }
+        if (operations == null || operations.isEmpty()) {
+            throw new AwsException("ValidationException", "Operations is required", 400);
+        }
+
+        KmsKey key = resolveKey(keyId, region);
+        String grantId = UUID.randomUUID().toString();
+        byte[] tokenBytes = new byte[32];
+        ThreadLocalRandom.current().nextBytes(tokenBytes);
+
+        KmsGrant grant = new KmsGrant();
+        grant.setGrantId(grantId);
+        grant.setGrantToken(Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes));
+        grant.setKeyId(key.getKeyId());
+        grant.setKeyArn(key.getArn());
+        grant.setGranteePrincipal(granteePrincipal);
+        grant.setRetiringPrincipal(retiringPrincipal);
+        grant.setOperations(new ArrayList<>(operations));
+
+        grantStore.put(region + "::" + grantId, grant);
+        LOG.infov("Created KMS grant: {0} for key {1} in {2}", grantId, key.getKeyId(), region);
+        return grant;
+    }
+
+    private static final int DEFAULT_GRANT_LIMIT = 50;
+    private static final int MAX_GRANT_LIMIT = 100;
+
+    public Map<String, Object> listGrants(String keyId, String region, String marker, Integer limit,
+                                           String grantIdFilter, String granteePrincipalFilter) {
+        // Validate filter mutual exclusivity
+        if (grantIdFilter != null && (grantIdFilter.length() > 128)) {
+            throw new AwsException("ValidationException", "GrantId exceeds maximum length of 128", 400);
+        }
+
+        KmsKey key = resolveKey(keyId, region);
+        String prefix = region + "::";
+
+        // Collect and sort grants deterministically by grantId
+        List<KmsGrant> sortedGrants = grantStore.scan(k -> k.startsWith(prefix)).stream()
+                .filter(grant -> key.getKeyId().equals(grant.getKeyId()))
+                .filter(grant -> grantIdFilter == null || grantIdFilter.isBlank()
+                        || grantIdFilter.equals(grant.getGrantId()))
+                .filter(grant -> granteePrincipalFilter == null || granteePrincipalFilter.isBlank()
+                        || granteePrincipalFilter.equals(grant.getGranteePrincipal()))
+                .sorted(Comparator.comparing(KmsGrant::getGrantId))
+                .toList();
+
+        return paginateGrants(sortedGrants, marker, limit);
+    }
+
+    public Map<String, Object> listRetirableGrants(String retiringPrincipal, String region,
+                                                    String marker, Integer limit) {
+        if (retiringPrincipal == null || retiringPrincipal.isBlank()) {
+            throw new AwsException("ValidationException", "RetiringPrincipal is required", 400);
+        }
+
+        String prefix = region + "::";
+
+        List<KmsGrant> sortedGrants = grantStore.scan(k -> k.startsWith(prefix)).stream()
+                .filter(grant -> retiringPrincipal.equals(grant.getRetiringPrincipal()))
+                .sorted(Comparator.comparing(KmsGrant::getGrantId))
+                .toList();
+
+        return paginateGrants(sortedGrants, marker, limit);
+    }
+
+    public void revokeGrant(String keyId, String grantId, String region) {
+        if (keyId == null || keyId.isBlank()) {
+            throw new AwsException("ValidationException", "KeyId is required", 400);
+        }
+        if (grantId == null || grantId.isBlank()) {
+            throw new AwsException("ValidationException", "GrantId is required", 400);
+        }
+
+        // Resolve the key to validate it exists
+        resolveKey(keyId, region);
+
+        String storageKey = region + "::" + grantId;
+        if (grantStore.get(storageKey).isEmpty()) {
+            throw new AwsException("NotFoundException", "Grant not found: " + grantId, 400);
+        }
+
+        grantStore.delete(storageKey);
+        LOG.infov("Revoked KMS grant: {0} for key {1} in {2}", grantId, keyId, region);
+    }
+
+    public void retireGrant(String grantToken, String keyId, String grantId, String region) {
+        boolean hasToken = grantToken != null && !grantToken.isBlank();
+        boolean hasKeyAndGrant = keyId != null && !keyId.isBlank() && grantId != null && !grantId.isBlank();
+
+        if (!hasToken && !hasKeyAndGrant) {
+            throw new AwsException("ValidationException",
+                    "Either GrantToken or both KeyId and GrantId must be provided", 400);
+        }
+
+        // Token-based retirement: scan all grants in the region for matching token
+        if (hasToken) {
+            String prefix = region + "::";
+            KmsGrant found = grantStore.scan(k -> k.startsWith(prefix)).stream()
+                    .filter(g -> grantToken.equals(g.getGrantToken()))
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("NotFoundException",
+                            "Grant not found for the given grant token", 400));
+
+            // Cross-verify GrantId if provided
+            if (grantId != null && !grantId.isBlank() && !grantId.equals(found.getGrantId())) {
+                throw new AwsException("NotFoundException", "Grant not found", 400);
+            }
+
+            // Cross-verify KeyId if provided
+            if (keyId != null && !keyId.isBlank()) {
+                KmsKey key = resolveKey(keyId, region);
+                if (!key.getKeyId().equals(found.getKeyId())) {
+                    throw new AwsException("NotFoundException",
+                            "Grant not found for the given key", 400);
+                }
+            }
+
+            grantStore.delete(region + "::" + found.getGrantId());
+            LOG.infov("Retired KMS grant: {0} by token in {1}", found.getGrantId(), region);
+            return;
+        }
+
+        // KeyId + GrantId retirement (administrative, distinct from RevokeGrant surface)
+        resolveKey(keyId, region);
+        String storageKey = region + "::" + grantId;
+        if (grantStore.get(storageKey).isEmpty()) {
+            throw new AwsException("NotFoundException", "Grant not found: " + grantId, 400);
+        }
+        grantStore.delete(storageKey);
+        LOG.infov("Retired KMS grant: {0} for key {1} in {2}", grantId, keyId, region);
+    }
+
+    private Map<String, Object> paginateGrants(List<KmsGrant> sortedGrants, String marker, Integer limit) {
+        int effectiveLimit = limit != null ? Math.clamp(limit, 1, MAX_GRANT_LIMIT) : DEFAULT_GRANT_LIMIT;
+
+        int startIndex = 0;
+        if (marker != null && !marker.isBlank()) {
+            String decodedMarker;
+            try {
+                decodedMarker = new String(Base64.getDecoder().decode(marker), StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException e) {
+                throw new AwsException("InvalidMarkerException",
+                        "The request was rejected because the marker is not valid.", 400);
+            }
+            String lastGrantId = decodedMarker;
+            boolean found = false;
+            for (int i = 0; i < sortedGrants.size(); i++) {
+                if (sortedGrants.get(i).getGrantId().equals(lastGrantId)) {
+                    startIndex = i + 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                throw new AwsException("InvalidMarkerException",
+                        "The request was rejected because the marker that specifies where pagination should next begin is not valid.", 400);
+            }
+        }
+
+        int endIndex = Math.min(startIndex + effectiveLimit, sortedGrants.size());
+        List<KmsGrant> page = sortedGrants.subList(startIndex, endIndex);
+        boolean truncated = endIndex < sortedGrants.size();
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("Grants", page.stream().map(this::grantToMap).toList());
+        result.put("Truncated", truncated);
+        if (truncated && !page.isEmpty()) {
+            String lastGrantId = page.getLast().getGrantId();
+            String nextMarker = Base64.getEncoder().encodeToString(lastGrantId.getBytes(StandardCharsets.UTF_8));
+            result.put("NextMarker", nextMarker);
+        }
+        return result;
+    }
+
+    private Map<String, Object> grantToMap(KmsGrant grant) {
+        Map<String, Object> result = new HashMap<>();
+        result.put("GrantId", grant.getGrantId());
+        result.put("KeyId", grant.getKeyArn());
+        result.put("GranteePrincipal", grant.getGranteePrincipal());
+        result.put("Operations", grant.getOperations());
+        result.put("CreationDate", grant.getCreationDate());
+        if (grant.getRetiringPrincipal() != null) {
+            result.put("RetiringPrincipal", grant.getRetiringPrincipal());
+        }
+        return result;
+    }
+
     public void scheduleKeyDeletion(String keyId, int pendingWindowInDays, String region) {
         KmsKey key = resolveKey(keyId, region);
         key.setKeyState("PendingDeletion");
@@ -285,6 +516,23 @@ public class KmsService {
         LOG.infov("Disabled key rotation for KMS key: {0} in {1}", key.getKeyId(), region);
     }
 
+    private static final int ON_DEMAND_ROTATION_LIMIT = 25;
+    public String rotateKeyOnDemand(String keyId, String region) {
+        KmsKey key = resolveKey(keyId, region);
+        if (!key.isEnabled()) {
+            throw new AwsException("DisabledException",
+                    "KMS key " + key.getKeyId() + " is disabled.", 400);
+        }
+        validateRotationSupported(key);
+        if (key.getOnDemandRotationCount() >= ON_DEMAND_ROTATION_LIMIT) {
+            throw new AwsException("LimitExceededException",
+                    "On-demand rotation quota for KMS key " + key.getKeyId() + " is exceeded.", 400);
+        }
+        key.setOnDemandRotationCount(key.getOnDemandRotationCount() + 1);
+        keyStore.put(region + "::" + key.getKeyId(), key);
+        return key.getKeyId();
+    }
+
     private void validateRotationSupported(KmsKey key) {
         if (!"ENCRYPT_DECRYPT".equals(key.getKeyUsage())
                 || !"SYMMETRIC_DEFAULT".equals(key.getCustomerMasterKeySpec())) {
@@ -324,31 +572,129 @@ public class KmsService {
 
     // ──────────────────────────── Crypto Ops (Mocks) ────────────────────────────
 
+    // v2 blob: kms:v2:<keyId>:<nonceHex>:<contextFingerprintHex>:<base64(plaintext)>
+    // Nonce makes Encrypt non-deterministic; contextFingerprint binds EncryptionContext as AAD.
+    // Legacy v1 (kms:<keyId>:<base64>) still accepted on Decrypt for persistent-store back-compat.
+    private static final String BLOB_PREFIX_V2 = "kms:v2:";
+    private static final String BLOB_PREFIX_V1 = "kms:";
+    private static final int NONCE_BYTES = 8;
+    private static final int MIN_MAC_MESSAGE_BYTES = 1;
+    private static final int MAX_MAC_MESSAGE_BYTES = 4096;
+    private static final int MIN_MAC_BYTES = 1;
+    private static final int MAX_MAC_BYTES = 6144;
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
     public byte[] encrypt(String keyId, byte[] plaintext, String region) {
+        return encrypt(keyId, plaintext, Map.of(), region);
+    }
+
+    public byte[] encrypt(String keyId, byte[] plaintext, Map<String, String> encryptionContext, String region) {
         KmsKey kmsKey = resolveKey(keyId, region);
-        // Local mock: prefix with keyId and base64
-        String mock = "kms:" + kmsKey.getKeyId() + ":" + Base64.getEncoder().encodeToString(plaintext);
-        return mock.getBytes(StandardCharsets.UTF_8);
+
+        byte[] nonceBytes = new byte[NONCE_BYTES];
+        SECURE_RANDOM.nextBytes(nonceBytes);
+        String nonceHex = HexFormat.of().formatHex(nonceBytes);
+
+        String blob = BLOB_PREFIX_V2
+                + kmsKey.getKeyId() + ":"
+                + nonceHex + ":"
+                + contextFingerprint(encryptionContext) + ":"
+                + Base64.getEncoder().encodeToString(plaintext);
+        return blob.getBytes(StandardCharsets.UTF_8);
     }
 
     public byte[] decrypt(byte[] ciphertext, String region) {
-        String data = new String(ciphertext, StandardCharsets.UTF_8);
-        if (!data.startsWith("kms:")) {
+        return decrypt(ciphertext, Map.of(), region);
+    }
+
+    public byte[] decrypt(byte[] ciphertext, Map<String, String> encryptionContext, String region) {
+        ParsedBlob parsed = parseBlob(ciphertext);
+        if (!parsed.contextFingerprint.equals(contextFingerprint(encryptionContext))) {
             throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
         }
-        String[] parts = data.split(":", 3);
-        if (parts.length < 3) throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
-
-        return Base64.getDecoder().decode(parts[2]);
+        return Base64.getDecoder().decode(parsed.payload);
     }
 
     public String decryptToKeyArn(byte[] ciphertext, String region) {
-        String data = new String(ciphertext, StandardCharsets.UTF_8);
-        if (data.startsWith("kms:")) {
-            String keyId = data.split(":")[1];
-            return resolveKey(keyId, region).getArn();
+        try {
+            return resolveKey(parseBlob(ciphertext).keyId, region).getArn();
+        } catch (AwsException e) {
+            return null;
         }
-        return null;
+    }
+
+    /**
+     * Single-pass decrypt + source-key-ARN resolution. {@link #decrypt} and
+     * {@link #decryptToKeyArn} remain independent primitives — neither delegates here.
+     */
+    public DecryptResult decryptAndResolveKey(byte[] ciphertext, Map<String, String> encryptionContext, String region) {
+        ParsedBlob parsed = parseBlob(ciphertext);
+        if (!parsed.contextFingerprint.equals(contextFingerprint(encryptionContext))) {
+            throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+        }
+        byte[] plaintext = Base64.getDecoder().decode(parsed.payload);
+        String keyArn;
+        try {
+            keyArn = resolveKey(parsed.keyId, region).getArn();
+        } catch (AwsException e) {
+            keyArn = null;
+        }
+        return new DecryptResult(plaintext, keyArn);
+    }
+
+    public record DecryptResult(byte[] plaintext, String keyArn) {}
+
+    public record GenerateMacResult(byte[] mac, String keyArn) {}
+
+    public record VerifyMacResult(String keyArn) {}
+
+    private record ParsedBlob(String keyId, String nonce, String contextFingerprint, String payload) {}
+
+    private static ParsedBlob parseBlob(byte[] ciphertext) {
+        String data = new String(ciphertext, StandardCharsets.UTF_8);
+        if (data.startsWith(BLOB_PREFIX_V2)) {
+            // v2: keyId, nonce, contextFingerprint, payload
+            String[] parts = data.substring(BLOB_PREFIX_V2.length()).split(":", 4);
+            if (parts.length < 4) {
+                throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+            }
+            return new ParsedBlob(parts[0], parts[1], parts[2], parts[3]);
+        }
+        if (data.startsWith(BLOB_PREFIX_V1)) {
+            // Legacy v1: kms:<keyId>:<base64>. No nonce, no context binding.
+            // Decrypts only when caller supplies empty/null context (fingerprint "").
+            String[] parts = data.substring(BLOB_PREFIX_V1.length()).split(":", 2);
+            if (parts.length == 2) {
+                return new ParsedBlob(parts[0], "", "", parts[1]);
+            }
+        }
+        throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+    }
+
+    /**
+     * Stable fingerprint of an EncryptionContext map. AWS treats EncryptionContext as a
+     * case-sensitive exact match, so we hash a length-prefixed serialization of the sorted
+     * (key, value) pairs. Returns "" for null / empty, so omitted-context and empty-map
+     * ciphertexts are interchangeable (matches AWS).
+     */
+    private static String contextFingerprint(Map<String, String> ctx) {
+        if (ctx == null || ctx.isEmpty()) {
+            return "";
+        }
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            new TreeMap<>(ctx).forEach((k, v) -> {
+                byte[] kb = k.getBytes(StandardCharsets.UTF_8);
+                byte[] vb = (v == null ? "" : v).getBytes(StandardCharsets.UTF_8);
+                md.update(ByteBuffer.allocate(4).putInt(kb.length).array());
+                md.update(kb);
+                md.update(ByteBuffer.allocate(4).putInt(vb.length).array());
+                md.update(vb);
+            });
+            return HexFormat.of().formatHex(md.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new AwsException("InternalFailure", "SHA-256 unavailable", 500);
+        }
     }
 
     public byte[] sign(String keyId, byte[] message, String algorithm, String region) {
@@ -413,6 +759,95 @@ public class KmsService {
         }
     }
 
+    public byte[] generateMac(String keyId, byte[] message, String algorithm, String region) {
+        KmsKey kmsKey = validateMacOperationKey(keyId, algorithm, region);
+        return generateMac(kmsKey, message, algorithm);
+    }
+
+    public GenerateMacResult generateMacAndResolveKey(String keyId, byte[] message, String algorithm, String region) {
+        KmsKey kmsKey = validateMacOperationKey(keyId, algorithm, region);
+        return new GenerateMacResult(generateMac(kmsKey, message, algorithm), kmsKey.getArn());
+    }
+
+    private byte[] generateMac(KmsKey kmsKey, byte[] message, String algorithm) {
+        validateMacMessageLength(message);
+
+        try {
+            byte[] keyBytes = Base64.getDecoder().decode(kmsKey.getPrivateKeyEncoded());
+            String jcaAlgorithm = mapMacAlgorithm(algorithm);
+            Mac mac = Mac.getInstance(jcaAlgorithm);
+            mac.init(new SecretKeySpec(keyBytes, jcaAlgorithm));
+            mac.update(message);
+            return mac.doFinal();
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new AwsException("InternalFailure", "Failed to generate MAC: " + e.getMessage(), 500);
+        }
+    }
+
+    public void verifyMac(String keyId, byte[] message, byte[] mac, String algorithm, String region) {
+        validateMacLength(mac);
+        KmsKey kmsKey = validateMacOperationKey(keyId, algorithm, region);
+        verifyMac(kmsKey, message, mac, algorithm);
+    }
+
+    public VerifyMacResult verifyMacAndResolveKey(String keyId, byte[] message, byte[] mac, String algorithm, String region) {
+        validateMacLength(mac);
+        KmsKey kmsKey = validateMacOperationKey(keyId, algorithm, region);
+        verifyMac(kmsKey, message, mac, algorithm);
+        return new VerifyMacResult(kmsKey.getArn());
+    }
+
+    private void verifyMac(KmsKey kmsKey, byte[] message, byte[] mac, String algorithm) {
+        byte[] expected = generateMac(kmsKey, message, algorithm);
+        if (!MessageDigest.isEqual(expected, mac)) {
+            throw new AwsException("KMSInvalidMacException", "The MAC is not valid.", 400);
+        }
+    }
+
+    private KmsKey validateMacOperationKey(String keyId, String algorithm, String region) {
+        KmsKey kmsKey = resolveKey(keyId, region);
+        String spec = kmsKey.getCustomerMasterKeySpec();
+        if (!isHmac(spec) || !"GENERATE_VERIFY_MAC".equals(kmsKey.getKeyUsage())) {
+            throw new AwsException("InvalidKeyUsageException",
+                    "MAC operations require an HMAC key with KeyUsage GENERATE_VERIFY_MAC.", 400);
+        }
+
+        String expectedAlgorithm = macAlgorithmFor(spec);
+        if (!Objects.equals(expectedAlgorithm, algorithm)) {
+            throw new AwsException("InvalidKeyUsageException",
+                    "MacAlgorithm " + algorithm + " is not valid for KeySpec " + spec + ".", 400);
+        }
+        return kmsKey;
+    }
+
+    private String mapMacAlgorithm(String awsAlgo) {
+        return switch (awsAlgo) {
+            case "HMAC_SHA_224" -> "HmacSHA224";
+            case "HMAC_SHA_256" -> "HmacSHA256";
+            case "HMAC_SHA_384" -> "HmacSHA384";
+            case "HMAC_SHA_512" -> "HmacSHA512";
+            default -> throw new AwsException("InvalidMacAlgorithmException", "Unsupported MAC algorithm: " + awsAlgo, 400);
+        };
+    }
+
+    private static void validateMacMessageLength(byte[] message) {
+        int length = message == null ? 0 : message.length;
+        if (length < MIN_MAC_MESSAGE_BYTES || length > MAX_MAC_MESSAGE_BYTES) {
+            throw new AwsException("ValidationException",
+                    "Message must be between 1 and 4096 bytes for MAC operations.", 400);
+        }
+    }
+
+    private static void validateMacLength(byte[] mac) {
+        int length = mac == null ? 0 : mac.length;
+        if (length < MIN_MAC_BYTES || length > MAX_MAC_BYTES) {
+            throw new AwsException("ValidationException",
+                    "Mac must be between 1 and 6144 bytes for VerifyMac.", 400);
+        }
+    }
+
     private PrivateKey loadPrivateKey(String encoded, String spec) throws Exception {
         byte[] decoded = Base64.getDecoder().decode(encoded);
         if (isSecgP256k1(spec)) {
@@ -450,14 +885,19 @@ public class KmsService {
     }
 
     public Map<String, Object> generateDataKey(String keyId, String keySpec, int numberOfBytes, String region) {
+        return generateDataKey(keyId, keySpec, numberOfBytes, Map.of(), region);
+    }
+
+    public Map<String, Object> generateDataKey(String keyId, String keySpec, int numberOfBytes,
+                                               Map<String, String> encryptionContext, String region) {
         resolveKey(keyId, region);
         int len = (keySpec != null && keySpec.contains("256")) ? 32 : (numberOfBytes > 0 ? numberOfBytes : 32);
-        
+
         byte[] plaintext = new byte[len];
         ThreadLocalRandom.current().nextBytes(plaintext);
-        
-        byte[] ciphertext = encrypt(keyId, plaintext, region);
-        
+
+        byte[] ciphertext = encrypt(keyId, plaintext, encryptionContext, region);
+
         Map<String, Object> result = new HashMap<>();
         result.put("Plaintext", plaintext);
         result.put("CiphertextBlob", ciphertext);

@@ -1,13 +1,11 @@
 quarkus:
   log:
-    # min-level sets the floor for what can be emitted at runtime. Default is INFO,
-    # which silently filters any TRACE/DEBUG logs even when a category override
-    # asks for them. Lowering the floor to TRACE lets users opt in per-category
-    # (e.g. QUARKUS_LOG_CATEGORY__IO_GITHUB_HECTORVENT_FLOCI_SERVICES_SQS__LEVEL=TRACE)
-    # without also having to raise min-level. Effective level is still INFO by default.
-    min-level: TRACE
     console:
-        color: true
+      format: "%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c{3.}] %s%e%n"
+    category:
+      "io.apicurio":
+        level: WARN
+
   http:
     port: ${floci.port}
     host: 0.0.0.0
@@ -20,6 +18,12 @@ quarkus:
     # No 'delay' value is set - observers run synchronously, no artificial sleep is introduced.
     delay-enabled: true
   native:
+    resources:
+      # The Pricing service reads its bundled snapshot at runtime via
+      # ClassLoader#getResourceAsStream. Quarkus's static resource analysis
+      # cannot detect dynamically-built paths, so the tree is registered
+      # explicitly to ensure GraalVM includes every file in the native image.
+      includes: pricing-snapshots/**
     additional-build-args:
       - --report-unsupported-elements-at-runtime
       - --allow-incomplete-classpath
@@ -34,8 +38,12 @@ quarkus:
       - --initialize-at-run-time=io.github.hectorvent.floci.core.common.BouncyCastleInitializer
       - --initialize-at-run-time=io.github.hectorvent.floci.services.acm.AcmService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.acm.CertificateGenerator
+      - --initialize-at-run-time=io.github.hectorvent.floci.config.TlsConfigSource
       - --initialize-at-run-time=io.github.hectorvent.floci.services.cognito.CognitoSrpHelper
       - --initialize-at-run-time=io.github.hectorvent.floci.services.ses.SesService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.route53.Route53Service
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.kms.KmsService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.cloudfront.CloudFrontService
 
 
 floci:
@@ -51,6 +59,7 @@ floci:
     mode: memory
     persistent-path: ./data
     host-persistent-path: ./data
+    prune-volumes-on-delete: false
     wal:
       compaction-interval-ms: 30000
     services:
@@ -84,9 +93,33 @@ floci:
     # extra-suffixes:
     #   - localhost.localstack.cloud
 
+    # Public resolvers appended after Floci's embedded DNS on spawned containers' HostConfig.Dns,
+    # and used as the fallback upstream for Floci's own DNS forwarder. Lets Lambda/CodeBuild
+    # resolve public hostnames even if the embedded forwarder cannot answer.
+    # Disable in offline/locked-down networks where these resolvers are blocked.
+    container-fallback-enabled: true              # FLOCI_DNS_CONTAINER_FALLBACK_ENABLED
+    container-fallback-servers:                   # FLOCI_DNS_CONTAINER_FALLBACK_SERVERS=1.1.1.1,1.0.0.1
+      - 8.8.8.8
+      - 8.8.4.4
+
   auth:
     validate-signatures: false
     presign-secret: local-emulator-secret
+
+  security:
+    # Comma-separated browser origins allowed by the global CORS filter.
+    # Env var: EXTRA_CORS_ALLOWED_ORIGINS=http://localhost:3000
+    # extra-cors-allowed-origins:
+    # Extra request/response CORS header names for browser clients.
+    # extra-cors-allowed-headers:
+    # extra-cors-expose-headers:
+    disable-cors-headers: false
+
+  tls:
+    enabled: false                     # FLOCI_TLS_ENABLED (default: false)
+    # cert-path: ""                    # FLOCI_TLS_CERT_PATH (PEM certificate file)
+    # key-path: ""                     # FLOCI_TLS_KEY_PATH (PEM private key file)
+    self-signed: true                  # FLOCI_TLS_SELF_SIGNED — auto-generate a self-signed cert if no cert-path provided
 
   docker:
     log-max-size: "10m"
@@ -141,6 +174,7 @@ floci:
       proxy-base-port: 6379
       proxy-max-port: 6399
       default-image: "valkey/valkey:8"
+      default-memcached-image: "memcached:1.6"
     rds:
       enabled: true
       proxy-base-port: 7001
@@ -148,6 +182,11 @@ floci:
       default-postgres-image: "postgres:16-alpine"
       default-mysql-image: "mysql:8.0"
       default-mariadb-image: "mariadb:11"
+    neptune:
+      enabled: true
+      proxy-base-port: 8182
+      proxy-max-port: 8282
+      default-image: "tinkerpop/gremlin-server:3.7.3"
     eventbridge:
       enabled: true
     scheduler:
@@ -178,7 +217,8 @@ floci:
     athena:
       enabled: true
       mock: false
-      # duck-url: http://floci-duck:3000   # set to skip container management
+    duck:
+      # url: http://floci-duck:3000   # set to skip container management
       default-image: "floci/floci-duck:latest"
     glue:
       enabled: true
@@ -192,7 +232,10 @@ floci:
     opensearch:
       enabled: true
       mock: false
-      default-image: "opensearchproject/opensearch:2"
+      # default-image: optional override; uncomment to lock every domain to a
+      # single image (e.g. private registry mirror). When unset, the image is
+      # picked from OpenSearchVersions.imageFor(EngineVersion).
+      # default-image: "registry.example.com/opensearch:2.19.5"
       proxy-base-port: 9400
       proxy-max-port: 9499
       keep-running-on-shutdown: false
@@ -230,6 +273,8 @@ floci:
       api-server-max-port: 6599
       data-path: ./data/eks
       keep-running-on-shutdown: false
+      endpoint-mode: host          # host = https://localhost:<hostPort> (host-reachable); network = container DNS name
+      iam-auth-webhook: true       # wire a token-auth webhook into k3s so `aws eks get-token` works
     elbv2:
       enabled: true
       mock: false
@@ -239,4 +284,31 @@ floci:
     codedeploy:
       enabled: true
     autoscaling:
+      enabled: true
+    backup:
+      enabled: true
+      job-completion-delay-seconds: 3
+    route53:
+      enabled: true
+    transfer:
+      enabled: true
+    textract:
+      enabled: true
+    pricing:
+      enabled: true
+    transcribe:
+      enabled: true
+    ce:
+      enabled: true
+      credit-usd-monthly: 0.0
+    cur:
+      enabled: true
+      emit-mode: synchronous
+      staging-bucket: floci-cur-staging
+    bcm-data-exports:
+      enabled: true
+      emit-mode: synchronous
+    cloudfront:
+      enabled: true
+    appsync:
       enabled: true

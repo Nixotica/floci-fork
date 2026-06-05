@@ -27,13 +27,18 @@ public interface EmulatorConfig {
     Optional<String> hostname();
 
     /**
-     * Returns the effective base URL, taking hostname into account.
+     * Returns the effective base URL, taking hostname and TLS into account.
      * If hostname is set, replaces the host in baseUrl with it.
+     * If TLS is enabled, switches the scheme from http:// to https://.
      */
     default String effectiveBaseUrl() {
-        return hostname()
+        String url = hostname()
                 .map(h -> baseUrl().replaceFirst("://[^:/]+(:\\d+)?", "://" + h + "$1"))
                 .orElse(baseUrl());
+        if (tls().enabled() && url.startsWith("http://")) {
+            url = "https://" + url.substring(7);
+        }
+        return url;
     }
 
     @WithDefault("us-east-1")
@@ -57,11 +62,15 @@ public interface EmulatorConfig {
 
     AuthConfig auth();
 
+    SecurityConfig security();
+
     ServicesConfig services();
 
     DockerConfig docker();
 
     InitHooksConfig initHooks();
+
+    TlsConfig tls();
 
     interface DnsConfig {
         /**
@@ -82,6 +91,41 @@ public interface EmulatorConfig {
          * </pre>
          */
         Optional<List<String>> extraSuffixes();
+
+        /**
+         * When {@code true} (default), the configured {@link #containerFallbackServers()} are
+         * appended after Floci's embedded DNS to every spawned container's {@code HostConfig.Dns}.
+         * This gives Lambda/CodeBuild/etc. a real secondary resolver so public hostnames still
+         * resolve if Floci's embedded forwarder cannot answer — mirroring the
+         * {@code docker run --dns <FlociIP> --dns 8.8.8.8} workaround.
+         *
+         * <p>Disable (via {@code FLOCI_DNS_CONTAINER_FALLBACK_ENABLED=false}) in offline or
+         * locked-down networks where the public resolvers are unreachable/blocked.
+         */
+        @WithDefault("true")
+        boolean containerFallbackEnabled();
+
+        /**
+         * Ordered list of public DNS resolvers used both as the fallback upstream for Floci's
+         * embedded DNS forwarder and (when {@link #containerFallbackEnabled()}) as the secondary
+         * resolvers injected into spawned containers.
+         *
+         * <p>Via environment variable (comma-separated):
+         * <pre>
+         * FLOCI_DNS_CONTAINER_FALLBACK_SERVERS=1.1.1.1,1.0.0.1
+         * </pre>
+         */
+        @WithDefault("8.8.8.8,8.8.4.4")
+        List<String> containerFallbackServers();
+    }
+
+    interface SecurityConfig {
+        Optional<List<String>> extraCorsAllowedOrigins();
+        Optional<List<String>> extraCorsAllowedHeaders();
+        Optional<List<String>> extraCorsExposeHeaders();
+
+        @WithDefault("false")
+        boolean disableCorsHeaders();
     }
 
     interface StorageConfig {
@@ -94,6 +138,14 @@ public interface EmulatorConfig {
         /** The path on the host machine where data is stored. Useful for Docker-in-Docker. */
         @WithDefault("${floci.storage.persistent-path}")
         String hostPersistentPath();
+
+        /**
+         * When {@code true}, named volumes are removed immediately after a child container stops
+         * on resource delete. In {@code memory} storage mode volumes are always removed regardless
+         * of this flag. Defaults to {@code false} to match real AWS behaviour (data survives delete).
+         */
+        @WithDefault("false")
+        boolean pruneVolumesOnDelete();
 
         WalConfig wal();
 
@@ -116,6 +168,10 @@ public interface EmulatorConfig {
         AppConfigDataStorageConfig appconfigdata();
         ElastiCacheStorageConfig elasticache();
         RdsStorageConfig rds();
+        NeptuneStorageConfig neptune();
+        BackupStorageConfig backup();
+        CloudFrontStorageConfig cloudfront();
+        AppSyncStorageConfig appsync();
     }
 
     interface SsmStorageConfig {
@@ -214,6 +270,28 @@ public interface EmulatorConfig {
         Optional<String> mode();
     }
 
+    interface NeptuneStorageConfig {
+        Optional<String> mode();
+    }
+
+    interface BackupStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface CloudFrontStorageConfig {
+        Optional<String> mode();
+    }
+
+    interface AppSyncStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
     interface WalConfig {
         @WithDefault("30000")
         long compactionIntervalMs();
@@ -273,6 +351,55 @@ public interface EmulatorConfig {
         CodeBuildServiceConfig codebuild();
         CodeDeployServiceConfig codedeploy();
         AutoScalingServiceConfig autoscaling();
+        BackupServiceConfig backup();
+        NeptuneServiceConfig neptune();
+        Route53ServiceConfig route53();
+        TransferServiceConfig transfer();
+        TextractServiceConfig textract();
+        PricingServiceConfig pricing();
+        DuckConfig duck();
+        TranscribeServiceConfig transcribe();
+        CostExplorerServiceConfig ce();
+        CurServiceConfig cur();
+        BcmDataExportsServiceConfig bcmDataExports();
+        ConfigServiceConfig configservice();
+        CloudFrontServiceConfig cloudfront();
+        AppSyncServiceConfig appsync();
+    }
+
+    interface TransferServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface BackupServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithDefault("3")
+        int jobCompletionDelaySeconds();
+    }
+
+    interface Route53ServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithDefault("ns-1.awsdns-01.org")
+        String defaultNameserver1();
+
+        @WithDefault("ns-2.awsdns-02.net")
+        String defaultNameserver2();
+
+        @WithDefault("ns-3.awsdns-03.com")
+        String defaultNameserver3();
+
+        @WithDefault("ns-4.awsdns-04.co.uk")
+        String defaultNameserver4();
+    }
+
+    interface ConfigServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
     }
 
     interface AutoScalingServiceConfig {
@@ -369,7 +496,10 @@ public interface EmulatorConfig {
         @WithDefault("valkey/valkey:8")
         String defaultImage();
 
-        /** Docker network to attach Valkey containers to. Empty = default bridge. */
+        @WithDefault("memcached:1.6")
+        String defaultMemcachedImage();
+
+        /** Docker network to attach ElastiCache containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
     }
 
@@ -393,6 +523,24 @@ public interface EmulatorConfig {
         String defaultMariadbImage();
 
         /** Docker network to attach DB containers to. Empty = default bridge. */
+        Optional<String> dockerNetwork();
+    }
+
+    interface NeptuneServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Base port of the proxy port range. First cluster gets this port. */
+        @WithDefault("8182")
+        int proxyBasePort();
+
+        /** Inclusive upper bound of the proxy port range. */
+        @WithDefault("8282")
+        int proxyMaxPort();
+
+        @WithDefault("tinkerpop/gremlin-server:3.7.3")
+        String defaultImage();
+
         Optional<String> dockerNetwork();
     }
 
@@ -475,6 +623,9 @@ public interface EmulatorConfig {
     interface CloudFormationServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("30")
+        long deletedStackRetentionSeconds();
     }
 
     interface AcmServiceConfig {
@@ -492,9 +643,11 @@ public interface EmulatorConfig {
 
         @WithDefault("false")
         boolean mock();
+    }
 
+    interface DuckConfig {
         /** When set, Floci uses this URL and skips floci-duck container management. */
-        Optional<String> duckUrl();
+        Optional<String> url();
 
         @WithDefault("floci/floci-duck:latest")
         String defaultImage();
@@ -535,8 +688,14 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean mock();
 
-        @WithDefault("opensearchproject/opensearch:2")
-        String defaultImage();
+        /**
+         * Optional fixed image used for every domain regardless of the
+         * requested {@code EngineVersion}. Useful for operators running a
+         * private registry mirror or pinning a specific patch tag. When unset
+         * (the common case), images resolve from
+         * {@code OpenSearchVersions.imageFor(...)} per the requested version.
+         */
+        Optional<String> defaultImage();
 
         @WithDefault("9400")
         int proxyBasePort();
@@ -576,6 +735,91 @@ public interface EmulatorConfig {
     interface BedrockRuntimeServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface TextractServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface PricingServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * Filesystem directory overriding the bundled pricing snapshot. When set, files at
+         * {@code <path>/services.json}, {@code <path>/products/<service>/<region>.json},
+         * {@code <path>/attribute-values/<service>/<attribute>.json}, and
+         * {@code <path>/price-lists/<service>.json} are read in preference to the classpath copy.
+         */
+        Optional<String> snapshotPath();
+    }
+
+    interface TranscribeServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface CostExplorerServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * Synthetic monthly USD credit applied as a {@code Credit} {@code RECORD_TYPE}
+         * row in {@code GetCostAndUsage} responses. The emitted credit is capped at
+         * the synthesized monthly usage so net cost never goes below zero.
+         * Defaults to zero (no credit emitted).
+         */
+        @WithDefault("0.0")
+        double creditUsdMonthly();
+    }
+
+    interface CurServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * Controls when CUR Parquet artifacts are emitted:
+         * <ul>
+         *   <li>{@code synchronous} — emit on report definition mutations (default; suits tests)</li>
+         *   <li>{@code daily} — emit once per 24h via the CUR-owned scheduled executor</li>
+         *   <li>{@code off} — management plane only, no Parquet emission</li>
+         * </ul>
+         */
+        @WithDefault("synchronous")
+        String emitMode();
+
+        /**
+         * S3 bucket used to stage NDJSON row payloads before DuckDB writes the
+         * final Parquet artifact. Created on first use if it doesn't exist.
+         */
+        @WithDefault("floci-cur-staging")
+        String stagingBucket();
+    }
+
+    interface CloudFrontServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithDefault("cloudfront.net")
+        String domainSuffix();
+    }
+
+    interface AppSyncServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface BcmDataExportsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * Same semantics as {@code floci.services.cur.emit-mode} but applied to
+         * BCM Data Exports {@code Export} records.
+         */
+        @WithDefault("synchronous")
+        String emitMode();
     }
 
     interface EcrServiceConfig {
@@ -770,6 +1014,27 @@ public interface EmulatorConfig {
 
         @WithDefault("false")
         boolean keepRunningOnShutdown();
+
+        /**
+         * Controls the endpoint that {@code describe-cluster} returns in real mode:
+         * <ul>
+         *   <li>{@code host} (default) — {@code https://localhost:<hostPort>}, reachable from the
+         *       host so {@code kubectl}/{@code aws eks} work out of the box.</li>
+         *   <li>{@code network} — the container DNS name {@code https://floci-eks-<name>:6443},
+         *       reachable from other containers on the Docker network (pre-#1118 behaviour). Falls
+         *       back to the host endpoint when Floci runs natively.</li>
+         * </ul>
+         */
+        @WithDefault("host")
+        String endpointMode();
+
+        /**
+         * When true, wires a token-authentication webhook into k3s so that the bearer token
+         * produced by {@code aws eks get-token} is validated by Floci and mapped to cluster-admin.
+         * This makes the native {@code aws eks update-kubeconfig} + {@code kubectl} flow work.
+         */
+        @WithDefault("true")
+        boolean iamAuthWebhook();
     }
 
     interface InitHooksConfig {
@@ -781,6 +1046,33 @@ public interface EmulatorConfig {
 
         @WithDefault("30")
         long timeoutSeconds();
+    }
+
+    /**
+     * Optional TLS configuration for enabling HTTPS on the Floci server.
+     * When enabled, all endpoints are reachable via {@code https://} and
+     * WebSocket connections work via {@code wss://}.
+     *
+     * <p>Both HTTP and HTTPS are served simultaneously (LocalStack parity).
+     */
+    interface TlsConfig {
+        /** Enable TLS/HTTPS on the server. Env: FLOCI_TLS_ENABLED */
+        @WithDefault("false")
+        boolean enabled();
+
+        /** Path to PEM certificate file. Env: FLOCI_TLS_CERT_PATH */
+        Optional<String> certPath();
+
+        /** Path to PEM private key file. Env: FLOCI_TLS_KEY_PATH */
+        Optional<String> keyPath();
+
+        /**
+         * Auto-generate a self-signed certificate when no cert-path/key-path provided.
+         * The generated files are persisted to {@code {storage.persistent-path}/tls/}
+         * and reused across restarts. Env: FLOCI_TLS_SELF_SIGNED
+         */
+        @WithDefault("true")
+        boolean selfSigned();
     }
 
     /**

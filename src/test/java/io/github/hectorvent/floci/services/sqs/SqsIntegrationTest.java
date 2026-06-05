@@ -251,6 +251,127 @@ class SqsIntegrationTest {
     }
 
     @Test
+    void createQueue_withTags_tagsReturnedByListQueueTags() {
+        // Regression test for https://github.com/floci-io/floci/issues/699
+        // Tags supplied at CreateQueue time must be visible via ListQueueTags.
+        String taggedQueueName = "tagged-queue-integration-test";
+
+        // Extract the queue URL from the CreateQueue response — don't hard-code the port
+        String taggedQueueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", taggedQueueName)
+            .formParam("Tag.1.Key", "k1")
+            .formParam("Tag.1.Value", "v1")
+            .formParam("Tag.2.Key", "k2")
+            .formParam("Tag.2.Value", "v2")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString(taggedQueueName))
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ListQueueTags")
+                .formParam("QueueUrl", taggedQueueUrl)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(containsString("k1"))
+                .body(containsString("v1"))
+                .body(containsString("k2"))
+                .body(containsString("v2"));
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", taggedQueueUrl)
+            .when()
+                .post("/");
+        }
+    }
+
+    @Test
+    void createQueue_jsonProtocol_withLowercaseTags_tagsReturnedByListQueueTags() {
+        // SQS JSON 1.0 schema uses lowercase "tags" for CreateQueue (cf. uppercase "Tags" for TagQueue).
+        String taggedQueueName = "tagged-queue-json-integration-test";
+
+        String taggedQueueUrl = given()
+            .contentType("application/x-amz-json-1.0")
+            .header("X-Amz-Target", "AmazonSQS.CreateQueue")
+            .body("{\"QueueName\": \"" + taggedQueueName + "\", \"tags\": {\"k1\": \"v1\", \"k2\": \"v2\"}}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("QueueUrl");
+
+        try {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ListQueueTags")
+                .formParam("QueueUrl", taggedQueueUrl)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(containsString("k1"))
+                .body(containsString("v1"))
+                .body(containsString("k2"))
+                .body(containsString("v2"));
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", taggedQueueUrl)
+            .when()
+                .post("/");
+        }
+    }
+
+    @Test
+    void createQueue_jsonProtocol_withUppercaseTags_tagsAreIgnored() {
+        // SQS JSON 1.0 only defines lowercase "tags" for CreateQueue; uppercase "Tags" belongs to
+        // TagQueue and must be treated as an unknown field here, matching real AWS.
+        String taggedQueueName = "ignored-uppercase-tags-queue";
+
+        String taggedQueueUrl = given()
+            .contentType("application/x-amz-json-1.0")
+            .header("X-Amz-Target", "AmazonSQS.CreateQueue")
+            .body("{\"QueueName\": \"" + taggedQueueName + "\", \"Tags\": {\"k1\": \"v1\"}}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("QueueUrl");
+
+        try {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ListQueueTags")
+                .formParam("QueueUrl", taggedQueueUrl)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(not(containsString("<Tag>")))
+                .body(not(containsString("k1")))
+                .body(not(containsString("v1")));
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", taggedQueueUrl)
+            .when()
+                .post("/");
+        }
+    }
+
+    @Test
     void unsupportedAction() {
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -260,6 +381,42 @@ class SqsIntegrationTest {
         .then()
             .statusCode(400)
             .body(containsString("UnsupportedOperation"));
+    }
+
+    @Test
+    void sendMessageBatch_queryProtocol_oversizedBatchReturnsBatchRequestTooLong() {
+        String queueName = "batch-oversize-query-queue";
+        String queueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", queueName)
+        .when().post("/").then().statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            String bigBody = "x".repeat(100_000);
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "SendMessageBatch")
+                .formParam("QueueUrl", queueUrl)
+                .formParam("SendMessageBatchRequestEntry.1.Id", "a")
+                .formParam("SendMessageBatchRequestEntry.1.MessageBody", bigBody)
+                .formParam("SendMessageBatchRequestEntry.2.Id", "b")
+                .formParam("SendMessageBatchRequestEntry.2.MessageBody", bigBody)
+                .formParam("SendMessageBatchRequestEntry.3.Id", "c")
+                .formParam("SendMessageBatchRequestEntry.3.MessageBody", bigBody)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body(containsString("BatchRequestTooLong"));
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", queueUrl)
+            .when().post("/");
+        }
     }
 
     @Test
@@ -346,5 +503,155 @@ class SqsIntegrationTest {
             .header("x-amzn-query-error", "AWS.SimpleQueueService.NonExistentQueue;Sender")
             .body(containsString("QueueDoesNotExist"))
             .body(not(containsString("AWS.SimpleQueueService.NonExistentQueue")));
+    }
+
+    @Test
+    void receiveMessage_queryProtocol_attributeNameFiltersSystemAttributes() {
+        String filterQueueName = "query-attr-filter-queue";
+        String filterQueueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", filterQueueName)
+        .when().post("/").then().statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "SendMessage")
+                .formParam("QueueUrl", filterQueueUrl)
+                .formParam("MessageBody", "hi")
+            .when().post("/").then().statusCode(200);
+
+            // No AttributeName.N requested: response must contain no <Attribute> entries
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", filterQueueUrl)
+                .formParam("MaxNumberOfMessages", "1")
+                .formParam("VisibilityTimeout", "0")
+            .when().post("/").then().statusCode(200)
+                .body(containsString("<Message>"))
+                .body(not(containsString("<Attribute>")));
+
+            // AttributeName.1=SenderId: only SenderId present, no SentTimestamp / ApproximateReceiveCount
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", filterQueueUrl)
+                .formParam("MaxNumberOfMessages", "1")
+                .formParam("VisibilityTimeout", "0")
+                .formParam("AttributeName.1", "SenderId")
+            .when().post("/").then().statusCode(200)
+                .body(containsString("<Name>SenderId</Name>"))
+                .body(not(containsString("<Name>SentTimestamp</Name>")))
+                .body(not(containsString("<Name>ApproximateReceiveCount</Name>")));
+
+            // MessageSystemAttributeName.1=All: full system-attribute set returned
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", filterQueueUrl)
+                .formParam("MaxNumberOfMessages", "1")
+                .formParam("VisibilityTimeout", "0")
+                .formParam("MessageSystemAttributeName.1", "All")
+            .when().post("/").then().statusCode(200)
+                .body(containsString("<Name>SenderId</Name>"))
+                .body(containsString("<Name>SentTimestamp</Name>"))
+                .body(containsString("<Name>ApproximateReceiveCount</Name>"))
+                .body(containsString("<Name>ApproximateFirstReceiveTimestamp</Name>"));
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", filterQueueUrl)
+            .when().post("/");
+        }
+    }
+
+    @Test
+    void sendMessage_queryProtocol_persistsAwsTraceHeader() {
+        String traceQueueName = "query-trace-queue";
+        String traceQueueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", traceQueueName)
+        .when().post("/").then().statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "SendMessage")
+                .formParam("QueueUrl", traceQueueUrl)
+                .formParam("MessageBody", "hi")
+                .formParam("MessageSystemAttribute.1.Name", "AWSTraceHeader")
+                .formParam("MessageSystemAttribute.1.Value.DataType", "String")
+                .formParam("MessageSystemAttribute.1.Value.StringValue", "Root=1-query-single")
+            .when().post("/").then().statusCode(200);
+
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", traceQueueUrl)
+                .formParam("MaxNumberOfMessages", "1")
+                .formParam("VisibilityTimeout", "0")
+                .formParam("MessageSystemAttributeName.1", "AWSTraceHeader")
+            .when().post("/").then().statusCode(200)
+                .body(containsString("<Name>AWSTraceHeader</Name>"))
+                .body(containsString("<Value>Root=1-query-single</Value>"));
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", traceQueueUrl)
+            .when().post("/");
+        }
+    }
+
+    @Test
+    void sendMessageBatch_queryProtocol_persistsAwsTraceHeaderPerEntry() {
+        String traceQueueName = "query-batch-trace-queue";
+        String traceQueueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", traceQueueName)
+        .when().post("/").then().statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "SendMessageBatch")
+                .formParam("QueueUrl", traceQueueUrl)
+                .formParam("SendMessageBatchRequestEntry.1.Id", "a")
+                .formParam("SendMessageBatchRequestEntry.1.MessageBody", "first")
+                .formParam("SendMessageBatchRequestEntry.1.MessageSystemAttribute.1.Name", "AWSTraceHeader")
+                .formParam("SendMessageBatchRequestEntry.1.MessageSystemAttribute.1.Value.DataType", "String")
+                .formParam("SendMessageBatchRequestEntry.1.MessageSystemAttribute.1.Value.StringValue", "Root=1-aaa")
+                .formParam("SendMessageBatchRequestEntry.2.Id", "b")
+                .formParam("SendMessageBatchRequestEntry.2.MessageBody", "second")
+                .formParam("SendMessageBatchRequestEntry.2.MessageSystemAttribute.1.Name", "AWSTraceHeader")
+                .formParam("SendMessageBatchRequestEntry.2.MessageSystemAttribute.1.Value.DataType", "String")
+                .formParam("SendMessageBatchRequestEntry.2.MessageSystemAttribute.1.Value.StringValue", "Root=1-bbb")
+            .when().post("/").then().statusCode(200);
+
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", traceQueueUrl)
+                .formParam("MaxNumberOfMessages", "10")
+                .formParam("VisibilityTimeout", "0")
+                .formParam("MessageSystemAttributeName.1", "AWSTraceHeader")
+            .when().post("/").then().statusCode(200)
+                .body(containsString("<Value>Root=1-aaa</Value>"))
+                .body(containsString("<Value>Root=1-bbb</Value>"));
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", traceQueueUrl)
+            .when().post("/");
+        }
     }
 }

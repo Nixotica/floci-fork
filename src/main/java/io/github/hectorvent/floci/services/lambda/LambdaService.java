@@ -217,6 +217,7 @@ public class LambdaService {
         }
 
         LambdaFunction fn = new LambdaFunction();
+        fn.setAccountId(regionResolver.getAccountId());
         fn.setFunctionName(functionName);
         fn.setFunctionArn(regionResolver.buildArn("lambda", region, "function:" + functionName));
         fn.setRuntime(runtime);
@@ -665,6 +666,7 @@ public class LambdaService {
 
         EventSourceMapping esm = new EventSourceMapping();
         esm.setUuid(UUID.randomUUID().toString());
+        esm.setAccountId(regionResolver.getAccountId());
         esm.setFunctionArn(fn.getFunctionArn());
         esm.setFunctionName(resolvedName);
         esm.setEventSourceArn(eventSourceArn);

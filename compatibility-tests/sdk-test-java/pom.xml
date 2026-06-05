@@ -92,6 +92,10 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>apigatewaymanagementapi</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>kms</artifactId>
         </dependency>
         <dependency>
@@ -148,6 +152,10 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>rds</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>neptune</artifactId>
         </dependency>
         <!-- EventBridge client -->
         <dependency>
@@ -238,6 +246,16 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>codedeploy</artifactId>
+        </dependency>
+        <!-- AWS Backup client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>backup</artifactId>
+        </dependency>
+        <!-- AppSync client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>appsync</artifactId>
         </dependency>
         <!-- AppConfig and AppConfigData clients -->
         <dependency>

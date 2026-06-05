@@ -3,11 +3,18 @@ package io.github.hectorvent.floci.services.opensearch;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.opensearch.model.AdvancedSecurityOptions;
 import io.github.hectorvent.floci.services.opensearch.model.ClusterConfig;
 import io.github.hectorvent.floci.services.opensearch.model.Domain;
+import io.github.hectorvent.floci.services.opensearch.model.DomainEndpointOptions;
 import io.github.hectorvent.floci.services.opensearch.model.EbsOptions;
+import io.github.hectorvent.floci.services.opensearch.model.EncryptionAtRestOptions;
+import io.github.hectorvent.floci.services.opensearch.model.NodeToNodeEncryptionOptions;
+import io.github.hectorvent.floci.services.opensearch.model.VpcOptions;
 import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -15,6 +22,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -27,26 +35,29 @@ public class OpenSearchService {
 
     private static final Logger LOG = Logger.getLogger(OpenSearchService.class);
 
-    private static final String DEFAULT_ENGINE_VERSION = "OpenSearch_2.11";
+    private static final String DEFAULT_ENGINE_VERSION = OpenSearchVersions.DEFAULT_VERSION;
 
     private final StorageBackend<String, Domain> domainStore;
     private final EmulatorConfig config;
+    private final RegionResolver regionResolver;
     private final OpenSearchDomainManager domainManager;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
 
     @Inject
     public OpenSearchService(StorageFactory storageFactory, EmulatorConfig config,
-                             OpenSearchDomainManager domainManager) {
+                             RegionResolver regionResolver, OpenSearchDomainManager domainManager) {
         this.domainStore = storageFactory.create("opensearch", "opensearch-domains.json",
                 new TypeReference<Map<String, Domain>>() {});
         this.config = config;
+        this.regionResolver = regionResolver;
         this.domainManager = domainManager;
     }
 
     OpenSearchService(StorageBackend<String, Domain> domainStore, EmulatorConfig config,
-                      OpenSearchDomainManager domainManager) {
+                      RegionResolver regionResolver, OpenSearchDomainManager domainManager) {
         this.domainStore = domainStore;
         this.config = config;
+        this.regionResolver = regionResolver;
         this.domainManager = domainManager;
     }
 
@@ -61,31 +72,58 @@ public class OpenSearchService {
     public void shutdown() {
         poller.shutdownNow();
         if (!config.services().opensearch().mock()) {
-            for (Domain domain : domainStore.scan(k -> true)) {
+            for (Domain domain : allDomains()) {
                 domainManager.stopDomain(domain);
             }
         }
     }
 
+    /**
+     * Bag of optional configuration blocks parsed by {@link OpenSearchController}
+     * and round-tripped on Describe. Any field can be null when the request
+     * omitted the corresponding block — the service treats null as "leave the
+     * existing value untouched" on update and "feature unset" on create.
+     */
+    public record DomainOptions(
+            VpcOptions vpcOptions,
+            AdvancedSecurityOptions advancedSecurityOptions,
+            EncryptionAtRestOptions encryptionAtRestOptions,
+            NodeToNodeEncryptionOptions nodeToNodeEncryptionOptions,
+            DomainEndpointOptions domainEndpointOptions) {
+
+        public static final DomainOptions EMPTY = new DomainOptions(null, null, null, null, null);
+    }
+
     public Domain createDomain(String domainName, String engineVersion, ClusterConfig clusterConfig,
                                 EbsOptions ebsOptions, Map<String, String> tags, String region) {
+        return createDomain(domainName, engineVersion, clusterConfig, ebsOptions, tags,
+                DomainOptions.EMPTY, region);
+    }
+
+    public Domain createDomain(String domainName, String engineVersion, ClusterConfig clusterConfig,
+                                EbsOptions ebsOptions, Map<String, String> tags,
+                                DomainOptions options, String region) {
         validateDomainName(domainName);
+        OpenSearchVersions.validate(engineVersion);
+        validateOptions(options);
 
         if (domainStore.get(domainName).isPresent()) {
             throw new AwsException("ResourceAlreadyExistsException",
                     "Domain with name " + domainName + " already exists.", 409);
         }
 
-        String accountId = config.defaultAccountId();
+        String accountId = regionResolver.getAccountId();
         Domain domain = new Domain();
         domain.setDomainName(domainName);
         domain.setDomainId(accountId + "/" + domainName);
+        domain.setAccountId(accountId);
         domain.setArn(AwsArnUtils.Arn.of("es", region, accountId, "domain/" + domainName).toString());
         domain.setEngineVersion(engineVersion != null ? engineVersion : DEFAULT_ENGINE_VERSION);
         domain.setProcessing(false);
         domain.setDeleted(false);
         domain.setEndpoint("");
         domain.setCreatedAt(Instant.now());
+        domain.setVolumeId(String.format("%06x", new SecureRandom().nextInt(0xFFFFFF)));
 
         if (clusterConfig != null) {
             domain.setClusterConfig(clusterConfig);
@@ -96,6 +134,7 @@ public class OpenSearchService {
         if (tags != null) {
             domain.setTags(tags);
         }
+        applyDomainOptions(domain, options);
 
         if (config.services().opensearch().mock()) {
             domain.setProcessing(false);
@@ -134,7 +173,16 @@ public class OpenSearchService {
     public Domain updateDomainConfig(String domainName, String engineVersion,
                                       ClusterConfig clusterConfig, EbsOptions ebsOptions,
                                       String region) {
+        return updateDomainConfig(domainName, engineVersion, clusterConfig, ebsOptions,
+                DomainOptions.EMPTY, region);
+    }
+
+    public Domain updateDomainConfig(String domainName, String engineVersion,
+                                      ClusterConfig clusterConfig, EbsOptions ebsOptions,
+                                      DomainOptions options, String region) {
         Domain domain = describeDomain(domainName);
+        OpenSearchVersions.validate(engineVersion);
+        validateOptions(options);
 
         if (engineVersion != null && !engineVersion.isBlank()) {
             domain.setEngineVersion(engineVersion);
@@ -160,6 +208,7 @@ public class OpenSearchService {
                 existing.setVolumeSize(ebsOptions.getVolumeSize());
             }
         }
+        applyDomainOptions(domain, options);
 
         domainStore.put(domainName, domain);
         return domain;
@@ -170,6 +219,7 @@ public class OpenSearchService {
         domain.setDeleted(true);
         if (!config.services().opensearch().mock()) {
             domainManager.stopDomain(domain);
+            domainManager.removeDomainStorage(domain);
         }
         domainStore.delete(domainName);
         LOG.infov("Deleted OpenSearch domain: {0}", domainName);
@@ -194,10 +244,13 @@ public class OpenSearchService {
 
     public Domain upgradeDomain(String domainName, String targetVersion) {
         Domain domain = describeDomain(domainName);
-        if (targetVersion != null && !targetVersion.isBlank()) {
-            domain.setEngineVersion(targetVersion);
-            domainStore.put(domainName, domain);
+        if (targetVersion == null || targetVersion.isBlank()) {
+            throw new AwsException("ValidationException",
+                    "TargetVersion is required for UpgradeDomain.", 400);
         }
+        OpenSearchVersions.validateUpgrade(domain.getEngineVersion(), targetVersion);
+        domain.setEngineVersion(targetVersion);
+        domainStore.put(domainName, domain);
         return domain;
     }
 
@@ -220,6 +273,62 @@ public class OpenSearchService {
         }
     }
 
+    /**
+     * Cross-block validation: only the cases where a wrong combination is
+     * deterministically rejected by AWS land here. Per-field syntax checks
+     * stay in the controller's parsers.
+     */
+    private void validateOptions(DomainOptions options) {
+        if (options == null) {
+            return;
+        }
+        VpcOptions vpc = options.vpcOptions();
+        if (vpc != null && !vpc.getSubnetIds().isEmpty() && vpc.getSubnetIds().stream().anyMatch(String::isBlank)) {
+            throw new AwsException("ValidationException",
+                    "VPCOptions.SubnetIds may not contain blank entries.", 400);
+        }
+        AdvancedSecurityOptions adv = options.advancedSecurityOptions();
+        if (adv != null && adv.isEnabled() && adv.isInternalUserDatabaseEnabled()) {
+            // AWS rejects internal user db without a master user — keep
+            // emulator-side parity so Terraform plans surface the same error.
+            if (adv.getMasterUserOptions() == null
+                    || adv.getMasterUserOptions().getMasterUserName() == null
+                    || adv.getMasterUserOptions().getMasterUserName().isBlank()) {
+                throw new AwsException("ValidationException",
+                        "AdvancedSecurityOptions.MasterUserOptions.MasterUserName is required "
+                                + "when InternalUserDatabaseEnabled=true.", 400);
+            }
+        }
+        DomainEndpointOptions deo = options.domainEndpointOptions();
+        if (deo != null && deo.isCustomEndpointEnabled()
+                && (deo.getCustomEndpoint() == null || deo.getCustomEndpoint().isBlank())) {
+            throw new AwsException("ValidationException",
+                    "DomainEndpointOptions.CustomEndpoint is required when CustomEndpointEnabled=true.", 400);
+        }
+    }
+
+    /** Copy non-null fields from {@code options} onto {@code domain}. Null leaves the field untouched. */
+    private void applyDomainOptions(Domain domain, DomainOptions options) {
+        if (options == null) {
+            return;
+        }
+        if (options.vpcOptions() != null) {
+            domain.setVpcOptions(options.vpcOptions());
+        }
+        if (options.advancedSecurityOptions() != null) {
+            domain.setAdvancedSecurityOptions(options.advancedSecurityOptions());
+        }
+        if (options.encryptionAtRestOptions() != null) {
+            domain.setEncryptionAtRestOptions(options.encryptionAtRestOptions());
+        }
+        if (options.nodeToNodeEncryptionOptions() != null) {
+            domain.setNodeToNodeEncryptionOptions(options.nodeToNodeEncryptionOptions());
+        }
+        if (options.domainEndpointOptions() != null) {
+            domain.setDomainEndpointOptions(options.domainEndpointOptions());
+        }
+    }
+
     private boolean matchesEngineType(String engineVersion, String engineType) {
         if ("Elasticsearch".equalsIgnoreCase(engineType)) {
             return engineVersion != null && engineVersion.startsWith("Elasticsearch");
@@ -229,14 +338,29 @@ public class OpenSearchService {
 
     private void startReadinessPoller() {
         poller.scheduleWithFixedDelay(() -> {
-            for (Domain domain : domainStore.scan(k -> true)) {
+            for (Domain domain : allDomains()) {
                 if (domain.isProcessing() && domainManager.isReady(domain)) {
                     domain.setProcessing(false);
-                    domainStore.put(domain.getDomainName(), domain);
+                    putDomain(domain);
                     LOG.infov("OpenSearch domain {0} is ready at {1}",
                             domain.getDomainName(), domain.getEndpoint());
                 }
             }
         }, 3, 3, TimeUnit.SECONDS);
+    }
+
+    private List<Domain> allDomains() {
+        if (domainStore instanceof AccountAwareStorageBackend<Domain> aware) {
+            return aware.scanAllAccounts();
+        }
+        return domainStore.scan(k -> true);
+    }
+
+    private void putDomain(Domain domain) {
+        if (domain.getAccountId() != null && domainStore instanceof AccountAwareStorageBackend<Domain> aware) {
+            aware.putForAccount(domain.getAccountId(), domain.getDomainName(), domain);
+        } else {
+            domainStore.put(domain.getDomainName(), domain);
+        }
     }
 }

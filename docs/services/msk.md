@@ -20,21 +20,18 @@ Floci emulates Amazon MSK by orchestrating **Redpanda** containers. This provide
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    msk:
-      enabled: true
-      mock: false  # Set to true for metadata-only CRUD (no Docker)
-      default-image: "redpandadata/redpanda:latest"
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_MSK_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_MSK_MOCK` | `false` | `true` = metadata-only CRUD, no Docker containers |
+| `FLOCI_SERVICES_MSK_DEFAULT_IMAGE` | `redpandadata/redpanda:latest` | Docker image for Redpanda (Kafka) containers |
 
 ## How it works
 
 When `mock` is set to `false` (default), Floci uses the Docker API to start a Redpanda container for each created cluster. For Docker socket setup, private registry authentication, and other Docker settings see [Docker Configuration](../configuration/docker.md).
 
 - **Port Mapping**: The Kafka API (9092) is mapped to a dynamic host port.
-- **Persistence**: Data is stored in the Floci persistent path under `msk/<cluster-name>`.
+- **Persistence**: Each cluster gets a named Docker volume (`floci-msk-{volumeId}`). In memory mode the volume is removed on cluster delete; in persistent modes it is retained unless `FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE=true`.
 - **Readiness**: The cluster state transitions to `ACTIVE` once the Redpanda `/ready` endpoint is reachable.
 
 ## Examples

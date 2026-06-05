@@ -91,11 +91,12 @@ class ScheduleDispatcherTest {
     void deletesAtScheduleWhenActionAfterCompletionIsDelete() {
         Schedule s = newSchedule("at1", "at(2026-04-21T09:17:54)", "ENABLED");
         s.setActionAfterCompletion("DELETE");
+        s.setAccountId("000000000000");
         when(schedulerService.listAllSchedules()).thenReturn(List.of(s));
 
         dispatcher.tick(Instant.parse("2026-04-21T09:18:00Z"));
 
-        verify(schedulerService, times(1)).deleteSchedule("at1", "default", "eu-central-1");
+        verify(schedulerService, times(1)).deleteScheduleForAccount("000000000000", "at1", "default", "eu-central-1");
     }
 
     @Test

@@ -39,33 +39,17 @@
 
 ## Configuration
 
-Defaults under `floci.services.ecr` in `application.yml`:
-
-```yaml
-floci:
-  services:
-    ecr:
-      enabled: true
-      registry-image: "registry:2"
-      registry-container-name: floci-ecr-registry
-      registry-base-port: 5100
-      registry-max-port: 5199
-      data-path: ./data/ecr
-      tls-enabled: false
-      keep-running-on-shutdown: true
-      uri-style: hostname     # or "path"
-```
-
-| Setting | Default | Description |
-| --- | --- | --- |
-| `enabled` | `true` | Enable the ECR control plane and lazy registry start |
-| `registry-image` | `registry:2` | Backing OCI registry image |
-| `registry-container-name` | `floci-ecr-registry` | Name used for idempotent reuse across restarts |
-| `registry-base-port` / `-max-port` | `5100` / `5199` | Port range allocated for the published registry port |
-| `data-path` | `./data/ecr` | Bind-mount root for `<data-path>/registry` (the registry's `/var/lib/registry`) |
-| `keep-running-on-shutdown` | `true` | Leave the container up so the next Floci start adopts it |
-| `uri-style` | `hostname` | `hostname` returns `*.dkr.ecr.<region>.localhost`; `path` returns `localhost:<port>/<account>/<region>/<repo>` |
-| `tls-enabled` | `false` | Reserved for the future ACM-backed TLS phase |
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_ECR_ENABLED` | `true` | Enable the ECR control plane and lazy registry start |
+| `FLOCI_SERVICES_ECR_REGISTRY_IMAGE` | `registry:2` | Backing OCI registry image |
+| `FLOCI_SERVICES_ECR_REGISTRY_CONTAINER_NAME` | `floci-ecr-registry` | Container name used for idempotent reuse across restarts |
+| `FLOCI_SERVICES_ECR_REGISTRY_BASE_PORT` | `5100` | First port in the registry port range |
+| `FLOCI_SERVICES_ECR_REGISTRY_MAX_PORT` | `5199` | Last port in the registry port range |
+| `FLOCI_SERVICES_ECR_DATA_PATH` | `./data/ecr` | Bind-mount root for the registry data directory |
+| `FLOCI_SERVICES_ECR_KEEP_RUNNING_ON_SHUTDOWN` | `true` | Leave the registry container running so the next Floci start adopts it |
+| `FLOCI_SERVICES_ECR_URI_STYLE` | `hostname` | `hostname` = `*.dkr.ecr.<region>.localhost`; `path` = `localhost:<port>/<account>/<region>/<repo>` |
+| `FLOCI_SERVICES_ECR_TLS_ENABLED` | `false` | Reserved for future ACM-backed TLS |
 
 ### Docker Compose port mapping
 

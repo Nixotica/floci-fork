@@ -1,34 +1,49 @@
 package io.github.hectorvent.floci.services.apigateway;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.Integration;
 import io.github.hectorvent.floci.services.apigateway.model.IntegrationResponse;
 import io.github.hectorvent.floci.services.apigateway.model.MethodConfig;
+import io.github.hectorvent.floci.services.apigateway.model.Stage;
+import io.github.hectorvent.floci.services.apigateway.model.UsagePlan;
+import io.github.hectorvent.floci.services.apigateway.model.UsagePlanKey;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Route;
+import io.github.hectorvent.floci.services.apigatewayv2.websocket.ConnectionInfo;
+import io.github.hectorvent.floci.services.apigatewayv2.websocket.WebSocketConnectionManager;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
+import io.github.hectorvent.floci.services.elbv2.model.Listener;
+import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.smallrye.common.annotation.Blocking;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.*;
 import org.jboss.logging.Logger;
 
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -55,12 +70,16 @@ public class ApiGatewayExecuteController {
     private final ObjectMapper objectMapper;
     private final VtlTemplateEngine vtlEngine;
     private final AwsServiceRouter serviceRouter;
+    private final WebSocketConnectionManager webSocketConnectionManager;
+    private final ElbV2Service elbV2Service;
 
     @Inject
     public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, ApiGatewayV2Service apiGatewayV2Service,
                                        LambdaService lambdaService, RegionResolver regionResolver,
                                        ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
-                                       AwsServiceRouter serviceRouter) {
+                                       AwsServiceRouter serviceRouter,
+                                       WebSocketConnectionManager webSocketConnectionManager,
+                                       ElbV2Service elbV2Service) {
         this.apiGatewayService = apiGatewayService;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
@@ -68,30 +87,106 @@ public class ApiGatewayExecuteController {
         this.objectMapper = objectMapper;
         this.vtlEngine = vtlEngine;
         this.serviceRouter = serviceRouter;
+        this.webSocketConnectionManager = webSocketConnectionManager;
+        this.elbV2Service = elbV2Service;
     }
+
+    /** Matches an ELBv2 listener ARN (ALB {@code app/} or NLB {@code net/}); group 1 = region. */
+    static final Pattern ELB_LISTENER_ARN = Pattern.compile(
+            "^arn:aws[^:]*:elasticloadbalancing:([^:]+):[^:]*:listener/(?:app|net)/.+$");
 
     private record AuthorizerResult(Response errorResponse, String principalId, Map<String, Object> context) {}
 
+    // ──────────────────────────── @connections API ────────────────────────────
+
+    private static final String CONNECTIONS_PREFIX = "@connections/";
+
+    private String decodeConnectionId(String rawConnectionId) {
+        return URLDecoder.decode(rawConnectionId, StandardCharsets.UTF_8);
+    }
+
+    /** Maximum payload size for @connections POST (128 KB, matching AWS limit). */
+    private static final int MAX_CONNECTIONS_PAYLOAD_BYTES = 128 * 1024;
+
+    private Response handlePostToConnection(String connectionId, byte[] body) {
+        if (body != null && body.length > MAX_CONNECTIONS_PAYLOAD_BYTES) {
+            return Response.status(413)
+                    .entity(new AwsErrorResponse("PayloadTooLargeException", "Payload too large"))
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+        }
+        try {
+            webSocketConnectionManager.sendMessage(connectionId, new String(body, StandardCharsets.UTF_8));
+            return Response.ok().build();
+        } catch (IllegalStateException e) {
+            return Response.status(410)
+                    .entity(new AwsErrorResponse("GoneException", "GoneException"))
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+        }
+    }
+
+    private Response handleGetConnectionInfo(String connectionId) {
+        ConnectionInfo info = webSocketConnectionManager.getConnectionInfo(connectionId);
+        if (info == null) {
+            return Response.status(410)
+                    .entity(new AwsErrorResponse("GoneException", "GoneException"))
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+        }
+        String connectedAt = Instant.ofEpochMilli(info.getConnectedAt()).toString();
+        String lastActiveAt = Instant.ofEpochMilli(info.getLastActiveAt()).toString();
+        String sourceIp = info.getSourceIp() != null ? info.getSourceIp() : "127.0.0.1";
+        String userAgent = info.getUserAgent() != null ? info.getUserAgent() : "";
+        String responseBody = String.format(
+                "{\"connectedAt\":\"%s\",\"lastActiveAt\":\"%s\",\"identity\":{\"sourceIp\":\"%s\",\"userAgent\":\"%s\"}}",
+                connectedAt, lastActiveAt, sourceIp, userAgent);
+        return Response.ok(responseBody).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    private Response handleDeleteConnection(String connectionId) {
+        try {
+            webSocketConnectionManager.closeConnection(connectionId);
+            return Response.noContent().build();
+        } catch (IllegalStateException e) {
+            return Response.status(410)
+                    .entity(new AwsErrorResponse("GoneException", "GoneException"))
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+        }
+    }
+
     @GET
+    @Blocking
     @Path("/{proxy: .*}")
     public Response handleGet(@Context HttpHeaders headers, @Context UriInfo uriInfo,
                               @PathParam("apiId") String apiId,
                               @PathParam("stageName") String stageName,
                               @PathParam("proxy") String proxy) {
+        if (proxy != null && proxy.startsWith(CONNECTIONS_PREFIX)) {
+            String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
+            return handleGetConnectionInfo(connectionId);
+        }
         return dispatch("GET", apiId, stageName, proxy, headers, uriInfo, null);
     }
 
     @POST
+    @Blocking
     @Path("/{proxy: .*}")
     public Response handlePost(@Context HttpHeaders headers, @Context UriInfo uriInfo,
                                @PathParam("apiId") String apiId,
                                @PathParam("stageName") String stageName,
                                @PathParam("proxy") String proxy,
                                byte[] body) {
+        if (proxy != null && proxy.startsWith(CONNECTIONS_PREFIX)) {
+            String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
+            return handlePostToConnection(connectionId, body);
+        }
         return dispatch("POST", apiId, stageName, proxy, headers, uriInfo, body);
     }
 
     @PUT
+    @Blocking
     @Path("/{proxy: .*}")
     public Response handlePut(@Context HttpHeaders headers, @Context UriInfo uriInfo,
                               @PathParam("apiId") String apiId,
@@ -102,15 +197,21 @@ public class ApiGatewayExecuteController {
     }
 
     @DELETE
+    @Blocking
     @Path("/{proxy: .*}")
     public Response handleDelete(@Context HttpHeaders headers, @Context UriInfo uriInfo,
                                  @PathParam("apiId") String apiId,
                                  @PathParam("stageName") String stageName,
                                  @PathParam("proxy") String proxy) {
+        if (proxy != null && proxy.startsWith(CONNECTIONS_PREFIX)) {
+            String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
+            return handleDeleteConnection(connectionId);
+        }
         return dispatch("DELETE", apiId, stageName, proxy, headers, uriInfo, null);
     }
 
     @PATCH
+    @Blocking
     @Path("/{proxy: .*}")
     public Response handlePatch(@Context HttpHeaders headers, @Context UriInfo uriInfo,
                                 @PathParam("apiId") String apiId,
@@ -139,10 +240,17 @@ public class ApiGatewayExecuteController {
             return dispatchV2(httpMethod, apiId, stageName, proxy, headers, uriInfo, body, region);
         }
 
+        // Resolve region for unsigned data-plane requests
+        String auth = headers.getHeaderString("Authorization");
+        if (auth == null || auth.isBlank()) {
+            region = apiGatewayService.resolveRestApiRegion(region, apiId);
+        }
+
         // Verify API and stage exist
+        Stage stage;
         try {
             apiGatewayService.getRestApi(region, apiId);
-            apiGatewayService.getStage(region, apiId, stageName);
+            stage = apiGatewayService.getStage(region, apiId, stageName);
         } catch (AwsException e) {
             return Response.status(e.getHttpStatus())
                     .entity(jsonMessage(e.getMessage()))
@@ -162,13 +270,17 @@ public class ApiGatewayExecuteController {
 
         MethodConfig method = matched.getResourceMethods().get(httpMethod.toUpperCase());
         if (method == null) {
+            method = matched.getResourceMethods().get("ANY");
+        }
+        if (method == null) {
             return Response.status(405)
                     .entity(jsonMessage("Method Not Allowed"))
                     .type(MediaType.APPLICATION_JSON).build();
         }
 
         // 1. Authorizer
-        AuthorizerResult authorizerResult = invokeAuthorizer(region, apiId, stageName, httpMethod, path, method, headers, uriInfo);
+        String resolvedApiKey = resolveApiKeyForRequest(region, apiId, stageName, headers);
+        AuthorizerResult authorizerResult = invokeAuthorizer(region, apiId, stageName, httpMethod, path, matched.getPath(), matched.getId(), stage, method, headers, uriInfo, resolvedApiKey);
         if (authorizerResult.errorResponse() != null) return authorizerResult.errorResponse();
 
         // 2. Request validation
@@ -186,8 +298,8 @@ public class ApiGatewayExecuteController {
                 integration.getType());
 
         return switch (integration.getType().toUpperCase()) {
-            case "AWS_PROXY" -> invokeProxy(region, httpMethod, path, proxy, stageName,
-                    matched, integration, headers, uriInfo, body, authorizerResult);
+            case "AWS_PROXY" -> invokeProxy(region, apiId, httpMethod, path, proxy, stageName,
+                    matched, stage, integration, headers, uriInfo, body, authorizerResult, resolvedApiKey);
             case "AWS" -> invokeAwsIntegration(region, httpMethod, path, proxy, stageName,
                     matched, integration, headers, uriInfo, body);
             case "MOCK" -> invokeMock(region, httpMethod, path, stageName, matched, integration, headers, uriInfo, body);
@@ -199,11 +311,12 @@ public class ApiGatewayExecuteController {
 
     // ──────────────────────────── AWS_PROXY ────────────────────────────
 
-    private Response invokeProxy(String region, String httpMethod, String path, String proxy,
+    private Response invokeProxy(String region, String apiId, String httpMethod, String path, String proxy,
                                  String stageName, ApiGatewayResource resource,
+                                 Stage stage,
                                  Integration integration, HttpHeaders headers,
                                  UriInfo uriInfo, byte[] body,
-                                 AuthorizerResult authorizerResult) {
+                                 AuthorizerResult authorizerResult, String resolvedApiKey) {
         String functionName = functionNameFromUri(integration.getUri());
         if (functionName == null) {
             return Response.status(500)
@@ -212,9 +325,9 @@ public class ApiGatewayExecuteController {
         }
 
         String requestId = UUID.randomUUID().toString();
-        String eventJson = buildProxyEvent(httpMethod, path, proxy, resource.getPath(),
-                stageName, headers, uriInfo, body, requestId,
-                authorizerResult.principalId(), authorizerResult.context());
+        String eventJson = buildProxyEvent(region, apiId, httpMethod, path, proxy, resource.getPath(),
+                resource.getId(), stageName, stage, headers, uriInfo, body, requestId,
+                authorizerResult.principalId(), authorizerResult.context(), resolvedApiKey);
 
         try {
             InvokeResult result = lambdaService.invoke(region, functionName, eventJson.getBytes(),
@@ -231,8 +344,11 @@ public class ApiGatewayExecuteController {
     }
 
     private AuthorizerResult invokeAuthorizer(String region, String apiId, String stageName,
-                                              String httpMethod, String requestPath, MethodConfig method,
-                                              HttpHeaders headers, UriInfo uriInfo) {
+                                              String httpMethod, String requestPath, String resourcePath,
+                                              String resourceId,
+                                              Stage stage,
+                                              MethodConfig method,
+                                              HttpHeaders headers, UriInfo uriInfo, String resolvedApiKey) {
         if ("CUSTOM".equals(method.getAuthorizationType())) {
             String authorizerId = method.getAuthorizerId();
             if (authorizerId == null) {
@@ -245,7 +361,7 @@ public class ApiGatewayExecuteController {
                 return new AuthorizerResult(null, null, null);
             }
 
-            String event = toAuthorizerEvent(auth, headers, region, apiId, stageName, httpMethod, requestPath);
+            String event = toAuthorizerEvent(auth, headers, region, apiId, stageName, httpMethod, requestPath, resourcePath, resourceId, stage, uriInfo, resolvedApiKey);
             try {
                 InvokeResult result = lambdaService.invoke(region, lambdaName, event.getBytes(), InvocationType.RequestResponse);
                 if (result.getFunctionError() != null) {
@@ -371,15 +487,89 @@ public class ApiGatewayExecuteController {
 
     private String toAuthorizerEvent(io.github.hectorvent.floci.services.apigateway.model.Authorizer auth,
                                      HttpHeaders headers, String region, String apiId, String stageName,
-                                     String httpMethod, String requestPath) {
+                                     String httpMethod, String requestPath,
+                                     String resourcePath, String resourceId, Stage stage, UriInfo uriInfo,
+                                     String resolvedApiKey) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("type", auth.getType());
         node.put("methodArn", buildMethodArn(region, apiId, stageName, httpMethod, requestPath));
         if ("TOKEN".equals(auth.getType())) {
             String headerName = auth.getIdentitySource().replace("method.request.header.", "");
             node.put("authorizationToken", headers.getHeaderString(headerName));
+        } else if ("REQUEST".equals(auth.getType())) {
+            node.put("resource", resourcePath);
+            node.put("path", requestPath);
+            node.put("httpMethod", httpMethod);
+            putSingleValueHeaders(node, headers);
+            putMultiValueHeaders(node, headers);
+            putQueryStringParameters(node, uriInfo);
+            putMultiValueQueryStringParameters(node, uriInfo);
+
+            Map<String, String> pathParams = extractPathParams(resourcePath, requestPath);
+            ObjectNode ppNode = node.putObject("pathParameters");
+            if (!pathParams.isEmpty()) {
+                pathParams.forEach(ppNode::put);
+            }
+
+            // stageVariables: populate from the Stage object (null if no variables configured)
+            Map<String, String> stageVars = stage != null ? stage.getVariables() : null;
+            if (stageVars != null && !stageVars.isEmpty()) {
+                ObjectNode svNode = node.putObject("stageVariables");
+                stageVars.forEach(svNode::put);
+            } else {
+                node.putNull("stageVariables");
+            }
+
+            ObjectNode ctx = node.putObject("requestContext");
+            ctx.put("accountId", regionResolver.getAccountId());
+            ctx.put("apiId", apiId);
+            ctx.put("resourceId", resourceId != null ? resourceId : "");
+            ctx.put("resourcePath", resourcePath);
+            ctx.put("path", requestPath);
+            ctx.put("httpMethod", httpMethod);
+            ctx.put("stage", stageName);
+            ctx.put("requestId", UUID.randomUUID().toString());
+            ctx.put("requestTimeEpoch", System.currentTimeMillis());
+
+            // identity.apiKey: resolve from usage plans linked to this (apiId, stage)
+            ObjectNode identity = ctx.putObject("identity");
+            identity.put("sourceIp", "127.0.0.1");
+            String userAgent = headers.getHeaderString("User-Agent");
+            identity.put("userAgent", userAgent != null ? userAgent : "");
+            if (resolvedApiKey != null) {
+                identity.put("apiKey", resolvedApiKey);
+            } else {
+                identity.putNull("apiKey");
+            }
+            identity.putNull("clientCert"); // null when mTLS is not configured (Floci does not support mTLS)
         }
         return node.toString();
+    }
+
+    /**
+     * Resolves the API key value for a request by matching the {@code x-api-key} header
+     * against usage plan keys linked to this (apiId, stageName) pair.
+     *
+     * <p>Returns the key value string if a matching enabled key is found, {@code null} otherwise.
+     */
+    private String resolveApiKeyForRequest(String region, String apiId, String stageName, HttpHeaders headers) {
+        String keyHeader = headers.getHeaderString("x-api-key");
+        if (keyHeader == null || keyHeader.isBlank()) {
+            return null;
+        }
+        // Find all usage plans that include this (apiId, stage) pair
+        for (UsagePlan plan : apiGatewayService.getUsagePlans(region)) {
+            boolean planCoversStage = plan.getApiStages().stream()
+                    .anyMatch(s -> apiId.equals(s.apiId()) && stageName.equals(s.stage()));
+            if (!planCoversStage) continue;
+            // Check if any key in this plan matches the header value
+            for (UsagePlanKey planKey : apiGatewayService.getUsagePlanKeys(region, plan.getId())) {
+                if (keyHeader.equals(planKey.getValue())) {
+                    return planKey.getValue();
+                }
+            }
+        }
+        return null;
     }
 
     private String buildMethodArn(String region, String apiId, String stageName, String httpMethod, String requestPath) {
@@ -391,70 +581,97 @@ public class ApiGatewayExecuteController {
     /**
      * Extracts function name from integration URI like
      * {@code arn:aws:apigateway:...:lambda:path/2015-03-31/functions/{fnArn}/invocations}.
+     * Delegates to {@link LambdaArnUtils#extractFunctionNameFromUri(String)}.
      */
     private String functionNameFromUri(String uri) {
-        if (uri == null) {
-            return null;
-        }
-        // URI contains "function:{name}" or "function:{arn}"
-        int idx = uri.indexOf("function:");
-        if (idx < 0) {
-            return null;
-        }
-        String after = uri.substring(idx + "function:".length());
-        // after may be "myFn/invocations" or "arn:aws:lambda:...:function:myFn/invocations"
-        // If it starts with "arn:" recurse on the remaining ARN
-        if (after.startsWith("arn:")) {
-            int fnIdx = after.lastIndexOf(":function:");
-            if (fnIdx < 0) {
-                return null;
-            }
-            after = after.substring(fnIdx + ":function:".length());
-        }
-        // Strip trailing "/invocations" or any path suffix
-        int slash = after.indexOf('/');
-        return slash >= 0 ? after.substring(0, slash) : after;
+        return LambdaArnUtils.extractFunctionNameFromUri(uri);
     }
 
-    private String buildProxyEvent(String httpMethod, String path, String proxy,
-                                   String resourcePath, String stageName,
+    private String buildProxyEvent(String region, String apiId,
+                                   String httpMethod, String path, String proxy,
+                                   String resourcePath, String resourceId,
+                                   String stageName, Stage stage,
                                    HttpHeaders headers, UriInfo uriInfo,
                                    byte[] body, String requestId,
-                                   String principalId, Map<String, Object> authorizerContext) {
+                                   String principalId, Map<String, Object> authorizerContext,
+                                   String resolvedApiKey) {
         ObjectNode event = objectMapper.createObjectNode();
         event.put("resource", resourcePath);
         event.put("path", path);
         event.put("httpMethod", httpMethod);
 
-        ObjectNode headersNode = event.putObject("headers");
-        MultivaluedMap<String, String> reqHeaders = headers.getRequestHeaders();
-        for (Map.Entry<String, java.util.List<String>> e : reqHeaders.entrySet()) {
-            if (!e.getValue().isEmpty()) headersNode.put(e.getKey(), e.getValue().get(0));
-        }
-
-        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
-        if (!queryParams.isEmpty()) {
-            ObjectNode qsp = event.putObject("queryStringParameters");
-            for (Map.Entry<String, java.util.List<String>> e : queryParams.entrySet()) {
-                if (!e.getValue().isEmpty()) qsp.put(e.getKey(), e.getValue().get(0));
-            }
-        } else {
-            event.putNull("queryStringParameters");
-        }
+        putSingleValueHeaders(event, headers);
+        putMultiValueHeaders(event, headers);
+        putQueryStringParameters(event, uriInfo);
+        putMultiValueQueryStringParameters(event, uriInfo);
 
         ObjectNode pathParams = event.putObject("pathParameters");
         if (proxy != null && !proxy.isEmpty()) pathParams.put("proxy", proxy);
         extractPathParams(resourcePath, path).forEach(pathParams::put);
 
-        event.putNull("stageVariables");
+        // stageVariables: populate from the Stage object (null if no variables configured)
+        Map<String, String> stageVars = stage != null ? stage.getVariables() : null;
+        if (stageVars != null && !stageVars.isEmpty()) {
+            ObjectNode svNode = event.putObject("stageVariables");
+            stageVars.forEach(svNode::put);
+        } else {
+            event.putNull("stageVariables");
+        }
+
+        String arnRegion = region != null ? region : regionResolver.getDefaultRegion();
+        String domainName = apiId + ".execute-api." + arnRegion + ".amazonaws.com";
+        long nowMillis = System.currentTimeMillis();
+        String requestTime = java.time.format.DateTimeFormatter
+                .ofPattern("dd/MMM/yyyy:HH:mm:ss Z")
+                .format(java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC));
 
         ObjectNode ctx = event.putObject("requestContext");
-        ctx.put("resourcePath", resourcePath);
+        ctx.put("accountId", regionResolver.getAccountId());
+        ctx.put("apiId", apiId);
+        ctx.put("domainName", domainName);
+        ctx.put("domainPrefix", apiId);
+        ctx.put("extendedRequestId", requestId);
         ctx.put("httpMethod", httpMethod);
-        ctx.put("stage", stageName);
+        ctx.put("path", path);
+        ctx.put("protocol", "HTTP/1.1");
         ctx.put("requestId", requestId);
-        ctx.put("requestTimeEpoch", System.currentTimeMillis());
-        ctx.putObject("identity").put("sourceIp", "127.0.0.1");
+        ctx.put("requestTime", requestTime);
+        ctx.put("requestTimeEpoch", nowMillis);
+        ctx.put("resourceId", resourceId != null ? resourceId : "");
+        ctx.put("resourcePath", resourcePath);
+        ctx.put("stage", stageName);
+
+        // identity — full shape matching AWS proxy event spec.
+        // Fields that require auth mechanisms not implemented in v1 REST API dispatch:
+        //   - accessKey, accountId, caller, user, userArn, principalOrgId: only set for AWS_IAM auth
+        //     (v1 dispatch does not implement AWS_IAM — invokeAuthorizer only handles CUSTOM)
+        //   - cognitoIdentityId, cognitoIdentityPoolId, cognitoAuthenticationType,
+        //     cognitoAuthenticationProvider: only set for COGNITO_USER_POOLS auth (not implemented in v1)
+        //   - clientCert: only set when mutual TLS is configured (not supported in Floci)
+        // AWS sends these as explicit JSON null (not absent), so we match that wire format.
+        ObjectNode identity = ctx.putObject("identity");
+        identity.putNull("accessKey");
+        identity.putNull("accountId");
+        identity.putNull("caller");
+        identity.putNull("cognitoAuthenticationProvider");
+        identity.putNull("cognitoAuthenticationType");
+        identity.putNull("cognitoIdentityId");
+        identity.putNull("cognitoIdentityPoolId");
+        identity.putNull("principalOrgId");
+        identity.put("sourceIp", "127.0.0.1");
+        identity.putNull("user");
+        String userAgent = headers.getHeaderString("User-Agent");
+        identity.put("userAgent", userAgent != null ? userAgent : "");
+        identity.putNull("userArn");
+        identity.putNull("clientCert"); // null when mTLS is not configured (Floci does not support mTLS)
+        // apiKey: use pre-resolved value from usage plan keys linked to this (apiId, stage)
+        if (resolvedApiKey != null) {
+            identity.put("apiKey", resolvedApiKey);
+        } else {
+            identity.putNull("apiKey");
+        }
+
+        // authorizer context (set by CUSTOM authorizer)
         if (principalId != null || (authorizerContext != null && !authorizerContext.isEmpty())) {
             ObjectNode authorizerNode = ctx.putObject("authorizer");
             if (principalId != null) {
@@ -481,6 +698,46 @@ public class ApiGatewayExecuteController {
             return objectMapper.writeValueAsString(event);
         } catch (Exception e) {
             throw new RuntimeException("Failed to serialize proxy event", e);
+        }
+    }
+
+    private void putSingleValueHeaders(ObjectNode event, HttpHeaders headers) {
+        ObjectNode headersNode = event.putObject("headers");
+        headers.getRequestHeaders().forEach((name, values) -> {
+            if (!values.isEmpty()) headersNode.put(name, values.get(0));
+        });
+    }
+
+    private void putMultiValueHeaders(ObjectNode event, HttpHeaders headers) {
+        ObjectNode mvHeaders = event.putObject("multiValueHeaders");
+        headers.getRequestHeaders().forEach((name, values) -> {
+            ArrayNode arr = mvHeaders.putArray(name);
+            values.forEach(arr::add);
+        });
+    }
+
+    private void putQueryStringParameters(ObjectNode event, UriInfo uriInfo) {
+        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
+        if (!queryParams.isEmpty()) {
+            ObjectNode qsp = event.putObject("queryStringParameters");
+            queryParams.forEach((name, values) -> {
+                if (!values.isEmpty()) qsp.put(name, values.get(0));
+            });
+        } else {
+            event.putNull("queryStringParameters");
+        }
+    }
+
+    private void putMultiValueQueryStringParameters(ObjectNode event, UriInfo uriInfo) {
+        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
+        if (!queryParams.isEmpty()) {
+            ObjectNode mqsp = event.putObject("multiValueQueryStringParameters");
+            queryParams.forEach((name, values) -> {
+                ArrayNode arr = mqsp.putArray(name);
+                values.forEach(arr::add);
+            });
+        } else {
+            event.putNull("multiValueQueryStringParameters");
         }
     }
 
@@ -554,7 +811,7 @@ public class ApiGatewayExecuteController {
 
         VtlTemplateEngine.VtlContext vtlCtx = new VtlTemplateEngine.VtlContext(
                 bodyStr, headerMap, queryMap, pathMap, stageName, httpMethod,
-                resource.getPath(), requestId, "000000000000", null);
+                resource.getPath(), requestId, regionResolver.getAccountId(), null);
 
         // Apply request parameter mapping (method.request.* → integration.request.*)
         Map<String, String> integrationReqParams = integration.getRequestParameters();
@@ -725,7 +982,7 @@ public class ApiGatewayExecuteController {
                 if (responseTemplate != null && !responseTemplate.isEmpty()) {
                     VtlTemplateEngine.VtlContext responseMappingCtx = new VtlTemplateEngine.VtlContext(
                             responseBodyStr, headerMap, queryMap, pathMap, stageName, httpMethod,
-                            resource.getPath(), requestId, "000000000000", null);
+                            resource.getPath(), requestId, regionResolver.getAccountId(), null);
                     templateResult = vtlEngine.evaluate(responseTemplate, responseMappingCtx);
                     finalBody = templateResult.body();
                 } else {
@@ -860,7 +1117,7 @@ public class ApiGatewayExecuteController {
 
         VtlTemplateEngine.VtlContext vtlCtx = new VtlTemplateEngine.VtlContext(
                 bodyStr, headerMap, queryMap, pathMap, stageName, httpMethod,
-                resource.getPath(), requestId, "000000000000", null);
+                resource.getPath(), requestId, regionResolver.getAccountId(), null);
 
         VtlTemplateEngine.EvaluateResult result = vtlEngine.evaluate(template, vtlCtx);
 
@@ -898,6 +1155,11 @@ public class ApiGatewayExecuteController {
             if (authError != null) return authError;
         }
 
+        if ("CUSTOM".equalsIgnoreCase(route.getAuthorizationType()) && route.getAuthorizerId() != null) {
+            Response authError = enforceRequestAuthorizerV2(region, apiId, stageName, route, httpMethod, path, headers, uriInfo);
+            if (authError != null) return authError;
+        }
+
         if (route.getTarget() == null) {
             return Response.status(500)
                     .entity(jsonMessage("No integration configured"))
@@ -915,6 +1177,13 @@ public class ApiGatewayExecuteController {
             return Response.status(500)
                     .entity(jsonMessage("Integration not found: " + integrationId))
                     .type(MediaType.APPLICATION_JSON).build();
+        }
+
+        String integrationType = integration.getIntegrationType();
+        if (integrationType == null || integrationType.isEmpty()) integrationType = "AWS_PROXY";
+
+        if ("HTTP_PROXY".equalsIgnoreCase(integrationType)) {
+            return dispatchHttpProxyV2(integration, route, httpMethod, path, headers, uriInfo, body, apiId, stageName);
         }
 
         String functionName = functionNameFromUri(integration.getIntegrationUri());
@@ -943,6 +1212,158 @@ public class ApiGatewayExecuteController {
             throw e;
         }
     }
+
+    private final io.github.hectorvent.floci.services.apigatewayv2.proxy.HttpProxyInvoker httpProxyInvoker =
+            new io.github.hectorvent.floci.services.apigatewayv2.proxy.HttpProxyInvoker();
+
+    private Response dispatchHttpProxyV2(io.github.hectorvent.floci.services.apigatewayv2.model.Integration integration,
+                                          Route route, String httpMethod, String path,
+                                          HttpHeaders headers, UriInfo uriInfo, byte[] body,
+                                          String apiId, String stageName) {
+        // CDK HttpAlbIntegration sets integrationUri to an ALB listener ARN. Resolve it
+        // to the listener's bound localhost port so HttpProxyInvoker (which assumes a
+        // concrete http(s) URL) can forward through the listener's data plane.
+        io.github.hectorvent.floci.services.apigatewayv2.model.Integration effective = integration;
+        String integrationUri = integration.getIntegrationUri();
+        if (integrationUri != null) {
+            Matcher m = ELB_LISTENER_ARN.matcher(integrationUri);
+            if (m.matches()) {
+                String albRegion = m.group(1);
+                Integer listenerPort = resolveAlbListenerPort(albRegion, integrationUri);
+                if (listenerPort == null) {
+                    LOG.warnv("ALB listener ARN unresolvable for v2 integration: {0}", integrationUri);
+                    return Response.status(502)
+                            .entity(jsonMessage("Bad Gateway: cannot resolve ALB listener: " + integrationUri))
+                            .type(MediaType.APPLICATION_JSON).build();
+                }
+                // Use 127.0.0.1 explicitly: ElbV2DataPlane binds the listener on 0.0.0.0
+                // (IPv4-only). "localhost" resolves to ::1 first on IPv6-preferred systems,
+                // which would fail to connect.
+                String resolvedUrl = "http://127.0.0.1:" + listenerPort + path;
+                effective = withResolvedUri(integration, resolvedUrl);
+                LOG.debugv("ALB integration: listener {0} → {1}", integrationUri, resolvedUrl);
+            }
+        }
+
+        Map<String, String> requestHeaders = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> e : headers.getRequestHeaders().entrySet()) {
+            requestHeaders.put(e.getKey(), String.join(",", e.getValue()));
+        }
+        Map<String, String> queryParams = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> e : uriInfo.getQueryParameters().entrySet()) {
+            queryParams.put(e.getKey(), String.join(",", e.getValue()));
+        }
+        Map<String, String> pathParams = extractV2PathParams(route.getRouteKey(), path);
+
+        Map<String, Object> claims = Map.of();
+        if ("JWT".equalsIgnoreCase(route.getAuthorizationType())) {
+            String token = extractBearerToken(headers);
+            if (token != null) {
+                Map<String, Object> parsed = parseAllJwtClaims(token);
+                if (parsed != null) claims = parsed;
+            }
+        }
+
+        String sourceIp = requestHeaders.getOrDefault("X-Forwarded-For", "127.0.0.1");
+        io.github.hectorvent.floci.services.apigatewayv2.proxy.RequestContext ctx =
+                new io.github.hectorvent.floci.services.apigatewayv2.proxy.RequestContext(
+                        apiId, stageName, httpMethod, path,
+                        pathParams.getOrDefault("proxy", ""), route.getRouteKey(),
+                        UUID.randomUUID().toString(), sourceIp,
+                        requestHeaders, queryParams, pathParams, body,
+                        claims, Map.of());
+
+        LOG.debugv("execute-api v2: {0} {1}/{2}{3} → HTTP_PROXY {4}",
+                httpMethod, apiId, stageName, path, effective.getIntegrationUri());
+
+        io.github.hectorvent.floci.services.apigatewayv2.proxy.ProxyResult result =
+                httpProxyInvoker.invoke(effective, ctx);
+
+        Response.ResponseBuilder rb = Response.status(result.statusCode());
+        if (result.body() != null) rb.entity(result.body());
+        if (result.headers() != null) {
+            for (Map.Entry<String, String> e : result.headers().entrySet()) {
+                rb.header(e.getKey(), e.getValue());
+            }
+        }
+        return rb.build();
+    }
+
+    /** Returns the listener's bound port, or null if the ARN is unknown or describeListeners throws. */
+    private Integer resolveAlbListenerPort(String region, String listenerArn) {
+        try {
+            List<Listener> matches = elbV2Service.describeListeners(region, null, List.of(listenerArn));
+            if (matches.isEmpty()) return null;
+            return matches.get(0).getPort();
+        } catch (Exception e) {
+            LOG.warnv("describeListeners failed for {0}: {1}", listenerArn, e.getMessage());
+            return null;
+        }
+    }
+
+    /** Shallow copy with {@code integrationUri} replaced; never mutate the stored Integration. */
+    private static io.github.hectorvent.floci.services.apigatewayv2.model.Integration withResolvedUri(
+            io.github.hectorvent.floci.services.apigatewayv2.model.Integration original, String targetUri) {
+        io.github.hectorvent.floci.services.apigatewayv2.model.Integration copy =
+                new io.github.hectorvent.floci.services.apigatewayv2.model.Integration(original);
+        copy.setIntegrationUri(targetUri);
+        return copy;
+    }
+
+    private static String extractBearerToken(HttpHeaders headers) {
+        String auth = headers.getHeaderString("Authorization");
+        if (auth == null) return null;
+        if (auth.startsWith("Bearer ")) return auth.substring("Bearer ".length()).trim();
+        return null;
+    }
+
+    /** Extracts ALL JWT claims as a Map<String,Object> for use as $context.authorizer.claims.X source values. */
+    private Map<String, Object> parseAllJwtClaims(String token) {
+        try {
+            String[] parts = token.split("\\.");
+            if (parts.length < 2) return null;
+            byte[] payloadBytes = Base64.getUrlDecoder().decode(padBase64(parts[1]));
+            String payload = new String(payloadBytes, StandardCharsets.UTF_8);
+            JsonNode root = objectMapper.readTree(payload);
+            return objectMapper.convertValue(root, MAP_TYPE);
+        } catch (Exception e) {
+            LOG.debugv("JWT full-claims parse error: {0}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Captures path parameters from a route key like {@code "ANY /wallet/{proxy+}"} matched
+     * against an actual path. Compiled regexes are cached per route key so the regex is
+     * built once and reused on every subsequent request to that route.
+     */
+    static Map<String, String> extractV2PathParams(String routeKey, String actualPath) {
+        if (routeKey == null) return Map.of();
+        String[] parts = routeKey.split("\\s+", 2);
+        if (parts.length != 2) return Map.of();
+        String template = parts[1];
+
+        Pattern p = ROUTE_TEMPLATE_PATTERNS.computeIfAbsent(template, t -> {
+            String regex = t.replaceAll("\\{([a-zA-Z_]+)\\+\\}", "(?<$1>.+)")
+                            .replaceAll("\\{([a-zA-Z_]+)\\}", "(?<$1>[^/]+)");
+            return Pattern.compile("^" + regex + "$");
+        });
+        Matcher m = p.matcher(actualPath);
+        if (!m.matches()) return Map.of();
+
+        Map<String, String> result = new java.util.LinkedHashMap<>();
+        Matcher names = ROUTE_PARAM_NAMES.matcher(template);
+        while (names.find()) {
+            try { result.put(names.group(1), m.group(names.group(1))); } catch (Exception ignored) {}
+        }
+        return result;
+    }
+
+    /** Cache of compiled route-template patterns keyed by the raw template (e.g. {@code "/wallet/{proxy+}"}). */
+    private static final ConcurrentHashMap<String, Pattern> ROUTE_TEMPLATE_PATTERNS = new ConcurrentHashMap<>();
+
+    /** Extracts parameter names from a route template; the pattern itself is constant. */
+    private static final Pattern ROUTE_PARAM_NAMES = Pattern.compile("\\{([a-zA-Z_]+)\\+?\\}");
 
     private Response enforceJwtAuthorizer(String region, String apiId, Route route, HttpHeaders headers) {
         Authorizer authorizer;
@@ -984,7 +1405,10 @@ public class ApiGatewayExecuteController {
 
             List<String> audiences = authorizer.getJwtConfiguration().audience();
             if (audiences != null && !audiences.isEmpty()) {
-                boolean audMatch = audiences.stream().anyMatch(a -> a.equals(claims.aud));
+                // Cognito access tokens omit `aud` and use `client_id` instead.
+                // Match either to support both ID tokens and access tokens.
+                boolean audMatch = audiences.stream().anyMatch(a ->
+                        a.equals(claims.aud) || a.equals(claims.clientId));
                 if (!audMatch) {
                     return Response.status(401)
                             .entity(jsonMessage("Unauthorized"))
@@ -994,6 +1418,273 @@ public class ApiGatewayExecuteController {
         }
 
         return null; // authorized
+    }
+
+    // ──────────────────────────── HTTP API v2 Lambda REQUEST authorizer ────────────────────────────
+
+    /**
+     * Enforces a Lambda REQUEST authorizer on an HTTP API (v2) route.
+     * Supports both payload format versions (1.0 and 2.0) and simple responses.
+     *
+     * @return null if authorized, or an error Response if denied/unauthorized
+     */
+    private Response enforceRequestAuthorizerV2(String region, String apiId, String stageName,
+                                                Route route, String httpMethod, String path,
+                                                HttpHeaders headers, UriInfo uriInfo) {
+        Authorizer authorizer;
+        try {
+            authorizer = apiGatewayV2Service.getAuthorizer(region, apiId, route.getAuthorizerId());
+        } catch (AwsException e) {
+            return Response.status(500)
+                    .entity(jsonMessage("Authorizer not found"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+
+        if (!"REQUEST".equalsIgnoreCase(authorizer.getAuthorizerType())) {
+            return null; // Not a REQUEST authorizer — skip
+        }
+
+        // Validate identity sources — if any configured source is missing, return 401 without invoking Lambda
+        List<String> identitySources = authorizer.getIdentitySource();
+        if (identitySources != null && !identitySources.isEmpty()) {
+            MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
+            for (String expression : identitySources) {
+                if (expression.startsWith("$request.header.")) {
+                    String headerName = expression.substring("$request.header.".length());
+                    String value = headers.getHeaderString(headerName);
+                    if (value == null || value.isEmpty()) {
+                        return Response.status(401)
+                                .entity(jsonMessage("Unauthorized"))
+                                .type(MediaType.APPLICATION_JSON).build();
+                    }
+                } else if (expression.startsWith("$request.querystring.")) {
+                    String paramName = expression.substring("$request.querystring.".length());
+                    String value = queryParams.getFirst(paramName);
+                    if (value == null || value.isEmpty()) {
+                        return Response.status(401)
+                                .entity(jsonMessage("Unauthorized"))
+                                .type(MediaType.APPLICATION_JSON).build();
+                    }
+                }
+                // $context.* identity sources are always present — no validation needed
+            }
+        }
+
+        // Build the authorizer event payload based on the configured payload format version
+        String payloadFormatVersion = authorizer.getAuthorizerPayloadFormatVersion();
+        String eventJson;
+        if ("2.0".equals(payloadFormatVersion)) {
+            eventJson = buildRequestAuthorizerEventV2(httpMethod, path, route.getRouteKey(),
+                    apiId, stageName, region, headers, uriInfo);
+        } else {
+            // Default to 1.0 format
+            eventJson = buildRequestAuthorizerEventV1(httpMethod, path, apiId, stageName, region, headers, uriInfo);
+        }
+
+        // Extract the Lambda function name from the authorizer URI
+        String functionName = functionNameFromUri(authorizer.getAuthorizerUri());
+        if (functionName == null) {
+            LOG.warnv("Cannot extract function name from authorizer URI: {0}", authorizer.getAuthorizerUri());
+            return Response.status(500)
+                    .entity(jsonMessage("Internal Server Error"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+
+        // Invoke the authorizer Lambda
+        InvokeResult invokeResult;
+        try {
+            invokeResult = lambdaService.invoke(region, functionName,
+                    eventJson.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
+        } catch (Exception e) {
+            LOG.warnv("Lambda REQUEST authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
+            return Response.status(500)
+                    .entity(jsonMessage("Internal Server Error"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+
+        // Check for function error (Lambda threw an exception)
+        if (invokeResult.getFunctionError() != null) {
+            LOG.warnv("Lambda REQUEST authorizer returned function error for API {0}: {1}",
+                    apiId, invokeResult.getFunctionError());
+            return Response.status(500)
+                    .entity(jsonMessage("Internal Server Error"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+
+        byte[] payload = invokeResult.getPayload();
+        if (payload == null || payload.length == 0) {
+            LOG.warnv("Lambda REQUEST authorizer returned empty payload for API {0}", apiId);
+            return Response.status(500)
+                    .entity(jsonMessage("Internal Server Error"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+
+        // Parse the authorizer response
+        try {
+            JsonNode response = objectMapper.readTree(payload);
+
+            // Check if simple responses are enabled (format 2.0 feature)
+            Boolean enableSimpleResponses = authorizer.getEnableSimpleResponses();
+            if (Boolean.TRUE.equals(enableSimpleResponses)) {
+                // Simple response format: {"isAuthorized": true/false, "context": {...}}
+                JsonNode isAuthorized = response.path("isAuthorized");
+                if (isAuthorized.isMissingNode() || isAuthorized.isNull()) {
+                    LOG.warnv("Lambda REQUEST authorizer simple response missing isAuthorized for API {0}", apiId);
+                    return Response.status(500)
+                            .entity(jsonMessage("Internal Server Error"))
+                            .type(MediaType.APPLICATION_JSON).build();
+                }
+                if (!isAuthorized.asBoolean(false)) {
+                    return Response.status(403)
+                            .entity(jsonMessage("Forbidden"))
+                            .type(MediaType.APPLICATION_JSON).build();
+                }
+                return null; // authorized
+            }
+
+            // IAM policy document format
+            JsonNode policyDocument = response.path("policyDocument");
+            if (policyDocument.isMissingNode() || policyDocument.isNull()) {
+                LOG.warnv("Authorizer response missing policyDocument for API {0}", apiId);
+                return Response.status(500)
+                        .entity(jsonMessage("Internal Server Error"))
+                        .type(MediaType.APPLICATION_JSON).build();
+            }
+
+            JsonNode statements = policyDocument.path("Statement");
+            if (statements.isMissingNode() || statements.isNull()
+                    || !statements.isArray() || statements.isEmpty()) {
+                LOG.warnv("Authorizer response missing or empty Statement array for API {0}", apiId);
+                return Response.status(500)
+                        .entity(jsonMessage("Internal Server Error"))
+                        .type(MediaType.APPLICATION_JSON).build();
+            }
+
+            String effect = statements.get(0).path("Effect").asText("Deny");
+            if ("Deny".equalsIgnoreCase(effect)) {
+                return Response.status(403)
+                        .entity(jsonMessage("User is not authorized to access this resource"))
+                        .type(MediaType.APPLICATION_JSON).build();
+            }
+
+            if (!"Allow".equalsIgnoreCase(effect)) {
+                LOG.warnv("Authorizer response has unrecognized Effect '{0}' for API {1}", effect, apiId);
+                return Response.status(500)
+                        .entity(jsonMessage("Internal Server Error"))
+                        .type(MediaType.APPLICATION_JSON).build();
+            }
+
+            return null; // authorized
+        } catch (Exception e) {
+            LOG.warnv("Failed to parse authorizer response for API {0}: {1}", apiId, e.getMessage());
+            return Response.status(500)
+                    .entity(jsonMessage("Internal Server Error"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+    }
+
+    /**
+     * Builds a REQUEST authorizer event in payload format version 1.0.
+     * Compatible with REST API (v1) REQUEST authorizer shape.
+     */
+    private String buildRequestAuthorizerEventV1(String httpMethod, String path,
+                                                  String apiId, String stageName, String region,
+                                                  HttpHeaders headers, UriInfo uriInfo) {
+        ObjectNode event = objectMapper.createObjectNode();
+        event.put("version", "1.0");
+        event.put("type", "REQUEST");
+        event.put("methodArn", buildMethodArn(region, apiId, stageName, httpMethod, path));
+        event.put("resource", path);
+        event.put("path", path);
+        event.put("httpMethod", httpMethod);
+
+        putSingleValueHeaders(event, headers);
+        putMultiValueHeaders(event, headers);
+        putQueryStringParameters(event, uriInfo);
+        putMultiValueQueryStringParameters(event, uriInfo);
+
+        event.putObject("pathParameters");
+        event.putNull("stageVariables");
+
+        // Request context
+        ObjectNode ctx = event.putObject("requestContext");
+        ctx.put("accountId", regionResolver.getAccountId());
+        ctx.put("apiId", apiId);
+        ctx.put("httpMethod", httpMethod);
+        ctx.put("path", path);
+        ctx.put("resourcePath", path);
+        ctx.put("stage", stageName);
+        ctx.put("requestId", UUID.randomUUID().toString());
+
+        try {
+            return objectMapper.writeValueAsString(event);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize v1 authorizer event", e);
+        }
+    }
+
+    /**
+     * Builds a REQUEST authorizer event in payload format version 2.0.
+     * Uses the newer HTTP API-native shape with routeArn, routeKey, rawPath, and requestContext.http.
+     */
+    private String buildRequestAuthorizerEventV2(String httpMethod, String path, String routeKey,
+                                                  String apiId, String stageName, String region,
+                                                  HttpHeaders headers, UriInfo uriInfo) {
+        ObjectNode event = objectMapper.createObjectNode();
+        event.put("version", "2.0");
+        event.put("type", "REQUEST");
+        event.put("routeArn", buildMethodArn(region, apiId, stageName, httpMethod, path));
+        event.put("routeKey", routeKey != null ? routeKey : "$default");
+        event.put("rawPath", path);
+        event.put("rawQueryString", uriInfo.getRequestUri().getRawQuery() != null
+                ? uriInfo.getRequestUri().getRawQuery() : "");
+
+        // Headers (lowercase keys for v2)
+        ObjectNode headersNode = event.putObject("headers");
+        MultivaluedMap<String, String> reqHeaders = headers.getRequestHeaders();
+        for (Map.Entry<String, List<String>> e : reqHeaders.entrySet()) {
+            if (!e.getValue().isEmpty()) headersNode.put(e.getKey().toLowerCase(), e.getValue().get(0));
+        }
+
+        // Query string parameters
+        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
+        if (!queryParams.isEmpty()) {
+            ObjectNode qsp = event.putObject("queryStringParameters");
+            for (Map.Entry<String, List<String>> e : queryParams.entrySet()) {
+                if (!e.getValue().isEmpty()) qsp.put(e.getKey(), e.getValue().get(0));
+            }
+        }
+
+        event.putObject("pathParameters");
+        event.putNull("stageVariables");
+
+        // Request context
+        ObjectNode ctx = event.putObject("requestContext");
+        String arnRegion = region != null ? region : regionResolver.getDefaultRegion();
+        ctx.put("accountId", regionResolver.getAccountId());
+        ctx.put("apiId", apiId);
+        ctx.put("domainName", apiId + ".execute-api." + arnRegion + ".amazonaws.com");
+        ctx.put("domainPrefix", apiId);
+        ctx.put("requestId", UUID.randomUUID().toString());
+        ctx.put("routeKey", routeKey != null ? routeKey : "$default");
+        ctx.put("stage", stageName);
+        ctx.put("time", java.time.format.DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z")
+                .format(java.time.ZonedDateTime.now()));
+        ctx.put("timeEpoch", System.currentTimeMillis());
+
+        ObjectNode http = ctx.putObject("http");
+        http.put("method", httpMethod);
+        http.put("path", path);
+        http.put("protocol", "HTTP/1.1");
+        http.put("sourceIp", "127.0.0.1");
+        http.put("userAgent", headers.getHeaderString("User-Agent") != null
+                ? headers.getHeaderString("User-Agent") : "");
+
+        try {
+            return objectMapper.writeValueAsString(event);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize v2 authorizer event", e);
+        }
     }
 
     private String extractToken(Authorizer authorizer, HttpHeaders headers) {
@@ -1019,7 +1710,7 @@ public class ApiGatewayExecuteController {
         return value;
     }
 
-    private record JwtClaims(String iss, String aud, long exp) {}
+    private record JwtClaims(String iss, String aud, String clientId, long exp) {}
 
     private JwtClaims parseJwtClaims(String token) {
         try {
@@ -1030,8 +1721,11 @@ public class ApiGatewayExecuteController {
             JsonNode claims = objectMapper.readTree(payload);
             String iss = claims.path("iss").asText(null);
             String aud = claims.path("aud").asText(null);
+            // Cognito access tokens omit `aud` and use `client_id` instead. AWS HTTP API
+            // JWT authorizers accept either when matching the configured audience list.
+            String clientId = claims.path("client_id").asText(null);
             long exp = claims.path("exp").asLong(0);
-            return new JwtClaims(iss, aud, exp);
+            return new JwtClaims(iss, aud, clientId, exp);
         } catch (Exception e) {
             LOG.debugv("JWT parse error: {0}", e.getMessage());
             return null;
@@ -1046,7 +1740,7 @@ public class ApiGatewayExecuteController {
         };
     }
 
-    private String buildV2ProxyEvent(String httpMethod, String path, String routeKey,
+    String buildV2ProxyEvent(String httpMethod, String path, String routeKey,
                                      String apiId, String stageName,
                                      HttpHeaders headers, UriInfo uriInfo,
                                      byte[] body, String requestId) {
@@ -1071,8 +1765,14 @@ public class ApiGatewayExecuteController {
             }
         }
 
+        Map<String, String> pathParams = extractV2PathParams(routeKey, path);
+        if (!pathParams.isEmpty()) {
+            ObjectNode pp = event.putObject("pathParameters");
+            pathParams.forEach(pp::put);
+        }
+
         ObjectNode ctx = event.putObject("requestContext");
-        ctx.put("accountId", "000000000000");
+        ctx.put("accountId", regionResolver.getAccountId());
         ctx.put("apiId", apiId);
         ctx.put("domainName", apiId + ".execute-api.us-east-1.amazonaws.com");
         ctx.put("domainPrefix", apiId);
@@ -1116,7 +1816,7 @@ public class ApiGatewayExecuteController {
      * Finds the best-matching resource for {@code requestPath}.
      * Priority: exact match > template path match (e.g. /items/{id}) > proxy+ wildcard.
      */
-    private ApiGatewayResource matchResource(List<ApiGatewayResource> resources, String requestPath) {
+    ApiGatewayResource matchResource(List<ApiGatewayResource> resources, String requestPath) {
         // 1. Exact match
         for (ApiGatewayResource r : resources) {
             if (requestPath.equals(r.getPath())) {
@@ -1131,13 +1831,30 @@ public class ApiGatewayExecuteController {
                 }
             }
         }
-        // 3. Proxy+ wildcard — {proxy+} matches any remaining path
+        // 3. Proxy+ wildcard — {proxy+} matches longest parent prefix
+        // Requires at least one path segment after the parent prefix (except root /{proxy+})
+        ApiGatewayResource best = null;
+        int bestLen = -1;
         for (ApiGatewayResource r : resources) {
-            if (r.getPathPart() != null && r.getPathPart().contains("{")) {
-                return r;
+            if (r.getPath() == null || !r.getPath().contains("{proxy+}")) continue;
+            String parentPrefix = r.getPath().substring(0, r.getPath().indexOf("{proxy+}"));
+            // Root /{proxy+} matches everything including /
+            if ("/".equals(parentPrefix)) {
+                if (best == null) {
+                    best = r;
+                    bestLen = 0;
+                }
+                continue;
+            }
+            // Non-root proxy+ requires at least one char after the prefix
+            if (requestPath.startsWith(parentPrefix)
+                    && requestPath.length() > parentPrefix.length()
+                    && parentPrefix.length() > bestLen) {
+                best = r;
+                bestLen = parentPrefix.length();
             }
         }
-        return null;
+        return best;
     }
 
     /**

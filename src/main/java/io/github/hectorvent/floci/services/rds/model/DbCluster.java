@@ -26,7 +26,8 @@ public class DbCluster {
     private Instant createdAt;
     private int proxyPort;
 
-    private String dockerVolumeName; // null in in-memory mode; "floci-rds-<id>" otherwise
+    private String dockerVolumeName;
+    private String volumeId;
 
     // Transient — not persisted
     private transient String containerId;
@@ -108,6 +109,9 @@ public class DbCluster {
 
     public String getDockerVolumeName() { return dockerVolumeName; }
     public void setDockerVolumeName(String dockerVolumeName) { this.dockerVolumeName = dockerVolumeName; }
+
+    public String getVolumeId() { return volumeId; }
+    public void setVolumeId(String volumeId) { this.volumeId = volumeId; }
 
     public String getContainerId() { return containerId; }
     public void setContainerId(String containerId) { this.containerId = containerId; }

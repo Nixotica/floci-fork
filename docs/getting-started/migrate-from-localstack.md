@@ -56,14 +56,19 @@ The port (`4566`), credentials (`test` / `test`), and AWS SDK configuration are 
 | `LOCALSTACK_HOST` | `FLOCI_HOSTNAME` | Hostname embedded in response URLs |
 | `LOCALSTACK_HOSTNAME` | `FLOCI_HOSTNAME` | Alias — same effect |
 | `PERSISTENCE=1` | `FLOCI_STORAGE_MODE=persistent` | Enable disk persistence |
+| `PERSIST_STATE=1` | `FLOCI_STORAGE_MODE=persistent` | Alias for `PERSISTENCE` — same effect |
 | `EDGE_PORT` | `FLOCI_PORT` | Bind port override |
 | `GATEWAY_LISTEN` | `QUARKUS_HTTP_HOST` | Bind address override |
 | `LS_LOG` / `DEBUG=1` | `QUARKUS_LOG_LEVEL` | Log verbosity |
+| `DOCKER_HOST` | `FLOCI_DOCKER_DOCKER_HOST` | Docker daemon socket path or TCP address |
 | `LAMBDA_DOCKER_NETWORK` | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | Network for Lambda containers |
 | `DOCKER_NETWORK` | `FLOCI_SERVICES_DOCKER_NETWORK` | Network for all spawned containers |
 | `LAMBDA_REMOVE_CONTAINERS=1` | `FLOCI_SERVICES_LAMBDA_EPHEMERAL=true` | Remove Lambda containers after invocation |
+| `USE_SSL=1` | `FLOCI_TLS_ENABLED=true` | Enable TLS/HTTPS — see [TLS / HTTPS](../configuration/tls.md) |
+| `CUSTOM_SSL_CERT_PATH` | `FLOCI_TLS_CERT_PATH` + `FLOCI_TLS_KEY_PATH` | LocalStack accepts a single combined PEM; Floci accepts it in both fields |
 | `SERVICES` | _(not needed)_ | Floci starts all 41 services instantly; no selection required |
 | `LAMBDA_EXECUTOR` | _(not needed)_ | Floci always runs Lambda in Docker containers |
+| `LAMBDA_REMOTE_DOCKER` | _(not supported)_ | Use per-function `S3Bucket=hot-reload` instead — see [Lambda](../services/lambda.md) |
 
 ### 3 — Init scripts (no change required)
 
@@ -199,6 +204,33 @@ services:
 
 1. Switch to `latest-compat` if your init scripts use `aws` or `boto3`.
 2. LocalStack stores data in `/var/lib/localstack`; Floci uses `/app/data`.
+
+## S3 virtual-hosted style DNS
+
+If you use LocalStack's public wildcard DNS (`*.s3.localhost.localstack.cloud`) for S3 virtual-hosted style addressing, Floci supports it without any change:
+
+```java
+// This LocalStack endpoint works unchanged with Floci
+S3Client s3 = S3Client.builder()
+    .endpointOverride(URI.create("http://s3.localhost.localstack.cloud:4566"))
+    .build();
+// SDK sends to: my-bucket.s3.localhost.localstack.cloud:4566 → Floci
+```
+
+Floci also registers its own wildcard DNS domains for virtual-hosted style:
+
+| Domain | Usage |
+|---|---|
+| `*.s3.localhost.floci.io` | S3 virtual-hosted style (`bucket.s3.localhost.floci.io`) |
+| `*.localhost.floci.io` | Direct subdomain style (`bucket.localhost.floci.io`) |
+
+DNS resolution works differently depending on where the client runs:
+
+**From the host machine** — both `*.localhost.localstack.cloud` and `*.localhost.floci.io` are registered in public DNS and resolve to `127.0.0.1`. Requests reach Floci via the Docker port binding (`4566:4566`) with no extra configuration.
+
+**From inside a Docker container** — `127.0.0.1` is the container's own loopback, not Floci. Floci's embedded DNS server handles this: it resolves `*.localhost.floci.io` and `*.localhost.localstack.cloud` (and `*.localhost.localstack.cloud` subdomains) to Floci's container IP on the Docker network. Spawned containers (Lambda, RDS, ElastiCache) are automatically configured to use Floci as their DNS resolver, so virtual-hosted S3 URLs work inside them without any extra setup.
+
+See [S3 → Virtual-Hosted Style](../services/s3.md#virtual-hosted-style) for full details and SDK examples.
 
 ## What stays the same
 

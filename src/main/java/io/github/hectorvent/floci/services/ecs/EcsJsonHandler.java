@@ -1,17 +1,22 @@
 package io.github.hectorvent.floci.services.ecs;
 
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ecs.model.Attribute;
+import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.CapacityProvider;
 import io.github.hectorvent.floci.services.ecs.model.ClusterSetting;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.ContainerInstance;
+import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
 import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
+import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
 import io.github.hectorvent.floci.services.ecs.model.EcsServiceModel;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.NetworkBinding;
+import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import io.github.hectorvent.floci.services.ecs.model.PortMapping;
 import io.github.hectorvent.floci.services.ecs.model.ProtectedTask;
@@ -127,7 +132,8 @@ public class EcsJsonHandler {
 
     private Response handleCreateCluster(JsonNode req, String region) {
         String name = req.path("clusterName").asText(null);
-        EcsCluster cluster = service.createCluster(name, region);
+        Map<String, String> tags = parseTagMap(req.path("tags"));
+        EcsCluster cluster = service.createCluster(name, tags, region);
         ObjectNode resp = objectMapper.createObjectNode();
         resp.set("cluster", clusterNode(cluster));
         return Response.ok(resp).build();
@@ -197,8 +203,12 @@ public class EcsJsonHandler {
         NetworkMode networkMode = parseEnum(req, "networkMode", NetworkMode.class);
         String cpu = req.has("cpu") ? req.path("cpu").asText() : null;
         String memory = req.has("memory") ? req.path("memory").asText() : null;
+        String taskRoleArn = req.hasNonNull("taskRoleArn") ? req.path("taskRoleArn").asText() : null;
+        String executionRoleArn = req.hasNonNull("executionRoleArn") ? req.path("executionRoleArn").asText() : null;
+        Map<String, String> tags = parseTagMap(req.path("tags"));
 
-        TaskDefinition td = service.registerTaskDefinition(family, containerDefs, networkMode, cpu, memory, region);
+        TaskDefinition td = service.registerTaskDefinition(family, containerDefs, networkMode, cpu, memory,
+                taskRoleArn, executionRoleArn, tags, region);
 
         ObjectNode resp = objectMapper.createObjectNode();
         resp.set("taskDefinition", taskDefinitionNode(td));
@@ -262,9 +272,11 @@ public class EcsJsonHandler {
         LaunchType launchType = parseEnum(req, "launchType", LaunchType.class);
         String group = req.has("group") ? req.path("group").asText() : null;
         String startedBy = req.has("startedBy") ? req.path("startedBy").asText() : null;
+        List<ContainerOverride> containerOverrides =
+                parseContainerOverrides(req.path("overrides").path("containerOverrides"));
 
         List<EcsTask> launched = service.runTask(cluster, taskDefinition, count,
-                launchType, group, startedBy, region);
+                launchType, group, startedBy, containerOverrides, region);
 
         ObjectNode resp = objectMapper.createObjectNode();
         ArrayNode arr = objectMapper.createArrayNode();
@@ -370,13 +382,75 @@ public class EcsJsonHandler {
         String taskDefinition = req.path("taskDefinition").asText();
         int desiredCount = req.path("desiredCount").asInt(1);
         LaunchType launchType = parseEnum(req, "launchType", LaunchType.class);
+        List<EcsLoadBalancer> loadBalancers = parseLoadBalancers(req.path("loadBalancers"));
+        NetworkConfiguration networkConfiguration = parseNetworkConfiguration(req.path("networkConfiguration"));
+        Map<String, String> tags = parseTagMap(req.path("tags"));
 
         EcsServiceModel svc = service.createService(cluster, serviceName, taskDefinition,
-                desiredCount, launchType, region);
+                desiredCount, launchType, loadBalancers, networkConfiguration, tags, region);
 
         ObjectNode resp = objectMapper.createObjectNode();
         resp.set("service", serviceNode(svc));
         return Response.ok(resp).build();
+    }
+
+    private List<EcsLoadBalancer> parseLoadBalancers(JsonNode node) {
+        List<EcsLoadBalancer> result = new ArrayList<>();
+        if (node == null || !node.isArray()) {
+            return result;
+        }
+        for (JsonNode lb : node) {
+            String targetGroupArn = lb.hasNonNull("targetGroupArn")
+                    ? lb.path("targetGroupArn").asText() : null;
+            String loadBalancerName = lb.hasNonNull("loadBalancerName")
+                    ? lb.path("loadBalancerName").asText() : null;
+            String containerName = lb.hasNonNull("containerName")
+                    ? lb.path("containerName").asText() : null;
+            Integer containerPort = lb.hasNonNull("containerPort")
+                    ? lb.path("containerPort").asInt() : null;
+
+            // AWS rejects malformed loadBalancers entries with InvalidParameterException.
+            // containerName + containerPort are always required; an entry must target
+            // either a target group (ALB/NLB) or a classic load balancer by name.
+            if (containerName == null || containerName.isBlank()) {
+                throw new AwsException("InvalidParameterException",
+                        "loadBalancers entry is missing the required containerName.", 400);
+            }
+            if (containerPort == null) {
+                throw new AwsException("InvalidParameterException",
+                        "loadBalancers entry is missing the required containerPort.", 400);
+            }
+            boolean hasTargetGroup = targetGroupArn != null && !targetGroupArn.isBlank();
+            boolean hasLoadBalancerName = loadBalancerName != null && !loadBalancerName.isBlank();
+            if (!hasTargetGroup && !hasLoadBalancerName) {
+                throw new AwsException("InvalidParameterException",
+                        "loadBalancers entry must specify either targetGroupArn or loadBalancerName.", 400);
+            }
+
+            EcsLoadBalancer m = new EcsLoadBalancer();
+            m.setTargetGroupArn(targetGroupArn);
+            m.setLoadBalancerName(loadBalancerName);
+            m.setContainerName(containerName);
+            m.setContainerPort(containerPort);
+            result.add(m);
+        }
+        return result;
+    }
+
+    private NetworkConfiguration parseNetworkConfiguration(JsonNode node) {
+        if (node == null || !node.isObject() || !node.hasNonNull("awsvpcConfiguration")) {
+            return null;
+        }
+        JsonNode awsvpc = node.path("awsvpcConfiguration");
+        AwsVpcConfiguration awsvpcConfig = new AwsVpcConfiguration();
+        awsvpcConfig.setSubnets(jsonArrayToList(awsvpc.path("subnets")));
+        awsvpcConfig.setSecurityGroups(jsonArrayToList(awsvpc.path("securityGroups")));
+        if (awsvpc.hasNonNull("assignPublicIp")) {
+            awsvpcConfig.setAssignPublicIp(awsvpc.path("assignPublicIp").asText());
+        }
+        NetworkConfiguration networkConfiguration = new NetworkConfiguration();
+        networkConfiguration.setAwsvpcConfiguration(awsvpcConfig);
+        return networkConfiguration;
     }
 
     private Response handleUpdateService(JsonNode req, String region) {
@@ -384,8 +458,10 @@ public class EcsJsonHandler {
         String serviceName = req.path("service").asText();
         String taskDefinition = req.has("taskDefinition") ? req.path("taskDefinition").asText() : null;
         Integer desiredCount = req.has("desiredCount") ? req.path("desiredCount").asInt() : null;
+        NetworkConfiguration networkConfiguration = parseNetworkConfiguration(req.path("networkConfiguration"));
 
-        EcsServiceModel svc = service.updateService(cluster, serviceName, taskDefinition, desiredCount, region);
+        EcsServiceModel svc = service.updateService(cluster, serviceName, taskDefinition, desiredCount,
+                networkConfiguration, region);
 
         ObjectNode resp = objectMapper.createObjectNode();
         resp.set("service", serviceNode(svc));
@@ -839,6 +915,8 @@ public class EcsJsonHandler {
         }
         if (td.getCpu() != null) { n.put("cpu", td.getCpu()); }
         if (td.getMemory() != null) { n.put("memory", td.getMemory()); }
+        if (td.getTaskRoleArn() != null) { n.put("taskRoleArn", td.getTaskRoleArn()); }
+        if (td.getExecutionRoleArn() != null) { n.put("executionRoleArn", td.getExecutionRoleArn()); }
 
         ArrayNode containers = objectMapper.createArrayNode();
         if (td.getContainerDefinitions() != null) {
@@ -954,6 +1032,35 @@ public class EcsJsonHandler {
         if (s.getNamespace() != null) { n.put("namespace", s.getNamespace()); }
         if (s.getTags() != null && !s.getTags().isEmpty()) {
             n.set("tags", tagsNode(s.getTags()));
+        }
+        if (s.getLoadBalancers() != null && !s.getLoadBalancers().isEmpty()) {
+            ArrayNode lbs = objectMapper.createArrayNode();
+            for (EcsLoadBalancer lb : s.getLoadBalancers()) {
+                ObjectNode ln = objectMapper.createObjectNode();
+                if (lb.getTargetGroupArn() != null) { ln.put("targetGroupArn", lb.getTargetGroupArn()); }
+                if (lb.getLoadBalancerName() != null) { ln.put("loadBalancerName", lb.getLoadBalancerName()); }
+                if (lb.getContainerName() != null) { ln.put("containerName", lb.getContainerName()); }
+                if (lb.getContainerPort() != null) { ln.put("containerPort", lb.getContainerPort()); }
+                lbs.add(ln);
+            }
+            n.set("loadBalancers", lbs);
+        }
+        if (s.getNetworkConfiguration() != null
+                && s.getNetworkConfiguration().getAwsvpcConfiguration() != null) {
+            AwsVpcConfiguration awsvpc = s.getNetworkConfiguration().getAwsvpcConfiguration();
+            ObjectNode awsvpcNode = objectMapper.createObjectNode();
+            ArrayNode subnets = objectMapper.createArrayNode();
+            awsvpc.getSubnets().forEach(subnets::add);
+            awsvpcNode.set("subnets", subnets);
+            ArrayNode securityGroups = objectMapper.createArrayNode();
+            awsvpc.getSecurityGroups().forEach(securityGroups::add);
+            awsvpcNode.set("securityGroups", securityGroups);
+            if (awsvpc.getAssignPublicIp() != null) {
+                awsvpcNode.put("assignPublicIp", awsvpc.getAssignPublicIp());
+            }
+            ObjectNode networkConfig = objectMapper.createObjectNode();
+            networkConfig.set("awsvpcConfiguration", awsvpcNode);
+            n.set("networkConfiguration", networkConfig);
         }
         return n;
     }
@@ -1131,6 +1238,25 @@ public class EcsJsonHandler {
         }
         for (JsonNode item : node) {
             result.add(new KeyValuePair(item.path("name").asText(), item.path("value").asText()));
+        }
+        return result;
+    }
+
+    private List<ContainerOverride> parseContainerOverrides(JsonNode node) {
+        List<ContainerOverride> result = new ArrayList<>();
+        if (!node.isArray()) {
+            return result;
+        }
+        for (JsonNode item : node) {
+            ContainerOverride co = new ContainerOverride();
+            co.setName(item.path("name").asText());
+            if (item.has("command") && item.path("command").isArray()) {
+                List<String> cmd = new ArrayList<>();
+                item.path("command").forEach(c -> cmd.add(c.asText()));
+                co.setCommand(cmd);
+            }
+            co.setEnvironment(parseKeyValuePairs(item.path("environment")));
+            result.add(co);
         }
         return result;
     }

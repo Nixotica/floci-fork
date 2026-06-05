@@ -1,13 +1,21 @@
 package io.github.hectorvent.floci.services.ec2;
 
-import io.quarkus.test.junit.QuarkusTest;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.startsWith;
+import static org.hamcrest.Matchers.containsString;
+
+import java.util.List;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import io.quarkus.test.junit.QuarkusTest;
 import static io.restassured.RestAssured.given;
-import static org.hamcrest.Matchers.*;
 
 /**
  * Integration tests for EC2 via the EC2 Query Protocol (form-encoded POST, XML response).
@@ -30,6 +38,8 @@ class Ec2IntegrationTest {
     private static String allocationId;
     private static String associationId;
     private static String volumeId;
+    private static String rootVolumeId;
+    private static String networkInterfaceId;
 
     // =========================================================================
     // Default resources
@@ -275,6 +285,22 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeSubnetsResponse.subnetSet.item.subnetId", equalTo(subnetId));
+    }
+
+    @Test
+    @Order(21)
+    void createSubnetHasAssignIpv6AddressOnCreation() {
+        given()
+            .formParam("Action", "DescribeSubnets")
+            .formParam("SubnetId.1", subnetId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeSubnetsResponse.subnetSet.item.assignIpv6AddressOnCreation", equalTo("false"))
+            .body("DescribeSubnetsResponse.subnetSet.item.enableDns64", equalTo("false"))
+            .body("DescribeSubnetsResponse.subnetSet.item.mapCustomerOwnedIpOnLaunch", equalTo("false"));
     }
 
     @Test
@@ -614,7 +640,7 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("RunInstancesResponse.instancesSet.item.instanceId", startsWith("i-"))
-            .body("RunInstancesResponse.instancesSet.item.instanceState.name", equalTo("running"))
+            .body("RunInstancesResponse.instancesSet.item.instanceState.name", equalTo("pending"))
             .body("RunInstancesResponse.instancesSet.item.instanceType", equalTo("t2.micro"))
             .body("RunInstancesResponse.instancesSet.item.keyName", equalTo("test-key"))
             .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
@@ -639,6 +665,85 @@ class Ec2IntegrationTest {
 
     @Test
     @Order(82)
+    void describeInstancesBlockDeviceMappingHasVolumeId() {
+        given()
+            .formParam("Action", "DescribeInstances")
+            .formParam("InstanceId.1", instanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.blockDeviceMapping.item.deviceName",
+                    equalTo("/dev/xvda"))
+            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.blockDeviceMapping.item.ebs.volumeId",
+                    startsWith("vol-"))
+            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.blockDeviceMapping.item.ebs.status",
+                    equalTo("attached"))
+            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.blockDeviceMapping.item.ebs.deleteOnTermination",
+                    equalTo("true"));
+    }
+
+    @Test
+    @Order(83)
+    void rootVolumeAppearsInDescribeVolumes() {
+        // Extract the root volume ID from DescribeInstances
+        String rootVolId = given()
+            .formParam("Action", "DescribeInstances")
+            .formParam("InstanceId.1", instanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .extract().path("DescribeInstancesResponse.reservationSet.item.instancesSet.item.blockDeviceMapping.item.ebs.volumeId");
+
+        // Verify it exists in DescribeVolumes with state=in-use
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("VolumeId.1", rootVolId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVolumesResponse.volumeSet.item.volumeId", equalTo(rootVolId))
+            .body("DescribeVolumesResponse.volumeSet.item.status", equalTo("in-use"));
+    }
+
+    @Test
+    @Order(84)
+    void describeInstanceAttributeDisableApiStop() {
+        given()
+            .formParam("Action", "DescribeInstanceAttribute")
+            .formParam("InstanceId", instanceId)
+            .formParam("Attribute", "disableApiStop")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceAttributeResponse.instanceId", equalTo(instanceId))
+            .body("DescribeInstanceAttributeResponse.disableApiStop.value", equalTo("false"));
+    }
+
+    @Test
+    @Order(85)
+    void describeInstanceAttributeDisableApiTermination() {
+        given()
+            .formParam("Action", "DescribeInstanceAttribute")
+            .formParam("InstanceId", instanceId)
+            .formParam("Attribute", "disableApiTermination")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceAttributeResponse.instanceId", equalTo(instanceId))
+            .body("DescribeInstanceAttributeResponse.disableApiTermination.value", equalTo("false"));
+    }
+
+    @Test
+    @Order(86)
     void describeInstancesByFilter() {
         given()
             .formParam("Action", "DescribeInstances")
@@ -654,7 +759,7 @@ class Ec2IntegrationTest {
     }
 
     @Test
-    @Order(83)
+    @Order(87)
     void describeInstanceStatus() {
         given()
             .formParam("Action", "DescribeInstanceStatus")
@@ -669,7 +774,7 @@ class Ec2IntegrationTest {
     }
 
     @Test
-    @Order(84)
+    @Order(88)
     void associateAddressToInstance() {
         associationId = given()
             .formParam("Action", "AssociateAddress")
@@ -685,7 +790,7 @@ class Ec2IntegrationTest {
     }
 
     @Test
-    @Order(85)
+    @Order(89)
     void stopInstance() {
         given()
             .formParam("Action", "StopInstances")
@@ -700,7 +805,7 @@ class Ec2IntegrationTest {
     }
 
     @Test
-    @Order(86)
+    @Order(89)
     void startInstance() {
         given()
             .formParam("Action", "StartInstances")
@@ -715,7 +820,7 @@ class Ec2IntegrationTest {
     }
 
     @Test
-    @Order(87)
+    @Order(89)
     void rebootInstance() {
         given()
             .formParam("Action", "RebootInstances")
@@ -726,6 +831,71 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("RebootInstancesResponse.return", equalTo("true"));
+    }
+
+    // =========================================================================
+    // Network Interfaces
+    // =========================================================================
+
+    @Test
+    @Order(79)
+    void describeNetworkInterfacesBeforeRun() {
+        // Before any instances exist, the set should be empty
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(88)
+    void describeNetworkInterfacesAfterRun() {
+        networkInterfaceId = given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()", greaterThanOrEqualTo(1))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].networkInterfaceId",
+                    startsWith("eni-"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].vpcId", notNullValue())
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].subnetId", notNullValue())
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].status", equalTo("in-use"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].privateIpAddress",
+                    notNullValue())
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].attachment.attachmentId",
+                    startsWith("eni-attach-"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].attachment.deviceIndex",
+                    equalTo("0"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].attachment.instanceId",
+                    notNullValue())
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].groupSet.item.size()",
+                    greaterThanOrEqualTo(1))
+            .extract().path("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].networkInterfaceId");
+    }
+
+    @Test
+    @Order(89)
+    void describeNetworkInterfacesByFilter() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("NetworkInterfaceId.1", networkInterfaceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()", equalTo(1))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].networkInterfaceId",
+                    equalTo(networkInterfaceId));
     }
 
     // =========================================================================
@@ -806,6 +976,353 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeTagsResponse.tagSet.item.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesFullFields() {
+        // Phase 3: Full field coverage — privateIpAddressesSet, association, tagSet, enriched attachment
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("NetworkInterfaceId.1", networkInterfaceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            // availabilityZone from instance placement
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].availabilityZone",
+                    startsWith("us-east-1"))
+            // tagSet propagated from instance tags (created at Order 90)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].tagSet.item[0].key",
+                    equalTo("Name"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].tagSet.item[0].value",
+                    equalTo("test-instance"))
+            // attachment: attachTime (from instance launchTime) and deleteOnTermination
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].attachment.attachTime",
+                    notNullValue())
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].attachment.deleteOnTermination",
+                    equalTo("true"))
+            // privateIpAddressesSet with primary IP and EIP association (from Order 84)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0]." +
+                    "privateIpAddressesSet.item[0].privateIpAddress", notNullValue())
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0]." +
+                    "privateIpAddressesSet.item[0].primary", equalTo("true"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0]." +
+                    "privateIpAddressesSet.item[0].association.publicIp", notNullValue())
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0]." +
+                    "privateIpAddressesSet.item[0].association.allocationId",
+                    startsWith("eipalloc-"));
+    }
+
+    // =========================================================================
+    // Network Interfaces — Filter tests (Phase 4)
+    // =========================================================================
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesFilterBySubnetId() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("Filter.1.Name", "subnet-id")
+            .formParam("Filter.1.Value.1", subnetId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
+                    greaterThanOrEqualTo(1))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].subnetId",
+                    equalTo(subnetId));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesFilterByVpcId() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("Filter.1.Name", "vpc-id")
+            .formParam("Filter.1.Value.1", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
+                    greaterThanOrEqualTo(1))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].vpcId",
+                    equalTo(vpcId));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesFilterByGroupId() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("Filter.1.Name", "group-id")
+            .formParam("Filter.1.Value.1", securityGroupId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
+                    greaterThanOrEqualTo(1));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesFilterByStatus() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("Filter.1.Name", "status")
+            .formParam("Filter.1.Value.1", "in-use")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
+                    greaterThanOrEqualTo(1))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].status",
+                    equalTo("in-use"));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesFilterByTag() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("Filter.1.Name", "tag:Name")
+            .formParam("Filter.1.Value.1", "test-instance")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
+                    greaterThanOrEqualTo(1));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesFilterNoMatch() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("Filter.1.Name", "status")
+            .formParam("Filter.1.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
+                    equalTo(0));
+    }
+
+    // =========================================================================
+    // Network Interfaces — Pagination (Phase 5)
+    // =========================================================================
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesMaxResultsTooLow() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("MaxResults", "4")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidMaxResults"));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesMaxResultsTooHigh() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("MaxResults", "1001")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidMaxResults"));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesMaxResultsNonNumeric() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("MaxResults", "abc")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidMaxResults"));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesMaxResultsWithNetworkInterfaceId() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("NetworkInterfaceId.1", networkInterfaceId)
+            .formParam("MaxResults", "5")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterCombination"));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesInvalidNextToken() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("NextToken", "invalid-token")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesWithMaxResultsNoNextToken() {
+        // When MaxResults exceeds the number of available ENIs,
+        // all results are returned and nextToken is omitted.
+        // This test works regardless of how many instances exist
+        // (including zero, e.g. when run in isolation).
+        String body = given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("MaxResults", "5")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+        .extract().body().asString();
+
+        org.hamcrest.MatcherAssert.assertThat(body, not(containsString("<nextToken>")));
+    }
+
+    // =========================================================================
+    // Network Interfaces — Error Handling (Phase 6)
+    // =========================================================================
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesNotFound() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("NetworkInterfaceId.1", "eni-0000000000000dead")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidNetworkInterfaceID.NotFound"));
+    }
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesMalformed() {
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("NetworkInterfaceId.1", "not-an-eni-id")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidNetworkInterfaceID.Malformed"));
+    }
+
+    // =========================================================================
+    // Network Interfaces — Multipage Pagination (Phase 5 completion)
+    // =========================================================================
+    //
+    // Self-contained test: launches additional instances, tests full
+    // pagination cycle (MaxResults truncation + NextToken continuation),
+    // then terminates the extra instances. Does not affect other tests.
+
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesMultipagePagination() {
+        // ── Launch 5 additional instances to have 6 total ENIs ──
+        List<String> batchIds = given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-0abcdef1234567890")
+            .formParam("InstanceType", "t2.micro")
+            .formParam("MinCount", "5")
+            .formParam("MaxCount", "5")
+            .formParam("KeyName", "test-key")
+            .formParam("SubnetId", subnetId)
+            .formParam("SecurityGroupId.1", securityGroupId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+        .extract().xmlPath().getList("RunInstancesResponse.instancesSet.item.instanceId", String.class);
+
+        assert batchIds.size() == 5 : "Expected 5 new instances, got " + batchIds.size();
+
+        // ── Page 1: MaxResults=5, expect 5 ENIs + nextToken ──
+        String nextToken = given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("MaxResults", "5")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()", equalTo(5))
+            .body("DescribeNetworkInterfacesResponse.nextToken", notNullValue())
+        .extract().path("DescribeNetworkInterfacesResponse.nextToken");
+
+        assert nextToken != null && !nextToken.isEmpty() : "Expected non-empty nextToken on truncated page";
+
+        // ── Page 2: use NextToken, expect remaining ENIs, no nextToken ──
+        String body = given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("MaxResults", "5")
+            .formParam("NextToken", nextToken)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
+                    org.hamcrest.Matchers.greaterThanOrEqualTo(1))
+        .extract().body().asString();
+
+        // Final page must NOT contain a nextToken element
+        org.hamcrest.MatcherAssert.assertThat(body,
+                not(containsString("<nextToken>")));
+
+        // ── Cleanup: terminate the 5 extra instances ──
+        for (String id : batchIds) {
+            given()
+                .formParam("Action", "TerminateInstances")
+                .formParam("InstanceId.1", id)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+        }
     }
 
     // =========================================================================
@@ -919,6 +1436,16 @@ class Ec2IntegrationTest {
     @Test
     @Order(100)
     void terminateInstance() {
+        // Capture root volume ID before termination
+        rootVolumeId = given()
+            .formParam("Action", "DescribeInstances")
+            .formParam("InstanceId.1", instanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .extract().path("DescribeInstancesResponse.reservationSet.item.instancesSet.item.blockDeviceMapping.item.ebs.volumeId");
+
         given()
             .formParam("Action", "TerminateInstances")
             .formParam("InstanceId.1", instanceId)
@@ -929,6 +1456,20 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .body("TerminateInstancesResponse.instancesSet.item.instanceId", equalTo(instanceId))
             .body("TerminateInstancesResponse.instancesSet.item.currentState.name", equalTo("shutting-down"));
+    }
+
+    @Test
+    @Order(100)
+    void rootVolumeDeletedAfterTermination() {
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("VolumeId.1", rootVolumeId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidVolume.NotFound"));
     }
 
     @Test
@@ -1116,5 +1657,127 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(400)
             .body("Response.Errors.Error.Code", equalTo("UnsupportedOperation"));
+    }
+
+    // =========================================================================
+    // Wildcard filtering
+    // =========================================================================
+
+    @Test
+    @Order(300)
+    void describeVpcsWithWildcardTagFilter() {
+        // Create a VPC with a specific tag value
+        String vpcWithWildcard = given()
+            .formParam("Action", "CreateVpc")
+            .formParam("CidrBlock", "10.1.0.0/16")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateVpcResponse.vpc.vpcId");
+
+        // Tag it with BEGINANDEND
+        given()
+            .formParam("Action", "CreateTags")
+            .formParam("ResourceId.1", vpcWithWildcard)
+            .formParam("Tag.1.Key", "Name")
+            .formParam("Tag.1.Value", "BEGINANDEND")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Test exact match still works
+        given()
+            .formParam("Action", "DescribeVpcs")
+            .formParam("Filter.1.Name", "tag:Name")
+            .formParam("Filter.1.Value.1", "BEGINANDEND")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcsResponse.vpcSet.item.vpcId", equalTo(vpcWithWildcard));
+
+        // Test wildcard with asterisk: BEGIN*END should match BEGINANDEND
+        given()
+            .formParam("Action", "DescribeVpcs")
+            .formParam("Filter.1.Name", "tag:Name")
+            .formParam("Filter.1.Value.1", "BEGIN*END")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcsResponse.vpcSet.item.vpcId", equalTo(vpcWithWildcard));
+
+        // Test wildcard with middle asterisk: *AND* should match BEGINANDEND
+        given()
+            .formParam("Action", "DescribeVpcs")
+            .formParam("Filter.1.Name", "tag:Name")
+            .formParam("Filter.1.Value.1", "*AND*")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcsResponse.vpcSet.item.vpcId", equalTo(vpcWithWildcard));
+
+        // Cleanup
+        given()
+            .formParam("Action", "DeleteVpc")
+            .formParam("VpcId", vpcWithWildcard)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/");
+    }
+
+    @Test
+    @Order(301)
+    void describeVpcsWithWildcardQuestionMark() {
+        // Create a VPC with a specific tag value
+        String vpcId1 = given()
+            .formParam("Action", "CreateVpc")
+            .formParam("CidrBlock", "10.2.0.0/16")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateVpcResponse.vpc.vpcId");
+
+        // Tag it with "test1"
+        given()
+            .formParam("Action", "CreateTags")
+            .formParam("ResourceId.1", vpcId1)
+            .formParam("Tag.1.Key", "Name")
+            .formParam("Tag.1.Value", "test1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Test wildcard with question mark: test? should match test1
+        given()
+            .formParam("Action", "DescribeVpcs")
+            .formParam("Filter.1.Name", "tag:Name")
+            .formParam("Filter.1.Value.1", "test?")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcsResponse.vpcSet.item.vpcId", equalTo(vpcId1));
+
+        // Cleanup
+        given()
+            .formParam("Action", "DeleteVpc")
+            .formParam("VpcId", vpcId1)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/");
     }
 }

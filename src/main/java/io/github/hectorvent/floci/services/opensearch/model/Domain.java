@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.opensearch.model;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
@@ -23,7 +24,7 @@ public class Domain {
     private String arn;
 
     @JsonProperty("EngineVersion")
-    private String engineVersion = "OpenSearch_2.11";
+    private String engineVersion;
 
     @JsonProperty("Processing")
     private boolean processing = false;
@@ -37,6 +38,21 @@ public class Domain {
     @JsonProperty("EBSOptions")
     private EbsOptions ebsOptions = new EbsOptions();
 
+    @JsonProperty("VPCOptions")
+    private VpcOptions vpcOptions;
+
+    @JsonProperty("AdvancedSecurityOptions")
+    private AdvancedSecurityOptions advancedSecurityOptions;
+
+    @JsonProperty("EncryptionAtRestOptions")
+    private EncryptionAtRestOptions encryptionAtRestOptions;
+
+    @JsonProperty("NodeToNodeEncryptionOptions")
+    private NodeToNodeEncryptionOptions nodeToNodeEncryptionOptions;
+
+    @JsonProperty("DomainEndpointOptions")
+    private DomainEndpointOptions domainEndpointOptions;
+
     @JsonProperty("Endpoint")
     private String endpoint = "";
 
@@ -45,6 +61,12 @@ public class Domain {
 
     @JsonProperty("ContainerId")
     private String containerId;
+
+    @JsonIgnore
+    private String accountId;
+
+    @JsonProperty("VolumeId")
+    private String volumeId;
 
     @JsonProperty("CreatedAt")
     @JsonFormat(shape = JsonFormat.Shape.NUMBER)
@@ -116,6 +138,46 @@ public class Domain {
         this.ebsOptions = ebsOptions;
     }
 
+    public VpcOptions getVpcOptions() {
+        return vpcOptions;
+    }
+
+    public void setVpcOptions(VpcOptions vpcOptions) {
+        this.vpcOptions = vpcOptions;
+    }
+
+    public AdvancedSecurityOptions getAdvancedSecurityOptions() {
+        return advancedSecurityOptions;
+    }
+
+    public void setAdvancedSecurityOptions(AdvancedSecurityOptions advancedSecurityOptions) {
+        this.advancedSecurityOptions = advancedSecurityOptions;
+    }
+
+    public EncryptionAtRestOptions getEncryptionAtRestOptions() {
+        return encryptionAtRestOptions;
+    }
+
+    public void setEncryptionAtRestOptions(EncryptionAtRestOptions encryptionAtRestOptions) {
+        this.encryptionAtRestOptions = encryptionAtRestOptions;
+    }
+
+    public NodeToNodeEncryptionOptions getNodeToNodeEncryptionOptions() {
+        return nodeToNodeEncryptionOptions;
+    }
+
+    public void setNodeToNodeEncryptionOptions(NodeToNodeEncryptionOptions nodeToNodeEncryptionOptions) {
+        this.nodeToNodeEncryptionOptions = nodeToNodeEncryptionOptions;
+    }
+
+    public DomainEndpointOptions getDomainEndpointOptions() {
+        return domainEndpointOptions;
+    }
+
+    public void setDomainEndpointOptions(DomainEndpointOptions domainEndpointOptions) {
+        this.domainEndpointOptions = domainEndpointOptions;
+    }
+
     public String getEndpoint() {
         return endpoint;
     }
@@ -140,11 +202,27 @@ public class Domain {
         this.containerId = containerId;
     }
 
+    public String getVolumeId() {
+        return volumeId;
+    }
+
+    public void setVolumeId(String volumeId) {
+        this.volumeId = volumeId;
+    }
+
     public Instant getCreatedAt() {
         return createdAt;
     }
 
     public void setCreatedAt(Instant createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public String getAccountId() {
+        return accountId;
+    }
+
+    public void setAccountId(String accountId) {
+        this.accountId = accountId;
     }
 }

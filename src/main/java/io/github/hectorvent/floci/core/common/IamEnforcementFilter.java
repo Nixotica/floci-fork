@@ -41,15 +41,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     private static final Logger LOG = Logger.getLogger(IamEnforcementFilter.class);
 
-    /** Extracts the access key ID from an AWS SigV4 Authorization header. */
-    private static final Pattern AKID_PATTERN =
-            Pattern.compile("Credential=([^/]+)/");
-
     /** Extracts the credential-scope service name (e.g. "s3", "lambda"). */
     private static final Pattern SERVICE_PATTERN =
             Pattern.compile("Credential=\\S+/\\d{8}/[^/]+/([^/]+)/");
 
     private final EmulatorConfig config;
+    private final AccountResolver accountResolver;
     private final IamService iamService;
     private final IamPolicyEvaluator evaluator;
     private final IamActionRegistry actionRegistry;
@@ -57,11 +54,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     @Inject
     public IamEnforcementFilter(EmulatorConfig config,
+                                AccountResolver accountResolver,
                                 IamService iamService,
                                 IamPolicyEvaluator evaluator,
                                 IamActionRegistry actionRegistry,
                                 ResourceArnBuilder arnBuilder) {
         this.config = config;
+        this.accountResolver = accountResolver;
         this.iamService = iamService;
         this.evaluator = evaluator;
         this.actionRegistry = actionRegistry;
@@ -79,7 +78,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             return;
         }
 
-        String akid = extractAccessKeyId(auth);
+        String akid = accountResolver.extractAccessKeyId(auth);
         if (akid == null || "test".equals(akid)) {
             return; // root bypass
         }
@@ -100,7 +99,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         }
 
         String region = config.defaultRegion();
-        String accountId = config.defaultAccountId();
+        String accountId = accountResolver.resolve(auth);
         String resource = arnBuilder.build(credentialScope, ctx, region, accountId);
 
         Decision decision = evaluator.evaluate(policies, action, resource);
@@ -108,11 +107,6 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);
             ctx.abortWith(accessDeniedResponse(action, credentialScope, ctx.getMediaType()));
         }
-    }
-
-    private String extractAccessKeyId(String auth) {
-        Matcher m = AKID_PATTERN.matcher(auth);
-        return m.find() ? m.group(1) : null;
     }
 
     private String extractCredentialScope(String auth) {

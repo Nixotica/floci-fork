@@ -28,18 +28,18 @@ class DynamoDbServiceTest {
         mapper = new ObjectMapper();
     }
 
-    private TableDefinition createUsersTable() {
+    private TableDefinition createUsersTable(String region) {
         return service.createTable("Users",
                 List.of(new KeySchemaElement("userId", "HASH")),
                 List.of(new AttributeDefinition("userId", "S")),
-                5L, 5L);
+                5L, 5L, region);
     }
 
     private static String tableArn(String region, String tableName) {
         return "arn:aws:dynamodb:" + region + ":000000000000:table/" + tableName;
     }
 
-    private TableDefinition createOrdersTable() {
+    private TableDefinition createOrdersTable(String region) {
         return service.createTable("Orders",
                 List.of(
                         new KeySchemaElement("customerId", "HASH"),
@@ -47,7 +47,7 @@ class DynamoDbServiceTest {
                 List.of(
                         new AttributeDefinition("customerId", "S"),
                         new AttributeDefinition("orderId", "S")),
-                5L, 5L);
+                5L, 5L, region);
     }
 
     private ObjectNode attributeValue(String type, String value) {
@@ -66,7 +66,7 @@ class DynamoDbServiceTest {
 
     @Test
     void createTable() {
-        TableDefinition table = createUsersTable();
+        TableDefinition table = createUsersTable("eu-west-1");
         assertEquals("Users", table.getTableName());
         assertEquals("ACTIVE", table.getTableStatus());
         assertNotNull(table.getTableArn());
@@ -76,15 +76,16 @@ class DynamoDbServiceTest {
 
     @Test
     void createTableWithSortKey() {
-        TableDefinition table = createOrdersTable();
+        TableDefinition table = createOrdersTable("eu-west-1");
         assertEquals("customerId", table.getPartitionKeyName());
         assertEquals("orderId", table.getSortKeyName());
     }
 
     @Test
     void createDuplicateTableThrows() {
-        createUsersTable();
-        assertThrows(AwsException.class, () -> createUsersTable());
+        String region = "eu-west-1";
+        createUsersTable(region);
+        assertThrows(AwsException.class, () -> createUsersTable(region));
     }
 
     @Test
@@ -93,42 +94,45 @@ class DynamoDbServiceTest {
                 service.createTable("arn:aws:dynamodb:us-east-1:000000000000:table/Users",
                         List.of(new KeySchemaElement("userId", "HASH")),
                         List.of(new AttributeDefinition("userId", "S")),
-                        5L, 5L));
-        assertEquals("InvalidParameterValue", ex.getErrorCode());
+                        5L, 5L, "eu-west-1"));
+        assertEquals("ValidationException", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
     }
 
     @Test
     void describeTable() {
-        createUsersTable();
-        TableDefinition table = service.describeTable("Users");
+        String region = "eu-west-1";
+        createUsersTable(region);
+        TableDefinition table = service.describeTable("Users", region);
         assertEquals("Users", table.getTableName());
     }
 
     @Test
     void describeTableAcceptsArn() {
-        createUsersTable();
-        TableDefinition table = service.describeTable(tableArn("us-east-1", "Users"));
+        createUsersTable("us-east-1");
+        TableDefinition table = service.describeTable(tableArn("us-east-1", "Users"), "us-east-1");
         assertEquals("Users", table.getTableName());
     }
 
     @Test
     void describeTableNotFound() {
-        assertThrows(AwsException.class, () -> service.describeTable("NonExistent"));
+        assertThrows(AwsException.class, () -> service.describeTable("NonExistent", "eu-west-1"));
     }
 
     @Test
     void deleteTable() {
-        createUsersTable();
-        service.deleteTable("Users");
-        assertThrows(AwsException.class, () -> service.describeTable("Users"));
+        String region = "eu-west-1";
+        createUsersTable(region);
+        service.deleteTable("Users", region);
+        assertThrows(AwsException.class, () -> service.describeTable("Users", region));
     }
 
     @Test
     void listTables() {
-        createUsersTable();
-        createOrdersTable();
-        List<String> tables = service.listTables();
+        String region = "eu-west-1";
+        createUsersTable(region);
+        createOrdersTable(region);
+        List<String> tables = service.listTables(region);
         assertEquals(2, tables.size());
         assertTrue(tables.contains("Users"));
         assertTrue(tables.contains("Orders"));
@@ -136,33 +140,34 @@ class DynamoDbServiceTest {
 
     @Test
     void putAndGetItem() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode userItem = item("userId", "user-1", "name", "Alice", "email", "alice@test.com");
-        service.putItem("Users", userItem);
+        service.putItem("Users", userItem, region);
 
         ObjectNode key = item("userId", "user-1");
-        JsonNode retrieved = service.getItem("Users", key);
+        JsonNode retrieved = service.getItem("Users", key, region);
         assertNotNull(retrieved);
         assertEquals("Alice", retrieved.get("name").get("S").asText());
     }
 
     @Test
     void putAndGetItemAcceptArnTableName() {
-        createUsersTable();
+        createUsersTable("us-east-1");
         ObjectNode userItem = item("userId", "user-1", "name", "Alice");
         String usersArn = tableArn("us-east-1", "Users");
 
-        service.putItem(usersArn, userItem);
+        service.putItem(usersArn, userItem, "us-east-1");
 
-        JsonNode retrieved = service.getItem(usersArn, item("userId", "user-1"));
+        JsonNode retrieved = service.getItem(usersArn, item("userId", "user-1"), "us-east-1");
         assertNotNull(retrieved);
         assertEquals("Alice", retrieved.get("name").get("S").asText());
     }
 
     @Test
     void batchGetPreservesRequestKeyButResolvesArn() {
-        createUsersTable();
-        service.putItem("Users", item("userId", "user-1", "name", "Alice"));
+        createUsersTable("us-east-1");
+        service.putItem("Users", item("userId", "user-1", "name", "Alice"), "us-east-1");
 
         ObjectNode request = mapper.createObjectNode();
         request.set("Keys", mapper.createArrayNode().add(item("userId", "user-1")));
@@ -176,82 +181,91 @@ class DynamoDbServiceTest {
 
     @Test
     void transactWriteConditionChecksAcceptArnTableName() {
-        createUsersTable();
-        service.putItem("Users", item("userId", "user-1", "name", "Alice"));
+        createUsersTable("us-east-1");
+        service.putItem("Users", item("userId", "user-1", "name", "Alice"), "us-east-1");
         String usersArn = tableArn("us-east-1", "Users");
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":name", attributeValue("S", "Alice"));
 
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#n", "name");
+
         ObjectNode update = mapper.createObjectNode();
         update.put("TableName", usersArn);
         update.set("Key", item("userId", "user-1"));
-        update.put("ConditionExpression", "name = :name");
+        update.put("ConditionExpression", "#n = :name");
         update.put("UpdateExpression", "SET email = :name");
+        update.set("ExpressionAttributeNames", exprNames);
         update.set("ExpressionAttributeValues", exprValues);
 
         ObjectNode transactItem = mapper.createObjectNode();
         transactItem.set("Update", update);
 
-        assertDoesNotThrow(() -> service.transactWriteItems(List.of(transactItem), "us-east-1"));
-        assertEquals("Alice", service.getItem("Users", item("userId", "user-1")).get("email").get("S").asText());
+        assertDoesNotThrow(() -> service.transactWriteItems(List.of(transactItem), "us-east-1", null, null));
+        assertEquals("Alice", service.getItem("Users", item("userId", "user-1"), "us-east-1").get("email").get("S").asText());
     }
 
     @Test
     void describeTableRejectsRegionMismatchArn() {
-        createUsersTable();
+        createUsersTable("us-east-1");
 
         AwsException ex = assertThrows(AwsException.class,
-                () -> service.describeTable(tableArn("eu-west-1", "Users")));
-        assertEquals("InvalidParameterValue", ex.getErrorCode());
+                () -> service.describeTable(tableArn("eu-west-1", "Users"), "us-east-1"));
+        assertEquals("ValidationException", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
     }
 
     @Test
     void getItemNotFound() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode key = item("userId", "nonexistent");
-        JsonNode result = service.getItem("Users", key);
+        JsonNode result = service.getItem("Users", key, region);
         assertNull(result);
     }
 
     @Test
     void putItemOverwrites() {
-        createUsersTable();
-        service.putItem("Users", item("userId", "user-1", "name", "Alice"));
-        service.putItem("Users", item("userId", "user-1", "name", "Bob"));
+        String region = "eu-west-1";
+        createUsersTable(region);
+        service.putItem("Users", item("userId", "user-1", "name", "Alice"), region);
+        service.putItem("Users", item("userId", "user-1", "name", "Bob"), region);
 
-        JsonNode retrieved = service.getItem("Users", item("userId", "user-1"));
+        JsonNode retrieved = service.getItem("Users", item("userId", "user-1"), region);
         assertEquals("Bob", retrieved.get("name").get("S").asText());
     }
 
     @Test
     void deleteItem() {
-        createUsersTable();
-        service.putItem("Users", item("userId", "user-1", "name", "Alice"));
-        service.deleteItem("Users", item("userId", "user-1"));
+        String region = "eu-west-1";
+        createUsersTable(region);
+        service.putItem("Users", item("userId", "user-1", "name", "Alice"), region);
+        service.deleteItem("Users", item("userId", "user-1"), region);
 
-        assertNull(service.getItem("Users", item("userId", "user-1")));
+        assertNull(service.getItem("Users", item("userId", "user-1"), region));
     }
 
     @Test
     void putAndGetWithCompositeKey() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1", "total", "100"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o2", "total", "200"));
-        service.putItem("Orders", item("customerId", "c2", "orderId", "o1", "total", "50"));
+        String region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1", "total", "100"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o2", "total", "200"), region);
+        service.putItem("Orders", item("customerId", "c2", "orderId", "o1", "total", "50"), region);
 
-        JsonNode result = service.getItem("Orders", item("customerId", "c1", "orderId", "o1"));
+        JsonNode result = service.getItem("Orders", item("customerId", "c1", "orderId", "o1"), region);
         assertNotNull(result);
         assertEquals("100", result.get("total").get("S").asText());
     }
 
     @Test
     void queryByPartitionKey() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1", "total", "100"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o2", "total", "200"));
-        service.putItem("Orders", item("customerId", "c2", "orderId", "o1", "total", "50"));
+        String region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1", "total", "100"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o2", "total", "200"), region);
+        service.putItem("Orders", item("customerId", "c2", "orderId", "o1", "total", "50"), region);
 
         // Build KeyConditions
         ObjectNode keyConditions = mapper.createObjectNode();
@@ -264,16 +278,17 @@ class DynamoDbServiceTest {
         pkCondition.set("AttributeValueList", attrList);
         keyConditions.set("customerId", pkCondition);
 
-        DynamoDbService.QueryResult results = service.query("Orders", keyConditions, null, null, null, null);
+        DynamoDbService.QueryResult results = service.query("Orders", keyConditions, null, null, null, null, region);
         assertEquals(2, results.items().size());
     }
 
     @Test
     void queryWithKeyConditionExpression() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o2"));
-        service.putItem("Orders", item("customerId", "c2", "orderId", "o1"));
+        String region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o2"), region);
+        service.putItem("Orders", item("customerId", "c2", "orderId", "o1"), region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         ObjectNode val = mapper.createObjectNode();
@@ -281,16 +296,17 @@ class DynamoDbServiceTest {
         exprValues.set(":pk", val);
 
         DynamoDbService.QueryResult results = service.query("Orders", null, exprValues,
-                "customerId = :pk", null, null);
+                "customerId = :pk", null, null, region);
         assertEquals(2, results.items().size());
     }
 
     @Test
     void queryWithBeginsWith() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-01-01"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-01-15"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-02-01"));
+        String region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-01-01"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-01-15"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-02-01"), region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         ObjectNode pkVal = mapper.createObjectNode();
@@ -301,16 +317,17 @@ class DynamoDbServiceTest {
         exprValues.set(":sk", skVal);
 
         DynamoDbService.QueryResult results = service.query("Orders", null, exprValues,
-                "customerId = :pk AND begins_with(orderId, :sk)", null, null);
+                "customerId = :pk AND begins_with(orderId, :sk)", null, null, region);
         assertEquals(2, results.items().size());
     }
 
     @Test
     void queryWithBetweenOnSortKey() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-01-01"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-01-15"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-02-01"));
+        String region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-01-01"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-01-15"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2024-02-01"), region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":pk", attributeValue("S", "c1"));
@@ -318,7 +335,7 @@ class DynamoDbServiceTest {
         exprValues.set(":to", attributeValue("S", "2024-01-31"));
 
         DynamoDbService.QueryResult results = service.query("Orders", null, exprValues,
-                "customerId = :pk AND orderId BETWEEN :from AND :to", null, null);
+                "customerId = :pk AND orderId BETWEEN :from AND :to", null, null, region);
 
         assertEquals(1, results.items().size());
         assertEquals("2024-01-15", results.items().getFirst().get("orderId").get("S").asText());
@@ -326,10 +343,10 @@ class DynamoDbServiceTest {
 
     @Test
     void queryWithScanIndexForwardFalseReturnsDescendingOrder() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o2"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o3"));
+        createOrdersTable("us-east-1");
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"), "us-east-1");
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o2"), "us-east-1");
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o3"), "us-east-1");
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":pk", attributeValue("S", "c1"));
@@ -344,26 +361,27 @@ class DynamoDbServiceTest {
 
     @Test
     void queryAppliesFilterExpressionAfterKeyCondition() {
-        createOrdersTable();
+        String region = "eu-west-1";
+        createOrdersTable(region);
 
         ObjectNode first = item("customerId", "c1", "orderId", "o1");
         first.set("total", attributeValue("N", "100"));
-        service.putItem("Orders", first);
+        service.putItem("Orders", first, region);
 
         ObjectNode second = item("customerId", "c1", "orderId", "o2");
         second.set("total", attributeValue("N", "100"));
-        service.putItem("Orders", second);
+        service.putItem("Orders", second, region);
 
         ObjectNode third = item("customerId", "c1", "orderId", "o3");
         third.set("total", attributeValue("N", "99"));
-        service.putItem("Orders", third);
+        service.putItem("Orders", third, region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":pk", attributeValue("S", "c1"));
         exprValues.set(":min", attributeValue("N", "100"));
 
         DynamoDbService.QueryResult results = service.query("Orders", null, exprValues,
-                "customerId = :pk", "total >= :min", null);
+                "customerId = :pk", "total >= :min", null, region);
 
         assertEquals(2, results.items().size());
         assertEquals(3, results.scannedCount());
@@ -374,19 +392,19 @@ class DynamoDbServiceTest {
 
     @Test
     void queryWithFilterExpressionAndLimitUsesPreFilterPageState() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
 
         ObjectNode first = item("customerId", "c1", "orderId", "o1");
         first.set("total", attributeValue("N", "100"));
-        service.putItem("Orders", first);
+        service.putItem("Orders", first, "us-east-1");
 
         ObjectNode second = item("customerId", "c1", "orderId", "o2");
         second.set("total", attributeValue("N", "99"));
-        service.putItem("Orders", second);
+        service.putItem("Orders", second, "us-east-1");
 
         ObjectNode third = item("customerId", "c1", "orderId", "o3");
         third.set("total", attributeValue("N", "100"));
-        service.putItem("Orders", third);
+        service.putItem("Orders", third, "us-east-1");
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":pk", attributeValue("S", "c1"));
@@ -413,21 +431,23 @@ class DynamoDbServiceTest {
 
     @Test
     void scan() {
-        createUsersTable();
-        service.putItem("Users", item("userId", "u1", "name", "Alice"));
-        service.putItem("Users", item("userId", "u2", "name", "Bob"));
-        service.putItem("Users", item("userId", "u3", "name", "Charlie"));
+        String region = "eu-west-1";
+        createUsersTable(region);
+        service.putItem("Users", item("userId", "u1", "name", "Alice"), region);
+        service.putItem("Users", item("userId", "u2", "name", "Bob"), region);
+        service.putItem("Users", item("userId", "u3", "name", "Charlie"), region);
 
-        DynamoDbService.ScanResult result = service.scan("Users", null, null, null, null, null, null);
+        DynamoDbService.ScanResult result = service.scan("Users", null, null, null, null, null, null, region);
         assertEquals(3, result.items().size());
     }
 
     @Test
     void scanWithScanFilter() {
-        createUsersTable();
-        service.putItem("Users", item("userId", "u1", "name", "Alice"));
-        service.putItem("Users", item("userId", "u2", "name", "Bob"));
-        service.putItem("Users", item("userId", "u3", "name", "Charlie"));
+        String region = "eu-west-1";
+        createUsersTable(region);
+        service.putItem("Users", item("userId", "u1", "name", "Alice"), region);
+        service.putItem("Users", item("userId", "u2", "name", "Bob"), region);
+        service.putItem("Users", item("userId", "u3", "name", "Charlie"), region);
 
         ObjectNode scanFilter = mapper.createObjectNode();
         ObjectNode condition = mapper.createObjectNode();
@@ -439,17 +459,18 @@ class DynamoDbServiceTest {
         condition.set("AttributeValueList", attrList);
         scanFilter.set("name", condition);
 
-        DynamoDbService.ScanResult result = service.scan("Users", null, null, null, scanFilter, null, null);
+        DynamoDbService.ScanResult result = service.scan("Users", null, null, null, scanFilter, null, null, region);
         assertEquals(1, result.items().size());
         assertEquals("Alice", result.items().get(0).get("name").get("S").asText());
     }
 
     @Test
     void scanWithScanFilterGE() {
-        createUsersTable();
-        service.putItem("Users", item("userId", "u1", "name", "Alice"));
-        service.putItem("Users", item("userId", "u2", "name", "Bob"));
-        service.putItem("Users", item("userId", "u3", "name", "Charlie"));
+        String region = "eu-west-1";
+        createUsersTable(region);
+        service.putItem("Users", item("userId", "u1", "name", "Alice"), region);
+        service.putItem("Users", item("userId", "u2", "name", "Bob"), region);
+        service.putItem("Users", item("userId", "u3", "name", "Charlie"), region);
 
         ObjectNode scanFilter = mapper.createObjectNode();
         ObjectNode condition = mapper.createObjectNode();
@@ -461,33 +482,36 @@ class DynamoDbServiceTest {
         condition.set("AttributeValueList", attrList);
         scanFilter.set("name", condition);
 
-        DynamoDbService.ScanResult result = service.scan("Users", null, null, null, scanFilter, null, null);
+        DynamoDbService.ScanResult result = service.scan("Users", null, null, null, scanFilter, null, null, region);
         assertEquals(2, result.items().size());
     }
 
     @Test
     void scanWithLimit() {
-        createUsersTable();
-        service.putItem("Users", item("userId", "u1"));
-        service.putItem("Users", item("userId", "u2"));
-        service.putItem("Users", item("userId", "u3"));
+        String region = "eu-west-1";
+        createUsersTable(region);
+        service.putItem("Users", item("userId", "u1"), region);
+        service.putItem("Users", item("userId", "u2"), region);
+        service.putItem("Users", item("userId", "u3"), region);
 
-        DynamoDbService.ScanResult result = service.scan("Users", null, null, null, null, 2, null);
+        DynamoDbService.ScanResult result = service.scan("Users", null, null, null, null, 2, null, region);
         assertEquals(2, result.items().size());
     }
 
     @Test
     void operationsOnNonExistentTableThrow() {
-        assertThrows(AwsException.class, () -> service.putItem("NoTable", item("id", "1")));
-        assertThrows(AwsException.class, () -> service.getItem("NoTable", item("id", "1")));
-        assertThrows(AwsException.class, () -> service.deleteItem("NoTable", item("id", "1")));
-        assertThrows(AwsException.class, () -> service.query("NoTable", null, null, null, null, null));
-        assertThrows(AwsException.class, () -> service.scan("NoTable", null, null, null, null, null, null));
+        String region = "eu-west-1";
+        assertThrows(AwsException.class, () -> service.putItem("NoTable", item("id", "1"), region));
+        assertThrows(AwsException.class, () -> service.getItem("NoTable", item("id", "1"), region));
+        assertThrows(AwsException.class, () -> service.deleteItem("NoTable", item("id", "1"), region));
+        assertThrows(AwsException.class, () -> service.query("NoTable", null, null, null, null, null, region));
+        assertThrows(AwsException.class, () -> service.scan("NoTable", null, null, null, null, null, null, region));
     }
 
     @Test
     void updateItemSetIfNotExistsOnNonExistentItemCreatesAttribute() {
-        createOrdersTable();
+        String region = "eu-west-1";
+        createOrdersTable(region);
 
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
 
@@ -498,9 +522,9 @@ class DynamoDbServiceTest {
 
         service.updateItem("Orders", key, null,
                 "SET price = if_not_exists(price, :val)",
-                null, exprValues, null);
+                null, exprValues, null, region);
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, region);
         assertNotNull(stored, "item should have been created");
         assertTrue(stored.has("price"), "price attribute must be present on a newly created item");
         assertEquals("100", stored.get("price").get("N").asText());
@@ -508,7 +532,8 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetIfNotExistsPreservesExistingValue() {
-        createOrdersTable();
+        String region = "eu-west-1";
+        createOrdersTable(region);
 
         // Put an item that already has price = 200
         ObjectNode existing = mapper.createObjectNode();
@@ -518,7 +543,7 @@ class DynamoDbServiceTest {
         existing.set("customerId", pkVal);
         existing.set("orderId", skVal);
         existing.set("price", priceExisting);
-        service.putItem("Orders", existing);
+        service.putItem("Orders", existing, region);
 
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
 
@@ -528,9 +553,9 @@ class DynamoDbServiceTest {
 
         service.updateItem("Orders", key, null,
                 "SET price = if_not_exists(price, :val)",
-                null, exprValues, null);
+                null, exprValues, null, region);
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, region);
         assertNotNull(stored);
         // Existing value must NOT be overwritten
         assertEquals("200", stored.get("price").get("N").asText(),
@@ -539,10 +564,11 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetIfNotExistsSetsAttributeWhenMissingFromExistingItem() {
-        createOrdersTable();
+        String region = "eu-west-1";
+        createOrdersTable(region);
 
         // Put an item that does NOT have a price attribute
-        service.putItem("Orders", item("customerId", "1", "orderId", "sort1"));
+        service.putItem("Orders", item("customerId", "1", "orderId", "sort1"), region);
 
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
 
@@ -552,9 +578,9 @@ class DynamoDbServiceTest {
 
         service.updateItem("Orders", key, null,
                 "SET price = if_not_exists(price, :val)",
-                null, exprValues, null);
+                null, exprValues, null, region);
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, region);
         assertNotNull(stored);
         assertTrue(stored.has("price"),
                 "price should be set when it was absent from an existing item");
@@ -563,7 +589,8 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetIfNotExistsMultipleAttributesOnNewItem() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode key = item("userId", "u-new");
 
@@ -573,11 +600,14 @@ class DynamoDbServiceTest {
         exprValues.set(":name", nameVal);
         exprValues.set(":score", scoreVal);
 
-        service.updateItem("Users", key, null,
-                "SET name = if_not_exists(name, :name), score = if_not_exists(score, :score)",
-                null, exprValues, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#n", "name");
 
-        JsonNode stored = service.getItem("Users", key);
+        service.updateItem("Users", key, null,
+                "SET #n = if_not_exists(#n, :name), score = if_not_exists(score, :score)",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored, "item should have been created");
         assertTrue(stored.has("name"), "name attribute must be present");
         assertEquals("DefaultName", stored.get("name").get("S").asText());
@@ -587,8 +617,9 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetIfNotExistsCopiesSourceAttributeWhenAttrNameDiffersFromCheckAttr() {
+        String region = "eu-west-1";
         // SET a = if_not_exists(b, :v) where b exists → a must be set to b's current value
-        createUsersTable();
+        createUsersTable(region);
 
         // Put an item that has "source" but not "target"
         ObjectNode existing = mapper.createObjectNode();
@@ -596,7 +627,7 @@ class DynamoDbServiceTest {
         ObjectNode sourceVal = mapper.createObjectNode(); sourceVal.put("S", "copied-value");
         existing.set("userId", userIdVal);
         existing.set("source", sourceVal);
-        service.putItem("Users", existing);
+        service.putItem("Users", existing, region);
 
         ObjectNode key = item("userId", "u-copy");
 
@@ -604,12 +635,15 @@ class DynamoDbServiceTest {
         ObjectNode fallbackVal = mapper.createObjectNode(); fallbackVal.put("S", "fallback");
         exprValues.set(":v", fallbackVal);
 
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#src", "source");
+
         // target = if_not_exists(source, :v) — source exists, so target should receive source's value
         service.updateItem("Users", key, null,
-                "SET target = if_not_exists(source, :v)",
-                null, exprValues, null);
+                "SET target = if_not_exists(#src, :v)",
+                exprNames, exprValues, null, region);
 
-        JsonNode stored = service.getItem("Users", key);
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertTrue(stored.has("target"), "target attribute must be present");
         assertEquals("copied-value", stored.get("target").get("S").asText(),
@@ -618,11 +652,12 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetIfNotExistsUsesFallbackWhenCheckAttrAbsentAndAttrNameDiffers() {
+        String region = "eu-west-1";
         // SET a = if_not_exists(b, :v) where b is absent → a must be set to :v
-        createUsersTable();
+        createUsersTable(region);
 
         // Item has no "source" attribute
-        service.putItem("Users", item("userId", "u-fallback"));
+        service.putItem("Users", item("userId", "u-fallback"), region);
 
         ObjectNode key = item("userId", "u-fallback");
 
@@ -630,11 +665,14 @@ class DynamoDbServiceTest {
         ObjectNode fallbackVal = mapper.createObjectNode(); fallbackVal.put("S", "fallback");
         exprValues.set(":v", fallbackVal);
 
-        service.updateItem("Users", key, null,
-                "SET target = if_not_exists(source, :v)",
-                null, exprValues, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#src", "source");
 
-        JsonNode stored = service.getItem("Users", key);
+        service.updateItem("Users", key, null,
+                "SET target = if_not_exists(#src, :v)",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertTrue(stored.has("target"), "target attribute must be present");
         assertEquals("fallback", stored.get("target").get("S").asText(),
@@ -643,7 +681,8 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetArithmeticIncrement() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         // Put an item with counter = 100
         ObjectNode existing = mapper.createObjectNode();
@@ -651,7 +690,7 @@ class DynamoDbServiceTest {
         ObjectNode counterVal = mapper.createObjectNode();
         counterVal.put("N", "100");
         existing.set("counter", counterVal);
-        service.putItem("Users", existing);
+        service.putItem("Users", existing, region);
 
         ObjectNode key = item("userId", "u1");
         ObjectNode exprValues = mapper.createObjectNode();
@@ -659,11 +698,14 @@ class DynamoDbServiceTest {
         incVal.put("N", "1");
         exprValues.set(":inc", incVal);
 
-        service.updateItem("Users", key, null,
-                "SET counter = counter + :inc",
-                null, exprValues, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#cnt", "counter");
 
-        JsonNode stored = service.getItem("Users", key);
+        service.updateItem("Users", key, null,
+                "SET #cnt = #cnt + :inc",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertEquals("101", stored.get("counter").get("N").asText(),
                 "counter should be incremented from 100 to 101");
@@ -671,14 +713,15 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetArithmeticDecrement() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode existing = mapper.createObjectNode();
         existing.set("userId", attributeValue("S", "u1"));
         ObjectNode counterVal = mapper.createObjectNode();
         counterVal.put("N", "50");
         existing.set("counter", counterVal);
-        service.putItem("Users", existing);
+        service.putItem("Users", existing, region);
 
         ObjectNode key = item("userId", "u1");
         ObjectNode exprValues = mapper.createObjectNode();
@@ -686,11 +729,14 @@ class DynamoDbServiceTest {
         decVal.put("N", "3");
         exprValues.set(":dec", decVal);
 
-        service.updateItem("Users", key, null,
-                "SET counter = counter - :dec",
-                null, exprValues, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#cnt", "counter");
 
-        JsonNode stored = service.getItem("Users", key);
+        service.updateItem("Users", key, null,
+                "SET #cnt = #cnt - :dec",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertEquals("47", stored.get("counter").get("N").asText(),
                 "counter should be decremented from 50 to 47");
@@ -698,7 +744,8 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetIfNotExistsWithArithmeticOnNewItem() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode key = item("userId", "u1");
         ObjectNode exprValues = mapper.createObjectNode();
@@ -709,11 +756,14 @@ class DynamoDbServiceTest {
         exprValues.set(":start", startVal);
         exprValues.set(":inc", incVal);
 
-        service.updateItem("Users", key, null,
-                "SET counter = if_not_exists(counter, :start) + :inc",
-                null, exprValues, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#cnt", "counter");
 
-        JsonNode stored = service.getItem("Users", key);
+        service.updateItem("Users", key, null,
+                "SET #cnt = if_not_exists(#cnt, :start) + :inc",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertEquals("60000001", stored.get("counter").get("N").asText(),
                 "counter should be if_not_exists default (60000000) + 1 = 60000001");
@@ -721,14 +771,15 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetIfNotExistsWithArithmeticOnExistingItem() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode existing = mapper.createObjectNode();
         existing.set("userId", attributeValue("S", "u1"));
         ObjectNode counterVal = mapper.createObjectNode();
         counterVal.put("N", "60000005");
         existing.set("counter", counterVal);
-        service.putItem("Users", existing);
+        service.putItem("Users", existing, region);
 
         ObjectNode key = item("userId", "u1");
         ObjectNode exprValues = mapper.createObjectNode();
@@ -739,11 +790,14 @@ class DynamoDbServiceTest {
         exprValues.set(":start", startVal);
         exprValues.set(":inc", incVal);
 
-        service.updateItem("Users", key, null,
-                "SET counter = if_not_exists(counter, :start) + :inc",
-                null, exprValues, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#cnt", "counter");
 
-        JsonNode stored = service.getItem("Users", key);
+        service.updateItem("Users", key, null,
+                "SET #cnt = if_not_exists(#cnt, :start) + :inc",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertEquals("60000006", stored.get("counter").get("N").asText(),
                 "counter should be existing (60000005) + 1 = 60000006");
@@ -751,7 +805,8 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemSetArithmeticConsecutiveIncrements() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode key = item("userId", "u1");
         ObjectNode exprValues = mapper.createObjectNode();
@@ -762,14 +817,17 @@ class DynamoDbServiceTest {
         exprValues.set(":start", startVal);
         exprValues.set(":inc", incVal);
 
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#cnt", "counter");
+
         // Three consecutive increments
         for (int i = 0; i < 3; i++) {
             service.updateItem("Users", key, null,
-                    "SET counter = if_not_exists(counter, :start) + :inc",
-                    null, exprValues, null);
+                    "SET #cnt = if_not_exists(#cnt, :start) + :inc",
+                    exprNames, exprValues, null, region);
         }
 
-        JsonNode stored = service.getItem("Users", key);
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertEquals("3", stored.get("counter").get("N").asText(),
                 "counter should be 3 after three increments starting from 0");
@@ -777,91 +835,98 @@ class DynamoDbServiceTest {
 
     @Test
     void scanWithBoolFilterExpression() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode u1 = item("userId", "u1");
         u1.set("deleted", boolAttributeValue(false));
-        service.putItem("Users", u1);
+        service.putItem("Users", u1, region);
 
         ObjectNode u2 = item("userId", "u2");
         u2.set("deleted", boolAttributeValue(true));
-        service.putItem("Users", u2);
+        service.putItem("Users", u2, region);
 
         ObjectNode u3 = item("userId", "u3");
         u3.set("deleted", boolAttributeValue(false));
-        service.putItem("Users", u3);
+        service.putItem("Users", u3, region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":d", boolAttributeValue(true));
 
-        DynamoDbService.ScanResult result = service.scan("Users", "deleted <> :d", null, exprValues, null, null, null);
+        DynamoDbService.ScanResult result = service.scan("Users", "deleted <> :d", null, exprValues, null, null, null, region);
         assertEquals(2, result.items().size());
     }
 
     @Test
     void scanContainsOnListAttribute() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode u1 = item("userId", "u1");
         u1.set("tags", listAttributeValue("a", "b"));
-        service.putItem("Users", u1);
+        service.putItem("Users", u1, region);
 
         ObjectNode u2 = item("userId", "u2");
         u2.set("tags", listAttributeValue("a", "c"));
-        service.putItem("Users", u2);
+        service.putItem("Users", u2, region);
 
         ObjectNode u3 = item("userId", "u3");
         u3.set("tags", listAttributeValue("b", "c"));
-        service.putItem("Users", u3);
+        service.putItem("Users", u3, region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":v", attributeValue("S", "a"));
 
-        DynamoDbService.ScanResult result = service.scan("Users", "contains(tags, :v)", null, exprValues, null, null, null);
+        DynamoDbService.ScanResult result = service.scan("Users", "contains(tags, :v)", null, exprValues, null, null, null, region);
         assertEquals(2, result.items().size());
     }
 
     @Test
     void scanContainsOnStringSetAttribute() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode u1 = item("userId", "u1");
         u1.set("roles", stringSetAttributeValue("admin", "user"));
-        service.putItem("Users", u1);
+        service.putItem("Users", u1, region);
 
         ObjectNode u2 = item("userId", "u2");
         u2.set("roles", stringSetAttributeValue("user"));
-        service.putItem("Users", u2);
+        service.putItem("Users", u2, region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":r", attributeValue("S", "admin"));
 
-        DynamoDbService.ScanResult result = service.scan("Users", "contains(roles, :r)", null, exprValues, null, null, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#r", "roles");
+
+        DynamoDbService.ScanResult result = service.scan("Users", "contains(#r, :r)", exprNames, exprValues, null, null, null, region);
         assertEquals(1, result.items().size());
     }
 
     @Test
     void scanAttributeExistsOnNestedMapPath() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode u1 = item("userId", "u1");
         u1.set("info", mapAttributeValue("name", "Alice"));
-        service.putItem("Users", u1);
+        service.putItem("Users", u1, region);
 
         ObjectNode u2 = item("userId", "u2");
         ObjectNode emptyMap = mapper.createObjectNode();
         ObjectNode mapWrapper = mapper.createObjectNode();
         mapWrapper.set("M", emptyMap);
         u2.set("info", mapWrapper);
-        service.putItem("Users", u2);
+        service.putItem("Users", u2, region);
 
         ObjectNode u3 = item("userId", "u3");
         u3.set("info", mapAttributeValue("name", "Bob"));
-        service.putItem("Users", u3);
+        service.putItem("Users", u3, region);
 
         ObjectNode exprNames = mapper.createObjectNode();
         exprNames.put("#n", "name");
 
-        DynamoDbService.ScanResult result = service.scan("Users", "attribute_exists(info.#n)", exprNames, null, null, null, null);
+        DynamoDbService.ScanResult result = service.scan("Users", "attribute_exists(info.#n)", exprNames, null, null, null, null, region);
         assertEquals(2, result.items().size());
 
-        DynamoDbService.ScanResult result2 = service.scan("Users", "attribute_not_exists(info.#n)", exprNames, null, null, null, null);
+        DynamoDbService.ScanResult result2 = service.scan("Users", "attribute_not_exists(info.#n)", exprNames, null, null, null, null, region);
         assertEquals(1, result2.items().size());
     }
 
@@ -921,44 +986,47 @@ class DynamoDbServiceTest {
 
     @Test
     void scanContainsOnNumberSetWithNumericNormalization() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode u1 = item("userId", "u1");
         u1.set("scores", numberSetAttributeValue("1", "2", "3"));
-        service.putItem("Users", u1);
+        service.putItem("Users", u1, region);
 
         ObjectNode u2 = item("userId", "u2");
         u2.set("scores", numberSetAttributeValue("4", "5"));
-        service.putItem("Users", u2);
+        service.putItem("Users", u2, region);
 
         // Search for "1.0" — should match "1" via numeric comparison
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":v", attributeValue("N", "1.0"));
 
-        DynamoDbService.ScanResult result = service.scan("Users", "contains(scores, :v)", null, exprValues, null, null, null);
+        DynamoDbService.ScanResult result = service.scan("Users", "contains(scores, :v)", null, exprValues, null, null, null, region);
         assertEquals(1, result.items().size(), "contains() on NS should match 1.0 == 1 numerically");
     }
 
     @Test
     void scanContainsOnBinarySet() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode u1 = item("userId", "u1");
         u1.set("bins", binarySetAttributeValue("AQID", "BAUG"));  // base64 for [1,2,3] and [4,5,6]
-        service.putItem("Users", u1);
+        service.putItem("Users", u1, region);
 
         ObjectNode u2 = item("userId", "u2");
         u2.set("bins", binarySetAttributeValue("BwgJ"));
-        service.putItem("Users", u2);
+        service.putItem("Users", u2, region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":v", attributeValue("B", "AQID"));
 
-        DynamoDbService.ScanResult result = service.scan("Users", "contains(bins, :v)", null, exprValues, null, null, null);
+        DynamoDbService.ScanResult result = service.scan("Users", "contains(bins, :v)", null, exprValues, null, null, null, region);
         assertEquals(1, result.items().size());
     }
 
     @Test
     void listAppendIfNotExistsCreatesListWhenAttributeMissing() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode key = item("userId", "u-list-new");
 
@@ -966,11 +1034,14 @@ class DynamoDbServiceTest {
         exprValues.set(":e", listAttributeValue());
         exprValues.set(":val", listAttributeValue("a"));
 
-        service.updateItem("Users", key, null,
-                "SET items = list_append(if_not_exists(items, :e), :val)",
-                null, exprValues, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#items", "items");
 
-        JsonNode stored = service.getItem("Users", key);
+        service.updateItem("Users", key, null,
+                "SET #items = list_append(if_not_exists(#items, :e), :val)",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertTrue(stored.has("items"), "items attribute must be created");
         assertEquals(1, stored.get("items").get("L").size());
@@ -979,22 +1050,26 @@ class DynamoDbServiceTest {
 
     @Test
     void listAppendIfNotExistsAppendsWhenAttributePresent() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode existing = item("userId", "u-list-existing");
         existing.set("items", listAttributeValue("a"));
-        service.putItem("Users", existing);
+        service.putItem("Users", existing, region);
 
         ObjectNode key = item("userId", "u-list-existing");
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":e", listAttributeValue());
         exprValues.set(":val", listAttributeValue("b"));
 
-        service.updateItem("Users", key, null,
-                "SET items = list_append(if_not_exists(items, :e), :val)",
-                null, exprValues, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#items", "items");
 
-        JsonNode stored = service.getItem("Users", key);
+        service.updateItem("Users", key, null,
+                "SET #items = list_append(if_not_exists(#items, :e), :val)",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
         assertNotNull(stored);
         assertEquals(2, stored.get("items").get("L").size());
         assertEquals("a", stored.get("items").get("L").get(0).get("S").asText());
@@ -1003,7 +1078,8 @@ class DynamoDbServiceTest {
 
     @Test
     void scanContainsOnListWithNumericElements() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         ObjectNode u1 = item("userId", "u1");
         var list = mapper.createArrayNode();
         list.add(attributeValue("N", "10"));
@@ -1011,7 +1087,7 @@ class DynamoDbServiceTest {
         ObjectNode listNode = mapper.createObjectNode();
         listNode.set("L", list);
         u1.set("values", listNode);
-        service.putItem("Users", u1);
+        service.putItem("Users", u1, region);
 
         ObjectNode u2 = item("userId", "u2");
         var list2 = mapper.createArrayNode();
@@ -1019,19 +1095,23 @@ class DynamoDbServiceTest {
         ObjectNode listNode2 = mapper.createObjectNode();
         listNode2.set("L", list2);
         u2.set("values", listNode2);
-        service.putItem("Users", u2);
+        service.putItem("Users", u2, region);
 
         // Search for N:10.0 — should match N:10 via type-aware comparison
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":v", attributeValue("N", "10.0"));
 
-        DynamoDbService.ScanResult result = service.scan("Users", "contains(values, :v)", null, exprValues, null, null, null);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#vals", "values");
+
+        DynamoDbService.ScanResult result = service.scan("Users", "contains(#vals, :v)", exprNames, exprValues, null, null, null, region);
         assertEquals(1, result.items().size(), "contains() on List with N elements should use type-aware numeric comparison");
     }
 
     @Test
     void updateItemSetAddsToStringSet() {
-        createOrdersTable();
+        String region = "eu-west-1";
+        createOrdersTable(region);
 
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
 
@@ -1048,7 +1128,7 @@ class DynamoDbServiceTest {
 
         service.updateItem("Orders", key, null,
                 "SET price = if_not_exists(price, :val) ADD tags :newTag",
-                null, exprValues, null);
+                null, exprValues, null, region);
 
         // And add another tag to the same item, to verify that the ADD works on existing items as well
         ObjectNode tagVal2 = mapper.createObjectNode();
@@ -1057,9 +1137,9 @@ class DynamoDbServiceTest {
         exprValues.set(":newTag", tagVal2);
         DynamoDbService.UpdateResult updateResult = service.updateItem("Orders", key, null,
                 "SET price = if_not_exists(price, :val) ADD tags :newTag",
-                null, exprValues, null);
+                null, exprValues, null, region);
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, region);
         assertNotNull(stored, "item should have been created");
         assertTrue(stored.has("tags"), "tags attribute must be present on item after ADD");
 
@@ -1085,7 +1165,8 @@ class DynamoDbServiceTest {
      */
     @Test
     void testUpdateWithSetAndRemoveCombined() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         // Put initial item WITHOUT the boolean field
         ObjectNode initialItem = mapper.createObjectNode();
@@ -1093,12 +1174,12 @@ class DynamoDbServiceTest {
         initialItem.set("created", attributeValue("N", "1234567890"));
         initialItem.set("entries", attributeValue("S", "initial"));
         initialItem.set("tempField", attributeValue("S", "to be removed"));
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         // Verify initial state - isActive doesn't exist
         ObjectNode key = mapper.createObjectNode();
         key.set("userId", attributeValue("S", "user-123"));
-        JsonNode beforeUpdate = service.getItem("Users", key);
+        JsonNode beforeUpdate = service.getItem("Users", key, region);
         assertFalse(beforeUpdate.has("isActive"), "isActive should not exist initially");
         assertTrue(beforeUpdate.has("tempField"), "tempField should exist initially");
 
@@ -1117,7 +1198,7 @@ class DynamoDbServiceTest {
         String updateExpr = "SET #entries = :entries, #isActive = :isActive REMOVE #tempField, #created";
 
         DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
-                updateExpr, exprAttrNames, exprAttrValues, "ALL_NEW");
+                updateExpr, exprAttrNames, exprAttrValues, "ALL_NEW", region);
 
         // Verify the result
         JsonNode newItem = result.newItem();
@@ -1136,7 +1217,7 @@ class DynamoDbServiceTest {
         assertFalse(newItem.has("created"), "created should be removed");
 
         // Get item to double-check persistence
-        JsonNode stored = service.getItem("Users", key);
+        JsonNode stored = service.getItem("Users", key, region);
         assertTrue(stored.get("isActive").get("BOOL").asBoolean(),
                 "isActive should still be true after get");
     }
@@ -1147,7 +1228,8 @@ class DynamoDbServiceTest {
      */
     @Test
     void testRemoveNestedMapKey() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         // Put item with a map attribute containing two keys
         ObjectNode initialItem = mapper.createObjectNode();
@@ -1158,19 +1240,19 @@ class DynamoDbServiceTest {
         ObjectNode ratingsMap = mapper.createObjectNode();
         ratingsMap.set("M", ratingsInner);
         initialItem.set("ratings", ratingsMap);
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode key = mapper.createObjectNode();
         key.set("userId", attributeValue("S", "user-1"));
 
         // Verify both keys exist
-        JsonNode before = service.getItem("Users", key);
+        JsonNode before = service.getItem("Users", key, region);
         assertTrue(before.get("ratings").get("M").has("foo"));
         assertTrue(before.get("ratings").get("M").has("bar"));
 
         // REMOVE ratings.foo
         DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
-                "REMOVE ratings.foo", null, null, "ALL_NEW");
+                "REMOVE ratings.foo", null, null, "ALL_NEW", region);
 
         JsonNode updated = result.newItem();
         assertFalse(updated.get("ratings").get("M").has("foo"),
@@ -1185,7 +1267,8 @@ class DynamoDbServiceTest {
      */
     @Test
     void testRemoveNestedMapKeyWithExpressionNames() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "user-2"));
@@ -1195,7 +1278,7 @@ class DynamoDbServiceTest {
         ObjectNode metaMap = mapper.createObjectNode();
         metaMap.set("M", metaInner);
         initialItem.set("metadata", metaMap);
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode key = mapper.createObjectNode();
         key.set("userId", attributeValue("S", "user-2"));
@@ -1206,7 +1289,7 @@ class DynamoDbServiceTest {
         exprAttrNames.put("#tmp", "temp");
 
         DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
-                "REMOVE #meta.#tmp", exprAttrNames, null, "ALL_NEW");
+                "REMOVE #meta.#tmp", exprAttrNames, null, "ALL_NEW", region);
 
         JsonNode updated = result.newItem();
         assertFalse(updated.get("metadata").get("M").has("temp"),
@@ -1220,19 +1303,20 @@ class DynamoDbServiceTest {
      */
     @Test
     void testRemoveNonExistentNestedPath() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "user-3"));
         initialItem.set("name", attributeValue("S", "Alice"));
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode key = mapper.createObjectNode();
         key.set("userId", attributeValue("S", "user-3"));
 
         // REMOVE on a path where the parent map doesn't exist - should not fail
         DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
-                "REMOVE nonexistent.child", null, null, "ALL_NEW");
+                "REMOVE nonexistent.child", null, null, "ALL_NEW", region);
 
         JsonNode updated = result.newItem();
         assertEquals("Alice", updated.get("name").get("S").asText(),
@@ -1244,7 +1328,8 @@ class DynamoDbServiceTest {
      */
     @Test
     void testRemoveDeeplyNestedMapKey() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         // Build: settings.notifications.email = "on", settings.notifications.sms = "off"
         ObjectNode initialItem = mapper.createObjectNode();
@@ -1262,14 +1347,14 @@ class DynamoDbServiceTest {
         settingsMap.set("M", settingsInner);
 
         initialItem.set("settings", settingsMap);
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode key = mapper.createObjectNode();
         key.set("userId", attributeValue("S", "user-4"));
 
         // REMOVE settings.notifications.sms
         DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
-                "REMOVE settings.notifications.sms", null, null, "ALL_NEW");
+                "REMOVE settings.notifications.sms", null, null, "ALL_NEW", region);
 
         JsonNode updated = result.newItem();
         JsonNode notifs = updated.get("settings").get("M").get("notifications").get("M");
@@ -1289,7 +1374,7 @@ class DynamoDbServiceTest {
         initialItem.set("userId", attributeValue("S", id));
         initialItem.set("counter", attributeValue("N", Long.toString(counterValue)));
         initialItem.set("name", attributeValue("S", nameValue));
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, "eu-west-1");
     }
 
     private ObjectNode userIdKey(String id) {
@@ -1300,38 +1385,42 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemWithDifferentSortKeysCreatesSeparateItems() {
-        createOrdersTable();
+        String region = "eu-west-1";
+        createOrdersTable(region);
 
         ObjectNode key1 = item("customerId", "c1", "orderId", "app1");
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":owner", attributeValue("S", "owner-1"));
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#owner", "owner");
 
         service.updateItem("Orders", key1, null,
-                "SET owner = :owner", null, exprValues, null);
+                "SET #owner = :owner", exprNames, exprValues, null, region);
 
         ObjectNode key2 = item("customerId", "c1", "orderId", "app2");
         exprValues = mapper.createObjectNode();
         exprValues.set(":owner", attributeValue("S", "owner-2"));
 
         service.updateItem("Orders", key2, null,
-                "SET owner = :owner", null, exprValues, null);
+                "SET #owner = :owner", exprNames, exprValues, null, region);
 
-        DynamoDbService.ScanResult scanResult = service.scan("Orders", null, null, null, null, null, null);
+        DynamoDbService.ScanResult scanResult = service.scan("Orders", null, null, null, null, null, null, region);
         assertEquals(2, scanResult.items().size(),
                 "two items with same partition key but different sort keys must be stored separately");
 
-        JsonNode item1 = service.getItem("Orders", key1);
+        JsonNode item1 = service.getItem("Orders", key1, region);
         assertNotNull(item1);
         assertEquals("owner-1", item1.get("owner").get("S").asText());
 
-        JsonNode item2 = service.getItem("Orders", key2);
+        JsonNode item2 = service.getItem("Orders", key2, region);
         assertNotNull(item2);
         assertEquals("owner-2", item2.get("owner").get("S").asText());
     }
 
     @Test
     void updateItemMissingSortKeyThrowsValidationException() {
-        createOrdersTable();
+        String region = "eu-west-1";
+        createOrdersTable(region);
 
         ObjectNode keyMissingSk = item("customerId", "c1");
         ObjectNode exprValues = mapper.createObjectNode();
@@ -1339,48 +1428,52 @@ class DynamoDbServiceTest {
 
         AwsException ex = assertThrows(AwsException.class, () ->
                 service.updateItem("Orders", keyMissingSk, null,
-                        "SET name = :val", null, exprValues, null));
+                        "SET name = :val", null, exprValues, null, region));
         assertEquals("ValidationException", ex.getErrorCode());
     }
 
     @Test
     void getItemMissingSortKeyThrowsValidationException() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1", "total", "100"));
+        String region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1", "total", "100"), region);
 
         ObjectNode keyMissingSk = item("customerId", "c1");
         AwsException ex = assertThrows(AwsException.class, () ->
-                service.getItem("Orders", keyMissingSk));
+                service.getItem("Orders", keyMissingSk, region));
         assertEquals("ValidationException", ex.getErrorCode());
     }
 
     @Test
     void deleteItemMissingSortKeyThrowsValidationException() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1", "total", "100"));
+        String region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1", "total", "100"), region);
 
         ObjectNode keyMissingSk = item("customerId", "c1");
         AwsException ex = assertThrows(AwsException.class, () ->
-                service.deleteItem("Orders", keyMissingSk));
+                service.deleteItem("Orders", keyMissingSk, region));
         assertEquals("ValidationException", ex.getErrorCode());
     }
 
     @Test
     void putItemMissingSortKeyThrowsValidationException() {
-        createOrdersTable();
+        String region = "eu-west-1";
+        createOrdersTable(region);
 
         ObjectNode itemMissingSk = item("customerId", "c1", "total", "100");
         AwsException ex = assertThrows(AwsException.class, () ->
-                service.putItem("Orders", itemMissingSk));
+                service.putItem("Orders", itemMissingSk, region));
         assertEquals("ValidationException", ex.getErrorCode());
     }
 
     @Test
     void updateExpressionAcceptsNewlineBetweenSetAndAdd() {
+        String region = "eu-west-1";
         // "SET ... \n ADD ..." — previously both clauses were silently dropped:
         // applySetClause greedily consumed ":newName\nADD counter :inc" as the
         // value and failed the lookup, so neither SET nor ADD ran.
-        createUsersTable();
+        createUsersTable(region);
         seedCounterItem("u1", 1L, "old");
 
         ObjectNode names = mapper.createObjectNode();
@@ -1391,9 +1484,9 @@ class DynamoDbServiceTest {
         values.set(":inc", attributeValue("N", "5"));
 
         service.updateItem("Users", userIdKey("u1"), null,
-                "SET #n = :newName\nADD #c :inc", names, values, "ALL_NEW");
+                "SET #n = :newName\nADD #c :inc", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u1"));
+        JsonNode stored = service.getItem("Users", userIdKey("u1"), region);
         assertEquals("new", stored.get("name").get("S").asText(),
                 "SET clause must apply across a newline boundary");
         assertEquals("6", stored.get("counter").get("N").asText(),
@@ -1402,7 +1495,8 @@ class DynamoDbServiceTest {
 
     @Test
     void updateExpressionAcceptsNewlineBetweenAddAndSet() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         seedCounterItem("u2", 10L, "old");
 
         ObjectNode names = mapper.createObjectNode();
@@ -1413,16 +1507,17 @@ class DynamoDbServiceTest {
         values.set(":inc", attributeValue("N", "3"));
 
         service.updateItem("Users", userIdKey("u2"), null,
-                "ADD #c :inc\nSET #n = :newName", names, values, "ALL_NEW");
+                "ADD #c :inc\nSET #n = :newName", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u2"));
+        JsonNode stored = service.getItem("Users", userIdKey("u2"), region);
         assertEquals("new", stored.get("name").get("S").asText());
         assertEquals("13", stored.get("counter").get("N").asText());
     }
 
     @Test
     void updateExpressionAcceptsTabBetweenClauses() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         seedCounterItem("u3", 0L, "old");
 
         ObjectNode names = mapper.createObjectNode();
@@ -1433,16 +1528,17 @@ class DynamoDbServiceTest {
         values.set(":inc", attributeValue("N", "1"));
 
         service.updateItem("Users", userIdKey("u3"), null,
-                "SET #n = :newName\tADD #c :inc", names, values, "ALL_NEW");
+                "SET #n = :newName\tADD #c :inc", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u3"));
+        JsonNode stored = service.getItem("Users", userIdKey("u3"), region);
         assertEquals("new", stored.get("name").get("S").asText());
         assertEquals("1", stored.get("counter").get("N").asText());
     }
 
     @Test
     void updateExpressionAcceptsCrlfBetweenClauses() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
         seedCounterItem("u4", 100L, "old");
 
         ObjectNode names = mapper.createObjectNode();
@@ -1453,17 +1549,18 @@ class DynamoDbServiceTest {
         values.set(":inc", attributeValue("N", "7"));
 
         service.updateItem("Users", userIdKey("u4"), null,
-                "SET #n = :newName\r\nADD #c :inc", names, values, "ALL_NEW");
+                "SET #n = :newName\r\nADD #c :inc", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u4"));
+        JsonNode stored = service.getItem("Users", userIdKey("u4"), region);
         assertEquals("new", stored.get("name").get("S").asText());
         assertEquals("107", stored.get("counter").get("N").asText());
     }
 
     @Test
     void updateExpressionAcceptsThreeNewlineSeparatedClauses() {
+        String region = "eu-west-1";
         // Canonical Go SDK shape: SET + ADD + DELETE joined by '\n'.
-        createUsersTable();
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "u5"));
@@ -1471,7 +1568,7 @@ class DynamoDbServiceTest {
         ObjectNode ss = mapper.createObjectNode();
         ss.putArray("SS").add("keep").add("drop");
         initialItem.set("tagsToClear", ss);
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode names = mapper.createObjectNode();
         names.put("#a", "alpha");
@@ -1488,9 +1585,9 @@ class DynamoDbServiceTest {
 
         service.updateItem("Users", userIdKey("u5"), null,
                 "SET #a = :a, #b = :b\nADD #c :inc\nDELETE #d :d",
-                names, values, "ALL_NEW");
+                names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u5"));
+        JsonNode stored = service.getItem("Users", userIdKey("u5"), region);
         assertEquals("A", stored.get("alpha").get("S").asText());
         assertEquals("B", stored.get("beta").get("S").asText());
         assertEquals("6", stored.get("counter").get("N").asText());
@@ -1502,13 +1599,14 @@ class DynamoDbServiceTest {
 
     @Test
     void updateExpressionAcceptsNewlineBetweenRemoveAndSet() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "u6"));
         initialItem.set("tempField", attributeValue("S", "bye"));
         initialItem.set("name", attributeValue("S", "old"));
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode names = mapper.createObjectNode();
         names.put("#t", "tempField");
@@ -1517,16 +1615,17 @@ class DynamoDbServiceTest {
         values.set(":newName", attributeValue("S", "new"));
 
         service.updateItem("Users", userIdKey("u6"), null,
-                "REMOVE #t\nSET #n = :newName", names, values, "ALL_NEW");
+                "REMOVE #t\nSET #n = :newName", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u6"));
+        JsonNode stored = service.getItem("Users", userIdKey("u6"), region);
         assertFalse(stored.has("tempField"), "tempField should be removed");
         assertEquals("new", stored.get("name").get("S").asText());
     }
 
     @Test
     void updateExpressionAcceptsNewlineBetweenDeleteAndAdd() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "u7"));
@@ -1534,7 +1633,7 @@ class DynamoDbServiceTest {
         ObjectNode ss = mapper.createObjectNode();
         ss.putArray("SS").add("keep").add("drop");
         initialItem.set("tags", ss);
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode names = mapper.createObjectNode();
         names.put("#c", "counter");
@@ -1546,9 +1645,9 @@ class DynamoDbServiceTest {
         values.set(":d", dropSet);
 
         service.updateItem("Users", userIdKey("u7"), null,
-                "DELETE #tag :d\nADD #c :inc", names, values, "ALL_NEW");
+                "DELETE #tag :d\nADD #c :inc", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u7"));
+        JsonNode stored = service.getItem("Users", userIdKey("u7"), region);
         assertEquals("12", stored.get("counter").get("N").asText());
         JsonNode remaining = stored.get("tags").get("SS");
         assertEquals(1, remaining.size());
@@ -1557,11 +1656,12 @@ class DynamoDbServiceTest {
 
     @Test
     void updateExpressionAddBeforeSetDoesNotSwallowSetKeywordAtIntraSetComma() {
+        String region = "eu-west-1";
         // Regression for Bug 2: before the advancement alignment fix,
         // applyAddClause preferred the next comma (inside the SET clause's
         // "b = :b, c = :c") over the SET keyword, consuming the keyword and
         // dropping the SET entirely.
-        createUsersTable();
+        createUsersTable(region);
         seedCounterItem("u8", 0L, "old");
 
         ObjectNode names = mapper.createObjectNode();
@@ -1573,9 +1673,9 @@ class DynamoDbServiceTest {
         values.set(":other", attributeValue("S", "x"));
 
         service.updateItem("Users", userIdKey("u8"), null,
-                "ADD #c :inc SET #n = :newName, extra = :other", names, values, "ALL_NEW");
+                "ADD #c :inc SET #n = :newName, extra = :other", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u8"));
+        JsonNode stored = service.getItem("Users", userIdKey("u8"), region);
         assertEquals("1", stored.get("counter").get("N").asText(), "ADD must apply");
         assertEquals("new", stored.get("name").get("S").asText(), "SET must apply");
         assertEquals("x", stored.get("extra").get("S").asText(), "second SET assignment must apply");
@@ -1583,13 +1683,14 @@ class DynamoDbServiceTest {
 
     @Test
     void updateExpressionRemoveBeforeSetDoesNotSwallowSetKeywordAtIntraSetComma() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "u9"));
         initialItem.set("tempField", attributeValue("S", "bye"));
         initialItem.set("name", attributeValue("S", "old"));
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode names = mapper.createObjectNode();
         names.put("#t", "tempField");
@@ -1599,9 +1700,9 @@ class DynamoDbServiceTest {
         values.set(":other", attributeValue("S", "x"));
 
         service.updateItem("Users", userIdKey("u9"), null,
-                "REMOVE #t SET #n = :newName, extra = :other", names, values, "ALL_NEW");
+                "REMOVE #t SET #n = :newName, extra = :other", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u9"));
+        JsonNode stored = service.getItem("Users", userIdKey("u9"), region);
         assertFalse(stored.has("tempField"), "REMOVE must apply");
         assertEquals("new", stored.get("name").get("S").asText(), "SET must apply");
         assertEquals("x", stored.get("extra").get("S").asText(), "second SET assignment must apply");
@@ -1609,7 +1710,8 @@ class DynamoDbServiceTest {
 
     @Test
     void updateExpressionDeleteBeforeSetDoesNotSwallowSetKeywordAtIntraSetComma() {
-        createUsersTable();
+        String region = "eu-west-1";
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "u10"));
@@ -1617,7 +1719,7 @@ class DynamoDbServiceTest {
         ObjectNode ss = mapper.createObjectNode();
         ss.putArray("SS").add("keep").add("drop");
         initialItem.set("tags", ss);
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode names = mapper.createObjectNode();
         names.put("#tag", "tags");
@@ -1630,9 +1732,9 @@ class DynamoDbServiceTest {
         values.set(":other", attributeValue("S", "x"));
 
         service.updateItem("Users", userIdKey("u10"), null,
-                "DELETE #tag :d SET #n = :newName, extra = :other", names, values, "ALL_NEW");
+                "DELETE #tag :d SET #n = :newName, extra = :other", names, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u10"));
+        JsonNode stored = service.getItem("Users", userIdKey("u10"), region);
         JsonNode remaining = stored.get("tags").get("SS");
         assertEquals(1, remaining.size());
         assertEquals("keep", remaining.get(0).asText());
@@ -1642,22 +1744,23 @@ class DynamoDbServiceTest {
 
     @Test
     void updateExpressionFindsValidKeywordAfterAttributeNameSuffix() {
+        String region = "eu-west-1";
         // Regression for the indexOfKeyword loop: an attribute name ending in
         // a keyword substring ("oldSET") must not mask a following real clause.
-        createUsersTable();
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "u12"));
         initialItem.set("oldSET", attributeValue("S", "bye"));
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode values = mapper.createObjectNode();
         values.set(":v", attributeValue("S", "hi"));
 
         service.updateItem("Users", userIdKey("u12"), null,
-                "REMOVE oldSET SET newAttr = :v", null, values, "ALL_NEW");
+                "REMOVE oldSET SET newAttr = :v", null, values, "ALL_NEW", region);
 
-        JsonNode stored = service.getItem("Users", userIdKey("u12"));
+        JsonNode stored = service.getItem("Users", userIdKey("u12"), region);
         assertFalse(stored.has("oldSET"), "oldSET should be removed");
         assertEquals("hi", stored.get("newAttr").get("S").asText(),
                 "SET must still be recognised past the oldSET attribute name");
@@ -1665,33 +1768,38 @@ class DynamoDbServiceTest {
 
     @Test
     void updateExpressionDoesNotMatchKeywordInsideAttributeName() {
+        String region = "eu-west-1";
         // False-positive guard for the indexOfKeyword boundary relaxation.
         // An attribute literally named "prefixSET" must not be treated as a
         // clause keyword, and a following comma must still split the SET clause.
-        createUsersTable();
+        createUsersTable(region);
 
         ObjectNode initialItem = mapper.createObjectNode();
         initialItem.set("userId", attributeValue("S", "u11"));
-        service.putItem("Users", initialItem);
+        service.putItem("Users", initialItem, region);
 
         ObjectNode values = mapper.createObjectNode();
         values.set(":v1", attributeValue("S", "one"));
         values.set(":v2", attributeValue("S", "two"));
 
-        service.updateItem("Users", userIdKey("u11"), null,
-                "SET prefixSET = :v1, other = :v2", null, values, "ALL_NEW");
+        ObjectNode names = mapper.createObjectNode();
+        names.put("#other", "other");
 
-        JsonNode stored = service.getItem("Users", userIdKey("u11"));
+        service.updateItem("Users", userIdKey("u11"), null,
+                "SET prefixSET = :v1, #other = :v2", names, values, "ALL_NEW", region);
+
+        JsonNode stored = service.getItem("Users", userIdKey("u11"), region);
         assertEquals("one", stored.get("prefixSET").get("S").asText());
         assertEquals("two", stored.get("other").get("S").asText());
     }
 
     @Test
     void queryWithParenthesizedBetweenKeyCondition() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-01-01Z#a"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-06-15Z#b"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-12-31Z#c"));
+        String region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-01-01Z#a"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-06-15Z#b"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-12-31Z#c"), region);
 
         ObjectNode exprValues = mapper.createObjectNode();
         exprValues.set(":pk", attributeValue("S", "c1"));
@@ -1699,15 +1807,15 @@ class DynamoDbServiceTest {
         exprValues.set(":end", attributeValue("S", "2026-12-31Z#z"));
 
         var result = service.query("Orders", null, exprValues,
-                "customerId = :pk AND (orderId BETWEEN :start AND :end)", null, null);
+                "customerId = :pk AND (orderId BETWEEN :start AND :end)", null, null, region);
         assertEquals(3, result.items().size(), "parenthesized BETWEEN should work");
     }
 
     @Test
     void queryWithCompactAndBetweenKeyCondition() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-01-01Z#a"));
-        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-06-15Z#b"));
+        createOrdersTable("us-east-1");
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-01-01Z#a"), "us-east-1");
+        service.putItem("Orders", item("customerId", "c1", "orderId", "2026-06-15Z#b"), "us-east-1");
 
         ObjectNode exprNames = mapper.createObjectNode();
         exprNames.put("#f0", "customerId");
@@ -1724,8 +1832,8 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemWithNestedDottedPathSetAndRemove() {
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"));
+        createOrdersTable("us-east-1");
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"), "us-east-1");
 
         ObjectNode exprNames = mapper.createObjectNode();
         exprNames.put("#details", "details");
@@ -1767,8 +1875,8 @@ class DynamoDbServiceTest {
     void updateItemSetFollowedByRemovePreservesAllAssignments() {
         // Reproduces the bug where SET's last assignment was lost because findNextComma
         // consumed into the REMOVE clause's comma-separated list.
-        createOrdersTable();
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"));
+        createOrdersTable("us-east-1");
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"), "us-east-1");
 
         ObjectNode exprNames = mapper.createObjectNode();
         exprNames.put("#a", "fieldA");
@@ -1802,11 +1910,11 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemConditionFailedReturnValuesNone() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
     
         ObjectNode order = item("customerId", "1", "orderId", "sort1", "testAttr", "testVal");
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
-        service.putItem("Orders", order);
+        service.putItem("Orders", order, "us-east-1");
 
         ObjectNode exprValues = mapper.createObjectNode();
         ObjectNode newVal = attributeValue("S", "newVal");
@@ -1818,7 +1926,7 @@ class DynamoDbServiceTest {
                 "SET newAttr = :val",
                 null, exprValues, "NONE", "testAttr <> :test", "us-east-1", "NONE"));
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, "us-east-1");
         assertNotNull(stored, "item should exist");
         assertFalse(stored.has("newAttr"), "new attribute should not have been added");
 
@@ -1827,11 +1935,11 @@ class DynamoDbServiceTest {
 
     @Test
     void updateItemConditionFailedReturnValuesAllOld() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
 
         ObjectNode order = item("customerId", "1", "orderId", "sort1", "testAttr", "testVal");
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
-        service.putItem("Orders", order);
+        service.putItem("Orders", order, "us-east-1");
 
         ObjectNode exprValues = mapper.createObjectNode();
         ObjectNode newVal = attributeValue("S", "newVal");
@@ -1843,7 +1951,7 @@ class DynamoDbServiceTest {
                 "SET newAttr = :val",
                 null, exprValues, "NONE", "testAttr <> :test", "us-east-1", "ALL_OLD"));
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, "us-east-1");
         assertNotNull(stored, "item should exist");
         assertFalse(stored.has("newAttr"), "new attribute should not have been added");
 
@@ -1855,14 +1963,14 @@ class DynamoDbServiceTest {
 
     @Test
     void putItemNetNewConditionFailedReturnValuesNone() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
     
         ObjectNode order = item("customerId", "1", "orderId", "sort1", "testAttr", "testVal");
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
         ConditionalCheckFailedException ex = assertThrows(ConditionalCheckFailedException.class, () -> 
             service.putItem("Orders", order, "attribute_exists(customerId)", null, null, "us-east-1", "NONE"));
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, "us-east-1");
         assertNull(stored, "item should not exist");
 
         assertNull(ex.getItem());
@@ -1870,14 +1978,14 @@ class DynamoDbServiceTest {
 
     @Test
     void putItemNetNewConditionFailedReturnValuesAllOld() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
     
         ObjectNode order = item("customerId", "1", "orderId", "sort1", "testAttr", "testVal");
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
         ConditionalCheckFailedException ex = assertThrows(ConditionalCheckFailedException.class, () -> 
             service.putItem("Orders", order, "attribute_exists(customerId)", null, null, "us-east-1", "ALL_OLD"));
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, "us-east-1");
         assertNull(stored, "item should not exist");
 
         assertNull(ex.getItem());
@@ -1885,18 +1993,18 @@ class DynamoDbServiceTest {
     
     @Test
     void putItemExistingConditionFailedReturnValuesNone() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
     
         ObjectNode order1 = item("customerId", "1", "orderId", "sort1", "testAttr", "testVal");
         ObjectNode order2 = item("customerId", "1", "orderId", "sort1", "testAttr", "testVal1");
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
 
-        service.putItem("Orders", order1);
+        service.putItem("Orders", order1, "us-east-1");
 
         ConditionalCheckFailedException ex = assertThrows(ConditionalCheckFailedException.class, () -> 
             service.putItem("Orders", order2, "attribute_exists(someAttr)", null, null, "us-east-1", "NONE"));
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, "us-east-1");
         assertNotNull(stored, "item should exist");
         assertTrue(stored.has("testAttr"), "item should have testAttr");
         assertEquals("testVal", stored.get("testAttr").get("S").asText());
@@ -1906,18 +2014,18 @@ class DynamoDbServiceTest {
 
     @Test
     void putItemExistingConditionFailedReturnValuesAllOld() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
 
         ObjectNode order1 = item("customerId", "1", "orderId", "sort1", "testAttr", "testVal");
         ObjectNode order2 = item("customerId", "1", "orderId", "sort1", "testAttr", "testVal1");
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
 
-        service.putItem("Orders", order1);
+        service.putItem("Orders", order1, "us-east-1");
 
         ConditionalCheckFailedException ex = assertThrows(ConditionalCheckFailedException.class, () -> 
             service.putItem("Orders", order2, "attribute_exists(someAttr)", null, null, "us-east-1", "ALL_OLD"));
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, "us-east-1");
         assertNotNull(stored, "item should exist");
         assertTrue(stored.has("testAttr"), "item should have testAttr");
         assertEquals("testVal", stored.get("testAttr").get("S").asText());
@@ -1932,17 +2040,17 @@ class DynamoDbServiceTest {
     
     @Test
     void deleteItemConditionFailedReturnValuesNone() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
     
         ObjectNode order = item("customerId", "1", "orderId", "sort1");
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
 
-        service.putItem("Orders", order);
+        service.putItem("Orders", order, "us-east-1");
 
         ConditionalCheckFailedException ex = assertThrows(ConditionalCheckFailedException.class, () -> 
             service.deleteItem("Orders", key, "attribute_exists(someAttr)", null, null, "us-east-1", "NONE"));
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, "us-east-1");
         assertNotNull(stored, "item should exist");
 
         assertNull(ex.getItem());
@@ -1950,22 +2058,294 @@ class DynamoDbServiceTest {
 
     @Test
     void deleteItemConditionFailedReturnValuesAllOld() {
-        createOrdersTable();
+        createOrdersTable("us-east-1");
 
         ObjectNode order = item("customerId", "1", "orderId", "sort1");
         ObjectNode key = item("customerId", "1", "orderId", "sort1");
 
-        service.putItem("Orders", order);
+        service.putItem("Orders", order, "us-east-1");
 
         ConditionalCheckFailedException ex = assertThrows(ConditionalCheckFailedException.class, () -> 
             service.deleteItem("Orders", key, "attribute_exists(someAttr)", null, null, "us-east-1", "ALL_OLD"));
 
-        JsonNode stored = service.getItem("Orders", key);
+        JsonNode stored = service.getItem("Orders", key, "us-east-1");
         assertNotNull(stored, "item should exist");
 
         JsonNode returnedItem = ex.getItem();
         assertNotNull(returnedItem);
         assertTrue(returnedItem.has("customerId"), "returned item should have customerId");
         assertEquals("1", returnedItem.get("customerId").get("S").asText());
+    }
+
+    // ── Regression tests: cross-attribute SET, parenthesized arithmetic,
+    //    and TransactWriteItems ClientRequestToken idempotency ──
+
+    @Test
+    void updateItemSetCrossAttributeReferenceUsesPreUpdateValue() {
+        String region = "eu-west-1";
+        // "SET a = :new, b = a" must write the ORIGINAL value of a into b.
+        // AWS DynamoDB applies SET actions atomically; attribute references on the RHS
+        // resolve to pre-update values.
+        createUsersTable(region);
+
+        ObjectNode existing = mapper.createObjectNode();
+        existing.set("userId", attributeValue("S", "u1"));
+        existing.set("a", attributeValue("S", "original_a"));
+        existing.set("b", attributeValue("S", "original_b"));
+        service.putItem("Users", existing, region);
+
+        ObjectNode key = item("userId", "u1");
+        ObjectNode exprValues = mapper.createObjectNode();
+        exprValues.set(":new_a", attributeValue("S", "new_a_value"));
+
+        service.updateItem("Users", key, null,
+                "SET a = :new_a, b = a",
+                null, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
+        assertNotNull(stored);
+        assertEquals("new_a_value", stored.get("a").get("S").asText(),
+                "a should be updated to the new value");
+        assertEquals("original_a", stored.get("b").get("S").asText(),
+                "b should receive a's pre-update value (atomic application)");
+    }
+
+    @Test
+    void updateItemSetCrossAttributeReferenceWithExpressionAttributeNames() {
+        String region = "eu-west-1";
+        // Same as above but using #placeholder names — the form most client libraries emit.
+        createUsersTable(region);
+
+        ObjectNode existing = mapper.createObjectNode();
+        existing.set("userId", attributeValue("S", "u1"));
+        existing.set("status", attributeValue("S", "ISSUED"));
+        existing.set("previousStatus", attributeValue("S", "NONE"));
+        service.putItem("Users", existing, region);
+
+        ObjectNode key = item("userId", "u1");
+        ObjectNode exprAttrNames = mapper.createObjectNode();
+        exprAttrNames.put("#s", "status");
+        exprAttrNames.put("#p", "previousStatus");
+        ObjectNode exprValues = mapper.createObjectNode();
+        exprValues.set(":v", attributeValue("S", "VOID"));
+
+        service.updateItem("Users", key, null,
+                "SET #s = :v, #p = #s",
+                exprAttrNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
+        assertEquals("VOID", stored.get("status").get("S").asText());
+        assertEquals("ISSUED", stored.get("previousStatus").get("S").asText(),
+                "previousStatus should receive the pre-update value of status");
+    }
+
+    @Test
+    void updateItemSetParenthesizedArithmeticAppliesSubtraction() {
+        String region = "eu-west-1";
+        // "SET c = (c - :v)" must subtract identically to the unwrapped form.
+        // Previously, findArithmeticOperator only returned operators at paren-depth 0,
+        // so wrapped arithmetic silently no-oped.
+        createUsersTable(region);
+
+        ObjectNode existing = mapper.createObjectNode();
+        existing.set("userId", attributeValue("S", "u1"));
+        ObjectNode counterVal = mapper.createObjectNode();
+        counterVal.put("N", "5");
+        existing.set("counter", counterVal);
+        service.putItem("Users", existing, region);
+
+        ObjectNode key = item("userId", "u1");
+        ObjectNode exprAttrNames = mapper.createObjectNode();
+        exprAttrNames.put("#c", "counter");
+        ObjectNode exprValues = mapper.createObjectNode();
+        ObjectNode vNode = mapper.createObjectNode();
+        vNode.put("N", "1");
+        exprValues.set(":v", vNode);
+
+        service.updateItem("Users", key, null,
+                "SET #c = (#c - :v)",
+                exprAttrNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
+        assertEquals("4", stored.get("counter").get("N").asText(),
+                "parenthesized arithmetic should subtract identically to the unwrapped form");
+    }
+
+    @Test
+    void updateItemSetParenthesizedIfNotExistsArithmeticAlongsidePlainAssignment() {
+        String region = "eu-west-1";
+        // ElectroDB-style emission: "SET c = (if_not_exists(c, :d) - :v), other = :s".
+        // Previously the parenthesized arithmetic was silently dropped while the simple
+        // SET clause applied — a confusing partial-success outcome.
+        createUsersTable(region);
+
+        ObjectNode existing = mapper.createObjectNode();
+        existing.set("userId", attributeValue("S", "u1"));
+        ObjectNode counterVal = mapper.createObjectNode();
+        counterVal.put("N", "5");
+        existing.set("counter", counterVal);
+        existing.set("other", attributeValue("S", "old"));
+        service.putItem("Users", existing, region);
+
+        ObjectNode key = item("userId", "u1");
+        ObjectNode exprAttrNames = mapper.createObjectNode();
+        exprAttrNames.put("#c", "counter");
+        exprAttrNames.put("#o", "other");
+        ObjectNode exprValues = mapper.createObjectNode();
+        ObjectNode vNode = mapper.createObjectNode(); vNode.put("N", "1");
+        ObjectNode dNode = mapper.createObjectNode(); dNode.put("N", "0");
+        exprValues.set(":v", vNode);
+        exprValues.set(":d", dNode);
+        exprValues.set(":s", attributeValue("S", "new"));
+
+        service.updateItem("Users", key, null,
+                "SET #c = (if_not_exists(#c, :d) - :v), #o = :s",
+                exprAttrNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
+        assertEquals("4", stored.get("counter").get("N").asText(),
+                "parenthesized arithmetic should apply alongside a simple SET clause");
+        assertEquals("new", stored.get("other").get("S").asText(),
+                "the non-parenthesized clause should still apply");
+    }
+
+    @Test
+    void updateItemSetDoubledOuterParensStillApplies() {
+        String region = "eu-west-1";
+        // Defence-in-depth: even multiply-wrapped expressions should parse the same as bare.
+        createUsersTable(region);
+
+        ObjectNode existing = mapper.createObjectNode();
+        existing.set("userId", attributeValue("S", "u1"));
+        ObjectNode counterVal = mapper.createObjectNode(); counterVal.put("N", "10");
+        existing.set("counter", counterVal);
+        service.putItem("Users", existing, region);
+
+        ObjectNode key = item("userId", "u1");
+        ObjectNode exprValues = mapper.createObjectNode();
+        ObjectNode vNode = mapper.createObjectNode(); vNode.put("N", "3");
+        exprValues.set(":v", vNode);
+
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#cnt", "counter");
+
+        service.updateItem("Users", key, null,
+                "SET #cnt = ((#cnt - :v))",
+                exprNames, exprValues, null, region);
+
+        JsonNode stored = service.getItem("Users", key, region);
+        assertEquals("7", stored.get("counter").get("N").asText());
+    }
+
+    @Test
+    void transactWriteItemsReplayWithSameTokenAndBodyIsNoOp() {
+        // ClientRequestToken contract: same token + same body → no re-application of writes.
+        createUsersTable("us-east-1");
+        service.putItem("Users", item("userId", "u1"), "us-east-1");
+
+        ObjectNode update = mapper.createObjectNode();
+        update.put("TableName", "Users");
+        update.set("Key", item("userId", "u1"));
+        ObjectNode exprValues = mapper.createObjectNode();
+        ObjectNode oneVal = mapper.createObjectNode(); oneVal.put("N", "1");
+        exprValues.set(":one", oneVal);
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#c", "counter");
+        update.put("UpdateExpression", "ADD #c :one");
+        update.set("ExpressionAttributeNames", exprNames);
+        update.set("ExpressionAttributeValues", exprValues);
+
+        ObjectNode transactItem = mapper.createObjectNode();
+        transactItem.set("Update", update);
+
+        ObjectNode rawRequest = mapper.createObjectNode();
+        rawRequest.putArray("TransactItems").add(transactItem);
+        rawRequest.put("ClientRequestToken", "tok-replay");
+
+        // First call applies the ADD: counter becomes 1.
+        service.transactWriteItems(List.of(transactItem), "us-east-1", "tok-replay", rawRequest);
+        // Replay must be a no-op.
+        service.transactWriteItems(List.of(transactItem), "us-east-1", "tok-replay", rawRequest);
+
+        JsonNode stored = service.getItem("Users", item("userId", "u1"), "us-east-1");
+        assertEquals("1", stored.get("counter").get("N").asText(),
+                "replay with the same ClientRequestToken must not re-apply the write");
+    }
+
+    @Test
+    void transactWriteItemsReplayWithSameTokenButDifferentBodyThrowsIdempotentMismatch() {
+        // ClientRequestToken contract: same token + different body → IdempotentParameterMismatchException.
+        createUsersTable("us-east-1");
+        service.putItem("Users", item("userId", "u1"), "us-east-1");
+
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#c", "counter");
+
+        // First request: ADD #c :x with :x = 1
+        ObjectNode update1 = mapper.createObjectNode();
+        update1.put("TableName", "Users");
+        update1.set("Key", item("userId", "u1"));
+        ObjectNode exprValues1 = mapper.createObjectNode();
+        ObjectNode oneVal = mapper.createObjectNode(); oneVal.put("N", "1");
+        exprValues1.set(":x", oneVal);
+        update1.put("UpdateExpression", "ADD #c :x");
+        update1.set("ExpressionAttributeNames", exprNames);
+        update1.set("ExpressionAttributeValues", exprValues1);
+        ObjectNode tx1 = mapper.createObjectNode(); tx1.set("Update", update1);
+        ObjectNode raw1 = mapper.createObjectNode();
+        raw1.putArray("TransactItems").add(tx1);
+        raw1.put("ClientRequestToken", "tok-mismatch");
+
+        service.transactWriteItems(List.of(tx1), "us-east-1", "tok-mismatch", raw1);
+
+        // Second request reuses the token but changes :x to 2.
+        ObjectNode update2 = mapper.createObjectNode();
+        update2.put("TableName", "Users");
+        update2.set("Key", item("userId", "u1"));
+        ObjectNode exprValues2 = mapper.createObjectNode();
+        ObjectNode twoVal = mapper.createObjectNode(); twoVal.put("N", "2");
+        exprValues2.set(":x", twoVal);
+        update2.put("UpdateExpression", "ADD #c :x");
+        update2.set("ExpressionAttributeNames", exprNames);
+        update2.set("ExpressionAttributeValues", exprValues2);
+        ObjectNode tx2 = mapper.createObjectNode(); tx2.set("Update", update2);
+        ObjectNode raw2 = mapper.createObjectNode();
+        raw2.putArray("TransactItems").add(tx2);
+        raw2.put("ClientRequestToken", "tok-mismatch");
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.transactWriteItems(List.of(tx2), "us-east-1", "tok-mismatch", raw2));
+        assertEquals("IdempotentParameterMismatchException", ex.getErrorCode());
+
+        // First call applied; second was rejected — counter remains 1.
+        JsonNode stored = service.getItem("Users", item("userId", "u1"), "us-east-1");
+        assertEquals("1", stored.get("counter").get("N").asText());
+    }
+
+    @Test
+    void transactWriteItemsNullClientRequestTokenSkipsIdempotencyCheck() {
+        // When no token is supplied, two calls with identical bodies should both apply
+        // (i.e. counter ends at 2). This is the pre-existing behaviour and must remain.
+        createUsersTable("us-east-1");
+        service.putItem("Users", item("userId", "u1"), "us-east-1");
+
+        ObjectNode update = mapper.createObjectNode();
+        update.put("TableName", "Users");
+        update.set("Key", item("userId", "u1"));
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#c", "counter");
+        ObjectNode exprValues = mapper.createObjectNode();
+        ObjectNode oneVal = mapper.createObjectNode(); oneVal.put("N", "1");
+        exprValues.set(":one", oneVal);
+        update.put("UpdateExpression", "ADD #c :one");
+        update.set("ExpressionAttributeNames", exprNames);
+        update.set("ExpressionAttributeValues", exprValues);
+        ObjectNode tx = mapper.createObjectNode(); tx.set("Update", update);
+
+        service.transactWriteItems(List.of(tx), "us-east-1", null, null);
+        service.transactWriteItems(List.of(tx), "us-east-1", null, null);
+
+        JsonNode stored = service.getItem("Users", item("userId", "u1"), "us-east-1");
+        assertEquals("2", stored.get("counter").get("N").asText());
     }
 }

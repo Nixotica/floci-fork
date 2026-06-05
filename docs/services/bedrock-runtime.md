@@ -24,12 +24,9 @@ InvokeModel bodies are passed through as opaque bytes; the stub does not parse r
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    bedrock-runtime:
-      enabled: true
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_BEDROCKRUNTIME_ENABLED` | `true` | Enable or disable the service |
 
 ## Examples
 

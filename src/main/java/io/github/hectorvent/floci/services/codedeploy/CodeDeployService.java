@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.codedeploy.model.Application;
 import io.github.hectorvent.floci.services.codedeploy.model.Deployment;
 import io.github.hectorvent.floci.services.codedeploy.model.DeploymentConfig;
@@ -48,11 +49,12 @@ public class CodeDeployService {
     private final Ec2Service ec2Service;
     private final ObjectMapper mapper;
     private final ObjectMapper yamlMapper;
+    private final RegionResolver regionResolver;
 
     @Inject
     public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
                              ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
-                             Ec2Service ec2Service, ObjectMapper mapper) {
+                             Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver) {
         this.lambdaService = lambdaService;
         this.ecsService = ecsService;
         this.elbV2Service = elbV2Service;
@@ -60,6 +62,7 @@ public class CodeDeployService {
         this.ec2Service = ec2Service;
         this.mapper = mapper;
         this.yamlMapper = new ObjectMapper(new YAMLFactory());
+        this.regionResolver = regionResolver;
     }
 
     // key: region -> name -> application
@@ -478,7 +481,7 @@ public class CodeDeployService {
 
         // Build initial target map
         String targetId = appSpec.functionName + ":" + appSpec.aliasName;
-        String targetArn = AwsArnUtils.Arn.of("lambda", region, "000000000000", "function:" + appSpec.functionName + ":" + appSpec.aliasName).toString();
+        String targetArn = AwsArnUtils.Arn.of("lambda", region, regionResolver.getAccountId(), "function:" + appSpec.functionName + ":" + appSpec.aliasName).toString();
         Map<String, Object> lambdaTargetMap = new ConcurrentHashMap<>();
         lambdaTargetMap.put("deploymentId", deploymentId);
         lambdaTargetMap.put("targetId", targetId);
@@ -591,7 +594,7 @@ public class CodeDeployService {
         Map<String, OnPremisesInstance> store = onPremisesFor(region);
         OnPremisesInstance inst = new OnPremisesInstance();
         inst.setInstanceName(instanceName);
-        inst.setInstanceArn(AwsArnUtils.Arn.of("codedeploy", region, "000000000000",
+        inst.setInstanceArn(AwsArnUtils.Arn.of("codedeploy", region, regionResolver.getAccountId(),
                 "instance/" + instanceName).toString());
         inst.setIamSessionArn(iamSessionArn);
         inst.setIamUserArn(iamUserArn);
@@ -1142,7 +1145,7 @@ public class CodeDeployService {
         }
 
         String targetId = clusterName + ":" + serviceName;
-        String targetArn = AwsArnUtils.Arn.of("ecs", region, "000000000000", "service/" + clusterName + "/" + serviceName).toString();
+        String targetArn = AwsArnUtils.Arn.of("ecs", region, regionResolver.getAccountId(), "service/" + clusterName + "/" + serviceName).toString();
 
         Map<String, Object> ecsTargetMap = new ConcurrentHashMap<>();
         ecsTargetMap.put("deploymentId", deploymentId);
@@ -1643,11 +1646,11 @@ public class CodeDeployService {
     }
 
     public String applicationArn(String region, String name) {
-        return AwsArnUtils.Arn.of("codedeploy", region, "000000000000", "application:" + name).toString();
+        return AwsArnUtils.Arn.of("codedeploy", region, regionResolver.getAccountId(), "application:" + name).toString();
     }
 
     public String deploymentGroupArn(String region, String appName, String groupName) {
-        return AwsArnUtils.Arn.of("codedeploy", region, "000000000000", "deploymentgroup:" + appName + "/" + groupName).toString();
+        return AwsArnUtils.Arn.of("codedeploy", region, regionResolver.getAccountId(), "deploymentgroup:" + appName + "/" + groupName).toString();
     }
 
     @SuppressWarnings("unchecked")

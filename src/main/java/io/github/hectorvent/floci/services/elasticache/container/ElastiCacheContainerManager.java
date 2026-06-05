@@ -14,6 +14,12 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.Closeable;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +35,15 @@ public class ElastiCacheContainerManager {
 
     private static final Logger LOG = Logger.getLogger(ElastiCacheContainerManager.class);
     private static final int BACKEND_PORT = 6379;
+
+    /**
+     * Docker can publish a host port before Valkey inside the container is listening. Without a probe,
+     * the auth proxy may connect, forward PING, and block on PONG until the client times out.
+     */
+    private static final int BACKEND_READY_DEADLINE_MS = 60_000;
+    private static final int BACKEND_READY_RETRY_MS = 100;
+    private static final int BACKEND_PROBE_CONNECT_MS = 2_000;
+    private static final byte[] RESP_PING = "*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.UTF_8);
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -100,7 +115,64 @@ public class ElastiCacheContainerManager {
                 info.containerId(), logGroup, logStream, region, "elasticache:" + groupId);
         handle.setLogStream(logHandle);
 
+        waitForBackendReady(groupId, endpoint.host(), endpoint.port());
+
         return handle;
+    }
+
+    private static void waitForBackendReady(String groupId, String host, int port) {
+        long deadline = System.currentTimeMillis() + BACKEND_READY_DEADLINE_MS;
+        int attempt = 0;
+        while (System.currentTimeMillis() < deadline) {
+            attempt++;
+            try (Socket s = new Socket()) {
+                s.connect(new InetSocketAddress(host, port), BACKEND_PROBE_CONNECT_MS);
+                s.setTcpNoDelay(true);
+                s.setSoTimeout(BACKEND_PROBE_CONNECT_MS);
+                OutputStream out = s.getOutputStream();
+                out.write(RESP_PING);
+                out.flush();
+                String line = readAsciiLineCrLf(s.getInputStream());
+                if (line.startsWith("+PONG")) {
+                    if (attempt > 1) {
+                        LOG.infov("ElastiCache backend ready for group {0} after {1} probe attempt(s)", groupId, attempt);
+                    }
+                    return;
+                }
+                if (LOG.isDebugEnabled()) {
+                    LOG.debugv("ElastiCache backend probe for group {0}: unexpected line {1}", groupId, line);
+                }
+            } catch (IOException e) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debugv("ElastiCache backend probe for group {0} attempt {1}: {2}", groupId, attempt, e.getMessage());
+                }
+            }
+            try {
+                Thread.sleep(BACKEND_READY_RETRY_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted while waiting for ElastiCache backend " + groupId, ie);
+            }
+        }
+        throw new RuntimeException(
+                "ElastiCache backend for group " + groupId + " did not become ready on " + host + ":" + port
+                        + " within " + BACKEND_READY_DEADLINE_MS + "ms");
+    }
+
+    private static String readAsciiLineCrLf(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        int b;
+        while ((b = in.read()) != -1) {
+            if (b == '\r') {
+                int next = in.read();
+                if (next != '\n') {
+                    throw new IOException("Expected \\n after \\r in RESP line");
+                }
+                break;
+            }
+            sb.append((char) b);
+        }
+        return sb.toString();
     }
 
     public void stop(ElastiCacheContainerHandle handle) {

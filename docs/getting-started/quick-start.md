@@ -208,5 +208,6 @@ sudo ufw allow in on docker0 to any port 5000:5099 proto tcp comment 'floci ecr 
 ## Next Steps
 
 - [Configure Docker Compose with ElastiCache and RDS ports](../configuration/docker-compose.md)
-- [Review all configuration options](../configuration/application-yml.md)
+- [Environment variables reference](../configuration/environment-variables.md)
+- [application.yml reference (source builds)](../configuration/advanced/application-yml.md)
 - [Browse per-service documentation](../services/index.md)

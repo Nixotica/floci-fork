@@ -508,6 +508,32 @@ public class ApiGatewayV2JsonHandler {
             ObjectNode tagsNode = node.putObject("Tags");
             api.getTags().forEach(tagsNode::put);
         }
+        if (api.getCorsConfiguration() != null) {
+            node.set("CorsConfiguration", toCorsNode(api.getCorsConfiguration()));
+        }
+        return node;
+    }
+
+    private ObjectNode toCorsNode(Api.Cors cors) {
+        ObjectNode node = objectMapper.createObjectNode();
+        if (cors.allowOrigins() != null) {
+            ArrayNode arr = node.putArray("AllowOrigins");
+            cors.allowOrigins().forEach(arr::add);
+        }
+        if (cors.allowMethods() != null) {
+            ArrayNode arr = node.putArray("AllowMethods");
+            cors.allowMethods().forEach(arr::add);
+        }
+        if (cors.allowHeaders() != null) {
+            ArrayNode arr = node.putArray("AllowHeaders");
+            cors.allowHeaders().forEach(arr::add);
+        }
+        if (cors.exposeHeaders() != null) {
+            ArrayNode arr = node.putArray("ExposeHeaders");
+            cors.exposeHeaders().forEach(arr::add);
+        }
+        if (cors.maxAge() != null) node.put("MaxAge", cors.maxAge());
+        if (cors.allowCredentials() != null) node.put("AllowCredentials", cors.allowCredentials());
         return node;
     }
 
@@ -530,6 +556,18 @@ public class ApiGatewayV2JsonHandler {
                 auth.getJwtConfiguration().audience().forEach(aud::add);
             }
         }
+        if (auth.getAuthorizerUri() != null) {
+            node.put("AuthorizerUri", auth.getAuthorizerUri());
+        }
+        if (auth.getAuthorizerPayloadFormatVersion() != null) {
+            node.put("AuthorizerPayloadFormatVersion", auth.getAuthorizerPayloadFormatVersion());
+        }
+        if (auth.getAuthorizerResultTtlInSeconds() != null) {
+            node.put("AuthorizerResultTtlInSeconds", auth.getAuthorizerResultTtlInSeconds());
+        }
+        if (auth.getEnableSimpleResponses() != null) {
+            node.put("EnableSimpleResponses", auth.getEnableSimpleResponses());
+        }
         return node;
     }
 
@@ -550,8 +588,31 @@ public class ApiGatewayV2JsonHandler {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("IntegrationId", i.getIntegrationId());
         node.put("IntegrationType", i.getIntegrationType());
+        if (i.getConnectionType() != null) node.put("ConnectionType", i.getConnectionType());
+        if (i.getConnectionId() != null) node.put("ConnectionId", i.getConnectionId());
         node.put("PayloadFormatVersion", i.getPayloadFormatVersion());
         if (i.getIntegrationUri() != null) node.put("IntegrationUri", i.getIntegrationUri());
+        if (i.getRequestTemplates() != null) {
+            ObjectNode requestTemplates = node.putObject("RequestTemplates");
+            i.getRequestTemplates().forEach(requestTemplates::put);
+        }
+        if (i.getResponseTemplates() != null) {
+            ObjectNode responseTemplates = node.putObject("ResponseTemplates");
+            i.getResponseTemplates().forEach(responseTemplates::put);
+        }
+        if (i.getRequestParameters() != null) {
+            ObjectNode requestParameters = node.putObject("RequestParameters");
+            i.getRequestParameters().forEach(requestParameters::put);
+        }
+        if (i.getTemplateSelectionExpression() != null) {
+            node.put("TemplateSelectionExpression", i.getTemplateSelectionExpression());
+        }
+        if (i.getIntegrationMethod() != null) {
+            node.put("IntegrationMethod", i.getIntegrationMethod());
+        }
+        if (i.getTimeoutInMillis() != 0) {
+            node.put("TimeoutInMillis", i.getTimeoutInMillis());
+        }
         return node;
     }
 
@@ -562,6 +623,10 @@ public class ApiGatewayV2JsonHandler {
         node.put("CreatedDate", s.getCreatedDate() / 1000.0);
         node.put("LastUpdatedDate", s.getLastUpdatedDate() / 1000.0);
         if (s.getDeploymentId() != null) node.put("DeploymentId", s.getDeploymentId());
+        if (s.getStageVariables() != null) {
+            ObjectNode stageVariables = node.putObject("StageVariables");
+            s.getStageVariables().forEach(stageVariables::put);
+        }
         return node;
     }
 

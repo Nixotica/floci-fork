@@ -30,13 +30,10 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 
 ### Configuration
 
-```yaml
-floci:
-  services:
-    cloudwatchlogs:
-      enabled: true
-      max-events-per-query: 10000
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_CLOUDWATCHLOGS_ENABLED` | `true` | Enable or disable the CloudWatch Logs service |
+| `FLOCI_SERVICES_CLOUDWATCHLOGS_MAX_EVENTS_PER_QUERY` | `10000` | Maximum events returned per `FilterLogEvents` / `GetLogEvents` call |
 
 ### Examples
 

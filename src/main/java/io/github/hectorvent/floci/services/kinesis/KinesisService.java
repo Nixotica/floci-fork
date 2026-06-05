@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.kinesis;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisConsumer;
@@ -68,6 +69,7 @@ public class KinesisService {
 
         String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
         KinesisStream stream = new KinesisStream(streamName, arn);
+        stream.setAccountId(regionResolver.getAccountId());
         stream.setStreamMode(resolvedMode);
 
         for (int i = 0; i < shardCount; i++) {
@@ -494,6 +496,76 @@ public class KinesisService {
     private KinesisStream resolveStream(String streamName, String region) {
         return store.get(regionKey(region, streamName))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Stream " + streamName + " not found", 400));
+    }
+
+    private KinesisStream resolveStreamForAccount(String accountId, String streamName, String region) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<KinesisStream> aware) {
+            return aware.getForAccount(accountId, regionKey(region, streamName))
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Stream " + streamName + " not found", 400));
+        }
+        return resolveStream(streamName, region);
+    }
+
+    public String getShardIteratorForAccount(String accountId, String streamName, String shardId,
+                                             String type, String sequenceNumber, String region) {
+        resolveStreamForAccount(accountId, streamName, region);
+        String raw = String.format("%s|%s|%s|%s|%d|",
+                streamName, shardId, type,
+                sequenceNumber != null ? sequenceNumber : "", 0);
+        return Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public Map<String, Object> getRecordsForAccount(String accountId, String shardIterator,
+                                                    Integer limit, String region) {
+        byte[] decoded = Base64.getDecoder().decode(shardIterator);
+        String[] parts = new String(decoded, StandardCharsets.UTF_8).split(java.util.regex.Pattern.quote("|"), -1);
+        if (parts.length < 5) {
+            throw new AwsException("InvalidArgumentException", "Invalid shard iterator", 400);
+        }
+        String streamName = parts[0];
+        String shardId = parts[1];
+        String type = parts[2];
+        String startSeq = parts[3];
+        int lastIndex = Integer.parseInt(parts[4]);
+
+        KinesisStream stream = resolveStreamForAccount(accountId, streamName, region);
+        KinesisShard shard = stream.getShards().stream()
+                .filter(s -> s.getShardId().equals(shardId))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
+
+        List<KinesisRecord> allRecords = shard.getRecords();
+        int startIndex = 0;
+        if ("TRIM_HORIZON".equals(type)) {
+            startIndex = lastIndex;
+        } else if ("LATEST".equals(type)) {
+            startIndex = allRecords.size();
+        } else if ("AFTER_SEQUENCE_NUMBER".equals(type)) {
+            for (int i = 0; i < allRecords.size(); i++) {
+                if (allRecords.get(i).getSequenceNumber().equals(startSeq)) {
+                    startIndex = i + 1;
+                    break;
+                }
+            }
+        }
+
+        int max = limit != null ? Math.min(limit, 1000) : 1000;
+        List<KinesisRecord> result = new ArrayList<>();
+        int nextIndex = startIndex;
+        for (int i = startIndex; i < allRecords.size() && result.size() < max; i++) {
+            result.add(allRecords.get(i));
+            nextIndex = i + 1;
+        }
+
+        String nextIterator = Base64.getEncoder().encodeToString(
+                String.format("%s|%s|%s|%s|%d|", streamName, shardId, "TRIM_HORIZON", "", nextIndex)
+                        .getBytes(StandardCharsets.UTF_8));
+        Map<String, Object> response = new HashMap<>();
+        response.put("Records", result);
+        response.put("NextShardIterator", nextIterator);
+        response.put("MillisBehindLatest", computeMillisBehindLatest(allRecords, nextIndex));
+        return response;
     }
 
     private KinesisShard selectShard(KinesisStream stream, String partitionKey) {

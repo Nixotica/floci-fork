@@ -27,6 +27,7 @@ Floci supports both API Gateway v1 (REST APIs) and API Gateway v2 (HTTP APIs).
 | **Models** | CreateModel, GetModel, GetModels, DeleteModel |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, DeleteDomainName |
 | **Base Path Mappings** | CreateBasePathMapping, GetBasePathMapping, GetBasePathMappings, DeleteBasePathMapping |
+| **Account** | GetAccount, UpdateAccount |
 | **Tags** | TagResource, UntagResource, GetTags (ListTagsForResource) |
 
 ### Not Implemented
@@ -42,7 +43,6 @@ These management-plane operations have no handler in v1. Calls will return `404`
 - Documentation parts and versions (the entire family, 10 operations)
 - VPC Links (5 operations)
 - Client Certificates (5 operations)
-- Account: `GetAccount`, `UpdateAccount`
 - `GetExport` / `ImportDocumentationParts`
 
 The execute plane (actual proxied HTTP traffic via `/restapis/{id}/{stage}/_user_request_/…`) is implemented separately and is not counted as management-plane operations.
@@ -102,12 +102,19 @@ curl http://localhost:4566/restapis/$API_ID/dev/_user_request_/users
 
 ---
 
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_APIGATEWAY_ENABLED` | `true` | Enable or disable API Gateway v1 (REST APIs) |
+| `FLOCI_SERVICES_APIGATEWAYV2_ENABLED` | `true` | Enable or disable API Gateway v2 (HTTP and WebSocket APIs) |
+
 ## API Gateway v2 (HTTP and WebSocket APIs) {#v2}
 
 **Protocol:** REST JSON
 **Endpoint:** `http://localhost:4566/v2/apis/...`
 
-Both HTTP and WebSocket protocol types are supported for the management plane. WebSocket data-plane (actual connection handling) is not yet implemented.
+Both HTTP and WebSocket protocol types are fully supported, including the WebSocket data-plane (real connection handling, message routing, and the `@connections` management API).
 
 ### Supported Operations
 
@@ -124,9 +131,60 @@ Both HTTP and WebSocket protocol types are supported for the management plane. W
 | **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
 | **Tags** | TagResource, UntagResource, GetTags |
 
+### WebSocket Data-Plane {#websocket-data-plane}
+
+Floci supports real WebSocket connections for API Gateway v2 WebSocket APIs. Clients connect via:
+
+```
+ws://localhost:4566/ws/{apiId}/{stageName}
+```
+
+#### Supported Features
+
+| Feature | Status |
+|---------|--------|
+| `$connect` route with Lambda integration | ✅ |
+| `$disconnect` route with Lambda integration | ✅ |
+| `$default` route (fallback) | ✅ |
+| Custom routes via `routeSelectionExpression` | ✅ |
+| Route response selection expression | ✅ |
+| Lambda REQUEST authorizer on `$connect` | ✅ |
+| Identity source validation (header/querystring) | ✅ |
+| `@connections` POST (send message to client) | ✅ |
+| `@connections` GET (get connection info) | ✅ |
+| `@connections` DELETE (disconnect client) | ✅ |
+| Stage variable substitution in integration URIs | ✅ |
+| AWS_PROXY integration (Lambda) | ✅ |
+| AWS integration (Lambda with VTL templates) | ✅ |
+| HTTP_PROXY integration | ✅ |
+| HTTP integration (with VTL templates) | ✅ |
+| MOCK integration | ✅ |
+| GoneException (410) for disconnected connections | ✅ |
+| Binary frame support (`isBase64Encoded: true`) | ✅ |
+| `$connect` response headers propagation | ✅ |
+| 128 KB payload size limit enforcement | ✅ |
+| 10-minute idle timeout | ✅ |
+| 2-hour max connection duration | ✅ |
+
+#### @connections Management API
+
+The `@connections` API allows server-side code (e.g., Lambda functions) to send messages to connected clients, retrieve connection metadata, or disconnect clients:
+
+```
+POST   /execute-api/{apiId}/{stageName}/@connections/{connectionId}  — Send message
+GET    /execute-api/{apiId}/{stageName}/@connections/{connectionId}  — Get connection info
+DELETE /execute-api/{apiId}/{stageName}/@connections/{connectionId}  — Disconnect client
+```
+
+#### Behavior Notes
+
+- **Connection URL**: Floci uses `ws://localhost:4566/ws/{apiId}/{stage}` instead of AWS's `wss://{api-id}.execute-api.{region}.amazonaws.com/{stage}`.
+- **Idle timeout**: 10 minutes (matching AWS default). Not configurable per-API.
+- **Max connection duration**: 2 hours (matching AWS). Connections are closed automatically.
+- **Payload size limit**: 128 KB per frame (matching AWS). Oversized messages receive an error frame.
+
 ### Not Implemented
 
-- WebSocket data-plane: actual WebSocket connection handling, `@connections` management API
 - `ReimportApi`, `ExportApi`, `GetApiMapping`, `CreateApiMapping`, `DeleteApiMapping`
 - `GetDomainName`, `CreateDomainName`, `DeleteDomainName`
 - `CreateVpcLink`, `GetVpcLink`, `GetVpcLinks`, `UpdateVpcLink`, `DeleteVpcLink`
@@ -213,4 +271,17 @@ aws apigatewayv2 create-stage \
   --api-id $WS_API_ID \
   --stage-name prod \
   --endpoint-url $AWS_ENDPOINT_URL
+
+# Connect via WebSocket (using wscat or any WebSocket client)
+# wscat -c ws://localhost:4566/ws/$WS_API_ID/prod
+
+# Send a message to a connected client via @connections API
+# curl -X POST http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID \
+#   -d "Hello from server"
+
+# Get connection info
+# curl http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
+
+# Disconnect a client
+# curl -X DELETE http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
 ```

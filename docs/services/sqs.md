@@ -77,15 +77,12 @@ curl -X DELETE "http://localhost:4566/_aws/sqs/messages?QueueUrl=$QUEUE_URL"
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    sqs:
-      enabled: true
-      default-visibility-timeout: 30  # Seconds
-      max-message-size: 262144        # 256 KB
-      clear-fifo-deduplication-cache-on-purge: false  # When true, PurgeQueue clears the FIFO deduplication cache for the queue and for any SNS FIFO topics that subscribe to that queue (SNS in-memory dedup)
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_SQS_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_SQS_DEFAULT_VISIBILITY_TIMEOUT` | `30` | Default message visibility timeout (seconds) |
+| `FLOCI_SERVICES_SQS_MAX_MESSAGE_SIZE` | `262144` | Maximum message size in bytes (256 KB) |
+| `FLOCI_SERVICES_SQS_CLEAR_FIFO_DEDUPLICATION_CACHE_ON_PURGE` | `false` | When `true`, `PurgeQueue` also clears the FIFO deduplication cache for the queue and any SNS FIFO topics subscribed to it |
 
 ## Examples
 

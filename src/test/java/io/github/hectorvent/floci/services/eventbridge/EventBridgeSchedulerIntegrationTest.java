@@ -299,15 +299,35 @@ class EventBridgeSchedulerIntegrationTest {
             @Override
             public StorageConfig storage() { return null; }
             @Override
-            public DnsConfig dns() { return Optional::empty; }
+            public DnsConfig dns() {
+                return new DnsConfig() {
+                    @Override
+                    public Optional<List<String>> extraSuffixes() { return Optional.empty(); }
+                    @Override
+                    public boolean containerFallbackEnabled() { return true; }
+                    @Override
+                    public List<String> containerFallbackServers() { return List.of("8.8.8.8", "8.8.4.4"); }
+                };
+            }
             @Override
             public AuthConfig auth() { return null; }
+            @Override
+            public SecurityConfig security() { return null; }
             @Override
             public ServicesConfig services() { return null; }
             @Override
             public DockerConfig docker() { return null; }
             @Override
             public EmulatorConfig.InitHooksConfig initHooks() { return null; }
+            @Override
+            public TlsConfig tls() {
+                return new TlsConfig() {
+                    @Override public boolean enabled() { return false; }
+                    @Override public Optional<String> certPath() { return Optional.empty(); }
+                    @Override public Optional<String> keyPath() { return Optional.empty(); }
+                    @Override public boolean selfSigned() { return true; }
+                };
+            }
         };
     }
 }

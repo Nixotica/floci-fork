@@ -27,13 +27,10 @@
 
 ## Configuration
 
-```yaml
-floci:
-  services:
-    secretsmanager:
-      enabled: true
-      default-recovery-window-days: 30   # Days before a deleted secret is purged
-```
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_SECRETSMANAGER_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_SECRETSMANAGER_DEFAULT_RECOVERY_WINDOW_DAYS` | `30` | Days before a deleted secret is permanently purged |
 
 ## Examples
 

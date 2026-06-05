@@ -26,6 +26,7 @@ public class DbInstance {
     private int proxyPort;
 
     private String dockerVolumeName; // null in in-memory mode; "floci-rds-<id>" otherwise
+    private String volumeId; // 6-char hex, generated once at creation; null on older persisted resources
 
     // Transient — not persisted; restored on startup by re-launching containers
     private transient String containerId;
@@ -112,6 +113,9 @@ public class DbInstance {
 
     public String getDockerVolumeName() { return dockerVolumeName; }
     public void setDockerVolumeName(String dockerVolumeName) { this.dockerVolumeName = dockerVolumeName; }
+
+    public String getVolumeId() { return volumeId; }
+    public void setVolumeId(String volumeId) { this.volumeId = volumeId; }
 
     public String getContainerId() { return containerId; }
     public void setContainerId(String containerId) { this.containerId = containerId; }

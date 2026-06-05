@@ -75,7 +75,8 @@ The following environment variables are pre-set in the compat image:
 | `AWS_DEFAULT_REGION` | `us-east-1` |
 | `AWS_ACCESS_KEY_ID` | `test` |
 | `AWS_SECRET_ACCESS_KEY` | `test` |
-| `AWS_CONFIG_FILE` | `/etc/floci/aws/config` (sets `endpoint_url = http://localhost:4566`) |
+| `AWS_ENDPOINT_URL` | `http://localhost:4566` |
+| `AWS_CONFIG_FILE` | `/etc/floci/aws/config` |
 
 Override any of them via `docker run -e` or the compose `environment` block.
 
@@ -163,16 +164,22 @@ aws ssm delete-parameter --name /app/bootstrapped
 
 ## Configuration
 
-| Key | Default | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `floci.init-hooks.shell-executable` | `/bin/sh` | Shell used to run `.sh` scripts |
-| `floci.init-hooks.timeout-seconds` | `30` | Maximum runtime per script before it is killed and treated as a failure |
-| `floci.init-hooks.shutdown-grace-period-seconds` | `2` | Extra wait after terminating a timed-out process |
+| `FLOCI_INIT_HOOKS_SHELL_EXECUTABLE` | `/bin/sh` | Shell used to run `.sh` scripts |
+| `FLOCI_INIT_HOOKS_TIMEOUT_SECONDS` | `30` | Maximum runtime per script before it is killed and treated as a failure |
+| `FLOCI_INIT_HOOKS_SHUTDOWN_GRACE_PERIOD_SECONDS` | `2` | Extra wait after terminating a timed-out script |
 
-```yaml title="application.yml"
-floci:
-  init-hooks:
-    shell-executable: /bin/sh
-    timeout-seconds: 60
-    shutdown-grace-period-seconds: 10
+Example — extend the timeout for slow seed scripts:
+
+```bash
+FLOCI_INIT_HOOKS_TIMEOUT_SECONDS=120
+```
+
+Or in Docker Compose:
+
+```yaml
+environment:
+  FLOCI_INIT_HOOKS_TIMEOUT_SECONDS: "120"
+  FLOCI_INIT_HOOKS_SHELL_EXECUTABLE: /bin/bash
 ```
