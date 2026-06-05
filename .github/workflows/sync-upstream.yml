@@ -1,0 +1,85 @@
+name: Sync from upstream
+
+on:
+  push:
+    branches:
+      - feat/sync-fork-action
+  schedule:
+    # Weekly, Mondays at 06:00 UTC. Adjust to taste.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/floci-io/floci.git
+  UPSTREAM_BRANCH: main
+  SYNC_BRANCH: sync/upstream-main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" origin/main; then
+            echo "Already up to date with upstream; nothing to sync."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_sha=$(git rev-parse --short "upstream/$UPSTREAM_BRANCH")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push sync branch
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git push --force origin "upstream/$UPSTREAM_BRANCH:refs/heads/$SYNC_BRANCH"
+
+      - name: Open or update pull request
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.check.outputs.upstream_sha }}
+        run: |
+          open_count=$(gh pr list --repo "$REPO" --head "$SYNC_BRANCH" --state open --json number --jq 'length')
+          if [ "$open_count" -gt 0 ]; then
+            echo "Sync PR already open; its head now points at upstream $UPSTREAM_SHA."
+            exit 0
+          fi
+          gh pr create \
+            --repo "$REPO" \
+            --base main \
+            --head "$SYNC_BRANCH" \
+            --title "Sync with upstream floci-io/floci ($UPSTREAM_SHA)" \
+            --body "$(cat <<'EOF'
+          Automated sync of new commits from [`floci-io/floci`](https://github.com/floci-io/floci) (`main`).
+
+          This branch points at the latest upstream `main`. The diff shows everything
+          added upstream since this fork last shared history with it.
+
+          **Merge with a merge commit (not squash or rebase)** so that upstream `main`
+          becomes a real ancestor of this fork's `main`. That lets the next scheduled run
+          detect the fork is up to date instead of re-opening an identical PR.
+
+          Resolve any merge conflicts via the GitHub UI or locally before merging.
+          EOF
+          )"
