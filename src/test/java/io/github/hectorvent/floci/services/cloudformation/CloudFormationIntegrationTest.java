@@ -5836,4 +5836,167 @@ class CloudFormationIntegrationTest {
                 .body("endpointConfiguration.vpcEndpointIds", contains("vpce-12345678"));
     }
 
+    @Test
+    void createStack_singlePublicSubnetVpc_provisionsRealEc2Ids() {
+        // CDK's single-public-subnet VPC pattern: VPC + IGW + Attachment + Subnet +
+        // RouteTable + Route(0.0.0.0/0 -> IGW) + Association + SG, all wired via Ref.
+        // Verifies the CFN engine writes real ids into Ec2Service (not stub uuids) so
+        // downstream resources (ECS Fargate, etc.) can resolve Ref/GetAtt to working values.
+        String stackName = "cfn-ec2-net-stack";
+        String template = """
+            {
+              "Resources": {
+                "TheVpc": {
+                  "Type": "AWS::EC2::VPC",
+                  "Properties": {
+                    "CidrBlock": "10.42.0.0/16",
+                    "EnableDnsSupport": "true",
+                    "EnableDnsHostnames": "true"
+                  }
+                },
+                "TheIgw": {
+                  "Type": "AWS::EC2::InternetGateway"
+                },
+                "TheAttachment": {
+                  "Type": "AWS::EC2::VPCGatewayAttachment",
+                  "Properties": {
+                    "VpcId": { "Ref": "TheVpc" },
+                    "InternetGatewayId": { "Ref": "TheIgw" }
+                  }
+                },
+                "PublicSubnet": {
+                  "Type": "AWS::EC2::Subnet",
+                  "Properties": {
+                    "VpcId": { "Ref": "TheVpc" },
+                    "CidrBlock": "10.42.1.0/24",
+                    "AvailabilityZone": "us-east-1a",
+                    "MapPublicIpOnLaunch": "true"
+                  }
+                },
+                "PublicRouteTable": {
+                  "Type": "AWS::EC2::RouteTable",
+                  "Properties": {
+                    "VpcId": { "Ref": "TheVpc" }
+                  }
+                },
+                "PublicRoute": {
+                  "Type": "AWS::EC2::Route",
+                  "Properties": {
+                    "RouteTableId": { "Ref": "PublicRouteTable" },
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "GatewayId": { "Ref": "TheIgw" }
+                  }
+                },
+                "PublicAssoc": {
+                  "Type": "AWS::EC2::SubnetRouteTableAssociation",
+                  "Properties": {
+                    "RouteTableId": { "Ref": "PublicRouteTable" },
+                    "SubnetId": { "Ref": "PublicSubnet" }
+                  }
+                },
+                "FargateSg": {
+                  "Type": "AWS::EC2::SecurityGroup",
+                  "Properties": {
+                    "GroupDescription": "Fargate service",
+                    "VpcId": { "Ref": "TheVpc" },
+                    "SecurityGroupIngress": [{
+                      "IpProtocol": "tcp",
+                      "FromPort": 80,
+                      "ToPort": 80,
+                      "CidrIp": "0.0.0.0/0"
+                    }]
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        String resourcesXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+
+        assertThat(resourcesXml, not(containsString("CREATE_FAILED")));
+
+        String vpcId = physicalIdByLogicalId(resourcesXml, "TheVpc");
+        String igwId = physicalIdByLogicalId(resourcesXml, "TheIgw");
+        String subnetId = physicalIdByLogicalId(resourcesXml, "PublicSubnet");
+        String rtId = physicalIdByLogicalId(resourcesXml, "PublicRouteTable");
+        String assocId = physicalIdByLogicalId(resourcesXml, "PublicAssoc");
+        String sgId = physicalIdByLogicalId(resourcesXml, "FargateSg");
+
+        assertThat(vpcId, matchesRegex("vpc-[0-9a-f]+"));
+        assertThat(igwId, matchesRegex("igw-[0-9a-f]+"));
+        assertThat(subnetId, matchesRegex("subnet-[0-9a-f]+"));
+        assertThat(rtId, matchesRegex("rtb-[0-9a-f]+"));
+        assertThat(assocId, matchesRegex("rtbassoc-[0-9a-f]+"));
+        assertThat(sgId, matchesRegex("sg-[0-9a-f]+"));
+
+        // The provisioned ids must be findable via the EC2 API — proves the CFN provisioner
+        // wrote into the same Ec2Service store the EC2 query handler reads from.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeVpcs")
+            .formParam("VpcId.1", vpcId)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcsResponse.vpcSet.item[0].vpcId", equalTo(vpcId))
+            .body("DescribeVpcsResponse.vpcSet.item[0].cidrBlock", equalTo("10.42.0.0/16"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeSubnets")
+            .formParam("SubnetId.1", subnetId)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeSubnetsResponse.subnetSet.item[0].subnetId", equalTo(subnetId))
+            .body("DescribeSubnetsResponse.subnetSet.item[0].vpcId", equalTo(vpcId))
+            .body("DescribeSubnetsResponse.subnetSet.item[0].cidrBlock", equalTo("10.42.1.0/24"))
+            .body("DescribeSubnetsResponse.subnetSet.item[0].availabilityZone", equalTo("us-east-1a"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeSecurityGroups")
+            .formParam("GroupId.1", sgId)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeSecurityGroupsResponse.securityGroupInfo.item[0].groupId", equalTo(sgId))
+            .body("DescribeSecurityGroupsResponse.securityGroupInfo.item[0].vpcId", equalTo(vpcId));
+
+        // The route table should contain the 0.0.0.0/0 route the CFN Route resource added,
+        // proving Ref resolution worked all the way to GatewayId.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeRouteTables")
+            .formParam("RouteTableId.1", rtId)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("0.0.0.0/0"))
+            .body(containsString(igwId));
+    }
+
 }

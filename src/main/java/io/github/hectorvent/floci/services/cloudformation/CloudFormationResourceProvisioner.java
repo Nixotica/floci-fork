@@ -12,6 +12,12 @@ import io.github.hectorvent.floci.services.dynamodb.model.GlobalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.IpPermission;
+import io.github.hectorvent.floci.services.ec2.model.IpRange;
+import io.github.hectorvent.floci.services.ec2.model.Ipv6Range;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecr.model.Repository;
 import io.github.hectorvent.floci.services.ecs.EcsService;
@@ -98,6 +104,7 @@ public class CloudFormationResourceProvisioner {
     private final CognitoService cognitoService;
     private final EcsService ecsService;
     private final ElbV2Service elbV2Service;
+    private final Ec2Service ec2Service;
 
     @Inject
     public CloudFormationResourceProvisioner(S3Service s3Service, SqsService sqsService,
@@ -112,7 +119,8 @@ public class CloudFormationResourceProvisioner {
                                              PipesService pipesService,
                                              CognitoService cognitoService,
                                              EcsService ecsService,
-                                             ElbV2Service elbV2Service) {
+                                             ElbV2Service elbV2Service,
+                                             Ec2Service ec2Service) {
         this.s3Service = s3Service;
         this.sqsService = sqsService;
         this.snsService = snsService;
@@ -130,6 +138,7 @@ public class CloudFormationResourceProvisioner {
         this.cognitoService = cognitoService;
         this.ecsService = ecsService;
         this.elbV2Service = elbV2Service;
+        this.ec2Service = ec2Service;
     }
 
     /**
@@ -214,6 +223,21 @@ public class CloudFormationResourceProvisioner {
                         provisionListener(resource, properties, engine, region);
                 case "AWS::ElasticLoadBalancingV2::ListenerRule" ->
                         provisionListenerRule(resource, properties, engine, region);
+                case "AWS::EC2::VPC" -> provisionVpc(resource, properties, engine, region, accountId);
+                case "AWS::EC2::Subnet" -> provisionSubnet(resource, properties, engine, region);
+                case "AWS::EC2::SecurityGroup" ->
+                        provisionSecurityGroup(resource, properties, engine, region, accountId, stackName);
+                case "AWS::EC2::SecurityGroupIngress" ->
+                        provisionSecurityGroupIngress(resource, properties, engine, region);
+                case "AWS::EC2::SecurityGroupEgress" ->
+                        provisionSecurityGroupEgress(resource, properties, engine, region);
+                case "AWS::EC2::InternetGateway" -> provisionInternetGateway(resource, region, accountId);
+                case "AWS::EC2::VPCGatewayAttachment" ->
+                        provisionVpcGatewayAttachment(resource, properties, engine, region);
+                case "AWS::EC2::RouteTable" -> provisionRouteTable(resource, properties, engine, region);
+                case "AWS::EC2::Route" -> provisionRoute(resource, properties, engine, region);
+                case "AWS::EC2::SubnetRouteTableAssociation" ->
+                        provisionSubnetRouteTableAssociation(resource, properties, engine, region);
                 default -> {
                     LOG.debugv("Stubbing unsupported resource type: {0} ({1})", resourceType, logicalId);
                     resource.setPhysicalId(logicalId + "-" + UUID.randomUUID().toString().substring(0, 8));
@@ -263,6 +287,17 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::ElasticLoadBalancingV2::TargetGroup" -> elbV2Service.deleteTargetGroup(region, physicalId);
                 case "AWS::ElasticLoadBalancingV2::Listener" -> elbV2Service.deleteListener(region, physicalId);
                 case "AWS::ElasticLoadBalancingV2::ListenerRule" -> elbV2Service.deleteRule(region, physicalId);
+                case "AWS::EC2::VPC" -> ec2Service.deleteVpc(region, physicalId);
+                case "AWS::EC2::Subnet" -> ec2Service.deleteSubnet(region, physicalId);
+                case "AWS::EC2::SecurityGroup" -> ec2Service.deleteSecurityGroup(region, physicalId);
+                case "AWS::EC2::InternetGateway" -> ec2Service.deleteInternetGateway(region, physicalId);
+                case "AWS::EC2::RouteTable" -> ec2Service.deleteRouteTable(region, physicalId);
+                case "AWS::EC2::SubnetRouteTableAssociation" -> ec2Service.disassociateRouteTable(region, physicalId);
+                case "AWS::EC2::VPCGatewayAttachment", "AWS::EC2::Route",
+                     "AWS::EC2::SecurityGroupIngress", "AWS::EC2::SecurityGroupEgress" -> {
+                    // Synthetic or rule-id handles don't map cleanly to a single delete call; mock state
+                    // is torn down with the parent resource.
+                }
                 default -> LOG.debugv("Skipping delete of unsupported resource type: {0}", resourceType);
             }
         } catch (Exception e) {
@@ -1451,6 +1486,229 @@ public class CloudFormationResourceProvisioner {
             }
         }
         return out;
+    }
+
+    // ── EC2 networking ────────────────────────────────────────────────────────
+
+    private void provisionVpc(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
+                              String region, String accountId) {
+        String cidr = resolveOrDefault(props, "CidrBlock", engine, "10.0.0.0/16");
+        var vpc = ec2Service.createVpc(region, cidr, false);
+
+        String dnsSupport = resolveOptional(props, "EnableDnsSupport", engine);
+        if (dnsSupport != null) {
+            ec2Service.modifyVpcAttribute(region, vpc.getVpcId(), "enableDnsSupport", dnsSupport);
+        }
+        String dnsHostnames = resolveOptional(props, "EnableDnsHostnames", engine);
+        if (dnsHostnames != null) {
+            ec2Service.modifyVpcAttribute(region, vpc.getVpcId(), "enableDnsHostnames", dnsHostnames);
+        }
+        applyEc2Tags(props, engine, region, vpc.getVpcId());
+
+        r.setPhysicalId(vpc.getVpcId());
+        r.getAttributes().put("VpcId", vpc.getVpcId());
+        r.getAttributes().put("CidrBlock", vpc.getCidrBlock());
+        r.getAttributes().put("Arn",
+                AwsArnUtils.Arn.of("ec2", region, accountId, "vpc/" + vpc.getVpcId()).toString());
+    }
+
+    private void provisionSubnet(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
+                                 String region) {
+        String vpcId = resolveOptional(props, "VpcId", engine);
+        String cidr = resolveOptional(props, "CidrBlock", engine);
+        String az = resolveOptional(props, "AvailabilityZone", engine);
+        var subnet = ec2Service.createSubnet(region, vpcId, cidr, az);
+
+        String mapPub = resolveOptional(props, "MapPublicIpOnLaunch", engine);
+        if (mapPub != null) {
+            ec2Service.modifySubnetAttribute(region, subnet.getSubnetId(), "mapPublicIpOnLaunch", mapPub);
+        }
+        applyEc2Tags(props, engine, region, subnet.getSubnetId());
+
+        r.setPhysicalId(subnet.getSubnetId());
+        r.getAttributes().put("SubnetId", subnet.getSubnetId());
+        r.getAttributes().put("VpcId", subnet.getVpcId());
+        r.getAttributes().put("CidrBlock", subnet.getCidrBlock());
+        r.getAttributes().put("AvailabilityZone", subnet.getAvailabilityZone());
+        r.getAttributes().put("SubnetArn", subnet.getSubnetArn());
+        r.getAttributes().put("Arn", subnet.getSubnetArn());
+    }
+
+    private void provisionSecurityGroup(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
+                                        String region, String accountId, String stackName) {
+        String name = resolveOptional(props, "GroupName", engine);
+        if (name == null || name.isBlank()) {
+            name = generatePhysicalName(stackName, r.getLogicalId(), 255, false);
+        }
+        String desc = resolveOrDefault(props, "GroupDescription", engine, "Managed by CloudFormation");
+        String vpcId = resolveOptional(props, "VpcId", engine);
+        var sg = ec2Service.createSecurityGroup(region, name, desc, vpcId);
+
+        if (props != null && props.has("SecurityGroupIngress")) {
+            List<IpPermission> perms = parseCfnIpPermissions(props.get("SecurityGroupIngress"), engine);
+            if (!perms.isEmpty()) {
+                ec2Service.authorizeSecurityGroupIngress(region, sg.getGroupId(), perms);
+            }
+        }
+        if (props != null && props.has("SecurityGroupEgress")) {
+            List<IpPermission> perms = parseCfnIpPermissions(props.get("SecurityGroupEgress"), engine);
+            if (!perms.isEmpty()) {
+                ec2Service.authorizeSecurityGroupEgress(region, sg.getGroupId(), perms);
+            }
+        }
+        applyEc2Tags(props, engine, region, sg.getGroupId());
+
+        r.setPhysicalId(sg.getGroupId());
+        r.getAttributes().put("GroupId", sg.getGroupId());
+        r.getAttributes().put("VpcId", sg.getVpcId() != null ? sg.getVpcId() : "");
+        r.getAttributes().put("Arn",
+                AwsArnUtils.Arn.of("ec2", region, accountId, "security-group/" + sg.getGroupId()).toString());
+    }
+
+    private void provisionSecurityGroupIngress(StackResource r, JsonNode props,
+                                               CloudFormationTemplateEngine engine, String region) {
+        String groupId = resolveOptional(props, "GroupId", engine);
+        if (groupId == null || groupId.isBlank()) {
+            groupId = resolveOptional(props, "GroupName", engine);
+        }
+        IpPermission perm = parseSingleCfnIpPermission(props, engine);
+        var rules = ec2Service.authorizeSecurityGroupIngress(region, groupId, List.of(perm));
+        String ruleId = rules.isEmpty()
+                ? "sgr-" + UUID.randomUUID().toString().substring(0, 8)
+                : rules.get(0).getSecurityGroupRuleId();
+        r.setPhysicalId(ruleId);
+        r.getAttributes().put("Id", ruleId);
+    }
+
+    private void provisionSecurityGroupEgress(StackResource r, JsonNode props,
+                                              CloudFormationTemplateEngine engine, String region) {
+        String groupId = resolveOptional(props, "GroupId", engine);
+        IpPermission perm = parseSingleCfnIpPermission(props, engine);
+        var rules = ec2Service.authorizeSecurityGroupEgress(region, groupId, List.of(perm));
+        String ruleId = rules.isEmpty()
+                ? "sgr-" + UUID.randomUUID().toString().substring(0, 8)
+                : rules.get(0).getSecurityGroupRuleId();
+        r.setPhysicalId(ruleId);
+        r.getAttributes().put("Id", ruleId);
+    }
+
+    private void provisionInternetGateway(StackResource r, String region, String accountId) {
+        var igw = ec2Service.createInternetGateway(region);
+        r.setPhysicalId(igw.getInternetGatewayId());
+        r.getAttributes().put("InternetGatewayId", igw.getInternetGatewayId());
+        r.getAttributes().put("Arn",
+                AwsArnUtils.Arn.of("ec2", region, accountId,
+                        "internet-gateway/" + igw.getInternetGatewayId()).toString());
+    }
+
+    private void provisionVpcGatewayAttachment(StackResource r, JsonNode props,
+                                               CloudFormationTemplateEngine engine, String region) {
+        String vpcId = resolveOptional(props, "VpcId", engine);
+        String igwId = resolveOptional(props, "InternetGatewayId", engine);
+        if (igwId != null && vpcId != null) {
+            ec2Service.attachInternetGateway(region, igwId, vpcId);
+            r.setPhysicalId("IGW|" + vpcId + "|" + igwId);
+        } else {
+            // VPN gateway attachments are not implemented in floci's EC2 service;
+            // record a stable handle so DescribeStackResources reports a sane id.
+            String vgwId = resolveOptional(props, "VpnGatewayId", engine);
+            r.setPhysicalId("VGW|" + vpcId + "|" + vgwId);
+        }
+    }
+
+    private void provisionRouteTable(StackResource r, JsonNode props,
+                                     CloudFormationTemplateEngine engine, String region) {
+        String vpcId = resolveOptional(props, "VpcId", engine);
+        var rt = ec2Service.createRouteTable(region, vpcId);
+        applyEc2Tags(props, engine, region, rt.getRouteTableId());
+
+        r.setPhysicalId(rt.getRouteTableId());
+        r.getAttributes().put("RouteTableId", rt.getRouteTableId());
+        r.getAttributes().put("VpcId", rt.getVpcId());
+    }
+
+    private void provisionRoute(StackResource r, JsonNode props,
+                                CloudFormationTemplateEngine engine, String region) {
+        String rtId = resolveOptional(props, "RouteTableId", engine);
+        String dest = resolveOptional(props, "DestinationCidrBlock", engine);
+        String gwId = resolveOptional(props, "GatewayId", engine);
+        if (gwId == null) gwId = resolveOptional(props, "NatGatewayId", engine);
+        if (gwId == null) gwId = resolveOptional(props, "TransitGatewayId", engine);
+        if (gwId == null) gwId = resolveOptional(props, "VpcEndpointId", engine);
+        if (gwId == null) gwId = resolveOptional(props, "EgressOnlyInternetGatewayId", engine);
+        if (rtId != null && dest != null && gwId != null) {
+            ec2Service.createRoute(region, rtId, dest, gwId);
+        }
+        String physical = "route-" + (rtId != null ? rtId : "unknown")
+                + "-" + Integer.toHexString(Objects.hash(dest, gwId));
+        r.setPhysicalId(physical);
+    }
+
+    private void provisionSubnetRouteTableAssociation(StackResource r, JsonNode props,
+                                                      CloudFormationTemplateEngine engine, String region) {
+        String rtId = resolveOptional(props, "RouteTableId", engine);
+        String subnetId = resolveOptional(props, "SubnetId", engine);
+        var assoc = ec2Service.associateRouteTable(region, rtId, subnetId);
+        r.setPhysicalId(assoc.getRouteTableAssociationId());
+        r.getAttributes().put("Id", assoc.getRouteTableAssociationId());
+    }
+
+    private List<IpPermission> parseCfnIpPermissions(JsonNode rulesNode,
+                                                     CloudFormationTemplateEngine engine) {
+        List<IpPermission> out = new ArrayList<>();
+        if (rulesNode == null || !rulesNode.isArray()) {
+            return out;
+        }
+        for (JsonNode rule : rulesNode) {
+            out.add(parseSingleCfnIpPermission(rule, engine));
+        }
+        return out;
+    }
+
+    private IpPermission parseSingleCfnIpPermission(JsonNode rule,
+                                                    CloudFormationTemplateEngine engine) {
+        IpPermission perm = new IpPermission();
+        perm.setIpProtocol(resolveOptional(rule, "IpProtocol", engine));
+        String from = resolveOptional(rule, "FromPort", engine);
+        String to = resolveOptional(rule, "ToPort", engine);
+        if (from != null) perm.setFromPort(Integer.parseInt(from));
+        if (to != null) perm.setToPort(Integer.parseInt(to));
+        String description = resolveOptional(rule, "Description", engine);
+
+        String cidrIp = resolveOptional(rule, "CidrIp", engine);
+        if (cidrIp != null) {
+            perm.getIpRanges().add(new IpRange(cidrIp, description));
+        }
+        String cidrIpv6 = resolveOptional(rule, "CidrIpv6", engine);
+        if (cidrIpv6 != null) {
+            Ipv6Range range = new Ipv6Range(cidrIpv6);
+            range.setDescription(description);
+            perm.getIpv6Ranges().add(range);
+        }
+        String srcSg = resolveOptional(rule, "SourceSecurityGroupId", engine);
+        if (srcSg == null) {
+            srcSg = resolveOptional(rule, "DestinationSecurityGroupId", engine);
+        }
+        if (srcSg != null) {
+            UserIdGroupPair pair = new UserIdGroupPair();
+            pair.setGroupId(srcSg);
+            perm.getUserIdGroupPairs().add(pair);
+        }
+        return perm;
+    }
+
+    private void applyEc2Tags(JsonNode props, CloudFormationTemplateEngine engine,
+                              String region, String resourceId) {
+        if (props == null || !props.has("Tags")) {
+            return;
+        }
+        Map<String, String> tagMap = parseCfnTags(props.get("Tags"), engine);
+        if (tagMap.isEmpty()) {
+            return;
+        }
+        List<Tag> tags = new ArrayList<>();
+        tagMap.forEach((k, v) -> tags.add(new Tag(k, v)));
+        ec2Service.createTags(region, List.of(resourceId), tags);
     }
 
     private void provisionRoute53HostedZone(StackResource r, JsonNode props, CloudFormationTemplateEngine engine) {
