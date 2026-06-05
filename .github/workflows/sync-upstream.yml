@@ -1,9 +1,6 @@
 name: Sync from upstream
 
 on:
-  push:
-    branches:
-      - feat/sync-fork-action
   schedule:
     # Weekly, Mondays at 06:00 UTC. Adjust to taste.
     - cron: '0 6 * * 1'
