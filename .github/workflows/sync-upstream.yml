@@ -1,6 +1,9 @@
 name: Sync from upstream
 
 on:
+  push:
+    branches:
+      - feat/sync-fork-action
   schedule:
     # Weekly, Mondays at 06:00 UTC. Adjust to taste.
     - cron: '0 6 * * 1'
@@ -18,6 +21,12 @@ env:
   UPSTREAM_REPO: https://github.com/floci-io/floci.git
   UPSTREAM_BRANCH: main
   SYNC_BRANCH: sync/upstream-main
+  # Files we never want to inherit from upstream. The Conventional Commits
+  # workflow rejects upstream's own `Release X.Y.Z` semantic-release commits
+  # whenever a sync PR replays them, so keeping it out of this fork lets every
+  # sync PR pass cleanly.
+  EXCLUDE_PATHS: |
+    .github/workflows/conventional-commits.yml
 
 jobs:
   sync:
@@ -45,10 +54,29 @@ jobs:
             echo "upstream_sha=$(git rev-parse --short "upstream/$UPSTREAM_BRANCH")" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push sync branch
+      - name: Build and push sync branch
         if: steps.check.outputs.changed == 'true'
         run: |
-          git push --force origin "upstream/$UPSTREAM_BRANCH:refs/heads/$SYNC_BRANCH"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$SYNC_BRANCH" "upstream/$UPSTREAM_BRANCH"
+
+          removed=()
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+              git rm -f "$path"
+              removed+=("$path")
+            fi
+          done <<< "$EXCLUDE_PATHS"
+
+          if [ ${#removed[@]} -gt 0 ]; then
+            git commit -m "ci: exclude upstream files not used in this fork
+
+          ${removed[*]}"
+          fi
+
+          git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
 
       - name: Open or update pull request
         if: steps.check.outputs.changed == 'true'
@@ -70,8 +98,8 @@ jobs:
             --body "$(cat <<'EOF'
           Automated sync of new commits from [`floci-io/floci`](https://github.com/floci-io/floci) (`main`).
 
-          This branch points at the latest upstream `main`. The diff shows everything
-          added upstream since this fork last shared history with it.
+          The diff shows everything added upstream since this fork last shared history
+          with it, plus a trailing commit removing files this fork chooses not to inherit.
 
           **Merge with a merge commit (not squash or rebase)** so that upstream `main`
           becomes a real ancestor of this fork's `main`. That lets the next scheduled run
