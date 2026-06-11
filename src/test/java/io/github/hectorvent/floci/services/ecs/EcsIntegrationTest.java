@@ -323,6 +323,68 @@ class EcsIntegrationTest {
             .body("task.lastStatus", equalTo("STOPPED"));
     }
 
+    @Test
+    @Order(24)
+    void runTaskWithAwsvpcNetworkConfigurationRoundTrips() {
+        String awsvpcTaskArn = ecs("RunTask")
+            .body("""
+                {
+                    "cluster": "%s",
+                    "taskDefinition": "%s",
+                    "launchType": "FARGATE",
+                    "count": 1,
+                    "networkConfiguration": {
+                        "awsvpcConfiguration": {
+                            "subnets": ["subnet-aaa", "subnet-bbb"],
+                            "securityGroups": ["sg-111"],
+                            "assignPublicIp": "ENABLED"
+                        }
+                    }
+                }
+                """.formatted(CLUSTER_NAME, TASK_DEF_FAMILY))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("tasks", hasSize(1))
+            .body("tasks[0].networkConfiguration.awsvpcConfiguration.subnets",
+                    containsInAnyOrder("subnet-aaa", "subnet-bbb"))
+            .body("tasks[0].networkConfiguration.awsvpcConfiguration.securityGroups", hasItem("sg-111"))
+            .body("tasks[0].networkConfiguration.awsvpcConfiguration.assignPublicIp", equalTo("ENABLED"))
+        .extract()
+            .path("tasks[0].taskArn");
+
+        ecs("DescribeTasks")
+            .body("""
+                {
+                    "cluster": "%s",
+                    "tasks": ["%s"]
+                }
+                """.formatted(CLUSTER_NAME, awsvpcTaskArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("tasks", hasSize(1))
+            .body("tasks[0].networkConfiguration.awsvpcConfiguration.subnets",
+                    containsInAnyOrder("subnet-aaa", "subnet-bbb"))
+            .body("tasks[0].networkConfiguration.awsvpcConfiguration.securityGroups", hasItem("sg-111"))
+            .body("tasks[0].networkConfiguration.awsvpcConfiguration.assignPublicIp", equalTo("ENABLED"));
+
+        ecs("StopTask")
+            .body("""
+                {
+                    "cluster": "%s",
+                    "task": "%s",
+                    "reason": "integration-test-cleanup"
+                }
+                """.formatted(CLUSTER_NAME, awsvpcTaskArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
     // ── Services ──────────────────────────────────────────────────────────────
 
     @Test

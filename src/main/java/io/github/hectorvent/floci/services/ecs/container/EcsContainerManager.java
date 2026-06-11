@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.NetworkBinding;
+import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.PortMapping;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import com.github.dockerjava.api.DockerClient;
@@ -63,9 +64,15 @@ public class EcsContainerManager {
     /**
      * Starts Docker containers for all container definitions in a task.
      * Updates the task's container list in-place with runtime network bindings and docker IDs.
+     *
+     * <p>{@code networkConfiguration} carries the awsvpc subnets/security groups/assignPublicIp
+     * supplied by RunTask or the task's parent service. It is the foundational signal for
+     * downstream ENI registration and DescribeNetworkInterfaces emulation; not yet consumed
+     * by the launch path, but threaded here so consumers can react when those land.
      */
     public EcsTaskHandle startTask(EcsTask task, TaskDefinition taskDef,
-                                   List<ContainerOverride> containerOverrides, String region) {
+                                   List<ContainerOverride> containerOverrides,
+                                   NetworkConfiguration networkConfiguration, String region) {
         String taskId = extractTaskId(task.getTaskArn());
 
         Map<String, String> containerIds = new LinkedHashMap<>();
