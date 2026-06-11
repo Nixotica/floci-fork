@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.glue;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -11,6 +12,7 @@ import io.github.hectorvent.floci.services.glue.model.Partition;
 import io.github.hectorvent.floci.services.glue.model.SchemaReference;
 import io.github.hectorvent.floci.services.glue.model.StorageDescriptor;
 import io.github.hectorvent.floci.services.glue.model.Table;
+import io.github.hectorvent.floci.services.glue.model.UserDefinedFunction;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
 import io.github.hectorvent.floci.services.glue.schemaregistry.SchemaToColumnsConverter;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.SchemaId;
@@ -21,18 +23,26 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 @ApplicationScoped
 public class GlueService {
 
     private static final Logger LOG = Logger.getLogger(GlueService.class);
+    private static final int MAX_FUNCTION_PATTERN_LENGTH = 255;
+    private static final int MAX_FUNCTION_RESULTS = 100;
 
     private final StorageBackend<String, Database> databaseStore;
     private final StorageBackend<String, Table> tableStore;
     private final StorageBackend<String, Partition> partitionStore;
+    private final StorageBackend<String, UserDefinedFunction> functionStore;
     private final GlueSchemaRegistryService schemaRegistryService;
     private final RegionResolver regionResolver;
 
@@ -40,9 +50,10 @@ public class GlueService {
     public GlueService(StorageFactory storageFactory,
                        GlueSchemaRegistryService schemaRegistryService,
                        RegionResolver regionResolver) {
-        this.databaseStore = storageFactory.create("glue", "databases.json", new TypeReference<Map<String, Database>>() {});
-        this.tableStore = storageFactory.create("glue", "tables.json", new TypeReference<Map<String, Table>>() {});
-        this.partitionStore = storageFactory.create("glue", "partitions.json", new TypeReference<Map<String, Partition>>() {});
+        this.databaseStore = storageFactory.create("glue", "databases.json", new TypeReference<>() {});
+        this.tableStore = storageFactory.create("glue", "tables.json", new TypeReference<>() {});
+        this.partitionStore = storageFactory.create("glue", "partitions.json", new TypeReference<>() {});
+        this.functionStore = storageFactory.create("glue", "functions.json", new TypeReference<>() {});
         this.schemaRegistryService = schemaRegistryService;
         this.regionResolver = regionResolver;
     }
@@ -50,25 +61,29 @@ public class GlueService {
     GlueService(StorageBackend<String, Database> databaseStore,
                 StorageBackend<String, Table> tableStore,
                 StorageBackend<String, Partition> partitionStore,
+                StorageBackend<String, UserDefinedFunction> functionStore,
                 GlueSchemaRegistryService schemaRegistryService,
                 RegionResolver regionResolver) {
         this.databaseStore = databaseStore;
         this.tableStore = tableStore;
         this.partitionStore = partitionStore;
+        this.functionStore = functionStore;
         this.schemaRegistryService = schemaRegistryService;
         this.regionResolver = regionResolver;
     }
 
     public void createDatabase(Database database) {
-        if (databaseStore.get(database.getName()).isPresent()) {
+        String databaseName = normalizeName(database.getName());
+        if (databaseStore.get(databaseName).isPresent()) {
             throw new AwsException("AlreadyExistsException", "Database already exists: " + database.getName(), 400);
         }
-        databaseStore.put(database.getName(), database);
+        database.setName(databaseName);
+        databaseStore.put(databaseName, database);
         LOG.infov("Created Glue Database: {0}", database.getName());
     }
 
     public Database getDatabase(String name) {
-        return databaseStore.get(name)
+        return databaseStore.get(normalizeName(name))
                 .orElseThrow(() -> new AwsException("EntityNotFoundException", "Database not found: " + name, 400));
     }
 
@@ -76,30 +91,43 @@ public class GlueService {
         return databaseStore.scan(k -> true);
     }
 
+    public void deleteDatabase(String name) {
+        String databaseName = getDatabase(name).getName();
+        List<String> tableNames = tableStore.scan(k -> true).stream()
+                .filter(table -> databaseName.equals(table.getDatabaseName()))
+                .map(Table::getName)
+                .toList();
+        tableNames.forEach(tableName -> deleteTable(name, tableName));
+        databaseStore.delete(databaseName);
+        LOG.infov("Deleted Glue Database: {0}", name);
+    }
+
     public void createTable(String databaseName, Table table) {
-        getDatabase(databaseName);
-        String key = databaseName + ":" + table.getName();
+        Database database = getDatabase(databaseName);
+        String key = tableKey(databaseName, table.getName());
         if (tableStore.get(key).isPresent()) {
             throw new AwsException("AlreadyExistsException", "Table already exists: " + table.getName(), 400);
         }
         validateSchemaReference(table);
-        table.setDatabaseName(databaseName);
+        table.setName(normalizeName(table.getName()));
+        table.setDatabaseName(database.getName());
         if (table.getCreateTime() == null) {
             table.setCreateTime(Instant.now());
         }
+        table.setVersionId("0");
         tableStore.put(key, table);
         LOG.infov("Created Glue Table: {0}.{1}", databaseName, table.getName());
     }
 
     public Table getTable(String databaseName, String tableName) {
-        String key = databaseName + ":" + tableName;
-        Table table = tableStore.get(key)
+        Table table = tableStore.get(tableKey(databaseName, tableName))
                 .orElseThrow(() -> new AwsException("EntityNotFoundException", "Table not found: " + databaseName + "." + tableName, 400));
         return withResolvedSchemaReference(table);
     }
 
     public List<Table> getTables(String databaseName) {
-        List<Table> tables = tableStore.scan(k -> k.startsWith(databaseName + ":"));
+        String prefix = normalizeName(databaseName) + ":";
+        List<Table> tables = tableStore.scan(k -> k.startsWith(prefix));
         List<Table> resolved = new ArrayList<>(tables.size());
         for (Table table : tables) {
             resolved.add(withResolvedSchemaReference(table));
@@ -108,15 +136,25 @@ public class GlueService {
     }
 
     public void updateTable(String databaseName, Table table) {
-        getDatabase(databaseName);
-        String key = databaseName + ":" + table.getName();
+        updateTable(databaseName, table, null);
+    }
+
+    public synchronized void updateTable(String databaseName, Table table, String versionId) {
+        Database database = getDatabase(databaseName);
+        String key = tableKey(databaseName, table.getName());
         Table existing = tableStore.get(key)
                 .orElseThrow(() -> new AwsException("EntityNotFoundException",
                         "Table not found: " + databaseName + "." + table.getName(), 400));
+        if (versionId != null && !versionId.equals(existing.getVersionId())) {
+            throw new AwsException("ConcurrentModificationException",
+                    "Update table failed due to concurrent modifications.", 400);
+        }
         validateSchemaReference(table);
-        table.setDatabaseName(databaseName);
+        table.setName(normalizeName(table.getName()));
+        table.setDatabaseName(database.getName());
         table.setCreateTime(existing.getCreateTime());
         table.setUpdateTime(Instant.now());
+        table.setVersionId(nextVersionId(existing.getVersionId()));
         tableStore.put(key, table);
         LOG.infov("Updated Glue Table: {0}.{1}", databaseName, table.getName());
     }
@@ -126,25 +164,110 @@ public class GlueService {
     }
 
     public void deleteTable(String databaseName, String tableName) {
-        String key = databaseName + ":" + tableName;
+        String key = tableKey(databaseName, tableName);
         tableStore.delete(key);
         partitionStore.scan(k -> k.startsWith(key + ":")).forEach(p -> {
-            partitionStore.delete(databaseName + ":" + tableName + ":" + String.join(",", p.getValues()));
+            partitionStore.delete(key + ":" + String.join(",", p.getValues()));
         });
         LOG.infov("Deleted Glue Table: {0}.{1}", databaseName, tableName);
     }
 
+    public List<BatchDeleteTableError> batchDeleteTables(String databaseName, List<String> tableNames) {
+        getDatabase(databaseName);
+        List<BatchDeleteTableError> errors = new ArrayList<>();
+        for (String tableName : tableNames) {
+            String key = tableKey(databaseName, tableName);
+            Optional<Table> table = tableStore.get(key);
+            if (table.isEmpty()) {
+                errors.add(new BatchDeleteTableError(
+                        tableName,
+                        new ErrorDetail("EntityNotFoundException", "Table " + tableName + " not found")));
+                continue;
+            }
+            deleteTable(databaseName, tableName);
+        }
+        return errors;
+    }
+
     public void createPartition(String databaseName, String tableName, Partition partition) {
-        getTable(databaseName, tableName);
-        String key = databaseName + ":" + tableName + ":" + String.join(",", partition.getValues());
-        partition.setDatabaseName(databaseName);
-        partition.setTableName(tableName);
+        Table table = getTable(databaseName, tableName);
+        String key = tableKey(databaseName, tableName) + ":" + String.join(",", partition.getValues());
+        partition.setDatabaseName(table.getDatabaseName());
+        partition.setTableName(table.getName());
         partitionStore.put(key, partition);
     }
 
     public List<Partition> getPartitions(String databaseName, String tableName) {
-        String prefix = databaseName + ":" + tableName + ":";
+        String prefix = tableKey(databaseName, tableName) + ":";
         return partitionStore.scan(k -> k.startsWith(prefix));
+    }
+
+    public void createUserDefinedFunction(String databaseName, UserDefinedFunction function) {
+        Database database = getDatabase(databaseName);
+        String key = functionKey(databaseName, function.getFunctionName());
+        if (functionStore.get(key).isPresent()) {
+            throw new AwsException("AlreadyExistsException",
+                    "Function already exists: " + databaseName + "." + function.getFunctionName(), 400);
+        }
+        function.setDatabaseName(database.getName());
+        function.setFunctionName(normalizeName(function.getFunctionName()));
+        function.setCreateTime(Instant.now());
+        functionStore.put(key, function);
+    }
+
+    public UserDefinedFunction getUserDefinedFunction(String databaseName, String functionName) {
+        getDatabase(databaseName);
+        return functionStore.get(functionKey(databaseName, functionName))
+                .orElseThrow(() -> new AwsException("EntityNotFoundException",
+                        "Function not found: " + databaseName + "." + functionName, 400));
+    }
+
+    public List<UserDefinedFunction> getUserDefinedFunctions(String databaseName, String pattern) {
+        return getUserDefinedFunctions(databaseName, pattern, null, null, null).functions();
+    }
+
+    public UserDefinedFunctionPage getUserDefinedFunctions(
+            String databaseName,
+            String pattern,
+            String functionType,
+            Integer maxResults,
+            String nextToken) {
+        String databaseNameFilter = databaseName == null ? null : getDatabase(databaseName).getName();
+        Pattern compiledPattern = compileFunctionPattern(pattern);
+        int offset = decodeFunctionNextToken(nextToken);
+        if (maxResults != null && (maxResults < 1 || maxResults > MAX_FUNCTION_RESULTS)) {
+            throw new AwsException("InvalidInputException", "MaxResults must be between 1 and 100", 400);
+        }
+        List<UserDefinedFunction> functions = functionStore.scan(k -> true).stream()
+                .filter(function -> databaseNameFilter == null || databaseNameFilter.equals(function.getDatabaseName()))
+                .filter(function -> functionType == null || functionType.equals(function.getFunctionType()))
+                .filter(function -> function.getFunctionName() != null)
+                .filter(function -> compiledPattern.matcher(function.getFunctionName()).matches())
+                .sorted(Comparator.comparing(
+                                UserDefinedFunction::getDatabaseName,
+                                Comparator.nullsFirst(String::compareTo))
+                        .thenComparing(UserDefinedFunction::getFunctionName, Comparator.nullsFirst(String::compareTo)))
+                .toList();
+        if (offset > functions.size()) {
+            throw new AwsException("InvalidInputException", "Invalid NextToken", 400);
+        }
+        int limit = maxResults == null ? functions.size() : maxResults;
+        int end = Math.min(functions.size(), offset + limit);
+        String newNextToken = end < functions.size() ? Integer.toString(end) : null;
+        return new UserDefinedFunctionPage(functions.subList(offset, end), newNextToken);
+    }
+
+    public void updateUserDefinedFunction(String databaseName, String functionName, UserDefinedFunction function) {
+        UserDefinedFunction existing = getUserDefinedFunction(databaseName, functionName);
+        function.setDatabaseName(existing.getDatabaseName());
+        function.setFunctionName(existing.getFunctionName());
+        function.setCreateTime(existing.getCreateTime());
+        functionStore.put(functionKey(databaseName, functionName), function);
+    }
+
+    public void deleteUserDefinedFunction(String databaseName, String functionName) {
+        getUserDefinedFunction(databaseName, functionName);
+        functionStore.delete(functionKey(databaseName, functionName));
     }
 
     private void validateSchemaReference(Table table) {
@@ -189,6 +312,59 @@ public class GlueService {
         return sd != null ? sd.getSchemaReference() : null;
     }
 
+    private static String functionKey(String databaseName, String functionName) {
+        return normalizeName(databaseName) + ":" + normalizeName(functionName);
+    }
+
+    private static String tableKey(String databaseName, String tableName) {
+        return normalizeName(databaseName) + ":" + normalizeName(tableName);
+    }
+
+    private static String normalizeName(String name) {
+        return name.toLowerCase(Locale.ROOT);
+    }
+
+    private static Pattern compileFunctionPattern(String pattern) {
+        if (pattern == null) {
+            return Pattern.compile(".*");
+        }
+        if (pattern.length() > MAX_FUNCTION_PATTERN_LENGTH) {
+            throw new AwsException("InvalidInputException", "Invalid function pattern: pattern is too long", 400);
+        }
+        try {
+            return Pattern.compile(pattern);
+        }
+        catch (PatternSyntaxException e) {
+            throw new AwsException("InvalidInputException", "Invalid function pattern: " + pattern, 400);
+        }
+    }
+
+    private static int decodeFunctionNextToken(String nextToken) {
+        if (nextToken == null) {
+            return 0;
+        }
+        try {
+            int offset = Integer.parseInt(nextToken);
+            if (offset < 0) {
+                throw new NumberFormatException();
+            }
+            return offset;
+        }
+        catch (NumberFormatException e) {
+            throw new AwsException("InvalidInputException", "Invalid NextToken", 400);
+        }
+    }
+
+    public record UserDefinedFunctionPage(List<UserDefinedFunction> functions, String nextToken) {}
+
+    public record BatchDeleteTableError(
+            @JsonProperty("TableName") String tableName,
+            @JsonProperty("ErrorDetail") ErrorDetail errorDetail) {}
+
+    public record ErrorDetail(
+            @JsonProperty("ErrorCode") String errorCode,
+            @JsonProperty("ErrorMessage") String errorMessage) {}
+
     private static Table copyTable(Table source) {
         Table copy = new Table();
         copy.setName(source.getName());
@@ -203,8 +379,21 @@ public class GlueService {
         copy.setTableType(source.getTableType());
         copy.setViewOriginalText(source.getViewOriginalText());
         copy.setViewExpandedText(source.getViewExpandedText());
+        copy.setVersionId(source.getVersionId());
         copy.setParameters(copyMap(source.getParameters()));
         return copy;
+    }
+
+    private static String nextVersionId(String versionId) {
+        if (versionId == null) {
+            return "1";
+        }
+        try {
+            return Long.toString(Math.addExact(Long.parseLong(versionId), 1));
+        }
+        catch (ArithmeticException | NumberFormatException e) {
+            throw new AwsException("InvalidInputException", "Invalid table VersionId: " + versionId, 400);
+        }
     }
 
     private static StorageDescriptor copyStorageDescriptor(StorageDescriptor source) {
@@ -260,6 +449,7 @@ public class GlueService {
             columnCopy.setName(column.getName());
             columnCopy.setType(column.getType());
             columnCopy.setComment(column.getComment());
+            columnCopy.setParameters(copyMap(column.getParameters()));
             copy.add(columnCopy);
         }
         return copy;
@@ -268,4 +458,5 @@ public class GlueService {
     private static Map<String, String> copyMap(Map<String, String> source) {
         return source != null ? new LinkedHashMap<>(source) : null;
     }
+
 }

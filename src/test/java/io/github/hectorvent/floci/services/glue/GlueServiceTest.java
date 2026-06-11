@@ -12,12 +12,15 @@ import io.github.hectorvent.floci.services.glue.model.Partition;
 import io.github.hectorvent.floci.services.glue.model.SchemaReference;
 import io.github.hectorvent.floci.services.glue.model.StorageDescriptor;
 import io.github.hectorvent.floci.services.glue.model.Table;
+import io.github.hectorvent.floci.services.glue.model.UserDefinedFunction;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.RegistryId;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.SchemaId;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -42,16 +45,21 @@ class GlueServiceTest {
 
     private GlueService glueService;
     private GlueSchemaRegistryService schemaRegistryService;
+    private StorageBackend<String, Table> tableStore;
+    private StorageBackend<String, Partition> partitionStore;
 
     @BeforeEach
     void setUp() {
         RegionResolver regionResolver = new RegionResolver(REGION, ACCOUNT_ID);
         StorageFactory storageFactory = new InMemoryStorageFactory();
         schemaRegistryService = new GlueSchemaRegistryService(storageFactory, regionResolver);
+        tableStore = new InMemoryStorage<>();
+        partitionStore = new InMemoryStorage<>();
         glueService = new GlueService(
                 new InMemoryStorage<String, Database>(),
-                new InMemoryStorage<String, Table>(),
-                new InMemoryStorage<String, Partition>(),
+                tableStore,
+                partitionStore,
+                new InMemoryStorage<String, UserDefinedFunction>(),
                 schemaRegistryService, regionResolver);
         glueService.createDatabase(new Database("db1"));
     }
@@ -61,7 +69,9 @@ class GlueServiceTest {
         Table table = new Table();
         table.setName("plain");
         StorageDescriptor sd = new StorageDescriptor();
-        sd.setColumns(java.util.List.of(new Column("a", "string")));
+        Column column = new Column("a", "string");
+        column.setParameters(Map.of("trino_type_id", "varchar"));
+        sd.setColumns(java.util.List.of(column));
         table.setStorageDescriptor(sd);
         glueService.createTable("db1", table);
 
@@ -69,6 +79,8 @@ class GlueServiceTest {
 
         assertEquals(1, fetched.getStorageDescriptor().getColumns().size());
         assertEquals("a", fetched.getStorageDescriptor().getColumns().get(0).getName());
+        assertEquals("0", fetched.getVersionId());
+        assertEquals("varchar", fetched.getStorageDescriptor().getColumns().get(0).getParameters().get("trino_type_id"));
         assertNull(fetched.getStorageDescriptor().getSchemaReference());
     }
 
@@ -199,8 +211,59 @@ class GlueServiceTest {
         Table fetched = glueService.getTable("db1", "plain");
         assertEquals(created.getCreateTime(), fetched.getCreateTime());
         assertNotNull(fetched.getUpdateTime());
+        assertEquals("1", fetched.getVersionId());
         assertEquals(1, fetched.getStorageDescriptor().getColumns().size());
         assertEquals("b", fetched.getStorageDescriptor().getColumns().get(0).getName());
+    }
+
+    @Test
+    void updateTableChecksVersionId() {
+        Table table = new Table();
+        table.setName("plain");
+        glueService.createTable("db1", table);
+        assertEquals("0", glueService.getTable("db1", "plain").getVersionId());
+
+        Table nonCanonicalVersionReplacement = new Table();
+        nonCanonicalVersionReplacement.setName("plain");
+        AwsException nonCanonicalVersionEx = assertThrows(AwsException.class,
+                () -> glueService.updateTable("db1", nonCanonicalVersionReplacement, "00"));
+        assertEquals("ConcurrentModificationException", nonCanonicalVersionEx.getErrorCode());
+        assertEquals("0", glueService.getTable("db1", "plain").getVersionId());
+
+        Table nonNumericVersionReplacement = new Table();
+        nonNumericVersionReplacement.setName("plain");
+        AwsException nonNumericVersionEx = assertThrows(AwsException.class,
+                () -> glueService.updateTable("db1", nonNumericVersionReplacement, "invalid"));
+        assertEquals("ConcurrentModificationException", nonNumericVersionEx.getErrorCode());
+        assertEquals("0", glueService.getTable("db1", "plain").getVersionId());
+
+        Table firstReplacement = new Table();
+        firstReplacement.setName("plain");
+        firstReplacement.setDescription("first");
+        glueService.updateTable("db1", firstReplacement, "0");
+        assertEquals("1", glueService.getTable("db1", "plain").getVersionId());
+
+        Table staleReplacement = new Table();
+        staleReplacement.setName("plain");
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.updateTable("db1", staleReplacement, "0"));
+
+        assertEquals("ConcurrentModificationException", ex.getErrorCode());
+        assertEquals("Update table failed due to concurrent modifications.", ex.getMessage());
+    }
+
+    @Test
+    void updateTableIncrementsMissingVersionId() {
+        Table existing = new Table();
+        existing.setName("plain");
+        existing.setDatabaseName("db1");
+        tableStore.put("db1:plain", existing);
+
+        Table replacement = new Table();
+        replacement.setName("plain");
+        glueService.updateTable("db1", replacement);
+
+        assertEquals("1", glueService.getTable("db1", "plain").getVersionId());
     }
 
     @Test
@@ -228,8 +291,320 @@ class GlueServiceTest {
     }
 
     @Test
+    void deleteDatabaseDeletesDatabaseTablesAndPartitions() {
+        Table table = new Table();
+        table.setName("plain");
+        glueService.createTable("db1", table);
+
+        Partition partition = new Partition();
+        partition.setValues(java.util.List.of("2026"));
+        glueService.createPartition("db1", "plain", partition);
+
+        glueService.deleteDatabase("db1");
+
+        assertThrows(AwsException.class, () -> glueService.getDatabase("db1"));
+        assertThrows(AwsException.class, () -> glueService.getTable("db1", "plain"));
+        assertTrue(tableStore.scan(k -> true).isEmpty());
+        assertTrue(partitionStore.scan(k -> true).isEmpty());
+    }
+
+    @Test
+    void deleteDatabaseDoesNotDeleteSimilarDatabaseNames() {
+        glueService.createDatabase(new Database("a"));
+        glueService.createDatabase(new Database("a:b"));
+        Table similarDatabaseTable = new Table();
+        similarDatabaseTable.setName("t");
+        glueService.createTable("a:b", similarDatabaseTable);
+
+        glueService.deleteDatabase("a");
+
+        assertEquals("t", glueService.getTable("a:b", "t").getName());
+    }
+
+    @Test
+    void deleteDatabaseForMissingDatabaseThrows() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.deleteDatabase("missing"));
+
+        assertEquals("EntityNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
+    void updateTableWithCurrentVersionIdSucceedsAndIncrementsVersionId() {
+        Table table = new Table();
+        table.setName("plain");
+        table.setParameters(Map.of("metadata_location", "s3://bucket/v1.metadata.json"));
+        glueService.createTable("db1", table);
+
+        Table created = glueService.getTable("db1", "plain");
+        Table replacement = new Table();
+        replacement.setName("plain");
+        replacement.setParameters(Map.of("metadata_location", "s3://bucket/v2.metadata.json"));
+
+        glueService.updateTable("db1", replacement, created.getVersionId());
+
+        Table fetched = glueService.getTable("db1", "plain");
+        assertEquals("1", fetched.getVersionId());
+        assertEquals("s3://bucket/v2.metadata.json", fetched.getParameters().get("metadata_location"));
+    }
+
+    @Test
+    void updateTableWithStaleVersionIdThrowsAndDoesNotOverwrite() {
+        Table table = new Table();
+        table.setName("plain");
+        table.setParameters(Map.of("metadata_location", "s3://bucket/v1.metadata.json"));
+        glueService.createTable("db1", table);
+
+        Table replacement = new Table();
+        replacement.setName("plain");
+        replacement.setParameters(Map.of("metadata_location", "s3://bucket/v2.metadata.json"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.updateTable("db1", replacement, "stale-version"));
+
+        assertEquals("ConcurrentModificationException", ex.getErrorCode());
+        Table fetched = glueService.getTable("db1", "plain");
+        assertEquals("0", fetched.getVersionId());
+        assertEquals("s3://bucket/v1.metadata.json", fetched.getParameters().get("metadata_location"));
+    }
+
+    @Test
+    void createTableIgnoresProvidedVersionId() {
+        Table table = new Table();
+        table.setName("plain");
+        table.setVersionId("7");
+
+        glueService.createTable("db1", table);
+
+        assertEquals("0", glueService.getTable("db1", "plain").getVersionId());
+    }
+
+    @Test
+    void updateTableWithSameVersionIdRejectsSecondUpdate() {
+        Table table = new Table();
+        table.setName("plain");
+        table.setParameters(Map.of("metadata_location", "s3://bucket/v1.metadata.json"));
+        glueService.createTable("db1", table);
+        String versionId = glueService.getTable("db1", "plain").getVersionId();
+
+        Table firstReplacement = new Table();
+        firstReplacement.setName("plain");
+        firstReplacement.setParameters(Map.of("metadata_location", "s3://bucket/v2a.metadata.json"));
+        glueService.updateTable("db1", firstReplacement, versionId);
+
+        Table secondReplacement = new Table();
+        secondReplacement.setName("plain");
+        secondReplacement.setParameters(Map.of("metadata_location", "s3://bucket/v2b.metadata.json"));
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.updateTable("db1", secondReplacement, versionId));
+
+        assertEquals("ConcurrentModificationException", ex.getErrorCode());
+        Table fetched = glueService.getTable("db1", "plain");
+        assertEquals("1", fetched.getVersionId());
+        assertEquals("s3://bucket/v2a.metadata.json", fetched.getParameters().get("metadata_location"));
+    }
+
+    @Test
+    void catalogNamesAreCaseInsensitiveAcrossApis() {
+        glueService.createDatabase(new Database("MixedCaseDatabase"));
+
+        assertEquals("mixedcasedatabase", glueService.getDatabase("MixedCaseDatabase").getName());
+        assertEquals("mixedcasedatabase", glueService.getDatabase("mixedcasedatabase").getName());
+        assertTrue(glueService.getDatabases().stream()
+                .map(Database::getName)
+                .toList()
+                .contains("mixedcasedatabase"));
+        AwsException databaseExists = assertThrows(AwsException.class,
+                () -> glueService.createDatabase(new Database("MIXEDCASEDATABASE")));
+        assertEquals("AlreadyExistsException", databaseExists.getErrorCode());
+
+        Table table = new Table();
+        table.setName("MixedCaseTable");
+        glueService.createTable("MixedCaseDatabase", table);
+        Table duplicateTable = new Table();
+        duplicateTable.setName("MIXEDCASETABLE");
+        AwsException tableExists = assertThrows(AwsException.class,
+                () -> glueService.createTable("MIXEDCASEDATABASE", duplicateTable));
+        assertEquals("AlreadyExistsException", tableExists.getErrorCode());
+        Table fetchedTable = glueService.getTable("mixedcasedatabase", "MIXEDCASETABLE");
+        assertEquals("mixedcasedatabase", fetchedTable.getDatabaseName());
+        assertEquals("mixedcasetable", fetchedTable.getName());
+        assertEquals(List.of("mixedcasetable"), glueService.getTables("MIXEDCASEDATABASE").stream()
+                .map(Table::getName)
+                .toList());
+
+        Table replacement = new Table();
+        replacement.setName("MIXEDCASETABLE");
+        replacement.setDescription("updated");
+        glueService.updateTable("MIXEDCASEDATABASE", replacement, fetchedTable.getVersionId());
+        assertEquals("updated", glueService.getTable("mixedcasedatabase", "mixedcasetable").getDescription());
+
+        Partition partition = new Partition();
+        partition.setValues(List.of("2026"));
+        glueService.createPartition("MIXEDCASEDATABASE", "MIXEDCASETABLE", partition);
+        Partition fetchedPartition = glueService.getPartitions("mixedcasedatabase", "mixedcasetable").get(0);
+        assertEquals("mixedcasedatabase", fetchedPartition.getDatabaseName());
+        assertEquals("mixedcasetable", fetchedPartition.getTableName());
+
+        UserDefinedFunction function = new UserDefinedFunction();
+        function.setFunctionName("MixedCaseFunction");
+        glueService.createUserDefinedFunction("mixedcasedatabase", function);
+        UserDefinedFunction duplicateFunction = new UserDefinedFunction();
+        duplicateFunction.setFunctionName("MIXEDCASEFUNCTION");
+        AwsException functionExists = assertThrows(AwsException.class,
+                () -> glueService.createUserDefinedFunction("MIXEDCASEDATABASE", duplicateFunction));
+        assertEquals("AlreadyExistsException", functionExists.getErrorCode());
+        UserDefinedFunction fetchedFunction = glueService.getUserDefinedFunction("MixedCaseDatabase", "MIXEDCASEFUNCTION");
+        assertEquals("mixedcasedatabase", fetchedFunction.getDatabaseName());
+        assertEquals("mixedcasefunction", fetchedFunction.getFunctionName());
+        GlueService.UserDefinedFunctionPage functions = glueService.getUserDefinedFunctions(
+                "MIXEDCASEDATABASE", "mixedcase.*", null, 1, null);
+        assertEquals(1, functions.functions().size());
+        assertNull(functions.nextToken());
+
+        UserDefinedFunction replacementFunction = new UserDefinedFunction();
+        replacementFunction.setFunctionName("ignored-name");
+        replacementFunction.setOwnerName("new-owner");
+        glueService.updateUserDefinedFunction("MIXEDCASEDATABASE", "MIXEDCASEFUNCTION", replacementFunction);
+        assertEquals("new-owner", glueService.getUserDefinedFunction("mixedcasedatabase", "mixedcasefunction").getOwnerName());
+
+        glueService.deleteUserDefinedFunction("MIXEDCASEDATABASE", "MIXEDCASEFUNCTION");
+        assertThrows(AwsException.class,
+                () -> glueService.getUserDefinedFunction("mixedcasedatabase", "mixedcasefunction"));
+
+        glueService.deleteTable("MIXEDCASEDATABASE", "MIXEDCASETABLE");
+        assertThrows(AwsException.class,
+                () -> glueService.getTable("mixedcasedatabase", "mixedcasetable"));
+
+        Table tableDeletedWithDatabase = new Table();
+        tableDeletedWithDatabase.setName("MixedCaseTableDeletedWithDatabase");
+        glueService.createTable("mixedcasedatabase", tableDeletedWithDatabase);
+        glueService.deleteDatabase("MIXEDCASEDATABASE");
+        assertThrows(AwsException.class, () -> glueService.getDatabase("mixedcasedatabase"));
+        assertThrows(AwsException.class,
+                () -> glueService.getTable("mixedcasedatabase", "mixedcasetabledeletedwithdatabase"));
+    }
+
+    @Test
+    void batchDeleteTablesDeletesExistingTablesAndReportsMissingTables() {
+        Table table = new Table();
+        table.setName("existing");
+        glueService.createTable("db1", table);
+
+        List<GlueService.BatchDeleteTableError> errors =
+                glueService.batchDeleteTables("db1", List.of("existing", "missing"));
+
+        assertEquals(1, errors.size());
+        assertEquals("missing", errors.get(0).tableName());
+        GlueService.ErrorDetail errorDetail = errors.get(0).errorDetail();
+        assertEquals("EntityNotFoundException", errorDetail.errorCode());
+        assertEquals("Table missing not found", errorDetail.errorMessage());
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.getTable("db1", "existing"));
+        assertEquals("EntityNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
     void getTableVersionsReturnsEmptyListForAthenaCompatibility() {
         assertTrue(glueService.getTableVersions().isEmpty());
+    }
+
+    @Test
+    void userDefinedFunctionsCanBeCreatedListedUpdatedAndDeleted() {
+        UserDefinedFunction function = new UserDefinedFunction();
+        function.setFunctionName("udf__test__integer");
+        function.setClassName("ExampleFunction");
+        function.setFunctionType("REGULAR_FUNCTION");
+        function.setOwnerType("USER");
+        function.setOwnerName("owner");
+        function.setCreateTime(Instant.EPOCH);
+
+        glueService.createUserDefinedFunction("db1", function);
+
+        UserDefinedFunction fetched = glueService.getUserDefinedFunction("db1", "udf__test__integer");
+        assertEquals("db1", fetched.getDatabaseName());
+        assertEquals("ExampleFunction", fetched.getClassName());
+        assertEquals("REGULAR_FUNCTION", fetched.getFunctionType());
+        assertEquals("owner", fetched.getOwnerName());
+        assertNotNull(fetched.getCreateTime());
+        assertTrue(fetched.getCreateTime().isAfter(Instant.EPOCH));
+        assertEquals(1, glueService.getUserDefinedFunctions("db1", "udf__test__.*").size());
+        assertEquals(1, glueService.getUserDefinedFunctions("db1", "udf__\\Qtest\\E__.*").size());
+        assertEquals(0, glueService.getUserDefinedFunctions("db1", "other__.*").size());
+
+        UserDefinedFunction replacement = new UserDefinedFunction();
+        replacement.setFunctionName("ignored-name");
+        replacement.setClassName("ExampleFunction");
+        replacement.setFunctionType("REGULAR_FUNCTION");
+        replacement.setOwnerType("USER");
+        replacement.setOwnerName("new-owner");
+        glueService.updateUserDefinedFunction("db1", "udf__test__integer", replacement);
+
+        UserDefinedFunction updated = glueService.getUserDefinedFunction("db1", "udf__test__integer");
+        assertEquals("udf__test__integer", updated.getFunctionName());
+        assertEquals(fetched.getCreateTime(), updated.getCreateTime());
+        assertEquals("new-owner", updated.getOwnerName());
+
+        glueService.deleteUserDefinedFunction("db1", "udf__test__integer");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.getUserDefinedFunction("db1", "udf__test__integer"));
+        assertEquals("EntityNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
+    void getUserDefinedFunctionsPaginatesFiltersAndScansAllDatabases() {
+        UserDefinedFunction db1Function = new UserDefinedFunction();
+        db1Function.setFunctionName("udf__test__integer");
+        db1Function.setFunctionType("REGULAR_FUNCTION");
+        glueService.createUserDefinedFunction("db1", db1Function);
+
+        UserDefinedFunction storedProcedure = new UserDefinedFunction();
+        storedProcedure.setFunctionName("udf__test__procedure");
+        storedProcedure.setFunctionType("STORED_PROCEDURE");
+        glueService.createUserDefinedFunction("db1", storedProcedure);
+
+        glueService.createDatabase(new Database("db2"));
+        UserDefinedFunction db2Function = new UserDefinedFunction();
+        db2Function.setFunctionName("udf__test__varchar");
+        db2Function.setFunctionType("REGULAR_FUNCTION");
+        glueService.createUserDefinedFunction("db2", db2Function);
+
+        GlueService.UserDefinedFunctionPage firstPage =
+                glueService.getUserDefinedFunctions(null, "udf__test__.*", "REGULAR_FUNCTION", 1, null);
+
+        assertEquals(1, firstPage.functions().size());
+        assertEquals("db1", firstPage.functions().getFirst().getDatabaseName());
+        assertEquals("udf__test__integer", firstPage.functions().getFirst().getFunctionName());
+        assertNotNull(firstPage.nextToken());
+
+        GlueService.UserDefinedFunctionPage secondPage =
+                glueService.getUserDefinedFunctions(
+                        null, "udf__test__.*", "REGULAR_FUNCTION", 1, firstPage.nextToken());
+
+        assertEquals(1, secondPage.functions().size());
+        assertEquals("db2", secondPage.functions().getFirst().getDatabaseName());
+        assertEquals("udf__test__varchar", secondPage.functions().getFirst().getFunctionName());
+        assertNull(secondPage.nextToken());
+    }
+
+    @Test
+    void getUserDefinedFunctionsRejectsInvalidPagingInput() {
+        AwsException maxResultsEx = assertThrows(AwsException.class,
+                () -> glueService.getUserDefinedFunctions("db1", ".*", null, 101, null));
+        assertEquals("InvalidInputException", maxResultsEx.getErrorCode());
+
+        AwsException nextTokenEx = assertThrows(AwsException.class,
+                () -> glueService.getUserDefinedFunctions("db1", ".*", null, 1, "invalid"));
+        assertEquals("InvalidInputException", nextTokenEx.getErrorCode());
+    }
+
+    @Test
+    void getUserDefinedFunctionsWithInvalidPatternThrows() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.getUserDefinedFunctions("db1", "udf__("));
+
+        assertEquals("InvalidInputException", ex.getErrorCode());
     }
 
     private Table tableReferencing(String registryName, String schemaName, Long versionNumber, String versionId) {
