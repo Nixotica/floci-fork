@@ -3,9 +3,12 @@ package io.github.hectorvent.floci.services.ecs;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
 import io.github.hectorvent.floci.services.ecs.container.EcsTaskHandle;
 import io.github.hectorvent.floci.services.ecs.model.Attribute;
+import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.CapacityProvider;
 import io.github.hectorvent.floci.services.ecs.model.ClusterSetting;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
@@ -14,7 +17,9 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
 import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
 import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
 import io.github.hectorvent.floci.services.ecs.model.EcsServiceModel;
+import io.github.hectorvent.floci.services.ecs.model.EcsAttachment;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
@@ -51,6 +56,7 @@ public class EcsService {
     private final RegionResolver regionResolver;
     private final EcsContainerManager containerManager;
     private final EcsLoadBalancerRegistrar lbRegistrar;
+    private final Ec2Service ec2Service;
     private final boolean dockerMode;
     private final String baseUrl;
     private final ScheduledExecutorService reconciler = Executors.newSingleThreadScheduledExecutor(
@@ -85,12 +91,14 @@ public class EcsService {
 
     @Inject
     public EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
-                      EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar) {
+                      EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
+                      Ec2Service ec2Service) {
         this.regionResolver = regionResolver;
         this.containerManager = containerManager;
         this.dockerMode = !config.services().ecs().mock();
         this.baseUrl = config.effectiveBaseUrl();
         this.lbRegistrar = lbRegistrar;
+        this.ec2Service = ec2Service;
     }
 
     @PostConstruct
@@ -316,6 +324,11 @@ public class EcsService {
             task.setContainerInstanceArn(containerInstanceArn);
             task.setNetworkConfiguration(networkConfiguration);
 
+            EcsAttachment eniAttachment = registerAwsvpcEni(task, networkConfiguration, region);
+            if (eniAttachment != null) {
+                task.getAttachments().add(eniAttachment);
+            }
+
             tasks.put(taskArn, task);
 
             if (dockerMode) {
@@ -375,6 +388,8 @@ public class EcsService {
             });
         }
 
+        deregisterAwsvpcEnis(task, region);
+
         EcsCluster cluster = resolveClusterByArn(task.getClusterArn());
         if (cluster != null && cluster.getRunningTasksCount() > 0) {
             cluster.setRunningTasksCount(cluster.getRunningTasksCount() - 1);
@@ -382,6 +397,52 @@ public class EcsService {
 
         LOG.infov("Stopped ECS task: {0}", task.getTaskArn());
         return task;
+    }
+
+    private void deregisterAwsvpcEnis(EcsTask task, String region) {
+        for (EcsAttachment att : task.getAttachments()) {
+            if (!"ElasticNetworkInterface".equals(att.getType())) {
+                continue;
+            }
+            for (KeyValuePair detail : att.getDetails()) {
+                if ("networkInterfaceId".equals(detail.name())) {
+                    ec2Service.deregisterEcsTaskNetworkInterface(region, detail.value());
+                }
+            }
+            att.setStatus("DELETED");
+        }
+    }
+
+    /**
+     * Builds the {@code ElasticNetworkInterface} attachment for an awsvpc task by allocating
+     * a synthetic ENI in {@link Ec2Service}. Returns {@code null} when the task is not
+     * awsvpc or no subnet was supplied — caller then leaves {@code attachments} empty.
+     */
+    private EcsAttachment registerAwsvpcEni(EcsTask task, NetworkConfiguration nc, String region) {
+        if (nc == null || nc.getAwsvpcConfiguration() == null) {
+            return null;
+        }
+        AwsVpcConfiguration awsvpc = nc.getAwsvpcConfiguration();
+        if (awsvpc.getSubnets() == null || awsvpc.getSubnets().isEmpty()) {
+            return null;
+        }
+        String subnetId = awsvpc.getSubnets().getFirst();
+        boolean assignPublicIp = "ENABLED".equalsIgnoreCase(awsvpc.getAssignPublicIp());
+        NetworkInterface eni = ec2Service.registerEcsTaskNetworkInterface(region, subnetId,
+                awsvpc.getSecurityGroups(), assignPublicIp, task.getTaskArn());
+
+        EcsAttachment attachment = new EcsAttachment();
+        attachment.setId(eni.getAttachment() != null ? eni.getAttachment().getAttachmentId() : null);
+        attachment.setType("ElasticNetworkInterface");
+        attachment.setStatus("ATTACHED");
+        attachment.getDetails().add(new KeyValuePair("subnetId", subnetId));
+        attachment.getDetails().add(new KeyValuePair("networkInterfaceId", eni.getNetworkInterfaceId()));
+        attachment.getDetails().add(new KeyValuePair("macAddress", eni.getMacAddress()));
+        attachment.getDetails().add(new KeyValuePair("privateIPv4Address", eni.getPrivateIpAddress()));
+        if (eni.getPrivateDnsName() != null) {
+            attachment.getDetails().add(new KeyValuePair("privateDnsName", eni.getPrivateDnsName()));
+        }
+        return attachment;
     }
 
     /** Registers a freshly-started task's containers as ELBv2 targets if its service is load-balanced. */

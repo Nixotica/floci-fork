@@ -26,6 +26,8 @@ import static org.hamcrest.Matchers.*;
 class EcsIntegrationTest {
 
     private static final String TARGET_PREFIX = "AmazonEC2ContainerServiceV20141113.";
+    private static final String EC2_AUTH_HEADER =
+            "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/ec2/aws4_request";
     private static final String REGION = "us-east-1";
     private static final String ACCOUNT = "000000000000";
     private static final String CLUSTER_NAME = "test-cluster";
@@ -383,6 +385,90 @@ class EcsIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+    }
+
+    @Test
+    @Order(25)
+    void runTaskAwsvpcRegistersEniAttachment() {
+        var run = ecs("RunTask")
+            .body("""
+                {
+                    "cluster": "%s",
+                    "taskDefinition": "%s",
+                    "launchType": "FARGATE",
+                    "count": 1,
+                    "networkConfiguration": {
+                        "awsvpcConfiguration": {
+                            "subnets": ["subnet-default-a"],
+                            "securityGroups": ["sg-default"],
+                            "assignPublicIp": "ENABLED"
+                        }
+                    }
+                }
+                """.formatted(CLUSTER_NAME, TASK_DEF_FAMILY))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("tasks", hasSize(1))
+            .body("tasks[0].attachments", hasSize(1))
+            .body("tasks[0].attachments[0].type", equalTo("ElasticNetworkInterface"))
+            .body("tasks[0].attachments[0].status", equalTo("ATTACHED"))
+            .body("tasks[0].attachments[0].id", startsWith("eni-attach-"))
+            .body("tasks[0].attachments[0].details.find { it.name == 'subnetId' }.value",
+                    equalTo("subnet-default-a"))
+            .body("tasks[0].attachments[0].details.find { it.name == 'networkInterfaceId' }.value",
+                    startsWith("eni-"))
+            .body("tasks[0].attachments[0].details.find { it.name == 'privateIPv4Address' }.value",
+                    notNullValue())
+            .body("tasks[0].attachments[0].details.find { it.name == 'macAddress' }.value", notNullValue())
+        .extract();
+
+        String eniTaskArn = run.path("tasks[0].taskArn");
+        String eniId = run.path("tasks[0].attachments[0].details.find { it.name == 'networkInterfaceId' }.value");
+
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("NetworkInterfaceId.1", eniId)
+            .header("Authorization", EC2_AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()", equalTo(1))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].networkInterfaceId",
+                    equalTo(eniId))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].subnetId",
+                    equalTo("subnet-default-a"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0]"
+                    + ".privateIpAddressesSet.item[0].association.publicIp",
+                    equalTo("127.0.0.1"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].groupSet.item[0].groupId",
+                    equalTo("sg-default"));
+
+        ecs("StopTask")
+            .body("""
+                {
+                    "cluster": "%s",
+                    "task": "%s",
+                    "reason": "integration-test-cleanup"
+                }
+                """.formatted(CLUSTER_NAME, eniTaskArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("NetworkInterfaceId.1", eniId)
+            .header("Authorization", EC2_AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidNetworkInterfaceID.NotFound"));
     }
 
     // ── Services ──────────────────────────────────────────────────────────────

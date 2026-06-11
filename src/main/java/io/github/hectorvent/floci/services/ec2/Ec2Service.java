@@ -79,6 +79,8 @@ public class Ec2Service {
     private final Map<String, Address> addresses = new ConcurrentHashMap<>();
     private final Map<String, Instance> instances = new ConcurrentHashMap<>();
     private final Map<String, Volume> volumes = new ConcurrentHashMap<>();
+    // region::networkInterfaceId → NetworkInterface (synthetic ENIs registered by ECS awsvpc tasks)
+    private final Map<String, NetworkInterface> ecsTaskNetworkInterfaces = new ConcurrentHashMap<>();
     // resourceId → List<Tag>
     private final Map<String, List<Tag>> tags = new ConcurrentHashMap<>();
     private final Set<String> seededRegions = ConcurrentHashMap.newKeySet();
@@ -1536,6 +1538,94 @@ public class Ec2Service {
 
     // ─── Network Interfaces ─────────────────────────────────────────────────────
 
+    /**
+     * Allocates a synthetic ENI for an ECS awsvpc task: assigns a private IP from the
+     * subnet, generates a MAC, attaches the requested security groups, and stores the
+     * resulting {@link NetworkInterface} so {@link #describeNetworkInterfaces} returns it.
+     * Used by {@code EcsService} when launching tasks with an {@code awsvpcConfiguration}.
+     *
+     * <p>If {@code assignPublicIp == "ENABLED"} the loopback address {@code 127.0.0.1} is
+     * recorded as the public IP — Floci runs locally, so there is no real EIP to attach,
+     * and {@code 127.0.0.1} is the only address downstream consumers can actually reach.
+     */
+    public NetworkInterface registerEcsTaskNetworkInterface(String region, String subnetId,
+                                                            List<String> securityGroupIds,
+                                                            boolean assignPublicIp, String taskArn) {
+        ensureDefaultResources(region);
+        String eniId = "eni-" + randomHex(17);
+        String privateIp = assignPrivateIp(region, subnetId);
+        String vpcId = null;
+        String availabilityZone = null;
+        Subnet subnet = subnetId != null ? subnets.get(key(region, subnetId)) : null;
+        if (subnet != null) {
+            vpcId = subnet.getVpcId();
+            availabilityZone = subnet.getAvailabilityZone();
+        }
+
+        NetworkInterface ni = new NetworkInterface();
+        ni.setNetworkInterfaceId(eniId);
+        ni.setSubnetId(subnetId);
+        ni.setVpcId(vpcId);
+        ni.setAvailabilityZone(availabilityZone);
+        ni.setOwnerId(accountId);
+        ni.setDescription("arn:aws:ecs:eni/" + (taskArn != null ? taskArn : eniId));
+        ni.setStatus("in-use");
+        ni.setMacAddress(randomMac());
+        ni.setPrivateIpAddress(privateIp);
+        ni.setPrivateDnsName("ip-" + privateIp.replace('.', '-') + ".ec2.internal");
+        ni.setInterfaceType("interface");
+
+        List<GroupIdentifier> groups = new ArrayList<>();
+        if (securityGroupIds != null) {
+            for (String sgId : securityGroupIds) {
+                GroupIdentifier gi = new GroupIdentifier();
+                gi.setGroupId(sgId);
+                SecurityGroup sg = securityGroups.get(key(region, sgId));
+                gi.setGroupName(sg != null ? sg.getGroupName() : sgId);
+                groups.add(gi);
+            }
+        }
+        ni.setGroups(groups);
+
+        NetworkInterfaceAttachment attachment = new NetworkInterfaceAttachment();
+        attachment.setAttachmentId("eni-attach-" + randomHex(17));
+        attachment.setDeviceIndex(1);
+        attachment.setStatus("attached");
+        attachment.setInstanceOwnerId("amazon-ecs");
+        attachment.setAttachTime(ISO_FMT.format(Instant.now()));
+        attachment.setDeleteOnTermination(true);
+        ni.setAttachment(attachment);
+
+        NetworkInterfacePrivateIpAddress primaryIp = new NetworkInterfacePrivateIpAddress();
+        primaryIp.setPrivateIpAddress(privateIp);
+        primaryIp.setPrivateDnsName(ni.getPrivateDnsName());
+        primaryIp.setPrimary(true);
+        if (assignPublicIp) {
+            NetworkInterfaceAssociation assoc = new NetworkInterfaceAssociation();
+            assoc.setPublicIp("127.0.0.1");
+            assoc.setIpOwnerId("amazon-ecs");
+            primaryIp.setAssociation(assoc);
+        }
+        ni.getPrivateIpAddresses().add(primaryIp);
+
+        ecsTaskNetworkInterfaces.put(key(region, eniId), ni);
+        return ni;
+    }
+
+    public void deregisterEcsTaskNetworkInterface(String region, String networkInterfaceId) {
+        if (networkInterfaceId == null) {
+            return;
+        }
+        ecsTaskNetworkInterfaces.remove(key(region, networkInterfaceId));
+    }
+
+    private String randomMac() {
+        Random rand = new Random();
+        return String.format("02:%02x:%02x:%02x:%02x:%02x",
+                rand.nextInt(256), rand.nextInt(256), rand.nextInt(256),
+                rand.nextInt(256), rand.nextInt(256));
+    }
+
     public NetworkInterfaceListResult describeNetworkInterfaces(String region, List<String> networkInterfaceIds,
                                                                    Map<String, List<String>> filters,
                                                                    int maxResults, String nextToken) {
@@ -1629,6 +1719,22 @@ public class Ec2Service {
 
                 result.add(ni);
             }
+        }
+
+        for (Map.Entry<String, NetworkInterface> entry : ecsTaskNetworkInterfaces.entrySet()) {
+            if (!entry.getKey().startsWith(region + "::")) {
+                continue;
+            }
+            NetworkInterface ni = entry.getValue();
+            if (!networkInterfaceIds.isEmpty()
+                    && !networkInterfaceIds.contains(ni.getNetworkInterfaceId())) {
+                continue;
+            }
+            foundIds.add(ni.getNetworkInterfaceId());
+            if (!matchesFilters(ni, filters, region)) {
+                continue;
+            }
+            result.add(ni);
         }
 
         // Phase 6: validate requested IDs exist
