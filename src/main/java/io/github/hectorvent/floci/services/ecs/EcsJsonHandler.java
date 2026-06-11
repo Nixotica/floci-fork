@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.ecs.model.ClusterSetting;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.ContainerInstance;
 import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
+import io.github.hectorvent.floci.services.ecs.model.EcsAttachment;
 import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
 import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
 import io.github.hectorvent.floci.services.ecs.model.EcsServiceModel;
@@ -1018,6 +1019,25 @@ public class EcsJsonHandler {
         ObjectNode netCfg = networkConfigurationNode(t.getNetworkConfiguration());
         if (netCfg != null) {
             n.set("networkConfiguration", netCfg);
+        }
+        if (t.getAttachments() != null && !t.getAttachments().isEmpty()) {
+            ArrayNode atts = objectMapper.createArrayNode();
+            for (EcsAttachment att : t.getAttachments()) {
+                ObjectNode an = objectMapper.createObjectNode();
+                if (att.getId() != null) { an.put("id", att.getId()); }
+                if (att.getType() != null) { an.put("type", att.getType()); }
+                if (att.getStatus() != null) { an.put("status", att.getStatus()); }
+                ArrayNode details = objectMapper.createArrayNode();
+                for (KeyValuePair kv : att.getDetails()) {
+                    ObjectNode dn = objectMapper.createObjectNode();
+                    dn.put("name", kv.name());
+                    dn.put("value", kv.value());
+                    details.add(dn);
+                }
+                an.set("details", details);
+                atts.add(an);
+            }
+            n.set("attachments", atts);
         }
         return n;
     }

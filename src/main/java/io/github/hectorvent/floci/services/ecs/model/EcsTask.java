@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ecs.model;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,6 +28,7 @@ public class EcsTask {
     private List<Container> containers;
     private String containerInstanceArn;
     private NetworkConfiguration networkConfiguration;
+    private List<EcsAttachment> attachments = new ArrayList<>();
     private boolean protectionEnabled;
     private Instant protectedUntil;
     private Map<String, String> tags = new HashMap<>();
@@ -82,6 +84,11 @@ public class EcsTask {
     public NetworkConfiguration getNetworkConfiguration() { return networkConfiguration; }
     public void setNetworkConfiguration(NetworkConfiguration networkConfiguration) {
         this.networkConfiguration = networkConfiguration;
+    }
+
+    public List<EcsAttachment> getAttachments() { return attachments; }
+    public void setAttachments(List<EcsAttachment> attachments) {
+        this.attachments = attachments != null ? attachments : new ArrayList<>();
     }
 
     public boolean isProtectionEnabled() { return protectionEnabled; }
