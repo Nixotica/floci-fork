@@ -267,11 +267,12 @@ public class EcsService {
 
     public List<EcsTask> runTask(String clusterRef, String taskDefinitionRef, int count,
                                   LaunchType launchType, String group, String startedBy,
-                                  List<ContainerOverride> containerOverrides, String region) {
+                                  List<ContainerOverride> containerOverrides,
+                                  NetworkConfiguration networkConfiguration, String region) {
         EcsCluster cluster = resolveClusterOrDefault(clusterRef, region);
         TaskDefinition taskDef = resolveTaskDefinitionOrThrow(taskDefinitionRef, region);
         return launchTasks(cluster, taskDef, count, launchType, group, startedBy, null,
-                containerOverrides, region);
+                containerOverrides, networkConfiguration, region);
     }
 
     public List<EcsTask> startTask(String clusterRef, List<String> containerInstanceRefs,
@@ -282,7 +283,7 @@ public class EcsService {
         for (String instanceRef : containerInstanceRefs) {
             ContainerInstance instance = resolveContainerInstanceOrThrow(cluster.getClusterArn(), instanceRef);
             List<EcsTask> launched = launchTasks(cluster, taskDef, 1, LaunchType.EC2,
-                    group, startedBy, instance.getContainerInstanceArn(), null, region);
+                    group, startedBy, instance.getContainerInstanceArn(), null, null, region);
             result.addAll(launched);
         }
         return result;
@@ -291,7 +292,8 @@ public class EcsService {
     private List<EcsTask> launchTasks(EcsCluster cluster, TaskDefinition taskDef, int count,
                                        LaunchType launchType, String group, String startedBy,
                                        String containerInstanceArn,
-                                       List<ContainerOverride> containerOverrides, String region) {
+                                       List<ContainerOverride> containerOverrides,
+                                       NetworkConfiguration networkConfiguration, String region) {
         List<EcsTask> launched = new ArrayList<>();
         for (int i = 0; i < count; i++) {
             String taskId = UUID.randomUUID().toString().replace("-", "");
@@ -312,12 +314,14 @@ public class EcsService {
             task.setCreatedAt(Instant.now());
             task.setContainers(List.of());
             task.setContainerInstanceArn(containerInstanceArn);
+            task.setNetworkConfiguration(networkConfiguration);
 
             tasks.put(taskArn, task);
 
             if (dockerMode) {
                 try {
-                    EcsTaskHandle handle = containerManager.startTask(task, taskDef, containerOverrides, region);
+                    EcsTaskHandle handle = containerManager.startTask(task, taskDef, containerOverrides,
+                            networkConfiguration, region);
                     taskHandles.put(taskArn, handle);
                     cluster.setRunningTasksCount(cluster.getRunningTasksCount() + 1);
                     LOG.infov("Started ECS task (docker): {0}", taskArn);
@@ -1157,7 +1161,8 @@ public class EcsService {
             for (int i = 0; i < toStart; i++) {
                 try {
                     List<EcsTask> launched = runTask(clusterName, svc.getTaskDefinition(), 1,
-                            svc.getLaunchType(), svc.getServiceName(), "ecs-svc", null, region);
+                            svc.getLaunchType(), svc.getServiceName(), "ecs-svc", null,
+                            svc.getNetworkConfiguration(), region);
                     LOG.infov("Service reconciler started task {0} for service {1}",
                             launched.getFirst().getTaskArn(), svc.getServiceName());
                 } catch (Exception e) {

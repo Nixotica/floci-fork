@@ -26,6 +26,7 @@ public class EcsTask {
     private String stoppedReason;
     private List<Container> containers;
     private String containerInstanceArn;
+    private NetworkConfiguration networkConfiguration;
     private boolean protectionEnabled;
     private Instant protectedUntil;
     private Map<String, String> tags = new HashMap<>();
@@ -77,6 +78,11 @@ public class EcsTask {
 
     public String getContainerInstanceArn() { return containerInstanceArn; }
     public void setContainerInstanceArn(String containerInstanceArn) { this.containerInstanceArn = containerInstanceArn; }
+
+    public NetworkConfiguration getNetworkConfiguration() { return networkConfiguration; }
+    public void setNetworkConfiguration(NetworkConfiguration networkConfiguration) {
+        this.networkConfiguration = networkConfiguration;
+    }
 
     public boolean isProtectionEnabled() { return protectionEnabled; }
     public void setProtectionEnabled(boolean protectionEnabled) { this.protectionEnabled = protectionEnabled; }

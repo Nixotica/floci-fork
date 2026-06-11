@@ -274,9 +274,10 @@ public class EcsJsonHandler {
         String startedBy = req.has("startedBy") ? req.path("startedBy").asText() : null;
         List<ContainerOverride> containerOverrides =
                 parseContainerOverrides(req.path("overrides").path("containerOverrides"));
+        NetworkConfiguration networkConfiguration = parseNetworkConfiguration(req.path("networkConfiguration"));
 
         List<EcsTask> launched = service.runTask(cluster, taskDefinition, count,
-                launchType, group, startedBy, containerOverrides, region);
+                launchType, group, startedBy, containerOverrides, networkConfiguration, region);
 
         ObjectNode resp = objectMapper.createObjectNode();
         ArrayNode arr = objectMapper.createArrayNode();
@@ -1014,6 +1015,10 @@ public class EcsJsonHandler {
         if (t.getTags() != null && !t.getTags().isEmpty()) {
             n.set("tags", tagsNode(t.getTags()));
         }
+        ObjectNode netCfg = networkConfigurationNode(t.getNetworkConfiguration());
+        if (netCfg != null) {
+            n.set("networkConfiguration", netCfg);
+        }
         return n;
     }
 
@@ -1045,24 +1050,31 @@ public class EcsJsonHandler {
             }
             n.set("loadBalancers", lbs);
         }
-        if (s.getNetworkConfiguration() != null
-                && s.getNetworkConfiguration().getAwsvpcConfiguration() != null) {
-            AwsVpcConfiguration awsvpc = s.getNetworkConfiguration().getAwsvpcConfiguration();
-            ObjectNode awsvpcNode = objectMapper.createObjectNode();
-            ArrayNode subnets = objectMapper.createArrayNode();
-            awsvpc.getSubnets().forEach(subnets::add);
-            awsvpcNode.set("subnets", subnets);
-            ArrayNode securityGroups = objectMapper.createArrayNode();
-            awsvpc.getSecurityGroups().forEach(securityGroups::add);
-            awsvpcNode.set("securityGroups", securityGroups);
-            if (awsvpc.getAssignPublicIp() != null) {
-                awsvpcNode.put("assignPublicIp", awsvpc.getAssignPublicIp());
-            }
-            ObjectNode networkConfig = objectMapper.createObjectNode();
-            networkConfig.set("awsvpcConfiguration", awsvpcNode);
-            n.set("networkConfiguration", networkConfig);
+        ObjectNode netCfg = networkConfigurationNode(s.getNetworkConfiguration());
+        if (netCfg != null) {
+            n.set("networkConfiguration", netCfg);
         }
         return n;
+    }
+
+    private ObjectNode networkConfigurationNode(NetworkConfiguration nc) {
+        if (nc == null || nc.getAwsvpcConfiguration() == null) {
+            return null;
+        }
+        AwsVpcConfiguration awsvpc = nc.getAwsvpcConfiguration();
+        ObjectNode awsvpcNode = objectMapper.createObjectNode();
+        ArrayNode subnets = objectMapper.createArrayNode();
+        awsvpc.getSubnets().forEach(subnets::add);
+        awsvpcNode.set("subnets", subnets);
+        ArrayNode securityGroups = objectMapper.createArrayNode();
+        awsvpc.getSecurityGroups().forEach(securityGroups::add);
+        awsvpcNode.set("securityGroups", securityGroups);
+        if (awsvpc.getAssignPublicIp() != null) {
+            awsvpcNode.put("assignPublicIp", awsvpc.getAssignPublicIp());
+        }
+        ObjectNode out = objectMapper.createObjectNode();
+        out.set("awsvpcConfiguration", awsvpcNode);
+        return out;
     }
 
     private ObjectNode containerInstanceNode(ContainerInstance ci) {
