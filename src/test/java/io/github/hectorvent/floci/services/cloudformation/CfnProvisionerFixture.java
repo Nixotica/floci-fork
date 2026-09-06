@@ -39,6 +39,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCapaci
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.FirehoseCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamRoleCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.IamUserCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IotCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IotDomainConfigurationCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.KinesisCfnProvisioner;
@@ -233,6 +234,7 @@ final class CfnProvisionerFixture {
             }
             if (iamService != null) {
                 discovered.add(new IamRoleCfnProvisioner(iamService));
+                discovered.add(new IamUserCfnProvisioner(iamService));
             }
             if (ecsService != null) {
                 discovered.add(new EcsCapacityCfnProvisioner(ecsService));
