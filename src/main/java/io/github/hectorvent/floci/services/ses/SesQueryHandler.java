@@ -16,6 +16,8 @@ import io.github.hectorvent.floci.services.ses.model.EventDestination;
 import io.github.hectorvent.floci.services.ses.model.Identity;
 import io.github.hectorvent.floci.services.ses.model.KinesisFirehoseDestination;
 import io.github.hectorvent.floci.services.ses.model.MessageTag;
+import io.github.hectorvent.floci.services.ses.model.ReceiptAction;
+import io.github.hectorvent.floci.services.ses.model.ReceiptRule;
 import io.github.hectorvent.floci.services.ses.model.ReceiptRuleSet;
 import io.github.hectorvent.floci.services.ses.model.SnsDestination;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -27,6 +29,7 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -129,6 +132,11 @@ public class SesQueryHandler {
                 case "DeleteReceiptRuleSet" -> handleDeleteReceiptRuleSet(params, region);
                 case "SetActiveReceiptRuleSet" -> handleSetActiveReceiptRuleSet(params, region);
                 case "DescribeActiveReceiptRuleSet" -> handleDescribeActiveReceiptRuleSet(region);
+                case "CreateReceiptRule" -> handleCreateReceiptRule(params, region);
+                case "DescribeReceiptRule" -> handleDescribeReceiptRule(params, region);
+                case "UpdateReceiptRule" -> handleUpdateReceiptRule(params, region);
+                case "DeleteReceiptRule" -> handleDeleteReceiptRule(params, region);
+                case "SetReceiptRulePosition" -> handleSetReceiptRulePosition(params, region);
                 default -> AwsQueryResponse.error("UnsupportedOperation",
                         "Operation " + action + " is not supported by SES.", AwsNamespaces.SES, 400);
             };
@@ -978,7 +986,7 @@ public class SesQueryHandler {
         ReceiptRuleSet ruleSet = sesService.describeReceiptRuleSet(getParam(params, "RuleSetName"), region);
         XmlBuilder xml = new XmlBuilder();
         writeReceiptRuleSetMetadata(xml, ruleSet);
-        xml.start("Rules").end("Rules");
+        writeReceiptRules(xml, ruleSet.getRules());
         return Response.ok(AwsQueryResponse.envelope(
                 "DescribeReceiptRuleSet", AwsNamespaces.SES, xml.build())).build();
     }
@@ -1014,10 +1022,186 @@ public class SesQueryHandler {
         // When no rule set is active AWS returns an empty result (no Metadata element).
         if (active != null) {
             writeReceiptRuleSetMetadata(xml, active);
-            xml.start("Rules").end("Rules");
+            writeReceiptRules(xml, active.getRules());
         }
         return Response.ok(AwsQueryResponse.envelope(
                 "DescribeActiveReceiptRuleSet", AwsNamespaces.SES, xml.build())).build();
+    }
+
+    private Response handleCreateReceiptRule(MultivaluedMap<String, String> params, String region) {
+        sesService.createReceiptRule(getParam(params, "RuleSetName"), parseReceiptRule(params),
+                getParam(params, "After"), region);
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult(
+                "CreateReceiptRule", AwsNamespaces.SES)).build();
+    }
+
+    private Response handleDescribeReceiptRule(MultivaluedMap<String, String> params, String region) {
+        ReceiptRule rule = sesService.describeReceiptRule(getParam(params, "RuleSetName"),
+                getParam(params, "RuleName"), region);
+        XmlBuilder xml = new XmlBuilder();
+        writeReceiptRule(xml, rule, "Rule");
+        return Response.ok(AwsQueryResponse.envelope(
+                "DescribeReceiptRule", AwsNamespaces.SES, xml.build())).build();
+    }
+
+    private Response handleUpdateReceiptRule(MultivaluedMap<String, String> params, String region) {
+        sesService.updateReceiptRule(getParam(params, "RuleSetName"), parseReceiptRule(params), region);
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult(
+                "UpdateReceiptRule", AwsNamespaces.SES)).build();
+    }
+
+    private Response handleDeleteReceiptRule(MultivaluedMap<String, String> params, String region) {
+        sesService.deleteReceiptRule(getParam(params, "RuleSetName"),
+                getParam(params, "RuleName"), region);
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult(
+                "DeleteReceiptRule", AwsNamespaces.SES)).build();
+    }
+
+    private Response handleSetReceiptRulePosition(MultivaluedMap<String, String> params, String region) {
+        sesService.setReceiptRulePosition(getParam(params, "RuleSetName"),
+                getParam(params, "RuleName"), getParam(params, "After"), region);
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult(
+                "SetReceiptRulePosition", AwsNamespaces.SES)).build();
+    }
+
+    private ReceiptRule parseReceiptRule(MultivaluedMap<String, String> params) {
+        ReceiptRule rule = new ReceiptRule();
+        rule.setName(getParam(params, "Rule.Name"));
+        // Absent booleans stay false, matching the AWS defaults a minimal create gets.
+        rule.setEnabled(parseXsdBoolean(params, "Rule.Enabled"));
+        rule.setScanEnabled(parseXsdBoolean(params, "Rule.ScanEnabled"));
+        rule.setTlsPolicy(getParam(params, "Rule.TlsPolicy"));
+        rule.setRecipients(extractMembers(params, "Rule.Recipients"));
+        // Index tokens are collected from the submitted keys rather than counted up sequentially:
+        // an action serialized as an empty structure contributes no keys at all, so the list can
+        // arrive with gaps (e.g. member.2 only). Probing pinned AWS's exact semantics: tokens are
+        // grouped by numeric value, ordered by (length, then lexicographically), and the i-th
+        // token must parse to i, or the padded empty slot is rejected because it carries no
+        // action type. A leading-zero token such as member.01 is therefore VALID on its own, and
+        // must be parsed under its original spelling rather than a rebuilt canonical one.
+        List<ReceiptAction> actions = new ArrayList<>();
+        int position = 1;
+        for (String token : receiptActionIndexTokens(params)) {
+            if (Integer.parseInt(token) != position) {
+                throw new AwsException("InvalidParameterValue",
+                        "Exactly one action type must be specified for each ReceiptAction", 400);
+            }
+            ReceiptAction action = parseReceiptAction(params, "Rule.Actions.member." + token + ".");
+            if (action != null) {
+                actions.add(action);
+                position++;
+            }
+        }
+        rule.setActions(actions);
+        return rule;
+    }
+
+    private List<String> receiptActionIndexTokens(MultivaluedMap<String, String> params) {
+        String prefix = "Rule.Actions.member.";
+        Map<Integer, String> byValue = new java.util.HashMap<>();
+        for (String key : params.keySet()) {
+            if (!key.startsWith(prefix)) {
+                continue;
+            }
+            int dot = key.indexOf('.', prefix.length());
+            if (dot < 0) {
+                continue;
+            }
+            String token = key.substring(prefix.length(), dot);
+            // ASCII digits only: Character.isDigit also accepts non-ASCII Unicode digits, which
+            // no AWS Query index grammar does; such a key is skipped like any unmodeled param.
+            if (token.isEmpty() || !token.chars().allMatch(c -> c >= '0' && c <= '9')) {
+                continue;
+            }
+            // A digit run that overflows int implies an index far beyond any contiguous list,
+            // which AWS's gap padding turns into the empty-slot rejection.
+            if (token.length() > 9) {
+                throw new AwsException("InvalidParameterValue",
+                        "Exactly one action type must be specified for each ReceiptAction", 400);
+            }
+            int value = Integer.parseInt(token);
+            if (value == 0) {
+                // Probed: AWS rejects member.0 outright.
+                throw new AwsException("MalformedInput", "0 is not a valid index", 400);
+            }
+            // Two spellings of the same numeric index keep one struct on AWS too; the probe
+            // showed the padded spelling winning, so prefer the longer token deterministically.
+            String existing = byValue.get(value);
+            if (existing == null || token.length() > existing.length()
+                    || (token.length() == existing.length() && token.compareTo(existing) > 0)) {
+                byValue.put(value, token);
+            }
+        }
+        List<String> tokens = new ArrayList<>(byValue.values());
+        tokens.sort(Comparator.comparingInt(String::length).thenComparing(Comparator.naturalOrder()));
+        return tokens;
+    }
+
+    private ReceiptAction parseReceiptAction(MultivaluedMap<String, String> params, String prefix) {
+        ReceiptAction parsed = null;
+        for (Map.Entry<String, List<String>> type : ReceiptAction.ACTION_FIELDS.entrySet()) {
+            ReceiptAction action = null;
+            for (String field : type.getValue()) {
+                String value = getParam(params, prefix + type.getKey() + "." + field);
+                if (value != null) {
+                    if (action == null) {
+                        action = new ReceiptAction(type.getKey());
+                    }
+                    action.getProperties().put(field, value);
+                }
+            }
+            if (action != null) {
+                if (parsed != null) {
+                    // Probed: a member carrying two action types is rejected, not truncated.
+                    throw new AwsException("InvalidParameterValue",
+                            "Exactly one action type must be specified for each ReceiptAction", 400);
+                }
+                parsed = action;
+            }
+        }
+        return parsed;
+    }
+
+    private void writeReceiptRules(XmlBuilder xml, List<ReceiptRule> rules) {
+        xml.start("Rules");
+        for (ReceiptRule rule : rules) {
+            writeReceiptRule(xml, rule, "member");
+        }
+        xml.end("Rules");
+    }
+
+    private void writeReceiptRule(XmlBuilder xml, ReceiptRule rule, String tag) {
+        xml.start(tag);
+        xml.elem("Name", rule.getName());
+        xml.elem("Enabled", String.valueOf(rule.isEnabled()));
+        xml.elem("TlsPolicy", rule.getTlsPolicy());
+        // AWS omits Recipients entirely when empty but always renders Actions, even as an empty
+        // list; recipients come back sorted regardless of the order they were sent in (probed).
+        if (!rule.getRecipients().isEmpty()) {
+            xml.start("Recipients");
+            rule.getRecipients().stream().sorted().forEach(r -> xml.elem("member", r));
+            xml.end("Recipients");
+        }
+        xml.start("Actions");
+        for (ReceiptAction action : rule.getActions()) {
+            xml.start("member");
+            List<String> fields = action.getType() == null
+                    ? null : ReceiptAction.ACTION_FIELDS.get(action.getType());
+            if (fields != null) {
+                xml.start(action.getType());
+                for (String field : fields) {
+                    String value = action.property(field);
+                    if (value != null) {
+                        xml.elem(field, value);
+                    }
+                }
+                xml.end(action.getType());
+            }
+            xml.end("member");
+        }
+        xml.end("Actions");
+        xml.elem("ScanEnabled", String.valueOf(rule.isScanEnabled()));
+        xml.end(tag);
     }
 
     private void writeReceiptRuleSetMetadata(XmlBuilder xml, ReceiptRuleSet ruleSet) {

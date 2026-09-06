@@ -1151,6 +1151,13 @@ class S3ServiceTest {
     }
 
     @Test
+    void bucketExists_reportsPresenceWithoutThrowing() {
+        s3Service.createBucket("exists-bucket", "us-east-1");
+        assertTrue(s3Service.bucketExists("exists-bucket"));
+        assertFalse(s3Service.bucketExists("ghost-bucket"));
+    }
+
+    @Test
     void authorizeAnonymousPutObjectIsANoOpWhenEnforceAuthIsOff() {
         // Default test config has FLOCI_SERVICES_S3_ENFORCE_AUTH unset/false.
         s3Service.createBucket("anon-put-bucket", "us-east-1");
