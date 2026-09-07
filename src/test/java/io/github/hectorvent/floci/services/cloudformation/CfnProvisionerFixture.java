@@ -576,7 +576,6 @@ final class CfnProvisionerFixture {
                     apiGatewayV2Service,
                     ecrService,
                     pipesService,
-                    cognitoService,
                     lambdaLayerService,
                     objectMapper,
                     customResourceResponseStore,
