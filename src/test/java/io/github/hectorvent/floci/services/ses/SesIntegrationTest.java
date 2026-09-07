@@ -133,6 +133,22 @@ class SesIntegrationTest {
     }
 
     @Test
+    @Order(15)
+    void getIdentityVerificationAttributes_domainStartsPending() {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", authorization("email"))
+            .formParam("Action", "GetIdentityVerificationAttributes")
+            .formParam("Identities.member.1", "example.com")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("example.com"))
+            .body(containsString("<VerificationStatus>Pending</VerificationStatus>"));
+    }
+
+    @Test
     @Order(8)
     void listVerifiedEmailAddresses() {
         given()
@@ -221,6 +237,27 @@ class SesIntegrationTest {
     }
 
     @Test
+    @Order(30)
+    void sendRawEmail_withoutSource_andNoMimeFrom_returnsInvalidParameterValue() {
+        // Complements sendRawEmail_withoutSource_acceptedWhenMimeFromPresent: with neither a
+        // Source parameter nor a MIME From header there is no sender, so the send is rejected.
+        // Verified against real AWS: v1 returns InvalidParameterValue "Missing required header 'From'." (400).
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
+            .formParam("Action", "SendRawEmail")
+            .formParam("Destinations.member.1", "recipient@example.com")
+            .formParam("RawMessage.Data", "Subject: hello\r\n\r\nbody\r\n")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>InvalidParameterValue</Code>"))
+            // The apostrophes are XML-escaped on the Query (XML) wire, matching AWS.
+            .body(containsString("Missing required header &apos;From&apos;."));
+    }
+
+    @Test
     @Order(12)
     void getSendQuota() {
         given()
@@ -292,7 +329,9 @@ class SesIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("example.com"))
-            .body(containsString("<DkimEnabled>"));
+            .body(containsString("<DkimEnabled>true</DkimEnabled>"))
+            .body(containsString("<DkimVerificationStatus>Pending</DkimVerificationStatus>"))
+            .body(containsString("<DkimTokens><member>"));
     }
 
     @Test
@@ -480,8 +519,8 @@ class SesIntegrationTest {
 
     @Test
     @Order(26)
-    void updateAccountSendingEnabled_treatsMissingOrBlankEnabledAsFalse() {
-        // Missing Enabled parameter
+    void updateAccountSendingEnabled_missingEnabledDefaultsToFalse_blankEnabledIsMalformed() {
+        // Missing Enabled parameter defaults to false (probed against real AWS 2026-09-05)
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", authorization("email"))
@@ -501,18 +540,8 @@ class SesIntegrationTest {
             .statusCode(200)
             .body(containsString("<Enabled>false</Enabled>"));
 
-        // restore so the next assertion observes the blank-string default cleanly
-        given()
-            .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", authorization("email"))
-            .formParam("Action", "UpdateAccountSendingEnabled")
-            .formParam("Enabled", "true")
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200);
-
-        // Blank Enabled parameter (e.g. AWS CLI passing --enabled "") behaves the same
+        // A present-but-blank Enabled (e.g. AWS CLI passing --enabled "") is rejected,
+        // unlike the absent case (probed against real AWS 2026-09-05)
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", authorization("email"))
@@ -521,17 +550,9 @@ class SesIntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(200);
-
-        given()
-            .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", authorization("email"))
-            .formParam("Action", "GetAccountSendingEnabled")
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200)
-            .body(containsString("<Enabled>false</Enabled>"));
+            .statusCode(400)
+            .body(containsString("<Code>MalformedInput</Code>"))
+            .body(containsString("missing value for boolean type"));
 
         // restore default state for downstream tests
         given()
@@ -606,7 +627,8 @@ class SesIntegrationTest {
 
     @Test
     @Order(28)
-    void updateAccountSendingEnabled_invalidValue_returns400() {
+    void updateAccountSendingEnabled_invalidValue_returnsMalformedInput() {
+        // Probed against real AWS 2026-09-05: non-xsd boolean values are MalformedInput
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", authorization("email"))
@@ -616,6 +638,7 @@ class SesIntegrationTest {
             .post("/")
         .then()
             .statusCode(400)
-            .body(containsString("InvalidParameterValue"));
+            .body(containsString("<Code>MalformedInput</Code>"))
+            .body(containsString("boolean must follow xsd1.1 definition"));
     }
 }

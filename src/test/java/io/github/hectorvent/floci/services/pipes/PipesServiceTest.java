@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.pipes;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.pipes.model.DesiredState;
 import io.github.hectorvent.floci.services.pipes.model.Pipe;
@@ -26,7 +27,7 @@ class PipesServiceTest {
     void setUp() {
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
         when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
-                .thenReturn(new InMemoryStorage<>());
+                .thenReturn(AccountAwareStorageBackend.inMemory("000000000000"));
 
         RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
 
@@ -108,6 +109,33 @@ class PipesServiceTest {
     }
 
     @Test
+    void createPipeWithManagedKafkaSourceRequiresTopicParameters() {
+        AwsException ex = assertThrows(AwsException.class, () ->
+                pipesService.createPipe("msk-pipe",
+                        "arn:aws:kafka:us-east-1:000000000000:cluster/test/uuid",
+                        "arn:aws:sqs:us-east-1:000000000000:target",
+                        "arn:aws:iam::000000000000:role/role",
+                        null, null, null, null, null, null, null, "us-east-1"));
+
+        assertEquals("ValidationException", ex.getErrorCode());
+    }
+
+    @Test
+    void createPipeWithSelfManagedKafkaSourceRequiresTopicParameters() throws Exception {
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        AwsException ex = assertThrows(AwsException.class, () ->
+                pipesService.createPipe("smk-pipe",
+                        "smk://localhost:9092",
+                        "arn:aws:sqs:us-east-1:000000000000:target",
+                        "arn:aws:iam::000000000000:role/role",
+                        null, null, null,
+                        mapper.readTree("{\"SelfManagedKafkaParameters\":{}}"),
+                        null, null, null, "us-east-1"));
+
+        assertEquals("ValidationException", ex.getErrorCode());
+    }
+
+    @Test
     void describePipe() {
         pipesService.createPipe("my-pipe",
                 "arn:aws:sqs:us-east-1:000000000000:source",
@@ -143,6 +171,62 @@ class PipesServiceTest {
         assertEquals("updated desc", updated.getDescription());
         assertEquals(DesiredState.STOPPED, updated.getDesiredState());
         assertEquals(PipeState.STOPPED, updated.getCurrentState());
+    }
+
+    /**
+     * The UpdatePipe contract: a property the caller omits keeps the value the pipe holds. It is
+     * the contract the CloudFormation update path relies on, and restorePipe is what reads an
+     * omitted property as a value to clear.
+     */
+    @Test
+    void updatePipeLeavesAnOmittedPropertyAlone() {
+        pipesService.createPipe("partial-update-pipe",
+                "arn:aws:sqs:us-east-1:000000000000:source",
+                "arn:aws:sqs:us-east-1:000000000000:target",
+                "arn:aws:iam::000000000000:role/original-role",
+                "the original description", DesiredState.RUNNING,
+                "arn:aws:lambda:us-east-1:000000000000:function:original-enrichment",
+                null, null, null, null, "us-east-1");
+
+        Pipe updated = pipesService.updatePipe("partial-update-pipe",
+                "arn:aws:sqs:us-east-1:000000000000:new-target",
+                null, null, null, null, null, null, null, "us-east-1");
+
+        assertEquals("arn:aws:sqs:us-east-1:000000000000:new-target", updated.getTarget());
+        assertEquals("arn:aws:iam::000000000000:role/original-role", updated.getRoleArn());
+        assertEquals("the original description", updated.getDescription());
+        assertEquals("arn:aws:lambda:us-east-1:000000000000:function:original-enrichment",
+                updated.getEnrichment());
+        assertEquals(DesiredState.RUNNING, updated.getDesiredState());
+        assertEquals(PipeState.RUNNING, updated.getCurrentState());
+    }
+
+    /**
+     * restorePipe is handed a whole configuration, so an omitted property is one the pipe must
+     * stop carrying. The desired state is the exception: currentState is read off it, so a null
+     * leaves both as they are instead of contradicting each other.
+     */
+    @Test
+    void restorePipeClearsAnOmittedPropertyAndKeepsTheDesiredState() {
+        pipesService.createPipe("restore-pipe",
+                "arn:aws:sqs:us-east-1:000000000000:source",
+                "arn:aws:sqs:us-east-1:000000000000:target",
+                "arn:aws:iam::000000000000:role/original-role",
+                "the original description", DesiredState.STOPPED,
+                "arn:aws:lambda:us-east-1:000000000000:function:original-enrichment",
+                null, null, null, null, "us-east-1");
+
+        Pipe restored = pipesService.restorePipe("restore-pipe",
+                "arn:aws:sqs:us-east-1:000000000000:target",
+                "arn:aws:iam::000000000000:role/original-role",
+                null, null, null, null, null, null, "us-east-1");
+
+        assertNull(restored.getDescription());
+        assertNull(restored.getEnrichment());
+        assertEquals("arn:aws:sqs:us-east-1:000000000000:target", restored.getTarget());
+        assertEquals("arn:aws:iam::000000000000:role/original-role", restored.getRoleArn());
+        assertEquals(DesiredState.STOPPED, restored.getDesiredState());
+        assertEquals(PipeState.STOPPED, restored.getCurrentState());
     }
 
     @Test

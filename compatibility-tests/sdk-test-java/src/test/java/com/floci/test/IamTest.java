@@ -27,6 +27,8 @@ import software.amazon.awssdk.services.iam.model.DeleteRolePolicyRequest;
 import software.amazon.awssdk.services.iam.model.DeleteUserRequest;
 import software.amazon.awssdk.services.iam.model.DetachRolePolicyRequest;
 import software.amazon.awssdk.services.iam.model.DetachUserPolicyRequest;
+import software.amazon.awssdk.services.iam.model.GetAccountSummaryResponse;
+import software.amazon.awssdk.services.iam.model.SummaryKeyType;
 import software.amazon.awssdk.services.iam.model.GetGroupRequest;
 import software.amazon.awssdk.services.iam.model.GetGroupResponse;
 import software.amazon.awssdk.services.iam.model.GetInstanceProfileRequest;
@@ -45,6 +47,7 @@ import software.amazon.awssdk.services.iam.model.ListAttachedRolePoliciesRequest
 import software.amazon.awssdk.services.iam.model.ListAttachedRolePoliciesResponse;
 import software.amazon.awssdk.services.iam.model.ListAttachedUserPoliciesRequest;
 import software.amazon.awssdk.services.iam.model.ListAttachedUserPoliciesResponse;
+import software.amazon.awssdk.services.iam.model.ListEntitiesForPolicyResponse;
 import software.amazon.awssdk.services.iam.model.ListGroupsForUserRequest;
 import software.amazon.awssdk.services.iam.model.ListGroupsForUserResponse;
 import software.amazon.awssdk.services.iam.model.ListInstanceProfilesResponse;
@@ -58,6 +61,7 @@ import software.amazon.awssdk.services.iam.model.NoSuchEntityException;
 import software.amazon.awssdk.services.iam.model.PutRolePolicyRequest;
 import software.amazon.awssdk.services.iam.model.RemoveRoleFromInstanceProfileRequest;
 import software.amazon.awssdk.services.iam.model.RemoveUserFromGroupRequest;
+import software.amazon.awssdk.services.iam.model.SimulatePrincipalPolicyRequest;
 import software.amazon.awssdk.services.iam.model.StatusType;
 import software.amazon.awssdk.services.iam.model.TagUserRequest;
 import software.amazon.awssdk.services.iam.model.UntagUserRequest;
@@ -111,6 +115,13 @@ class IamTest {
                     iam.detachUserPolicy(DetachUserPolicyRequest.builder()
                             .userName(USER_NAME).policyArn(policyArn).build());
                 } catch (Exception ignored) {}
+                try {
+                    iam.detachGroupPolicy(request -> request
+                            .groupName(GROUP_NAME).policyArn(policyArn));
+                } catch (Exception cleanupError) {
+                    System.err.printf("Could not detach IAM test group policy during cleanup: %s%n",
+                            cleanupError.getMessage());
+                }
             }
             try {
                 iam.deleteRole(DeleteRoleRequest.builder().roleName(ROLE_NAME).build());
@@ -376,7 +387,68 @@ class IamTest {
     }
 
     @Test
+    @Order(100)
+    void listEntitiesForPolicy() {
+        Assumptions.assumeTrue(policyArn != null);
+
+        iam.attachGroupPolicy(request -> request
+                .groupName(GROUP_NAME).policyArn(policyArn));
+
+        ListEntitiesForPolicyResponse response = iam.listEntitiesForPolicy(request -> request
+                .policyArn(policyArn));
+
+        assertThat(response.policyRoles()).anySatisfy(role -> {
+            assertThat(role.roleName()).isEqualTo(ROLE_NAME);
+            assertThat(role.roleId()).isNotBlank();
+        });
+        assertThat(response.policyUsers()).anySatisfy(user -> {
+            assertThat(user.userName()).isEqualTo(USER_NAME);
+            assertThat(user.userId()).isNotBlank();
+        });
+        assertThat(response.policyGroups()).anySatisfy(group -> {
+            assertThat(group.groupName()).isEqualTo(GROUP_NAME);
+            assertThat(group.groupId()).isNotBlank();
+        });
+        assertThat(response.isTruncated()).isFalse();
+    }
+
+    @Test
+    @Order(101)
+    void getAccountSummary() {
+        GetAccountSummaryResponse response = iam.getAccountSummary();
+        assertThat(response.summaryMap()).hasSize(34);
+        assertThat(response.summaryMap().get(SummaryKeyType.USERS_QUOTA)).isEqualTo(5000);
+        assertThat(response.summaryMap().get(SummaryKeyType.GROUPS_QUOTA)).isEqualTo(300);
+        assertThat(response.summaryMap().get(SummaryKeyType.ROLES_QUOTA)).isEqualTo(1000);
+        assertThat(response.summaryMap().get(SummaryKeyType.POLICIES_QUOTA)).isEqualTo(1500);
+        assertThat(response.summaryMap().get(SummaryKeyType.INSTANCE_PROFILES_QUOTA)).isEqualTo(1000);
+        assertThat(response.summaryMap().get(SummaryKeyType.ATTACHED_POLICIES_PER_ROLE_QUOTA)).isEqualTo(20);
+        assertThat(response.summaryMap().get(SummaryKeyType.POLICY_SIZE_QUOTA)).isEqualTo(6144);
+    }
+
+    @Test
     @Order(24)
+    void simulatePrincipalPolicy() {
+        var response = iam.simulatePrincipalPolicy(SimulatePrincipalPolicyRequest.builder()
+                .policySourceArn("arn:aws:iam::000000000000:user/" + USER_NAME)
+                .actionNames("s3:GetObject", "ec2:RunInstances")
+                .resourceArns("*")
+                .build());
+
+        assertThat(response.evaluationResults()).hasSize(2);
+        assertThat(response.evaluationResults())
+                .anySatisfy(result -> {
+                    assertThat(result.evalActionName()).isEqualTo("s3:GetObject");
+                    assertThat(result.evalDecisionAsString()).isEqualTo("allowed");
+                })
+                .anySatisfy(result -> {
+                    assertThat(result.evalActionName()).isEqualTo("ec2:RunInstances");
+                    assertThat(result.evalDecisionAsString()).isEqualTo("implicitDeny");
+                });
+    }
+
+    @Test
+    @Order(25)
     void putRolePolicy() {
         iam.putRolePolicy(PutRolePolicyRequest.builder()
                 .roleName(ROLE_NAME)
@@ -386,7 +458,7 @@ class IamTest {
     }
 
     @Test
-    @Order(25)
+    @Order(26)
     void getRolePolicy() {
         GetRolePolicyResponse response = iam.getRolePolicy(GetRolePolicyRequest.builder()
                 .roleName(ROLE_NAME).policyName("inline-exec").build());
@@ -395,7 +467,7 @@ class IamTest {
     }
 
     @Test
-    @Order(26)
+    @Order(27)
     void listRolePolicies() {
         ListRolePoliciesResponse response = iam.listRolePolicies(
                 ListRolePoliciesRequest.builder().roleName(ROLE_NAME).build());
@@ -406,7 +478,7 @@ class IamTest {
     // ── Instance Profiles ──────────────────────────────────────────────
 
     @Test
-    @Order(27)
+    @Order(28)
     void createInstanceProfile() {
         CreateInstanceProfileResponse response = iam.createInstanceProfile(
                 CreateInstanceProfileRequest.builder()
@@ -417,14 +489,14 @@ class IamTest {
     }
 
     @Test
-    @Order(28)
+    @Order(29)
     void addRoleToInstanceProfile() {
         iam.addRoleToInstanceProfile(AddRoleToInstanceProfileRequest.builder()
                 .instanceProfileName(INSTANCE_PROFILE_NAME).roleName(ROLE_NAME).build());
     }
 
     @Test
-    @Order(29)
+    @Order(30)
     void getInstanceProfile() {
         GetInstanceProfileResponse response = iam.getInstanceProfile(
                 GetInstanceProfileRequest.builder()
@@ -435,7 +507,7 @@ class IamTest {
     }
 
     @Test
-    @Order(30)
+    @Order(31)
     void listInstanceProfiles() {
         ListInstanceProfilesResponse response = iam.listInstanceProfiles();
 
@@ -446,7 +518,7 @@ class IamTest {
     // ── Error Cases ────────────────────────────────────────────────────
 
     @Test
-    @Order(31)
+    @Order(32)
     void getUserNotFoundThrows() {
         assertThatThrownBy(() -> iam.getUser(GetUserRequest.builder()
                 .userName("nonexistent-user-xyz").build()))

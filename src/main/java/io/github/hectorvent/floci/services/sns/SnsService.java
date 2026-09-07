@@ -4,13 +4,19 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.sns.model.PlatformApplication;
 import io.github.hectorvent.floci.services.sns.model.PlatformEndpoint;
 import io.github.hectorvent.floci.services.sns.model.PushNotification;
+import io.github.hectorvent.floci.services.sns.model.SentSms;
 import io.github.hectorvent.floci.services.sns.model.Subscription;
 import io.github.hectorvent.floci.services.sns.model.Topic;
 import io.github.hectorvent.floci.services.sqs.SqsService;
@@ -48,12 +54,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 @ApplicationScoped
-public class SnsService {
+public class SnsService implements Resettable, ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(SnsService.class);
     private static final Duration FIFO_DEDUP_WINDOW = Duration.ofMinutes(5);
     private static final int MAX_PUBLISH_SIZE = 262_144;
     private static final int PUSH_CAPTURE_LIMIT = 1000;
+    private static final String CONTROL_TOWER_AGGREGATE_SECURITY_TOPIC =
+            "aws-controltower-AggregateSecurityNotifications";
     private static final List<String> PENDING_CONFIRMATION_PROTOCOLS =
             List.of("http", "https", "email", "email-json", "sms");
     /** Mobile-push platforms Floci mocks. iOS and Android only — anything else is rejected. */
@@ -67,6 +75,7 @@ public class SnsService {
     private final StorageBackend<String, PlatformApplication> platformAppStore;
     private final StorageBackend<String, PlatformEndpoint> platformEndpointStore;
     private final Deque<PushNotification> pushCapture = new ConcurrentLinkedDeque<>();
+    private final StorageBackend<String, SentSms> smsStore;
     private final RegionResolver regionResolver;
     private final SqsService sqsService;
     private final LambdaService lambdaService;
@@ -93,6 +102,9 @@ public class SnsService {
                 storageFactory.create("sns", "sns-platform-endpoints.json",
                         new TypeReference<Map<String, PlatformEndpoint>>() {
                         }),
+                storageFactory.create("sns", "sns-sms.json",
+                        new TypeReference<Map<String, SentSms>>() {
+                        }),
                 regionResolver,
                 sqsService,
                 lambdaService,
@@ -109,8 +121,8 @@ public class SnsService {
                RegionResolver regionResolver, SqsService sqsService,
                LambdaService lambdaService) {
         this(topicStore, subscriptionStore,
-                new io.github.hectorvent.floci.core.storage.InMemoryStorage<>(),
-                new io.github.hectorvent.floci.core.storage.InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 regionResolver, sqsService, lambdaService);
     }
 
@@ -124,6 +136,7 @@ public class SnsService {
         this.subscriptionStore = subscriptionStore;
         this.platformAppStore = platformAppStore;
         this.platformEndpointStore = platformEndpointStore;
+        this.smsStore = new InMemoryStorage<>();
         this.regionResolver = regionResolver;
         this.sqsService = sqsService;
         this.lambdaService = lambdaService;
@@ -136,18 +149,25 @@ public class SnsService {
                StorageBackend<String, Subscription> subscriptionStore,
                StorageBackend<String, PlatformApplication> platformAppStore,
                StorageBackend<String, PlatformEndpoint> platformEndpointStore,
+               StorageBackend<String, SentSms> smsStore,
                RegionResolver regionResolver, SqsService sqsService,
                LambdaService lambdaService, String baseUrl, ObjectMapper objectMapper) {
         this.topicStore = topicStore;
         this.subscriptionStore = subscriptionStore;
         this.platformAppStore = platformAppStore;
         this.platformEndpointStore = platformEndpointStore;
+        this.smsStore = smsStore;
         this.regionResolver = regionResolver;
         this.sqsService = sqsService;
         this.lambdaService = lambdaService;
         this.baseUrl = baseUrl;
         this.objectMapper = objectMapper;
         this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+    }
+
+    public void clear() {
+        pushCapture.clear();
+        fifoDeduplicationCache.clear();
     }
 
     public Topic createTopic(String name, Map<String, String> attributes,
@@ -203,6 +223,10 @@ public class SnsService {
         return topicStore.scan(k -> k.startsWith(prefix));
     }
 
+    public boolean topicExists(String topicArn, String region) {
+        return topicStore.get(topicKey(region, topicArn)).isPresent();
+    }
+
     public Map<String, String> getTopicAttributes(String topicArn, String region) {
         String key = topicKey(region, topicArn);
         Topic topic = topicStore.get(key)
@@ -240,7 +264,7 @@ public class SnsService {
 
     public Subscription subscribe(String topicArn, String protocol, String endpoint, String region, Map<String, String> attributes) {
         String topicKey = topicKey(region, topicArn);
-        if (topicStore.get(topicKey).isEmpty()) {
+        if (topicStore.get(topicKey).isEmpty() && !ensureControlTowerManagedTopic(topicArn, region)) {
             throw new AwsException("NotFound", "Topic does not exist.", 404);
         }
         if (protocol == null || protocol.isBlank()) {
@@ -286,6 +310,16 @@ public class SnsService {
         }
 
         return subscription;
+    }
+
+    private boolean ensureControlTowerManagedTopic(String topicArn, String region) {
+        String expectedArn = regionResolver.buildArn(
+                "sns", region, CONTROL_TOWER_AGGREGATE_SECURITY_TOPIC);
+        if (!expectedArn.equals(topicArn)) {
+            return false;
+        }
+        createTopic(CONTROL_TOWER_AGGREGATE_SECURITY_TOPIC, Map.of(), Map.of(), region);
+        return true;
     }
 
     public String confirmSubscription(String topicArn, String token, String region) {
@@ -357,7 +391,13 @@ public class SnsService {
 
         // Send SMS
         if (phoneNumber != null) {
-            return UUID.randomUUID().toString();
+            String messageId = UUID.randomUUID().toString();
+            String effectiveRegion = region != null ? region : "us-east-1";
+            SentSms sms = new SentSms(messageId, effectiveRegion, phoneNumber,
+                    message, subject, Instant.now());
+            smsStore.put("sms::" + effectiveRegion + "::" + messageId, sms);
+            LOG.infov("SNS SMS published: messageId={0} phone={1}", messageId, phoneNumber);
+            return messageId;
         }
 
         // Send a message to topic or directly to a target ARN
@@ -382,6 +422,8 @@ public class SnsService {
         String topicStoreKey = topicKey(region, effectiveArn);
         Topic topic = topicStore.get(topicStoreKey)
                 .orElseThrow(() -> new AwsException("NotFound", "Topic does not exist.", 404));
+
+        validateTopicMessageStructure(message, messageStructure);
 
         boolean isFifo = "true".equals(topic.getAttributes().get("FifoTopic"));
         String dedupId = messageDeduplicationId;
@@ -414,7 +456,7 @@ public class SnsService {
             if (!matchesFilterPolicy(sub, parsedBody, messageAttributes)) {
                 continue;
             }
-            deliverMessage(sub, message, subject, messageAttributes, messageId, effectiveArn, messageGroupId, dedupId);
+            deliverMessage(sub, message, subject, messageAttributes, messageId, effectiveArn, messageGroupId, dedupId, messageStructure);
         }
         LOG.infov("Published message {0} to topic {1}", messageId, effectiveArn);
         return messageId;
@@ -608,7 +650,18 @@ public class SnsService {
             throw new AwsException("PlatformApplicationDisabled",
                     "Platform application is disabled.", 400);
         }
-        String payload = resolvePushPayload(app.getPlatform(), message, messageStructure);
+        return capturePushForEndpoint(endpoint, app, message, subject, messageStructure, messageAttributes);
+    }
+
+    /**
+     * Resolves the platform payload and records a captured push for the given endpoint/app.
+     * Shared by direct-to-endpoint {@code Publish} and topic fan-out to {@code application}
+     * subscriptions, so broadcast pushes surface identically via the retrospection API.
+     */
+    private String capturePushForEndpoint(PlatformEndpoint endpoint, PlatformApplication app,
+                                          String message, String subject, String messageStructure,
+                                          Map<String, MessageAttributeValue> messageAttributes) {
+        String payload = resolveProtocolPayload(app.getPlatform(), message, messageStructure);
         String messageId = UUID.randomUUID().toString();
         recordPushNotification(new PushNotification(
                 endpoint.getArn(), app.getArn(), app.getPlatform(), endpoint.getToken(),
@@ -618,12 +671,15 @@ public class SnsService {
     }
 
     /**
-     * Resolves the payload SNS would forward to APNS/FCM for this platform.
-     * If {@code messageStructure="json"}, pick the platform-specific key ({@code APNS},
-     * {@code APNS_SANDBOX}, {@code GCM}, {@code FCM}) from the JSON envelope, falling back
-     * to {@code default}. Otherwise return the raw message.
+     * Resolves the payload SNS would forward to a given delivery target.
+     * If {@code messageStructure="json"}, pick the target-specific key from the JSON envelope,
+     * falling back to {@code default}. The key is the push platform for mobile endpoints
+     * ({@code APNS}, {@code APNS_SANDBOX}, {@code GCM}, {@code FCM}) and the subscription
+     * protocol for every other subscriber ({@code sqs}, {@code lambda}, {@code http},
+     * {@code https}, {@code email}, {@code email-json}, {@code sms}).
+     * Otherwise return the raw message.
      */
-    private String resolvePushPayload(String platform, String message, String messageStructure) {
+    private String resolveProtocolPayload(String protocol, String message, String messageStructure) {
         if (messageStructure == null || !"json".equals(messageStructure)) {
             return message;
         }
@@ -639,18 +695,51 @@ public class SnsService {
                     "Invalid parameter: Message Reason: Messages must be a JSON object.",
                     400);
         }
-        JsonNode platformValue = root.get(platform);
-        if (platformValue != null && !platformValue.isNull()) {
-            return platformValue.isTextual() ? platformValue.asText() : platformValue.toString();
+        // Real SNS ignores a key whose value isn't a string ("Non-string values will cause the
+        // key to be ignored"), falling through to default rather than stringifying it.
+        JsonNode protocolValue = root.get(protocol);
+        if (protocolValue != null && protocolValue.isTextual()) {
+            return protocolValue.asText();
         }
         JsonNode defaultValue = root.get("default");
-        if (defaultValue != null && !defaultValue.isNull()) {
-            return defaultValue.isTextual() ? defaultValue.asText() : defaultValue.toString();
+        if (defaultValue != null && defaultValue.isTextual()) {
+            return defaultValue.asText();
         }
         throw new AwsException("InvalidParameter",
-                "Invalid parameter: Message Reason: Messages must have a '" + platform
+                "Invalid parameter: Message Reason: Messages must have a '" + protocol
                         + "' or 'default' key.",
                 400);
+    }
+
+    /**
+     * Validates {@code MessageStructure="json"} on a topic {@code Publish} the way the real SNS
+     * API does: synchronously, before any fan-out. The message must be a JSON object carrying a
+     * top-level {@code default} entry. Validating here (rather than lazily inside per-subscriber
+     * delivery) means a malformed envelope surfaces to the caller as {@code InvalidParameter}
+     * instead of being silently swallowed while the {@code publish} call still reports success.
+     * {@code PublishBatch} runs the same check per entry, reporting a bad envelope as that entry's
+     * {@code BatchResultErrorEntry} rather than failing the whole batch.
+     */
+    private void validateTopicMessageStructure(String message, String messageStructure) {
+        if (!"json".equals(messageStructure)) {
+            return;
+        }
+        JsonNode root;
+        try {
+            root = objectMapper.readTree(message);
+        } catch (Exception e) {
+            throw new AwsException("InvalidParameter",
+                    "Invalid parameter: Message Structure - JSON message body failed to parse", 400);
+        }
+        if (root == null || !root.isObject()) {
+            throw new AwsException("InvalidParameter",
+                    "Invalid parameter: Message Structure - JSON message body should be an object.", 400);
+        }
+        JsonNode defaultValue = root.get("default");
+        if (defaultValue == null || !defaultValue.isTextual()) {
+            throw new AwsException("InvalidParameter",
+                    "Invalid parameter: Message Structure - No default entry in JSON message body", 400);
+        }
     }
 
     private void recordPushNotification(PushNotification notification) {
@@ -762,8 +851,16 @@ public class SnsService {
                 continue;
             }
             String subject = (String) entry.get("Subject");
+            String messageStructure = (String) entry.get("MessageStructure");
             String messageGroupId = (String) entry.get("MessageGroupId");
             String messageDeduplicationId = (String) entry.get("MessageDeduplicationId");
+
+            try {
+                validateTopicMessageStructure(message, messageStructure);
+            } catch (AwsException e) {
+                failed.add(new String[]{id, e.getErrorCode(), e.getMessage(), "true"});
+                continue;
+            }
 
             if (isFifo && (messageGroupId == null || messageGroupId.isBlank())) {
                 failed.add(new String[]{id, "InvalidParameter",
@@ -791,7 +888,7 @@ public class SnsService {
                     bodyParseAttempted = true;
                 }
                 if (!matchesFilterPolicy(sub, parsedBody, attrs)) continue;
-                deliverMessage(sub, message, subject, attrs, messageId, topicArn, messageGroupId, messageDeduplicationId);
+                deliverMessage(sub, message, subject, attrs, messageId, topicArn, messageGroupId, messageDeduplicationId, messageStructure);
             }
             LOG.debugv("Batch published message {0} (id={1}) to {2}", messageId, id, topicArn);
             successful.add(new String[]{id, messageId});
@@ -823,6 +920,29 @@ public class SnsService {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Resource does not exist.", 404));
         return new java.util.LinkedHashMap<>(topic.getTags());
+    }
+
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (Topic topic : topicStore.scan(k -> true)) {
+            String arn = topic.getTopicArn();
+            if (arn == null) {
+                continue;
+            }
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            resources.add(new ExplorerResource(
+                    arn, "sns:topic", "sns",
+                    parsed.region(), parsed.accountId(),
+                    topic.getCreatedAt() != null ? topic.getCreatedAt() : Instant.now(),
+                    topic.getTags() != null ? topic.getTags() : Map.of()));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("sns:topic", "sns", true));
     }
 
     /**
@@ -1207,8 +1327,15 @@ public class SnsService {
 
     private void deliverMessage(Subscription sub, String message, String subject,
                                 Map<String, MessageAttributeValue> messageAttributes, String messageId,
-                                String topicArn, String messageGroupId, String messageDeduplicationId) {
+                                String topicArn, String messageGroupId, String messageDeduplicationId,
+                                String messageStructure) {
         try {
+            // Under MessageStructure="json" every subscriber gets the value under its own
+            // protocol key, falling back to "default". The application case resolves against
+            // the push platform (APNS/GCM/...) inside capturePushForEndpoint instead.
+            String protocolMessage = "application".equals(sub.getProtocol())
+                    ? message
+                    : resolveProtocolPayload(sub.getProtocol(), message, messageStructure);
             switch (sub.getProtocol()) {
                 case "sqs" -> {
                     String region = extractRegionFromArn(sub.getEndpoint());
@@ -1218,8 +1345,8 @@ public class SnsService {
                     String queueUrl = sqsArnToUrl(sub.getEndpoint());
                     boolean rawDelivery = "true".equalsIgnoreCase(sub.getAttributes().get("RawMessageDelivery"));
                     String body = rawDelivery
-                            ? message
-                            : buildSnsEnvelope(message, subject, messageAttributes, topicArn, messageId);
+                            ? protocolMessage
+                            : buildSnsEnvelope(protocolMessage, subject, messageAttributes, topicArn, messageId);
                     Map<String, MessageAttributeValue> sqsAttributes = rawDelivery
                             ? toSqsMessageAttributes(messageAttributes)
                             : Collections.emptyMap();
@@ -1229,7 +1356,7 @@ public class SnsService {
                 case "lambda" -> {
                     String fnName = extractFunctionName(sub.getEndpoint());
                     String region = extractRegionFromArn(sub.getEndpoint());
-                    String eventJson = buildSnsLambdaEvent(topicArn, messageId, message,
+                    String eventJson = buildSnsLambdaEvent(topicArn, messageId, protocolMessage,
                             subject, messageAttributes, sub.getSubscriptionArn());
                     lambdaService.invoke(region, fnName, eventJson.getBytes(), InvocationType.Event);
                     LOG.debugv("Delivered SNS message to Lambda: {0}", sub.getEndpoint());
@@ -1238,8 +1365,8 @@ public class SnsService {
                     if (httpClient == null) break;
                     boolean rawDelivery = "true".equalsIgnoreCase(sub.getAttributes().get("RawMessageDelivery"));
                     String body = rawDelivery
-                            ? message
-                            : buildSnsHttpNotification(message, subject, messageAttributes, topicArn, messageId, sub.getSubscriptionArn());
+                            ? protocolMessage
+                            : buildSnsHttpNotification(protocolMessage, subject, messageAttributes, topicArn, messageId, sub.getSubscriptionArn());
                     var requestBuilder = HttpRequest.newBuilder()
                             .uri(URI.create(sub.getEndpoint()))
                             .timeout(Duration.ofSeconds(5))
@@ -1259,9 +1386,34 @@ public class SnsService {
                             .thenAccept(response -> logHttpResult("Delivered SNS notification", endpoint, response.statusCode()))
                             .exceptionally(ex -> { LOG.warnv("Failed to deliver SNS message to {0}: {1}", endpoint, ex.getMessage()); return null; });
                 }
+                case "application" -> {
+                    String region = extractRegionFromArn(sub.getEndpoint());
+                    if (region == null) {
+                        region = extractRegionFromArn(topicArn);
+                    }
+                    String endpointArn = sub.getEndpoint();
+                    PlatformEndpoint endpoint = platformEndpointStore.get(endpointKey(region, endpointArn)).orElse(null);
+                    if (endpoint == null) {
+                        LOG.debugv("Skipping topic fan-out to missing platform endpoint {0}", endpointArn);
+                        break;
+                    }
+                    if (!"true".equalsIgnoreCase(endpoint.getAttributes().getOrDefault("Enabled", "true"))) {
+                        LOG.debugv("Skipping topic fan-out to disabled platform endpoint {0}", endpointArn);
+                        break;
+                    }
+                    PlatformApplication app = platformAppStore.get(
+                            platformAppKey(region, endpoint.getPlatformApplicationArn())).orElse(null);
+                    if (app == null || "false".equalsIgnoreCase(app.getAttributes().get("Enabled"))) {
+                        LOG.debugv("Skipping topic fan-out to endpoint {0}: platform application missing or disabled",
+                                endpointArn);
+                        break;
+                    }
+                    capturePushForEndpoint(endpoint, app, message, subject, messageStructure, messageAttributes);
+                    LOG.debugv("Delivered SNS message to platform endpoint: {0}", endpointArn);
+                }
                 case "email", "email-json" -> LOG.infov("SNS email delivery (stub): to={0}, subject={1}, message={2}",
-                        sub.getEndpoint(), subject, message);
-                case "sms" -> LOG.infov("SNS SMS delivery (stub): to={0}, message={1}", sub.getEndpoint(), message);
+                        sub.getEndpoint(), subject, protocolMessage);
+                case "sms" -> LOG.infov("SNS SMS delivery (stub): to={0}, message={1}", sub.getEndpoint(), protocolMessage);
                 default -> LOG.debugv("Protocol {0} delivery not implemented, skipping: {1}",
                         sub.getProtocol(), sub.getEndpoint());
             }
@@ -1501,5 +1653,20 @@ public class SnsService {
 
     private static String subKey(String region, String subscriptionArn) {
         return "sub::" + region + "::" + subscriptionArn;
+    }
+
+    /** All SMS messages published since last clear. Used by SnsInspectionController. */
+    public List<SentSms> getSentMessages() {
+        return smsStore.scan(k -> k.startsWith("sms::"));
+    }
+
+    /** Drop all stored SMS records. Used by SnsInspectionController. */
+    public void clearSentMessages() {
+        for (String key : smsStore.keys()) {
+            if (key.startsWith("sms::")) {
+                smsStore.delete(key);
+            }
+        }
+        LOG.info("Cleared all SNS SMS records");
     }
 }

@@ -11,8 +11,10 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.*;
 
 @ApplicationScoped
@@ -44,8 +46,19 @@ public class AutoScalingQueryHandler {
                 case "DeleteAutoScalingGroup"       -> handleDeleteAutoScalingGroup(p, region);
                 case "DescribeAutoScalingGroups"    -> handleDescribeAutoScalingGroups(p, region);
                 case "SetDesiredCapacity"           -> handleSetDesiredCapacity(p, region);
+                case "SuspendProcesses"             -> handleSuspendProcesses(p, region);
+                case "ResumeProcesses"              -> handleResumeProcesses(p, region);
+                case "PutWarmPool"                  -> handlePutWarmPool(p, region);
+                case "DescribeWarmPool"             -> handleDescribeWarmPool(p, region);
+                case "DeleteWarmPool"               -> handleDeleteWarmPool(p, region);
+                case "StartInstanceRefresh"         -> handleStartInstanceRefresh(p, region);
+                case "DescribeInstanceRefreshes"    -> handleDescribeInstanceRefreshes(p, region);
+                case "CreateOrUpdateTags"           -> handleCreateOrUpdateTags(p, region);
+                case "DeleteTags"                   -> handleDeleteTags(p, region);
                 // Instances
                 case "DescribeAutoScalingInstances" -> handleDescribeAutoScalingInstances(p, region);
+                case "SetInstanceProtection"        -> handleSetInstanceProtection(p, region);
+                case "SetInstanceHealth"            -> handleSetInstanceHealth(p, region);
                 case "AttachInstances"              -> handleAttachInstances(p, region);
                 case "DetachInstances"              -> handleDetachInstances(p, region);
                 case "TerminateInstanceInAutoScalingGroup" -> handleTerminateInstance(p, region);
@@ -56,6 +69,9 @@ public class AutoScalingQueryHandler {
                 case "AttachLoadBalancers"               -> handleAttachLoadBalancers(p, region);
                 case "DetachLoadBalancers"               -> handleDetachLoadBalancers(p, region);
                 case "DescribeLoadBalancers"             -> handleDescribeLoadBalancers(p, region);
+                case "AttachTrafficSources"              -> handleAttachTrafficSources(p, region);
+                case "DetachTrafficSources"               -> handleDetachTrafficSources(p, region);
+                case "DescribeTrafficSources"             -> handleDescribeTrafficSources(p, region);
                 // Lifecycle hooks
                 case "PutLifecycleHook"             -> handlePutLifecycleHook(p, region);
                 case "DeleteLifecycleHook"          -> handleDeleteLifecycleHook(p, region);
@@ -66,6 +82,9 @@ public class AutoScalingQueryHandler {
                 case "PutScalingPolicy"             -> handlePutScalingPolicy(p, region);
                 case "DeletePolicy"                 -> handleDeletePolicy(p, region);
                 case "DescribePolicies"             -> handleDescribePolicies(p, region);
+                case "PutScheduledUpdateGroupAction" -> handlePutScheduledUpdateGroupAction(p, region);
+                case "DeleteScheduledAction"         -> handleDeleteScheduledAction(p, region);
+                case "DescribeScheduledActions"      -> handleDescribeScheduledActions(p, region);
                 // Activities
                 case "DescribeScalingActivities"    -> handleDescribeScalingActivities(p, region);
                 // Metadata
@@ -91,13 +110,14 @@ public class AutoScalingQueryHandler {
     private Response handleCreateLaunchConfiguration(MultivaluedMap<String, String> p, String region) {
         service.createLaunchConfiguration(region,
                 p.getFirst("LaunchConfigurationName"),
+                p.getFirst("InstanceId"),
                 p.getFirst("ImageId"),
                 p.getFirst("InstanceType"),
                 p.getFirst("KeyName"),
                 memberList(p, "SecurityGroups"),
                 p.getFirst("UserData"),
                 p.getFirst("IamInstanceProfile"),
-                "true".equalsIgnoreCase(p.getFirst("AssociatePublicIpAddress")));
+                nullableBoolParam(p, "AssociatePublicIpAddress"));
         String xml = new XmlBuilder()
                 .start("CreateLaunchConfigurationResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
@@ -117,10 +137,14 @@ public class AutoScalingQueryHandler {
             xml.start("member")
                .elem("LaunchConfigurationName", lc.getLaunchConfigurationName())
                .elem("LaunchConfigurationARN", lc.getLaunchConfigurationArn())
-               .elem("ImageId", lc.getImageId() != null ? lc.getImageId() : "")
-               .elem("InstanceType", lc.getInstanceType() != null ? lc.getInstanceType() : "t3.micro")
-               .elem("CreatedTime", ISO_FMT.format(lc.getCreatedTime()))
-               .elem("AssociatePublicIpAddress", String.valueOf(lc.isAssociatePublicIpAddress()));
+               .elem("CreatedTime", ISO_FMT.format(lc.getCreatedTime()));
+            // AWS omits the flag entirely when the LC never set it, which is
+            // what tells a caller the subnet default still applies.
+            if (lc.getAssociatePublicIpAddress() != null) {
+                xml.elem("AssociatePublicIpAddress", String.valueOf(lc.getAssociatePublicIpAddress()));
+            }
+            if (lc.getImageId() != null) { xml.elem("ImageId", lc.getImageId()); }
+            if (lc.getInstanceType() != null) { xml.elem("InstanceType", lc.getInstanceType()); }
             if (lc.getKeyName() != null) { xml.elem("KeyName", lc.getKeyName()); }
             if (lc.getUserData() != null) { xml.elem("UserData", lc.getUserData()); }
             if (lc.getIamInstanceProfile() != null) { xml.elem("IamInstanceProfile", lc.getIamInstanceProfile()); }
@@ -146,22 +170,27 @@ public class AutoScalingQueryHandler {
     // ── Auto Scaling Group ────────────────────────────────────────────────────
 
     private Response handleCreateAutoScalingGroup(MultivaluedMap<String, String> p, String region) {
-        service.createAutoScalingGroup(region,
+        ParsedTags parsedTags = parseTags(p);
+        AutoScalingGroup asg = service.createAutoScalingGroup(region,
                 p.getFirst("AutoScalingGroupName"),
                 p.getFirst("LaunchConfigurationName"),
+                p.getFirst("LaunchTemplate.LaunchTemplateId"),
                 p.getFirst("LaunchTemplate.LaunchTemplateName"),
                 p.getFirst("LaunchTemplate.Version"),
+                parseMixedInstancesPolicy(p),
                 intParam(p, "MinSize", 0),
                 intParam(p, "MaxSize", 0),
                 intParam(p, "DesiredCapacity", intParam(p, "MinSize", 0)),
                 intParam(p, "DefaultCooldown", 300),
                 memberList(p, "AvailabilityZones"),
+                commaList(p.getFirst("VPCZoneIdentifier")),
                 memberList(p, "TargetGroupARNs"),
                 memberList(p, "LoadBalancerNames"),
                 p.getFirst("HealthCheckType"),
                 intParam(p, "HealthCheckGracePeriod", 0),
                 memberList(p, "TerminationPolicies"),
-                parseTags(p));
+                parsedTags.tags(),
+                parsedTags.propagateAtLaunch());
         return ok(new XmlBuilder()
                 .start("CreateAutoScalingGroupResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
@@ -171,16 +200,20 @@ public class AutoScalingQueryHandler {
     private Response handleUpdateAutoScalingGroup(MultivaluedMap<String, String> p, String region) {
         List<String> azs = memberList(p, "AvailabilityZones");
         List<String> tps = memberList(p, "TerminationPolicies");
+        List<String> subnetIds = commaList(p.getFirst("VPCZoneIdentifier"));
         service.updateAutoScalingGroup(region,
                 p.getFirst("AutoScalingGroupName"),
                 p.getFirst("LaunchConfigurationName"),
+                p.getFirst("LaunchTemplate.LaunchTemplateId"),
                 p.getFirst("LaunchTemplate.LaunchTemplateName"),
                 p.getFirst("LaunchTemplate.Version"),
+                parseMixedInstancesPolicy(p),
                 p.getFirst("MinSize") != null ? Integer.parseInt(p.getFirst("MinSize")) : null,
                 p.getFirst("MaxSize") != null ? Integer.parseInt(p.getFirst("MaxSize")) : null,
                 p.getFirst("DesiredCapacity") != null ? Integer.parseInt(p.getFirst("DesiredCapacity")) : null,
                 p.getFirst("DefaultCooldown") != null ? Integer.parseInt(p.getFirst("DefaultCooldown")) : null,
                 azs.isEmpty() ? null : azs,
+                subnetIds.isEmpty() ? null : subnetIds,
                 p.getFirst("HealthCheckType"),
                 p.getFirst("HealthCheckGracePeriod") != null ? Integer.parseInt(p.getFirst("HealthCheckGracePeriod")) : null,
                 tps.isEmpty() ? null : tps);
@@ -233,18 +266,33 @@ public class AutoScalingQueryHandler {
         if (asg.getLaunchConfigurationName() != null) {
             xml.elem("LaunchConfigurationName", asg.getLaunchConfigurationName());
         }
-        if (asg.getLaunchTemplateName() != null) {
-            xml.start("LaunchTemplate")
-               .elem("LaunchTemplateName", asg.getLaunchTemplateName());
+        if (asg.getLaunchTemplateId() != null || asg.getLaunchTemplateName() != null) {
+            xml.start("LaunchTemplate");
+            if (asg.getLaunchTemplateId() != null) {
+                xml.elem("LaunchTemplateId", asg.getLaunchTemplateId());
+            }
+            if (asg.getLaunchTemplateName() != null) {
+                xml.elem("LaunchTemplateName", asg.getLaunchTemplateName());
+            }
             if (asg.getLaunchTemplateVersion() != null) {
                 xml.elem("Version", asg.getLaunchTemplateVersion());
             }
             xml.end("LaunchTemplate");
         }
+        appendMixedInstancesPolicyXml(xml, asg.getMixedInstancesPolicy());
+        // Botocore's own AutoScalingGroup shape documents WarmPoolConfiguration as a member of
+        // DescribeAutoScalingGroups' response, not only reachable via DescribeWarmPool -
+        // terraform-aws-autoscaling's warm_pool example reads the group's warm pool state this
+        // way. Shared with handleDescribeWarmPool so the two never drift.
+        appendWarmPoolConfigurationXml(xml, service.describeWarmPool(asg.getRegion(), asg.getAutoScalingGroupName()));
 
         xml.start("AvailabilityZones");
         for (String az : asg.getAvailabilityZones()) { xml.elem("member", az); }
         xml.end("AvailabilityZones");
+
+        if (!asg.getSubnetIds().isEmpty()) {
+            xml.elem("VPCZoneIdentifier", String.join(",", asg.getSubnetIds()));
+        }
 
         xml.start("TargetGroupARNs");
         for (String arn : asg.getTargetGroupARNs()) { xml.elem("member", arn); }
@@ -258,6 +306,12 @@ public class AutoScalingQueryHandler {
         for (String tp : asg.getTerminationPolicies()) { xml.elem("member", tp); }
         xml.end("TerminationPolicies");
 
+        xml.start("SuspendedProcesses");
+        for (String sp : asg.getSuspendedProcesses()) {
+            xml.start("member").elem("ProcessName", sp).end("member");
+        }
+        xml.end("SuspendedProcesses");
+
         xml.start("Instances");
         for (AsgInstance inst : asg.getInstances()) {
             xml.start("member")
@@ -269,6 +323,7 @@ public class AutoScalingQueryHandler {
             if (inst.getLaunchConfigurationName() != null) {
                 xml.elem("LaunchConfigurationName", inst.getLaunchConfigurationName());
             }
+            appendInstanceLaunchTemplateXml(xml, inst);
             if (inst.getInstanceType() != null) { xml.elem("InstanceType", inst.getInstanceType()); }
             xml.end("member");
         }
@@ -281,7 +336,7 @@ public class AutoScalingQueryHandler {
                .elem("Value", tag.getValue())
                .elem("ResourceId", asg.getAutoScalingGroupName())
                .elem("ResourceType", "auto-scaling-group")
-               .elem("PropagateAtLaunch", "false")
+               .elem("PropagateAtLaunch", String.valueOf(asg.getTagPropagateAtLaunch().getOrDefault(tag.getKey(), false)))
                .end("member");
         }
         xml.end("Tags");
@@ -297,6 +352,120 @@ public class AutoScalingQueryHandler {
                 .start("SetDesiredCapacityResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
                 .end("SetDesiredCapacityResponse").build());
+    }
+
+    private Response handleStartInstanceRefresh(MultivaluedMap<String, String> p, String region) {
+        InstanceRefresh refresh = service.startInstanceRefresh(region,
+                p.getFirst("AutoScalingGroupName"), parseInstanceRefresh(p));
+        return ok(new XmlBuilder()
+                .start("StartInstanceRefreshResponse", NS)
+                  .start("StartInstanceRefreshResult")
+                    .elem("InstanceRefreshId", refresh.getInstanceRefreshId())
+                  .end("StartInstanceRefreshResult")
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("StartInstanceRefreshResponse").build());
+    }
+
+    private Response handleDescribeInstanceRefreshes(MultivaluedMap<String, String> p, String region) {
+        AutoScalingService.InstanceRefreshPage page = service.describeInstanceRefreshes(region,
+                p.getFirst("AutoScalingGroupName"),
+                memberList(p, "InstanceRefreshIds"),
+                nullableIntParam(p, "MaxRecords"),
+                p.getFirst("NextToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeInstanceRefreshesResponse", NS)
+                  .start("DescribeInstanceRefreshesResult")
+                    .start("InstanceRefreshes");
+        for (InstanceRefresh refresh : page.instanceRefreshes()) {
+            appendInstanceRefreshXml(xml, refresh);
+        }
+        xml.end("InstanceRefreshes");
+        if (page.nextToken() != null) {
+            xml.elem("NextToken", page.nextToken());
+        }
+        xml.end("DescribeInstanceRefreshesResult")
+           .raw(AwsQueryResponse.responseMetadata())
+           .end("DescribeInstanceRefreshesResponse");
+        return ok(xml.build());
+    }
+
+    private void appendInstanceRefreshXml(XmlBuilder xml, InstanceRefresh refresh) {
+        xml.start("member")
+           .elem("InstanceRefreshId", refresh.getInstanceRefreshId())
+           .elem("AutoScalingGroupName", refresh.getAutoScalingGroupName())
+           .elem("Status", refresh.getStatus())
+           .elem("StatusReason", refresh.getStatusReason())
+           .elem("PercentageComplete", String.valueOf(refresh.getPercentageComplete()))
+           .elem("InstancesToUpdate", String.valueOf(refresh.getInstancesToUpdate()))
+           .elem("StartTime", ISO_FMT.format(refresh.getStartTime()));
+        if (refresh.getEndTime() != null) {
+            xml.elem("EndTime", ISO_FMT.format(refresh.getEndTime()));
+        }
+        if (refresh.getStrategy() != null) {
+            xml.elem("Strategy", refresh.getStrategy());
+        }
+        appendDesiredConfigurationXml(xml, refresh);
+        appendPreferencesXml(xml, refresh);
+        xml.end("member");
+    }
+
+    private void appendDesiredConfigurationXml(XmlBuilder xml, InstanceRefresh refresh) {
+        if (!refresh.hasDesiredConfiguration()) {
+            return;
+        }
+        xml.start("DesiredConfiguration")
+           .start("LaunchTemplate")
+           .elem("LaunchTemplateId", refresh.getDesiredLaunchTemplateId())
+           .elem("LaunchTemplateName", refresh.getDesiredLaunchTemplateName())
+           .elem("Version", refresh.getDesiredLaunchTemplateVersion())
+           .end("LaunchTemplate")
+           .end("DesiredConfiguration");
+    }
+
+    private void appendPreferencesXml(XmlBuilder xml, InstanceRefresh refresh) {
+        xml.start("Preferences")
+           .elem("MinHealthyPercentage", intString(refresh.getMinHealthyPercentage()))
+           .elem("MaxHealthyPercentage", intString(refresh.getMaxHealthyPercentage()))
+           .elem("InstanceWarmup", intString(refresh.getInstanceWarmup()))
+           .elem("SkipMatching", boolString(refresh.getSkipMatching()))
+           .elem("AutoRollback", boolString(refresh.getAutoRollback()))
+           .elem("ScaleInProtectedInstances", refresh.getScaleInProtectedInstances())
+           .elem("StandbyInstances", refresh.getStandbyInstances())
+           .elem("CheckpointDelay", intString(refresh.getCheckpointDelay()))
+           .elem("BakeTime", intString(refresh.getBakeTime()));
+        if (!refresh.getCheckpointPercentages().isEmpty()) {
+            xml.start("CheckpointPercentages");
+            for (Integer percentage : refresh.getCheckpointPercentages()) {
+                xml.elem("member", String.valueOf(percentage));
+            }
+            xml.end("CheckpointPercentages");
+        }
+        xml.end("Preferences");
+    }
+
+    private Response handleCreateOrUpdateTags(MultivaluedMap<String, String> p, String region) {
+        for (TagRequest tag : parseTagRequests(p)) {
+            service.createOrUpdateTags(
+                    region,
+                    tag.resourceId(),
+                    tag.resourceType(),
+                    Map.of(tag.key(), tag.value()),
+                    Map.of(tag.key(), tag.propagateAtLaunch()));
+        }
+        return ok(new XmlBuilder()
+                .start("CreateOrUpdateTagsResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("CreateOrUpdateTagsResponse").build());
+    }
+
+    private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
+        for (TagRequest tag : parseTagRequests(p)) {
+            service.deleteTags(region, tag.resourceId(), tag.resourceType(), List.of(tag.key()));
+        }
+        return ok(new XmlBuilder()
+                .start("DeleteTagsResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DeleteTagsResponse").build());
     }
 
     // ── Instances ─────────────────────────────────────────────────────────────
@@ -318,14 +487,116 @@ public class AutoScalingQueryHandler {
             if (inst.getLaunchConfigurationName() != null) {
                 xml.elem("LaunchConfigurationName", inst.getLaunchConfigurationName());
             }
+            appendInstanceLaunchTemplateXml(xml, inst);
             if (inst.getInstanceType() != null) { xml.elem("InstanceType", inst.getInstanceType()); }
             xml.end("member");
         }
         xml.end("AutoScalingInstances")
            .end("DescribeAutoScalingInstancesResult")
-           .raw(AwsQueryResponse.responseMetadata())
-           .end("DescribeAutoScalingInstancesResponse");
+                .raw(AwsQueryResponse.responseMetadata())
+                .end("DescribeAutoScalingInstancesResponse");
         return ok(xml.build());
+    }
+
+    private Response handleSetInstanceProtection(MultivaluedMap<String, String> p, String region) {
+        String groupName = p.getFirst("AutoScalingGroupName");
+        List<String> instanceIds = memberList(p, "InstanceIds");
+        boolean protectedFromScaleIn = requiredBoolParam(p, "ProtectedFromScaleIn");
+        service.setInstanceProtection(region, groupName, instanceIds, protectedFromScaleIn);
+        return ok(new XmlBuilder()
+                .start("SetInstanceProtectionResponse", NS)
+                .raw(AwsQueryResponse.responseMetadata())
+                .end("SetInstanceProtectionResponse")
+                .build());
+    }
+
+    private Response handleSetInstanceHealth(MultivaluedMap<String, String> p, String region) {
+        String instanceId = p.getFirst("InstanceId");
+        String healthStatus = p.getFirst("HealthStatus");
+        // Defaults to true per the 2011-01-01 model: absent means "respect the grace period".
+        boolean shouldRespectGracePeriod = Boolean.parseBoolean(
+                Optional.ofNullable(p.getFirst("ShouldRespectGracePeriod")).orElse("true"));
+        service.setInstanceHealth(region, instanceId, healthStatus, shouldRespectGracePeriod);
+        return ok(new XmlBuilder()
+                .start("SetInstanceHealthResponse", NS)
+                .raw(AwsQueryResponse.responseMetadata())
+                .end("SetInstanceHealthResponse")
+                .build());
+    }
+
+    private static void appendInstanceLaunchTemplateXml(XmlBuilder xml, AsgInstance inst) {
+        if (inst.getLaunchTemplateId() == null && inst.getLaunchTemplateName() == null) {
+            return;
+        }
+        xml.start("LaunchTemplate");
+        if (inst.getLaunchTemplateId() != null) {
+            xml.elem("LaunchTemplateId", inst.getLaunchTemplateId());
+        }
+        if (inst.getLaunchTemplateName() != null) {
+            xml.elem("LaunchTemplateName", inst.getLaunchTemplateName());
+        }
+        if (inst.getLaunchTemplateVersion() != null) {
+            xml.elem("Version", inst.getLaunchTemplateVersion());
+        }
+        xml.end("LaunchTemplate");
+    }
+
+    private static void appendMixedInstancesPolicyXml(XmlBuilder xml, MixedInstancesPolicy policy) {
+        if (policy == null) {
+            return;
+        }
+        xml.start("MixedInstancesPolicy");
+        MixedInstancesPolicy.LaunchTemplate launchTemplate = policy.getLaunchTemplate();
+        if (launchTemplate != null) {
+            xml.start("LaunchTemplate");
+            appendMixedLaunchTemplateSpecificationXml(xml, launchTemplate.getLaunchTemplateSpecification());
+            if (!launchTemplate.getOverrides().isEmpty()) {
+                xml.start("Overrides");
+                for (MixedInstancesPolicy.LaunchTemplateOverride override : launchTemplate.getOverrides()) {
+                    xml.start("member");
+                    if (override.getInstanceType() != null) {
+                        xml.elem("InstanceType", override.getInstanceType());
+                    }
+                    xml.end("member");
+                }
+                xml.end("Overrides");
+            }
+            xml.end("LaunchTemplate");
+        }
+        MixedInstancesPolicy.InstancesDistribution distribution = policy.getInstancesDistribution();
+        if (distribution != null) {
+            xml.start("InstancesDistribution");
+            if (distribution.getOnDemandBaseCapacity() != null) {
+                xml.elem("OnDemandBaseCapacity", String.valueOf(distribution.getOnDemandBaseCapacity()));
+            }
+            if (distribution.getOnDemandPercentageAboveBaseCapacity() != null) {
+                xml.elem("OnDemandPercentageAboveBaseCapacity",
+                        String.valueOf(distribution.getOnDemandPercentageAboveBaseCapacity()));
+            }
+            if (distribution.getSpotAllocationStrategy() != null) {
+                xml.elem("SpotAllocationStrategy", distribution.getSpotAllocationStrategy());
+            }
+            xml.end("InstancesDistribution");
+        }
+        xml.end("MixedInstancesPolicy");
+    }
+
+    private static void appendMixedLaunchTemplateSpecificationXml(
+            XmlBuilder xml, MixedInstancesPolicy.LaunchTemplateSpecification specification) {
+        if (specification == null) {
+            return;
+        }
+        xml.start("LaunchTemplateSpecification");
+        if (specification.getLaunchTemplateId() != null) {
+            xml.elem("LaunchTemplateId", specification.getLaunchTemplateId());
+        }
+        if (specification.getLaunchTemplateName() != null) {
+            xml.elem("LaunchTemplateName", specification.getLaunchTemplateName());
+        }
+        if (specification.getVersion() != null) {
+            xml.elem("Version", specification.getVersion());
+        }
+        xml.end("LaunchTemplateSpecification");
     }
 
     private Response handleAttachInstances(MultivaluedMap<String, String> p, String region) {
@@ -532,7 +803,9 @@ public class AutoScalingQueryHandler {
                 p.getFirst("PolicyType"),
                 p.getFirst("AdjustmentType"),
                 intParam(p, "ScalingAdjustment", 0),
-                intParam(p, "Cooldown", 300));
+                intParam(p, "Cooldown", 300),
+                nullableIntParam(p, "EstimatedInstanceWarmup"),
+                parseTargetTrackingConfiguration(p));
         return ok(new XmlBuilder()
                 .start("PutScalingPolicyResponse", NS)
                   .start("PutScalingPolicyResult")
@@ -567,6 +840,10 @@ public class AutoScalingQueryHandler {
                .elem("ScalingAdjustment", String.valueOf(policy.getScalingAdjustment()))
                .elem("Cooldown", String.valueOf(policy.getCooldown()));
             if (policy.getAdjustmentType() != null) { xml.elem("AdjustmentType", policy.getAdjustmentType()); }
+            if (policy.getEstimatedInstanceWarmup() != null) {
+                xml.elem("EstimatedInstanceWarmup", String.valueOf(policy.getEstimatedInstanceWarmup()));
+            }
+            appendTargetTrackingConfigurationXml(xml, policy.getTargetTrackingConfiguration());
             xml.end("member");
         }
         xml.end("ScalingPolicies")
@@ -574,6 +851,44 @@ public class AutoScalingQueryHandler {
            .raw(AwsQueryResponse.responseMetadata())
            .end("DescribePoliciesResponse");
         return ok(xml.build());
+    }
+
+    private static ScalingPolicy.TargetTrackingConfiguration parseTargetTrackingConfiguration(MultivaluedMap<String, String> p) {
+        String predefinedMetricType = p.getFirst("TargetTrackingConfiguration.PredefinedMetricSpecification.PredefinedMetricType");
+        Double targetValue = nullableDoubleParam(p, "TargetTrackingConfiguration.TargetValue");
+        if (predefinedMetricType == null && targetValue == null) {
+            return null;
+        }
+        ScalingPolicy.TargetTrackingConfiguration configuration = new ScalingPolicy.TargetTrackingConfiguration();
+        if (predefinedMetricType != null) {
+            ScalingPolicy.PredefinedMetricSpecification specification =
+                    new ScalingPolicy.PredefinedMetricSpecification();
+            specification.setPredefinedMetricType(predefinedMetricType);
+            configuration.setPredefinedMetricSpecification(specification);
+        }
+        configuration.setTargetValue(targetValue);
+        return configuration;
+    }
+
+    private static void appendTargetTrackingConfigurationXml(
+            XmlBuilder xml, ScalingPolicy.TargetTrackingConfiguration configuration) {
+        if (configuration == null) {
+            return;
+        }
+        xml.start("TargetTrackingConfiguration");
+        ScalingPolicy.PredefinedMetricSpecification predefinedMetric =
+                configuration.getPredefinedMetricSpecification();
+        if (predefinedMetric != null) {
+            xml.start("PredefinedMetricSpecification");
+            if (predefinedMetric.getPredefinedMetricType() != null) {
+                xml.elem("PredefinedMetricType", predefinedMetric.getPredefinedMetricType());
+            }
+            xml.end("PredefinedMetricSpecification");
+        }
+        if (configuration.getTargetValue() != null) {
+            xml.elem("TargetValue", String.valueOf(configuration.getTargetValue()));
+        }
+        xml.end("TargetTrackingConfiguration");
     }
 
     // ── Activities ────────────────────────────────────────────────────────────
@@ -709,13 +1024,140 @@ public class AutoScalingQueryHandler {
         return result;
     }
 
-    private Map<String, String> parseTags(MultivaluedMap<String, String> p) {
-        Map<String, String> result = new LinkedHashMap<>();
+    private List<String> commaList(String value) {
+        if (value == null || value.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(value.split(","))
+                .map(String::trim)
+                .filter(item -> !item.isEmpty())
+                .toList();
+    }
+
+    private MixedInstancesPolicy parseMixedInstancesPolicy(MultivaluedMap<String, String> p) {
+        if (!hasAnyPrefix(p, "MixedInstancesPolicy.")) {
+            return null;
+        }
+        MixedInstancesPolicy policy = new MixedInstancesPolicy();
+
+        MixedInstancesPolicy.LaunchTemplate launchTemplate = new MixedInstancesPolicy.LaunchTemplate();
+        MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                new MixedInstancesPolicy.LaunchTemplateSpecification();
+        specification.setLaunchTemplateId(p.getFirst(
+                "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId"));
+        specification.setLaunchTemplateName(p.getFirst(
+                "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName"));
+        specification.setVersion(p.getFirst(
+                "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.Version"));
+        if (specification.getLaunchTemplateId() != null
+                || specification.getLaunchTemplateName() != null
+                || specification.getVersion() != null) {
+            launchTemplate.setLaunchTemplateSpecification(specification);
+        }
+        launchTemplate.setOverrides(parseMixedLaunchTemplateOverrides(p));
+        if (launchTemplate.getLaunchTemplateSpecification() != null || !launchTemplate.getOverrides().isEmpty()) {
+            policy.setLaunchTemplate(launchTemplate);
+        }
+
+        MixedInstancesPolicy.InstancesDistribution distribution =
+                new MixedInstancesPolicy.InstancesDistribution();
+        distribution.setOnDemandBaseCapacity(nullableIntParam(
+                p, "MixedInstancesPolicy.InstancesDistribution.OnDemandBaseCapacity"));
+        distribution.setOnDemandPercentageAboveBaseCapacity(nullableIntParam(
+                p, "MixedInstancesPolicy.InstancesDistribution.OnDemandPercentageAboveBaseCapacity"));
+        distribution.setSpotAllocationStrategy(
+                p.getFirst("MixedInstancesPolicy.InstancesDistribution.SpotAllocationStrategy"));
+        if (distribution.getOnDemandBaseCapacity() != null
+                || distribution.getOnDemandPercentageAboveBaseCapacity() != null
+                || distribution.getSpotAllocationStrategy() != null) {
+            policy.setInstancesDistribution(distribution);
+        }
+        return policy;
+    }
+
+    private static boolean hasAnyPrefix(MultivaluedMap<String, String> p, String prefix) {
+        for (String key : p.keySet()) {
+            if (key.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<MixedInstancesPolicy.LaunchTemplateOverride> parseMixedLaunchTemplateOverrides(
+            MultivaluedMap<String, String> p) {
+        List<MixedInstancesPolicy.LaunchTemplateOverride> result = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String instanceType = p.getFirst("MixedInstancesPolicy.LaunchTemplate.Overrides.member."
+                    + i + ".InstanceType");
+            if (instanceType == null) { break; }
+            MixedInstancesPolicy.LaunchTemplateOverride override =
+                    new MixedInstancesPolicy.LaunchTemplateOverride();
+            override.setInstanceType(instanceType);
+            result.add(override);
+        }
+        return result;
+    }
+
+    private ParsedTags parseTags(MultivaluedMap<String, String> p) {
+        Map<String, String> tags = new LinkedHashMap<>();
+        Map<String, Boolean> propagateAtLaunch = new LinkedHashMap<>();
         for (int i = 1; ; i++) {
             String key = p.getFirst("Tags.member." + i + ".Key");
             if (key == null) { break; }
             String value = p.getFirst("Tags.member." + i + ".Value");
-            result.put(key, value != null ? value : "");
+            tags.put(key, value != null ? value : "");
+            propagateAtLaunch.put(key,
+                    Boolean.parseBoolean(p.getFirst("Tags.member." + i + ".PropagateAtLaunch")));
+        }
+        return new ParsedTags(tags, propagateAtLaunch);
+    }
+
+    private List<TagRequest> parseTagRequests(MultivaluedMap<String, String> p) {
+        List<TagRequest> result = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String key = p.getFirst("Tags.member." + i + ".Key");
+            if (key == null) { break; }
+            String resourceId = p.getFirst("Tags.member." + i + ".ResourceId");
+            String resourceType = p.getFirst("Tags.member." + i + ".ResourceType");
+            String value = p.getFirst("Tags.member." + i + ".Value");
+            boolean propagateAtLaunch = Boolean.parseBoolean(p.getFirst("Tags.member." + i + ".PropagateAtLaunch"));
+            result.add(new TagRequest(resourceId, resourceType, key, value != null ? value : "", propagateAtLaunch));
+        }
+        return result;
+    }
+
+    private record TagRequest(String resourceId, String resourceType, String key, String value, boolean propagateAtLaunch) {}
+
+    private record ParsedTags(Map<String, String> tags, Map<String, Boolean> propagateAtLaunch) {}
+
+    private InstanceRefresh parseInstanceRefresh(MultivaluedMap<String, String> p) {
+        InstanceRefresh refresh = new InstanceRefresh();
+        refresh.setStrategy(p.getFirst("Strategy"));
+        refresh.setDesiredLaunchTemplateId(p.getFirst("DesiredConfiguration.LaunchTemplate.LaunchTemplateId"));
+        refresh.setDesiredLaunchTemplateName(p.getFirst("DesiredConfiguration.LaunchTemplate.LaunchTemplateName"));
+        refresh.setDesiredLaunchTemplateVersion(p.getFirst("DesiredConfiguration.LaunchTemplate.Version"));
+        refresh.setMinHealthyPercentage(nullableIntParam(p, "Preferences.MinHealthyPercentage"));
+        refresh.setMaxHealthyPercentage(nullableIntParam(p, "Preferences.MaxHealthyPercentage"));
+        refresh.setInstanceWarmup(nullableIntParam(p, "Preferences.InstanceWarmup"));
+        refresh.setSkipMatching(nullableBoolParam(p, "Preferences.SkipMatching"));
+        refresh.setAutoRollback(nullableBoolParam(p, "Preferences.AutoRollback"));
+        refresh.setScaleInProtectedInstances(p.getFirst("Preferences.ScaleInProtectedInstances"));
+        refresh.setStandbyInstances(p.getFirst("Preferences.StandbyInstances"));
+        refresh.setCheckpointDelay(nullableIntParam(p, "Preferences.CheckpointDelay"));
+        refresh.setBakeTime(nullableIntParam(p, "Preferences.BakeTime"));
+        refresh.setCheckpointPercentages(memberIntList(p, "Preferences.CheckpointPercentages"));
+        return refresh;
+    }
+
+    private List<Integer> memberIntList(MultivaluedMap<String, String> p, String prefix) {
+        List<Integer> result = new ArrayList<>();
+        for (String value : memberList(p, prefix)) {
+            try {
+                result.add(Integer.parseInt(value));
+            } catch (NumberFormatException ignored) {
+                // Keep Query parsing permissive like the existing integer helpers.
+            }
         }
         return result;
     }
@@ -724,6 +1166,260 @@ public class AutoScalingQueryHandler {
         String val = p.getFirst(key);
         if (val == null || val.isBlank()) { return defaultValue; }
         try { return Integer.parseInt(val); } catch (NumberFormatException e) { return defaultValue; }
+    }
+
+    // ── Suspend/resume scaling processes ────────────────────────────────────
+
+    private Response handleSuspendProcesses(MultivaluedMap<String, String> p, String region) {
+        service.suspendProcesses(region,
+                p.getFirst("AutoScalingGroupName"),
+                memberList(p, "ScalingProcesses"));
+        return ok(new XmlBuilder()
+                .start("SuspendProcessesResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("SuspendProcessesResponse").build());
+    }
+
+    private Response handleResumeProcesses(MultivaluedMap<String, String> p, String region) {
+        service.resumeProcesses(region,
+                p.getFirst("AutoScalingGroupName"),
+                memberList(p, "ScalingProcesses"));
+        return ok(new XmlBuilder()
+                .start("ResumeProcessesResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("ResumeProcessesResponse").build());
+    }
+
+    // ── Warm pools ──────────────────────────────────────────────────────────
+    // Parsed against botocore's autoscaling/2011-01-01/service-2.json
+    // (PutWarmPoolType, DescribeWarmPoolType, DescribeWarmPoolAnswer,
+    // DeleteWarmPoolType, WarmPoolConfiguration, InstanceReusePolicy) rather than
+    // docs prose - see AutoScalingService's warm-pool section for the
+    // full-replace-with-defaults rationale behind PutWarmPool's parsing here.
+
+    private Response handlePutWarmPool(MultivaluedMap<String, String> p, String region) {
+        service.putWarmPool(region,
+                p.getFirst("AutoScalingGroupName"),
+                nullableIntParam(p, "MaxGroupPreparedCapacity"),
+                nullableIntParam(p, "MinSize"),
+                p.getFirst("PoolState"),
+                nullableBoolParam(p, "InstanceReusePolicy.ReuseOnScaleIn"));
+        return ok(new XmlBuilder()
+                .start("PutWarmPoolResponse", NS)
+                  .start("PutWarmPoolResult").end("PutWarmPoolResult")
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("PutWarmPoolResponse").build());
+    }
+
+    private Response handleDescribeWarmPool(MultivaluedMap<String, String> p, String region) {
+        WarmPoolConfiguration pool = service.describeWarmPool(region, p.getFirst("AutoScalingGroupName"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeWarmPoolResponse", NS)
+                  .start("DescribeWarmPoolResult");
+        appendWarmPoolConfigurationXml(xml, pool);
+        xml.start("Instances").end("Instances")
+           .end("DescribeWarmPoolResult")
+           .raw(AwsQueryResponse.responseMetadata())
+           .end("DescribeWarmPoolResponse");
+        return ok(xml.build());
+    }
+
+    private static void appendWarmPoolConfigurationXml(XmlBuilder xml, WarmPoolConfiguration pool) {
+        if (pool == null) {
+            return;
+        }
+        xml.start("WarmPoolConfiguration");
+        if (pool.getMaxGroupPreparedCapacity() != null) {
+            xml.elem("MaxGroupPreparedCapacity", String.valueOf(pool.getMaxGroupPreparedCapacity()));
+        }
+        xml.elem("MinSize", String.valueOf(pool.getMinSize()))
+           .elem("PoolState", pool.getPoolState())
+           .start("InstanceReusePolicy")
+             .elem("ReuseOnScaleIn", String.valueOf(pool.isReuseOnScaleIn()))
+           .end("InstanceReusePolicy")
+           .end("WarmPoolConfiguration");
+    }
+
+    private Response handleDeleteWarmPool(MultivaluedMap<String, String> p, String region) {
+        service.deleteWarmPool(region,
+                p.getFirst("AutoScalingGroupName"),
+                "true".equalsIgnoreCase(p.getFirst("ForceDelete")));
+        return ok(new XmlBuilder()
+                .start("DeleteWarmPoolResponse", NS)
+                  .start("DeleteWarmPoolResult").end("DeleteWarmPoolResult")
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DeleteWarmPoolResponse").build());
+    }
+
+    // ── Traffic sources ─────────────────────────────────────────────────────
+    // AWS's own DescribeTrafficSources doc page example shows a bare, unwrapped
+    // <TrafficSources> element per item, which reads as a flattened list - but
+    // botocore's actual service-2.json models the TrafficSources list WITHOUT
+    // "flattened": true and with member locationName "member" like every other
+    // list in this API, so the wire shape is the normal
+    // <TrafficSources><member>...</member></TrafficSources>. The doc page's
+    // example was simply wrong; trusting it verbatim left the AWS provider's own
+    // post-create waiter polling DescribeTrafficSources and never finding the
+    // resource it had just attached - the actual wire format, not the docs, is
+    // the source of truth here.
+
+    private Response handleAttachTrafficSources(MultivaluedMap<String, String> p, String region) {
+        service.attachTrafficSources(region, p.getFirst("AutoScalingGroupName"), parseTrafficSources(p));
+        return ok(new XmlBuilder()
+                .start("AttachTrafficSourcesResponse", NS)
+                  .start("AttachTrafficSourcesResult").end("AttachTrafficSourcesResult")
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("AttachTrafficSourcesResponse").build());
+    }
+
+    private Response handleDetachTrafficSources(MultivaluedMap<String, String> p, String region) {
+        service.detachTrafficSources(region, p.getFirst("AutoScalingGroupName"), parseTrafficSources(p));
+        return ok(new XmlBuilder()
+                .start("DetachTrafficSourcesResponse", NS)
+                  .start("DetachTrafficSourcesResult").end("DetachTrafficSourcesResult")
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DetachTrafficSourcesResponse").build());
+    }
+
+    private Response handleDescribeTrafficSources(MultivaluedMap<String, String> p, String region) {
+        Map<String, String> sources = service.describeTrafficSources(region,
+                p.getFirst("AutoScalingGroupName"), p.getFirst("TrafficSourceType"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeTrafficSourcesResponse", NS)
+                  .start("DescribeTrafficSourcesResult")
+                    .start("TrafficSources");
+        sources.forEach((identifier, type) -> xml.start("member")
+               .elem("Identifier", identifier)
+               .elem("State", "InService")
+               .elem("Type", type)
+               .end("member"));
+        xml.end("TrafficSources")
+           .end("DescribeTrafficSourcesResult")
+           .raw(AwsQueryResponse.responseMetadata())
+           .end("DescribeTrafficSourcesResponse");
+        return ok(xml.build());
+    }
+
+    private List<AutoScalingService.TrafficSourceIdentifier> parseTrafficSources(MultivaluedMap<String, String> p) {
+        List<AutoScalingService.TrafficSourceIdentifier> result = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String identifier = p.getFirst("TrafficSources.member." + i + ".Identifier");
+            if (identifier == null) { break; }
+            String type = p.getFirst("TrafficSources.member." + i + ".Type");
+            result.add(new AutoScalingService.TrafficSourceIdentifier(identifier, type));
+        }
+        return result;
+    }
+
+    // ── Scheduled actions ───────────────────────────────────────────────────
+
+    private Response handlePutScheduledUpdateGroupAction(MultivaluedMap<String, String> p, String region) {
+        service.putScheduledUpdateGroupAction(region,
+                p.getFirst("AutoScalingGroupName"),
+                p.getFirst("ScheduledActionName"),
+                parseInstant("StartTime", p.getFirst("StartTime")),
+                parseInstant("EndTime", p.getFirst("EndTime")),
+                p.getFirst("Recurrence"),
+                p.getFirst("TimeZone"),
+                nullableIntParam(p, "MinSize"),
+                nullableIntParam(p, "MaxSize"),
+                nullableIntParam(p, "DesiredCapacity"));
+        return ok(new XmlBuilder()
+                .start("PutScheduledUpdateGroupActionResponse", NS)
+                  .start("PutScheduledUpdateGroupActionResult").end("PutScheduledUpdateGroupActionResult")
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("PutScheduledUpdateGroupActionResponse").build());
+    }
+
+    private Response handleDeleteScheduledAction(MultivaluedMap<String, String> p, String region) {
+        service.deleteScheduledAction(region,
+                p.getFirst("AutoScalingGroupName"), p.getFirst("ScheduledActionName"));
+        return ok(new XmlBuilder()
+                .start("DeleteScheduledActionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DeleteScheduledActionResponse").build());
+    }
+
+    private Response handleDescribeScheduledActions(MultivaluedMap<String, String> p, String region) {
+        List<ScheduledAction> actions = service.describeScheduledActions(
+                region, p.getFirst("AutoScalingGroupName"), memberList(p, "ScheduledActionNames"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeScheduledActionsResponse", NS)
+                  .start("DescribeScheduledActionsResult")
+                    .start("ScheduledUpdateGroupActions");
+        for (ScheduledAction action : actions) {
+            xml.start("member")
+               .elem("ScheduledActionName", action.getScheduledActionName())
+               .elem("ScheduledActionARN", action.getScheduledActionArn())
+               .elem("AutoScalingGroupName", action.getAutoScalingGroupName());
+            if (action.getStartTime() != null) { xml.elem("StartTime", ISO_FMT.format(action.getStartTime())); }
+            if (action.getEndTime() != null) { xml.elem("EndTime", ISO_FMT.format(action.getEndTime())); }
+            if (action.getRecurrence() != null) { xml.elem("Recurrence", action.getRecurrence()); }
+            if (action.getTimeZone() != null) { xml.elem("TimeZone", action.getTimeZone()); }
+            if (action.getMinSize() != null) { xml.elem("MinSize", String.valueOf(action.getMinSize())); }
+            if (action.getMaxSize() != null) { xml.elem("MaxSize", String.valueOf(action.getMaxSize())); }
+            if (action.getDesiredCapacity() != null) {
+                xml.elem("DesiredCapacity", String.valueOf(action.getDesiredCapacity()));
+            }
+            xml.end("member");
+        }
+        xml.end("ScheduledUpdateGroupActions")
+           .end("DescribeScheduledActionsResult")
+           .raw(AwsQueryResponse.responseMetadata())
+           .end("DescribeScheduledActionsResponse");
+        return ok(xml.build());
+    }
+
+    private Instant parseInstant(String name, String value) {
+        if (value == null || value.isBlank()) { return null; }
+        try {
+            return Instant.parse(value);
+        } catch (DateTimeParseException e) {
+            throw new AwsException("ValidationError",
+                    name + " '" + value + "' is not a valid ISO 8601 timestamp.", 400);
+        }
+    }
+
+    private Integer nullableIntParam(MultivaluedMap<String, String> p, String key) {
+        String val = p.getFirst(key);
+        if (val == null || val.isBlank()) { return null; }
+        try { return Integer.parseInt(val); } catch (NumberFormatException e) { return null; }
+    }
+
+    private static Double nullableDoubleParam(MultivaluedMap<String, String> p, String key) {
+        String val = p.getFirst(key);
+        if (val == null || val.isBlank()) { return null; }
+        try { return Double.parseDouble(val); } catch (NumberFormatException e) { return null; }
+    }
+
+    private Boolean nullableBoolParam(MultivaluedMap<String, String> p, String key) {
+        String val = p.getFirst(key);
+        if (val == null || val.isBlank()) { return null; }
+        return Boolean.parseBoolean(val);
+    }
+
+    /** A required boolean member must be present and exactly "true"/"false" — never silently coerced to false. */
+    private boolean requiredBoolParam(MultivaluedMap<String, String> p, String key) {
+        String val = p.getFirst(key);
+        if (val == null || val.isBlank()) {
+            throw new AwsException("ValidationError",
+                    "1 validation error detected: Value null at '" + key
+                            + "' failed to satisfy constraint: Member must not be null", 400);
+        }
+        if (!"true".equalsIgnoreCase(val) && !"false".equalsIgnoreCase(val)) {
+            throw new AwsException("ValidationError",
+                    "1 validation error detected: Value '" + val + "' at '" + key
+                            + "' failed to satisfy constraint: Member must be a valid boolean", 400);
+        }
+        return Boolean.parseBoolean(val);
+    }
+
+    private String intString(Integer value) {
+        return value != null ? String.valueOf(value) : null;
+    }
+
+    private String boolString(Boolean value) {
+        return value != null ? String.valueOf(value) : null;
     }
 
     private Response ok(String xml) {

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 
@@ -119,9 +120,13 @@ class GuardedMessageQueue {
         // message from a previous ReceiveMessage call is blocked until that
         // message is deleted or its visibility expires. Within a single call
         // we may return multiple messages from the same group (preserving
-        // insertion order), up to MaxNumberOfMessages.
+        // insertion order), up to MaxNumberOfMessages. A not-visible message
+        // that was never claimed — no receipt handle — is only waiting out its
+        // DelaySeconds and must not lock its group.
         Set<String> groupsWithInFlight =
-                messages.stream().filter(msg -> !msg.isVisible() && msg.getMessageGroupId() != null)
+                messages.stream()
+                        .filter(msg -> !msg.isVisible() && msg.getReceiptHandle() != null
+                                && msg.getMessageGroupId() != null)
                         .map(Message::getMessageGroupId).collect(Collectors.toSet());
 
         for (Message msg : messages) {
@@ -203,18 +208,32 @@ class GuardedMessageQueue {
         }
     }
 
-    record MessageCounts(long visible, long inFlight) {
+    record MessageCounts(long visible, long inFlight, long delayed) {
     }
 
+    /**
+     * Splits the queue contents the way AWS SQS reports them in
+     * GetQueueAttributes: visible (ApproximateNumberOfMessages), in flight
+     * (ApproximateNumberOfMessagesNotVisible) and delayed
+     * (ApproximateNumberOfMessagesDelayed). A message that is not visible and
+     * was never claimed — no receipt handle — can only be waiting out its
+     * DelaySeconds, so it counts as delayed rather than in flight.
+     */
     MessageCounts messageCounts() {
         try (var _ = hold()) {
             long visible = 0;
             long inFlight = 0;
+            long delayed = 0;
             for (Message m : messages) {
-                if (m.isVisible()) visible++;
-                else inFlight++;
+                if (m.isVisible()) {
+                    visible++;
+                } else if (m.getReceiptHandle() == null) {
+                    delayed++;
+                } else {
+                    inFlight++;
+                }
             }
-            return new MessageCounts(visible, inFlight);
+            return new MessageCounts(visible, inFlight, delayed);
         }
     }
 
@@ -252,6 +271,33 @@ class GuardedMessageQueue {
         if (closed || messageStore == null || storageKey == null) {
             return;
         }
+        if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
+            String accountId = extractAccountFromStorageKey(storageKey);
+            if (accountId != null) {
+                aware.putForAccount(accountId, storageKey, new ArrayList<>(messages));
+                return;
+            }
+        }
         messageStore.put(storageKey, new ArrayList<>(messages));
+    }
+
+    /**
+     * Extracts the 12-digit account ID from a storage key of the form
+     * {@code region::/accountId/queueName}.
+     */
+    private static String extractAccountFromStorageKey(String storageKey) {
+        if (storageKey == null) {
+            return null;
+        }
+        // storageKey format: "us-east-1::/000000000001/my-queue"
+        int separator = storageKey.indexOf("::");
+        if (separator < 0) {
+            return null;
+        }
+        String path = storageKey.substring(separator + 2); // "/000000000001/my-queue"
+        String trimmed = path.startsWith("/") ? path.substring(1) : path;
+        int slash = trimmed.indexOf('/');
+        String candidate = slash > 0 ? trimmed.substring(0, slash) : trimmed;
+        return candidate.matches("\\d{12}") ? candidate : null;
     }
 }

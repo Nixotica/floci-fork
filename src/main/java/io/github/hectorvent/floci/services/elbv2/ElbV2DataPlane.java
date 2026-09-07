@@ -3,8 +3,11 @@ package io.github.hectorvent.floci.services.elbv2;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.TlsProxyServer;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
+import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import io.github.hectorvent.floci.services.elbv2.model.Rule;
 import io.github.hectorvent.floci.services.elbv2.model.RuleCondition;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
@@ -45,6 +48,7 @@ public class ElbV2DataPlane {
     private static final List<String> HOP_BY_HOP_HEADERS = List.of(
             "connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailers", "proxy-authorization", "proxy-authenticate"
     );
+    private static final String PRESERVE_HOST_HEADER_ATTRIBUTE = "routing.http.preserve_host_header.enabled";
 
     @Inject
     Vertx vertx;
@@ -59,17 +63,29 @@ public class ElbV2DataPlane {
     EmulatorConfig config;
 
     @Inject
+    TlsProxyServer tlsProxyServer;
+
+    @Inject
     LambdaService lambdaService;
+
+    @Inject
+    Ec2Service ec2Service;
 
     @Inject
     ObjectMapper objectMapper;
 
-    private final Map<String, HttpServer> servers = new ConcurrentHashMap<>();
+    private final Map<Integer, HttpServer> servers = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicBoolean releaseHandlerRegistered =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private final Map<Integer, Map<String, String>> listenersByHostAndPort = new ConcurrentHashMap<>();
+    private final Map<String, ListenerBinding> listenerBindings = new ConcurrentHashMap<>();
     private final Map<String, AtomicReference<List<CompiledRule>>> ruleChains = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> rrCounters = new ConcurrentHashMap<>();
     private final Map<String, String> listenerRegions = new ConcurrentHashMap<>();
 
     private HttpClient proxyClient;
+
+    private record ListenerBinding(int port, String host, String loadBalancerArn) {}
 
     @PostConstruct
     void init() {
@@ -81,10 +97,12 @@ public class ElbV2DataPlane {
 
     @PreDestroy
     void shutdown() {
-        for (Map.Entry<String, HttpServer> e : servers.entrySet()) {
+        for (Map.Entry<Integer, HttpServer> e : servers.entrySet()) {
             e.getValue().close();
         }
         servers.clear();
+        listenersByHostAndPort.clear();
+        listenerBindings.clear();
         ruleChains.clear();
         rrCounters.clear();
         listenerRegions.clear();
@@ -98,23 +116,49 @@ public class ElbV2DataPlane {
         List<CompiledRule> compiled = compileRules(rules);
         ruleChains.put(listenerArn, new AtomicReference<>(compiled));
         listenerRegions.put(listenerArn, region);
+        ListenerBinding binding = binding(listener, region);
+        listenerBindings.put(listenerArn, binding);
+        listenersByHostAndPort.computeIfAbsent(binding.port(), ignored -> new ConcurrentHashMap<>())
+                .put(binding.host(), listenerArn);
+        ensureReleaseHandlerRegistered();
+        servers.computeIfAbsent(binding.port(), this::startPortServer);
+    }
 
-        HttpServer server = vertx.createHttpServer(new HttpServerOptions()
-                .setHost("0.0.0.0")
-                .setPort(listener.getPort()));
-
-        server.requestHandler(req -> handleRequest(req, listenerArn, region));
-        server.listen()
-                .onSuccess(s -> LOG.infov("ELBv2 listener started on port {0} for {1}", String.valueOf(listener.getPort()), listenerArn))
-                .onFailure(err -> LOG.warnv("ELBv2 listener failed to start on port {0}: {1}", String.valueOf(listener.getPort()), err.getMessage()));
-
-        servers.put(listenerArn, server);
+    public void restartListener(Listener listener, String region, List<Rule> rules) {
+        if (config.services().elbv2().mock()) {
+            return;
+        }
+        String listenerArn = listener.getListenerArn();
+        ListenerBinding newBinding = binding(listener, region);
+        ListenerBinding oldBinding = listenerBindings.get(listenerArn);
+        if (newBinding.equals(oldBinding)) {
+            ruleChains.put(listenerArn, new AtomicReference<>(compileRules(rules)));
+            listenerRegions.put(listenerArn, region);
+            listenersByHostAndPort.computeIfAbsent(newBinding.port(), ignored -> new ConcurrentHashMap<>())
+                    .put(newBinding.host(), listenerArn);
+            ensureReleaseHandlerRegistered();
+            servers.computeIfAbsent(newBinding.port(), this::startPortServer);
+            return;
+        }
+        oldBinding = listenerBindings.remove(listenerArn);
+        if (oldBinding != null) {
+            Map<String, String> listenersByHost = listenersByHostAndPort.get(oldBinding.port());
+            if (listenersByHost != null) {
+                listenersByHost.remove(oldBinding.host(), listenerArn);
+                closePortServerIfUnused(oldBinding.port(), listenersByHost);
+            }
+        }
+        startListener(listener, region, rules);
     }
 
     public void stopListener(String listenerArn) {
-        HttpServer server = servers.remove(listenerArn);
-        if (server != null) {
-            server.close();
+        ListenerBinding binding = listenerBindings.remove(listenerArn);
+        if (binding != null) {
+            Map<String, String> listenersByHost = listenersByHostAndPort.get(binding.port());
+            if (listenersByHost != null) {
+                listenersByHost.remove(binding.host(), listenerArn);
+                closePortServerIfUnused(binding.port(), listenersByHost);
+            }
         }
         ruleChains.remove(listenerArn);
         listenerRegions.remove(listenerArn);
@@ -127,7 +171,126 @@ public class ElbV2DataPlane {
         }
     }
 
-    private void handleRequest(io.vertx.core.http.HttpServerRequest req, String listenerArn, String region) {
+    /**
+     * Ports Floci reserves for itself, which a load balancer listener must not take.
+     *
+     * <p>The emulator's own port is always reserved. With TLS enabled the TLS proxy also binds
+     * {@code floci.tls.aws-https-port} (443 by default), because CDK's custom-resource
+     * {@code cfn-response} callback hardcodes {@code https://} and ignores the port in the
+     * ResponseURL, so it always lands on 443.
+     *
+     * <p>Without this the two raced: whichever started first won. A stack restored from
+     * persistence could hand 443 to an ALB listener, which then answered CDK's callback in plain
+     * HTTP and hung every {@code Custom::} resource - and the reverse on a fresh start. Yielding
+     * here makes the outcome deterministic and keeps the emulator's own control path working. To
+     * give 443 to load balancers instead, set {@code floci.tls.aws-https-port=0} or disable TLS.
+     */
+    // Package-private for ElbV2ReservedPortTest.
+    boolean isReservedByFloci(int port) {
+        if (port == config.port()) {
+            return true;
+        }
+        // Ask the proxy whether it actually holds the port rather than inferring it from config.
+        // Binding the AWS-HTTPS port is privileged and its failure is non-fatal, so a port the
+        // proxy never acquired must stay available to listeners instead of going unserved.
+        return tlsProxyServer.reservesPort(port);
+    }
+
+    /**
+     * Binds any registered listener whose port the proxy has just released. Yielding a port whose
+     * bind had not resolved yet is the safe default, but if that bind then fails nothing else
+     * would ever retry the listener, leaving it registered with no data plane and the port free.
+     */
+    private void bindListenersWaitingOn(int port) {
+        if (listenersByHostAndPort.containsKey(port)) {
+            servers.computeIfAbsent(port, this::startPortServer);
+        }
+    }
+
+    /**
+     * Subscribes to the proxy's released ports, once, on the first listener to need it: the data
+     * plane is only live once a listener exists, and this keeps the proxy out of the mock-mode
+     * path entirely.
+     *
+     * <p>Placement is load-bearing on both sides. It runs after the listener is in
+     * {@code listenersByHostAndPort}, so the replay of ports already given up finds it, and before
+     * {@code servers.computeIfAbsent}, because {@code onPortReleased} replays synchronously: doing
+     * this from inside the mapping function re-entered {@code computeIfAbsent} for the very key it
+     * was still computing, which a {@link ConcurrentHashMap} rejects outright.
+     */
+    private void ensureReleaseHandlerRegistered() {
+        if (releaseHandlerRegistered.compareAndSet(false, true)) {
+            tlsProxyServer.onPortReleased(this::bindListenersWaitingOn);
+        }
+    }
+
+    private HttpServer startPortServer(int port) {
+        if (isReservedByFloci(port)) {
+            // Returning null leaves `servers` untouched: computeIfAbsent skips a null mapping.
+            // The emulator's own port cannot be handed over, so the two cases need different
+            // advice: freeing floci.tls.aws-https-port is only meaningful for the TLS proxy.
+            String remedy = port == config.port()
+                    ? "This is the emulator's own port, so it cannot be freed; give the listener a different port."
+                    : "Set floci.tls.aws-https-port=0 (or disable TLS) to free it.";
+            LOG.warnv("ELBv2 listener port {0} is reserved by Floci itself; the listener is "
+                    + "registered but serves no traffic. {1}", String.valueOf(port), remedy);
+            return null;
+        }
+        HttpServer server = vertx.createHttpServer(new HttpServerOptions()
+                .setHost("0.0.0.0")
+                .setPort(port));
+        server.requestHandler(req -> handleRequest(req, port));
+        server.listen()
+                .onSuccess(s -> LOG.infov("ELBv2 listener port started on {0}", String.valueOf(port)))
+                .onFailure(err -> {
+                    servers.remove(port);
+                    clearPortBindings(port);
+                    server.close();
+                    LOG.warnv("ELBv2 listener port failed to start on {0}: {1}", String.valueOf(port), err.getMessage());
+                });
+        return server;
+    }
+
+    private void closePortServerIfUnused(int port, Map<String, String> listenersByHost) {
+        if (!listenersByHost.isEmpty()) {
+            return;
+        }
+        listenersByHostAndPort.remove(port, listenersByHost);
+        HttpServer server = servers.remove(port);
+        if (server != null) {
+            server.close();
+        }
+    }
+
+    private void clearPortBindings(int port) {
+        Map<String, String> listenersByHost = listenersByHostAndPort.remove(port);
+        if (listenersByHost == null) {
+            return;
+        }
+        for (String listenerArn : listenersByHost.values()) {
+            listenerBindings.remove(listenerArn);
+            ruleChains.remove(listenerArn);
+            listenerRegions.remove(listenerArn);
+        }
+    }
+
+    private ListenerBinding binding(Listener listener, String region) {
+        LoadBalancer loadBalancer = elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn());
+        String host = loadBalancer != null ? normalizeHost(loadBalancer.getDnsName()) : listener.getLoadBalancerArn();
+        return new ListenerBinding(listener.getPort(), host, listener.getLoadBalancerArn());
+    }
+
+    private void handleRequest(io.vertx.core.http.HttpServerRequest req, int port) {
+        String listenerArn = resolveListenerArn(port, req.host());
+        if (listenerArn == null) {
+            req.response().setStatusCode(502).end("No listener for host");
+            return;
+        }
+        String region = listenerRegions.get(listenerArn);
+        if (region == null) {
+            req.response().setStatusCode(502).end("No listener region");
+            return;
+        }
         AtomicReference<List<CompiledRule>> ref = ruleChains.get(listenerArn);
         if (ref == null) {
             req.response().setStatusCode(502).end("No rule chain");
@@ -136,27 +299,56 @@ public class ElbV2DataPlane {
         List<CompiledRule> chain = ref.get();
         for (CompiledRule compiled : chain) {
             if (compiled.matches(req)) {
-                executeAction(req, compiled.action, region);
+                executeAction(req, compiled.action, region, listenerArn);
                 return;
             }
         }
         req.response().setStatusCode(502).end("No matching rule");
     }
 
-    private void executeAction(io.vertx.core.http.HttpServerRequest req, Action action, String region) {
+    private String resolveListenerArn(int port, String hostHeader) {
+        Map<String, String> listenersByHost = listenersByHostAndPort.get(port);
+        if (listenersByHost == null || listenersByHost.isEmpty()) {
+            return null;
+        }
+        String host = normalizeHost(hostHeader);
+        String listenerArn = listenersByHost.get(host);
+        if (listenerArn != null) {
+            return listenerArn;
+        }
+        if (listenersByHost.size() == 1) {
+            return listenersByHost.values().iterator().next();
+        }
+        return null;
+    }
+
+    private static String normalizeHost(String host) {
+        if (host == null) {
+            return "";
+        }
+        String normalized = host.trim().toLowerCase();
+        int colon = normalized.lastIndexOf(':');
+        int bracket = normalized.lastIndexOf(']');
+        if (colon > -1 && colon > bracket) {
+            normalized = normalized.substring(0, colon);
+        }
+        return normalized;
+    }
+
+    private void executeAction(io.vertx.core.http.HttpServerRequest req, Action action, String region, String listenerArn) {
         if (action == null) {
             req.response().setStatusCode(502).end("No action");
             return;
         }
         switch (action.getType() != null ? action.getType() : "") {
-            case "forward" -> executeForward(req, action, region);
+            case "forward" -> executeForward(req, action, region, listenerArn);
             case "redirect" -> executeRedirect(req, action);
             case "fixed-response" -> executeFixedResponse(req, action);
             default -> req.response().setStatusCode(502).end("Unsupported action type");
         }
     }
 
-    private void executeForward(io.vertx.core.http.HttpServerRequest req, Action action, String region) {
+    private void executeForward(io.vertx.core.http.HttpServerRequest req, Action action, String region, String listenerArn) {
         String tgArn = resolveTgArn(action);
         if (tgArn == null) {
             req.response().setStatusCode(502).end("No target group");
@@ -192,7 +384,19 @@ public class ElbV2DataPlane {
         int idx = Math.abs(counter.getAndIncrement() % candidates.size());
         TargetDescription target = candidates.get(idx);
         int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
-        proxyRequest(req, target.getId(), targetPort);
+        proxyRequest(req, ElbV2TargetResolver.resolveHost(ec2Service, tg, target), targetPort,
+                preserveHostHeader(listenerArn, region));
+    }
+
+    private boolean preserveHostHeader(String listenerArn, String region) {
+        ListenerBinding binding = listenerBindings.get(listenerArn);
+        if (binding == null) {
+            return false;
+        }
+        LoadBalancer loadBalancer = elbV2Service.getLoadBalancer(region, binding.loadBalancerArn());
+        return loadBalancer != null
+                && loadBalancer.getAttributes() != null
+                && Boolean.parseBoolean(loadBalancer.getAttributes().get(PRESERVE_HOST_HEADER_ATTRIBUTE));
     }
 
     private void invokeLambdaTarget(io.vertx.core.http.HttpServerRequest req, String functionArn, String region) {
@@ -341,7 +545,8 @@ public class ElbV2DataPlane {
         return tuples.get(tuples.size() - 1).getTargetGroupArn();
     }
 
-    private void proxyRequest(io.vertx.core.http.HttpServerRequest req, String host, int port) {
+    private void proxyRequest(io.vertx.core.http.HttpServerRequest req, String host, int port,
+                              boolean preserveHostHeader) {
         req.bodyHandler(body -> {
             RequestOptions opts = new RequestOptions()
                     .setHost(host)
@@ -355,7 +560,9 @@ public class ElbV2DataPlane {
                                 clientReq.putHeader(entry.getKey(), entry.getValue());
                             }
                         });
-                        clientReq.putHeader("Host", host + ":" + port);
+                        if (!preserveHostHeader) {
+                            clientReq.putHeader("Host", host + ":" + port);
+                        }
                         clientReq.send(body)
                                 .onSuccess(resp -> {
                                     req.response().setStatusCode(resp.statusCode());

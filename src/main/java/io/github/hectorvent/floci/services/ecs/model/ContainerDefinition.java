@@ -15,9 +15,11 @@ public class ContainerDefinition {
     private boolean essential = true;
     private List<PortMapping> portMappings;
     private List<KeyValuePair> environment;
+    private List<Secret> secrets;
     private List<String> command;
     private List<String> entryPoint;
     private List<MountPoint> mountPoints;
+    private LogConfiguration logConfiguration;
 
     public String getName() { return name; }
     public void setName(String name) { this.name = name; }
@@ -43,6 +45,9 @@ public class ContainerDefinition {
     public List<KeyValuePair> getEnvironment() { return environment; }
     public void setEnvironment(List<KeyValuePair> environment) { this.environment = environment; }
 
+    public List<Secret> getSecrets() { return secrets; }
+    public void setSecrets(List<Secret> secrets) { this.secrets = secrets; }
+
     public List<String> getCommand() { return command; }
     public void setCommand(List<String> command) { this.command = command; }
 
@@ -51,4 +56,7 @@ public class ContainerDefinition {
 
     public List<MountPoint> getMountPoints() { return mountPoints; }
     public void setMountPoints(List<MountPoint> mountPoints) { this.mountPoints = mountPoints; }
+
+    public LogConfiguration getLogConfiguration() { return logConfiguration; }
+    public void setLogConfiguration(LogConfiguration logConfiguration) { this.logConfiguration = logConfiguration; }
 }

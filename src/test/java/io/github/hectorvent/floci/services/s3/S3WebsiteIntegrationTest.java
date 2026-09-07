@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.s3;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,10 @@ import static org.hamcrest.Matchers.*;
 class S3WebsiteIntegrationTest {
 
     private static final String BUCKET = "website-test-bucket";
+
+    private String websiteHost() {
+        return BUCKET + ".s3-website-us-east-1.localhost:" + RestAssured.port;
+    }
 
     @Test
     @Order(1)
@@ -74,19 +79,33 @@ class S3WebsiteIntegrationTest {
 
     @Test
     @Order(5)
-    void indexRedirectionNotWorkingYetWithoutIndexFile() {
-        // Access root - should return XML list because index.html is missing
+    void uploadErrorFile() {
         given()
+            .contentType("text/html")
+            .body("<html><body>Custom Error</body></html>")
         .when()
-            .get("/" + BUCKET)
+            .put("/" + BUCKET + "/error.html")
         .then()
-            .statusCode(200)
-            .contentType("application/xml")
-            .body(containsString("<ListBucketResult"));
+            .statusCode(200);
     }
 
     @Test
     @Order(6)
+    void missingIndexServesErrorDocument() {
+        given()
+            .header("Host", websiteHost())
+        .when()
+            .get("/")
+        .then()
+            .statusCode(404)
+            .contentType("text/html")
+            .header("x-amz-error-code", "NoSuchKey")
+            .header("x-amz-error-message", "The specified key does not exist.")
+            .body(equalTo("<html><body>Custom Error</body></html>"));
+    }
+
+    @Test
+    @Order(7)
     void uploadIndexFile() {
         given()
             .contentType("text/html")
@@ -98,12 +117,12 @@ class S3WebsiteIntegrationTest {
     }
 
     @Test
-    @Order(7)
+    @Order(8)
     void indexRedirectionWorks() {
-        // Access root - should now return index.html content
         given()
+            .header("Host", websiteHost())
         .when()
-            .get("/" + BUCKET)
+            .get("/")
         .then()
             .statusCode(200)
             .contentType("text/html")
@@ -111,7 +130,287 @@ class S3WebsiteIntegrationTest {
     }
 
     @Test
-    @Order(8)
+    @Order(12)
+    void indexServedForRootEvenWithQueryString() {
+        // A website endpoint has no S3 REST API, so a query string on the site root (e.g. an SPA
+        // OAuth callback GET /?code=...&state=...) must still serve the index document rather than
+        // fall through to a ListObjects response.
+        given()
+            .header("Host", websiteHost())
+            .queryParam("code", "abc")
+            .queryParam("state", "xyz")
+        .when()
+            .get("/")
+        .then()
+            .statusCode(200)
+            .contentType("text/html")
+            .body(equalTo("<html><body>Hello Website</body></html>"));
+    }
+
+    @Test
+    @Order(13)
+    void headWebsiteRootServesIndexMetadataWithoutBody() {
+        given()
+            .header("Host", websiteHost())
+            .queryParam("code", "abc")
+            .queryParam("state", "xyz")
+        .when()
+            .head("/")
+        .then()
+            .statusCode(200)
+            .contentType("text/html")
+            .header("Content-Length", equalTo("39"))
+            .header("ETag", not(isEmptyOrNullString()))
+            .header("Last-Modified", not(isEmptyOrNullString()))
+            .header("Accept-Ranges", equalTo("bytes"))
+            .body(emptyString());
+    }
+
+    @Test
+    @Order(9)
+    void missingKeyServesErrorDocument() {
+        given()
+            .header("Host", websiteHost())
+        .when()
+            .get("/missing-page")
+        .then()
+            .statusCode(404)
+            .contentType("text/html")
+            .header("x-amz-error-code", "NoSuchKey")
+            .header("x-amz-error-message", "The specified key does not exist.")
+            .body(equalTo("<html><body>Custom Error</body></html>"));
+    }
+
+    @Test
+    @Order(10)
+    void missingKeyReturnsXmlForRegularApiRequest() {
+        given()
+        .when()
+            .get("/" + BUCKET + "/missing-page")
+        .then()
+            .statusCode(404)
+            .body(containsString("NoSuchKey"));
+    }
+
+    @Test
+    @Order(11)
+    void missingErrorDocumentServesHtmlFallback() {
+        given().delete("/" + BUCKET + "/error.html");
+
+        given()
+            .header("Host", websiteHost())
+        .when()
+            .get("/missing-page")
+        .then()
+            .statusCode(404)
+            .contentType("text/html")
+            .header("x-amz-error-code", "NoSuchKey")
+            .header("x-amz-error-message", "The specified key does not exist.")
+            .body(containsString("404 Not Found"))
+            .body(containsString("NoSuchKey"));
+
+        given()
+            .contentType("text/html")
+            .body("<html><body>Custom Error</body></html>")
+        .when()
+            .put("/" + BUCKET + "/error.html")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(14)
+    void uploadSubdirectoryIndex() {
+        given()
+            .contentType("text/html")
+            .body("<html><body>Docs Home</body></html>")
+        .when()
+            .put("/" + BUCKET + "/docs/index.html")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(15)
+    void directoryRequestServesIndexDocumentWithQueryString() {
+        // GET /docs/ on the website endpoint serves docs/index.html (AWS index-document resolution),
+        // not the error document. Website endpoints expose only object GET/HEAD behavior, so a query
+        // name that is an S3 REST subresource must remain an ordinary website query string.
+        given()
+            .header("Host", websiteHost())
+            .queryParam("tagging", "")
+        .when()
+            .get("/docs/")
+        .then()
+            .statusCode(200)
+            .contentType("text/html")
+            .body(equalTo("<html><body>Docs Home</body></html>"));
+    }
+
+    @Test
+    @Order(16)
+    void directoryWithoutTrailingSlashRedirects() {
+        // GET /docs (a folder, not an object) 302-redirects to /docs/ so the page's relative asset
+        // URLs resolve against the correct base — matching real S3 website behavior.
+        given()
+            .header("Host", websiteHost())
+            .redirects().follow(false)
+        .when()
+            .get("/docs")
+        .then()
+            .statusCode(302)
+            .header("Location", equalTo("/docs/"));
+    }
+
+    /**
+     * Real S3 drops the query string from the folder redirect: a live us-east-1 website endpoint
+     * answers {@code GET /photos?code=abc&state=xyz} with a bare {@code Location: /photos/}.
+     * An SPA relying on the callback parameters surviving the redirect has to handle that on AWS,
+     * so the emulator matches rather than improving on it.
+     */
+    @Test
+    @Order(17)
+    void directoryRedirectDropsQueryStringLikeRealS3() {
+        given()
+            .header("Host", websiteHost())
+            .redirects().follow(false)
+        .when()
+            .get("/docs?code=abc&state=xyz")
+        .then()
+            .statusCode(302)
+            .header("Location", equalTo("/docs/"));
+    }
+
+    @Test
+    @Order(18)
+    void nestedDirectoryServesIndexDocument() {
+        given()
+            .contentType("text/html")
+            .body("<html><body>Nested</body></html>")
+        .when()
+            .put("/" + BUCKET + "/a/b/index.html")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Host", websiteHost())
+        .when()
+            .get("/a/b/")
+        .then()
+            .statusCode(200)
+            .body(equalTo("<html><body>Nested</body></html>"));
+    }
+
+    @Test
+    @Order(19)
+    void directoryWithoutIndexServesErrorDocument() {
+        // A trailing-slash request whose prefix has no index document falls back to the error document.
+        given()
+            .header("Host", websiteHost())
+        .when()
+            .get("/no-such-dir/")
+        .then()
+            .statusCode(404)
+            .contentType("text/html")
+            .header("x-amz-error-code", "NoSuchKey")
+            .body(equalTo("<html><body>Custom Error</body></html>"));
+    }
+
+    @Test
+    @Order(20)
+    void headWebsiteDirectoryServesIndexMetadataWithoutBody() {
+        given()
+            .header("Host", websiteHost())
+        .when()
+            .head("/docs/")
+        .then()
+            .statusCode(200)
+            .contentType("text/html")
+            .header("Content-Length", equalTo("35"))
+            .header("ETag", not(isEmptyOrNullString()))
+            .header("Last-Modified", not(isEmptyOrNullString()))
+            .header("Accept-Ranges", equalTo("bytes"))
+            .body(emptyString());
+    }
+
+    @Test
+    @Order(21)
+    void headWebsiteDirectoryWithoutTrailingSlashRedirectsWithoutBody() {
+        given()
+            .header("Host", websiteHost())
+            .redirects().follow(false)
+        .when()
+            .head("/docs?code=abc&state=xyz")
+        .then()
+            .statusCode(302)
+            .header("Location", equalTo("/docs/"))
+            .body(emptyString());
+    }
+
+    @Test
+    @Order(22)
+    void headWebsiteMissingKeyServesErrorMetadataWithoutBody() {
+        given()
+            .header("Host", websiteHost())
+        .when()
+            .head("/missing-page")
+        .then()
+            .statusCode(404)
+            .contentType("text/html")
+            .header("Content-Length", equalTo("38"))
+            .header("x-amz-error-code", equalTo("NoSuchKey"))
+            .header("x-amz-error-message", equalTo("The specified key does not exist."))
+            .body(emptyString());
+    }
+
+    @Test
+    @Order(23)
+    void websiteWithoutCustomErrorDocumentServesDefaultHtmlForGetAndHead() {
+        String xml = """
+                <WebsiteConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <IndexDocument>
+                        <Suffix>index.html</Suffix>
+                    </IndexDocument>
+                </WebsiteConfiguration>
+                """;
+        given()
+            .queryParam("website", "")
+            .contentType("application/xml")
+            .body(xml)
+        .when()
+            .put("/" + BUCKET)
+        .then()
+            .statusCode(200);
+
+        var getResponse = given()
+            .header("Host", websiteHost())
+        .when()
+            .get("/missing-page");
+
+        getResponse.then()
+            .statusCode(404)
+            .contentType("text/html")
+            .header("Content-Length", notNullValue())
+            .header("x-amz-error-code", equalTo("NoSuchKey"))
+            .header("x-amz-error-message", equalTo("The specified key does not exist."))
+            .body(containsString("404 Not Found"))
+            .body(containsString("NoSuchKey"));
+
+        given()
+            .header("Host", websiteHost())
+        .when()
+            .head("/missing-page")
+        .then()
+            .statusCode(404)
+            .contentType("text/html")
+            .header("Content-Length", equalTo(getResponse.header("Content-Length")))
+            .header("x-amz-error-code", equalTo("NoSuchKey"))
+            .header("x-amz-error-message", equalTo("The specified key does not exist."))
+            .body(emptyString());
+    }
+
+    @Test
+    @Order(24)
     void deleteWebsiteConfiguration() {
         given()
             .queryParam("website", "")
@@ -120,7 +419,6 @@ class S3WebsiteIntegrationTest {
         .then()
             .statusCode(204);
 
-        // Verify it's gone
         given()
             .queryParam("website", "")
         .when()
@@ -130,9 +428,12 @@ class S3WebsiteIntegrationTest {
     }
 
     @Test
-    @Order(9)
+    @Order(25)
     void cleanup() {
         given().delete("/" + BUCKET + "/index.html");
+        given().delete("/" + BUCKET + "/error.html");
+        given().delete("/" + BUCKET + "/docs/index.html");
+        given().delete("/" + BUCKET + "/a/b/index.html");
         given().delete("/" + BUCKET);
     }
 }

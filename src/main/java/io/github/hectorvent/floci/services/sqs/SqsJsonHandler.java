@@ -195,7 +195,8 @@ public class SqsJsonHandler {
     private Response handleSendMessage(JsonNode request, String region) {
         String queueUrl = request.path("QueueUrl").asText(null);
         String messageBody = request.path("MessageBody").asText(null);
-        int delaySeconds = request.path("DelaySeconds").asInt(0);
+        JsonNode delayNode = request.path("DelaySeconds");
+        Integer delaySeconds = parseOptionalInteger(delayNode, "DelaySeconds");
         String messageGroupId = request.path("MessageGroupId").asText(null);
         String messageDeduplicationId = request.path("MessageDeduplicationId").asText(null);
 
@@ -238,11 +239,23 @@ public class SqsJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Integer getOptionalIntField(JsonNode request, String field) {
+        JsonNode node = request.path(field);
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isIntegralNumber() || !node.canConvertToInt()) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value " + node.asText() + " for parameter " + field + " is invalid. Reason: Must be an integer.", 400);
+        }
+        return node.asInt();
+    }
+
     private Response handleReceiveMessage(JsonNode request, String region) {
         String queueUrl = request.path("QueueUrl").asText(null);
         int maxMessages = request.path("MaxNumberOfMessages").asInt(1);
         int visibilityTimeout = request.path("VisibilityTimeout").asInt(-1);
-        int waitTimeSeconds = request.path("WaitTimeSeconds").asInt(0);
+        Integer waitTimeSeconds = getOptionalIntField(request, "WaitTimeSeconds");
 
         java.util.Set<String> requestedAttrs = new java.util.LinkedHashSet<>();
         requestedAttrs.addAll(jsonNodeToList(request.path("AttributeNames")));
@@ -347,7 +360,7 @@ public class SqsJsonHandler {
         ArrayNode successful = objectMapper.createArrayNode();
         ArrayNode failed = objectMapper.createArrayNode();
 
-        record ParsedEntry(String id, String body, int delay, String groupId, String dedupId,
+        record ParsedEntry(String id, String body, Integer delay, String groupId, String dedupId,
                            Map<String, MessageAttributeValue> attributes, String awsTraceHeader) {}
 
         List<ParsedEntry> parsedEntries = new ArrayList<>();
@@ -356,7 +369,8 @@ public class SqsJsonHandler {
             for (JsonNode entry : entries) {
                 String id = entry.path("Id").asText();
                 String messageBody = entry.path("MessageBody").asText(null);
-                int delaySeconds = entry.path("DelaySeconds").asInt(0);
+                JsonNode entryDelayNode = entry.path("DelaySeconds");
+                Integer delaySeconds = parseOptionalInteger(entryDelayNode, "DelaySeconds");
                 String messageGroupId = entry.path("MessageGroupId").asText(null);
                 String messageDeduplicationId = entry.path("MessageDeduplicationId").asText(null);
 
@@ -582,5 +596,16 @@ public class SqsJsonHandler {
             });
         }
         return map;
+    }
+
+    private Integer parseOptionalInteger(JsonNode node, String paramName) {
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isIntegralNumber()) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value for parameter " + paramName + " is invalid. Reason: Must be an integer.", 400);
+        }
+        return node.asInt();
     }
 }

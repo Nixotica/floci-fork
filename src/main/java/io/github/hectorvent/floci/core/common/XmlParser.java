@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
+import org.jboss.logging.Logger;
+
 import javax.xml.stream.XMLInputFactory;
 import javax.xml.stream.XMLStreamConstants;
 import javax.xml.stream.XMLStreamException;
@@ -23,6 +25,7 @@ import java.util.Map;
  */
 public final class XmlParser {
 
+    private static final Logger LOG = Logger.getLogger(XmlParser.class);
     private static final XMLInputFactory FACTORY;
 
     static {
@@ -70,6 +73,34 @@ public final class XmlParser {
     }
 
     /**
+     * Returns the local name of the document's root element, parsing the whole body —
+     * so trailing garbage or any well-formedness error yields {@code null}.
+     *
+     * <pre>{@code
+     * boolean valid = "AccelerateConfiguration".equals(XmlParser.rootElementName(body));
+     * }</pre>
+     */
+    public static String rootElementName(String xml) {
+        if (xml == null || xml.isEmpty()) {
+            return null;
+        }
+        String root = null;
+        try {
+            XMLStreamReader r = FACTORY.createXMLStreamReader(new StringReader(xml));
+            while (r.hasNext()) {
+                if (r.next() == XMLStreamConstants.START_ELEMENT && root == null) {
+                    root = r.getLocalName();
+                }
+            }
+            r.close();
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
+            return null;
+        }
+        return root;
+    }
+
+    /**
      * Extracts the text content of every element whose local name matches {@code elementName}.
      *
      * <pre>{@code
@@ -91,7 +122,9 @@ public final class XmlParser {
                 }
             }
             r.close();
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
+        }
         return result;
     }
 
@@ -160,7 +193,9 @@ public final class XmlParser {
                 }
             }
             r.close();
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
+        }
         return result;
     }
 
@@ -206,7 +241,9 @@ public final class XmlParser {
                 }
             }
             r.close();
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
+        }
         return result;
     }
 
@@ -256,8 +293,116 @@ public final class XmlParser {
                 }
             }
             r.close();
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
+        }
         return result;
+    }
+
+    /**
+     * Returns the local names of the direct child elements of the first
+     * {@code parentElement}, in document order, or an empty list when the
+     * parent is absent. Unlike {@link #extractGroups(String, String)}, children
+     * are reported whether they are leaves or containers.
+     *
+     * <pre>{@code
+     * List<String> children = XmlParser.childElementNames(body, "InputSerialization");
+     * // <InputSerialization><CSV>...</CSV></InputSerialization> → [CSV]
+     * }</pre>
+     */
+    public static List<String> childElementNames(String xml, String parentElement) {
+        List<String> result = new ArrayList<>();
+        if (xml == null || xml.isEmpty()) {
+            return result;
+        }
+        try {
+            XMLStreamReader r = FACTORY.createXMLStreamReader(new StringReader(xml));
+            boolean inParent = false;
+            int depth = 0;
+            while (r.hasNext()) {
+                int event = r.next();
+                if (event == XMLStreamConstants.START_ELEMENT) {
+                    if (!inParent) {
+                        if (parentElement.equals(r.getLocalName())) {
+                            inParent = true;
+                            depth = 1;
+                        }
+                    } else {
+                        if (depth == 1) {
+                            result.add(r.getLocalName());
+                        }
+                        depth++;
+                    }
+                } else if (event == XMLStreamConstants.END_ELEMENT && inParent) {
+                    depth--;
+                    if (depth == 0) {
+                        break;
+                    }
+                }
+            }
+            r.close();
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * Parses the first element with the requested local name into a small immutable element tree.
+     *
+     * <p>This supports structured AWS XML payloads where the same leaf name appears in multiple
+     * nested blocks and the flat extraction helpers would lose that context. Namespace prefixes are
+     * ignored, external entities and DTDs remain disabled by the shared factory, and malformed input
+     * returns {@code null} after a diagnostic log entry.
+     */
+    public static XmlElement extractElementTree(String xml, String elementName) {
+        if (xml == null || xml.isEmpty()) {
+            return null;
+        }
+        try {
+            XMLStreamReader r = FACTORY.createXMLStreamReader(new StringReader(xml));
+            while (r.hasNext()) {
+                int event = r.next();
+                if (event == XMLStreamConstants.START_ELEMENT
+                        && elementName.equals(r.getLocalName())) {
+                    XmlElement result = readElementTree(r);
+                    r.close();
+                    return result;
+                }
+            }
+            r.close();
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during structured parse: {0}", e.getMessage());
+        }
+        return null;
+    }
+
+    private static XmlElement readElementTree(XMLStreamReader r) throws XMLStreamException {
+        String name = r.getLocalName();
+        StringBuilder text = new StringBuilder();
+        List<XmlElement> children = new ArrayList<>();
+        while (r.hasNext()) {
+            int event = r.next();
+            if (event == XMLStreamConstants.START_ELEMENT) {
+                children.add(readElementTree(r));
+            } else if (event == XMLStreamConstants.CHARACTERS
+                    || event == XMLStreamConstants.CDATA) {
+                text.append(r.getText());
+            } else if (event == XMLStreamConstants.END_ELEMENT) {
+                return new XmlElement(name, text.toString().trim(), List.copyOf(children));
+            }
+        }
+        throw new XMLStreamException("Unexpected end of XML while reading " + name);
+    }
+
+    /** A namespace-agnostic XML element used by {@link #extractElementTree(String, String)}. */
+    public record XmlElement(String name, String text, List<XmlElement> children) {
+        public XmlElement child(String childName) {
+            return children.stream()
+                    .filter(child -> childName.equals(child.name()))
+                    .findFirst()
+                    .orElse(null);
+        }
     }
 
     /**
@@ -312,7 +457,9 @@ public final class XmlParser {
                 }
             }
             r.close();
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
+        }
         return result;
     }
 }

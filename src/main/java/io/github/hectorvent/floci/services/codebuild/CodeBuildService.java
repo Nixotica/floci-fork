@@ -1,8 +1,11 @@
 package io.github.hectorvent.floci.services.codebuild;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.storage.StorageBackedMap;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.codebuild.model.Build;
 import io.github.hectorvent.floci.services.codebuild.model.BuildPhase;
 import io.github.hectorvent.floci.services.codebuild.model.Project;
@@ -11,6 +14,7 @@ import io.github.hectorvent.floci.services.codebuild.model.ProjectEnvironment;
 import io.github.hectorvent.floci.services.codebuild.model.ProjectSource;
 import io.github.hectorvent.floci.services.codebuild.model.ReportGroup;
 import io.github.hectorvent.floci.services.codebuild.model.SourceCredential;
+import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -28,23 +32,70 @@ import java.util.stream.Collectors;
 public class CodeBuildService {
 
     // key: region -> name -> project
-    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Project>> projects = new ConcurrentHashMap<>();
+    private Map<String, Map<String, Project>> projects = new ConcurrentHashMap<>();
     // key: region -> arn -> report group
-    private final ConcurrentHashMap<String, ConcurrentHashMap<String, ReportGroup>> reportGroups = new ConcurrentHashMap<>();
+    private Map<String, Map<String, ReportGroup>> reportGroups = new ConcurrentHashMap<>();
     // key: region -> arn -> source credential (token is stored but never returned)
-    private final ConcurrentHashMap<String, ConcurrentHashMap<String, SourceCredential>> sourceCredentials = new ConcurrentHashMap<>();
-    // key: region -> buildId -> build
+    private Map<String, Map<String, SourceCredential>> sourceCredentials = new ConcurrentHashMap<>();
+    // key: account:region -> buildId -> build (transient: builds are runtime state)
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Build>> builds = new ConcurrentHashMap<>();
-    // key: region:projectName -> build counter
+    // key: account:region -> buildId -> request buildspec override (transient: builds are runtime state)
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, String>> buildspecOverrides = new ConcurrentHashMap<>();
+    // key: account:region:projectName -> last allocated build number (durable across restarts)
+    private Map<String, Long> persistedBuildCounters = new ConcurrentHashMap<>();
+    // key: account:region:projectName -> build counter (runtime synchronization wrapper)
     private final ConcurrentHashMap<String, AtomicLong> buildCounters = new ConcurrentHashMap<>();
 
     private final CodeBuildRunner runner;
     private final EmulatorConfig config;
+    private final StorageFactory storageFactory;
 
     @Inject
-    public CodeBuildService(CodeBuildRunner runner, EmulatorConfig config) {
+    public CodeBuildService(CodeBuildRunner runner, EmulatorConfig config, StorageFactory storageFactory) {
         this.runner = runner;
         this.config = config;
+        this.storageFactory = storageFactory;
+    }
+
+    @PostConstruct
+    void initializeStorage() {
+        if (storageFactory == null) {
+            return; // keeps non-CDI unit tests working
+        }
+        this.projects = storageBacked("codebuild-projects.json",
+                new TypeReference<Map<String, Map<String, Project>>>() {});
+        this.reportGroups = storageBacked("codebuild-report-groups.json",
+                new TypeReference<Map<String, Map<String, ReportGroup>>>() {});
+        this.sourceCredentials = storageBacked("codebuild-source-credentials.json",
+                new TypeReference<Map<String, Map<String, SourceCredential>>>() {});
+        this.persistedBuildCounters = storageBacked("codebuild-build-counters.json",
+                new TypeReference<Map<String, Long>>() {});
+        normalizeRegionMaps(projects);
+        normalizeRegionMaps(reportGroups);
+        normalizeRegionMaps(sourceCredentials);
+    }
+
+    private <V> Map<String, V> storageBacked(String fileName, TypeReference<Map<String, V>> typeReference) {
+        return new StorageBackedMap<>(storageFactory.create("codebuild", fileName, typeReference));
+    }
+
+    /** After load, re-wrap the persisted inner maps as {@link ConcurrentHashMap} so per-region
+     *  mutation stays thread-safe (Jackson deserializes them as plain LinkedHashMaps). */
+    private <V> void normalizeRegionMaps(Map<String, Map<String, V>> resources) {
+        for (Map.Entry<String, Map<String, V>> entry : new ArrayList<>(resources.entrySet())) {
+            if (!(entry.getValue() instanceof ConcurrentHashMap)) {
+                resources.put(entry.getKey(), new ConcurrentHashMap<>(entry.getValue()));
+            }
+        }
+    }
+
+    /** {@link StorageBackedMap} only flushes on a top-level put, so an in-place mutation of a
+     *  region's inner map must be written back by re-putting the region entry. */
+    private <V> void persistRegion(Map<String, Map<String, V>> resources, String region) {
+        Map<String, V> regionResources = resources.get(region);
+        if (regionResources != null) {
+            resources.put(region, regionResources);
+        }
     }
 
     private Map<String, Project> projectsFor(String region) {
@@ -59,8 +110,12 @@ public class CodeBuildService {
         return sourceCredentials.computeIfAbsent(region, r -> new ConcurrentHashMap<>());
     }
 
-    private Map<String, Build> buildsFor(String region) {
-        return builds.computeIfAbsent(region, r -> new ConcurrentHashMap<>());
+    private Map<String, Build> buildsFor(String account, String region) {
+        return builds.computeIfAbsent(account + ":" + region, ignored -> new ConcurrentHashMap<>());
+    }
+
+    private Map<String, String> buildspecOverridesFor(String account, String region) {
+        return buildspecOverrides.computeIfAbsent(account + ":" + region, ignored -> new ConcurrentHashMap<>());
     }
 
     // ---- Projects ----
@@ -121,6 +176,7 @@ public class CodeBuildService {
         project.setProjectVisibility("PRIVATE");
 
         store.put(name, project);
+        persistRegion(projects, region);
         return project;
     }
 
@@ -160,6 +216,7 @@ public class CodeBuildService {
         if (concurrentBuildLimit != null) { project.setConcurrentBuildLimit(concurrentBuildLimit); }
         project.setLastModified(Instant.now().toEpochMilli() / 1000.0);
 
+        persistRegion(projects, region);
         return project;
     }
 
@@ -168,12 +225,22 @@ public class CodeBuildService {
         if (store.remove(name) == null) {
             throw new AwsException("ResourceNotFoundException", "Project not found: " + name, 400);
         }
+        persistRegion(projects, region);
     }
 
     public List<Project> batchGetProjects(String region, List<String> names) {
         Map<String, Project> store = projectsFor(region);
         return names.stream()
-                .map(store::get)
+                .map(identifier -> {
+                    Project project = store.get(identifier);
+                    if (project != null) {
+                        return project;
+                    }
+                    return store.values().stream()
+                            .filter(candidate -> identifier.equals(candidate.getArn()))
+                            .findFirst()
+                            .orElse(null);
+                })
                 .filter(p -> p != null)
                 .collect(Collectors.toList());
     }
@@ -213,6 +280,7 @@ public class CodeBuildService {
         rg.setStatus("ACTIVE");
 
         store.put(arn, rg);
+        persistRegion(reportGroups, region);
         return rg;
     }
 
@@ -227,6 +295,7 @@ public class CodeBuildService {
         if (exportConfig != null) { rg.setExportConfig(exportConfig); }
         if (tags != null) { rg.setTags(tags); }
         rg.setLastModified(Instant.now().toEpochMilli() / 1000.0);
+        persistRegion(reportGroups, region);
         return rg;
     }
 
@@ -235,6 +304,7 @@ public class CodeBuildService {
         if (store.remove(arn) == null) {
             throw new AwsException("ResourceNotFoundException", "Report group not found: " + arn, 400);
         }
+        persistRegion(reportGroups, region);
     }
 
     public List<ReportGroup> batchGetReportGroups(String region, List<String> arns) {
@@ -277,6 +347,7 @@ public class CodeBuildService {
         cred.setAuthType(authType);
         // Token is accepted but not stored in plaintext in a returned field
         store.put(arn, cred);
+        persistRegion(sourceCredentials, region);
         return cred;
     }
 
@@ -290,6 +361,7 @@ public class CodeBuildService {
             throw new AwsException("ResourceNotFoundException",
                     "Source credentials not found: " + arn, 400);
         }
+        persistRegion(sourceCredentials, region);
     }
 
     // ---- Curated Environment Images ----
@@ -355,10 +427,14 @@ public class CodeBuildService {
             throw new AwsException("ResourceNotFoundException", "Project not found: " + projectName, 400);
         }
 
-        String counterKey = region + ":" + projectName;
-        long buildNumber = buildCounters
-                .computeIfAbsent(counterKey, k -> new AtomicLong(0))
-                .incrementAndGet();
+        String counterKey = account + ":" + region + ":" + projectName;
+        AtomicLong counter = buildCounters.computeIfAbsent(counterKey,
+                key -> new AtomicLong(persistedBuildCounters.getOrDefault(key, 0L)));
+        long buildNumber;
+        synchronized (counter) {
+            buildNumber = counter.incrementAndGet();
+            persistedBuildCounters.put(counterKey, buildNumber);
+        }
 
         String buildId = projectName + ":" + buildNumber;
         String arn = AwsArnUtils.Arn.of("codebuild", region, account, "build/" + buildId).toString();
@@ -394,31 +470,35 @@ public class CodeBuildService {
 
         build.setPhases(new CopyOnWriteArrayList<>());
 
-        buildsFor(region).put(buildId, build);
+        buildsFor(account, region).put(buildId, build);
+        if (buildspecOverride != null && !buildspecOverride.isBlank()) {
+            buildspecOverridesFor(account, region).put(buildId, buildspecOverride);
+        }
+        Build responseBuild = copyBuild(build);
 
         runner.startBuild(region, build, project, buildspecOverride);
 
-        return build;
+        return responseBuild;
     }
 
-    public Build getBuild(String region, String buildId) {
-        Build build = buildsFor(region).get(buildId);
+    public Build getBuild(String region, String account, String buildId) {
+        Build build = buildsFor(account, region).get(buildId);
         if (build == null) {
             throw new AwsException("ResourceNotFoundException", "Build not found: " + buildId, 400);
         }
         return build;
     }
 
-    public List<Build> batchGetBuilds(String region, List<String> buildIds) {
-        Map<String, Build> store = buildsFor(region);
+    public List<Build> batchGetBuilds(String region, String account, List<String> buildIds) {
+        Map<String, Build> store = buildsFor(account, region);
         return buildIds.stream()
                 .map(store::get)
                 .filter(b -> b != null)
                 .collect(Collectors.toList());
     }
 
-    public List<String> listBuilds(String region) {
-        return buildsFor(region).values().stream()
+    public List<String> listBuilds(String region, String account) {
+        return buildsFor(account, region).values().stream()
                 .sorted((a, b) -> Double.compare(
                         b.getStartTime() != null ? b.getStartTime() : 0,
                         a.getStartTime() != null ? a.getStartTime() : 0))
@@ -426,8 +506,8 @@ public class CodeBuildService {
                 .collect(Collectors.toList());
     }
 
-    public List<String> listBuildsForProject(String region, String projectName) {
-        return buildsFor(region).values().stream()
+    public List<String> listBuildsForProject(String region, String account, String projectName) {
+        return buildsFor(account, region).values().stream()
                 .filter(b -> projectName.equals(b.getProjectName()))
                 .sorted((a, b) -> Double.compare(
                         b.getStartTime() != null ? b.getStartTime() : 0,
@@ -436,18 +516,42 @@ public class CodeBuildService {
                 .collect(Collectors.toList());
     }
 
-    public void stopBuild(String region, String buildId) {
-        Build build = buildsFor(region).get(buildId);
+    public void stopBuild(String region, String account, String buildId) {
+        Build build = buildsFor(account, region).get(buildId);
         if (build == null) {
             throw new AwsException("ResourceNotFoundException", "Build not found: " + buildId, 400);
         }
-        runner.stopBuild(buildId);
+        runner.stopBuild(build.getArn());
     }
 
     public Build retryBuild(String region, String account, String buildId) {
-        Build original = getBuild(region, buildId);
+        Build original = getBuild(region, account, buildId);
+        String buildspecOverride = buildspecOverridesFor(account, region).get(original.getId());
         return startBuild(region, account, original.getProjectName(),
-                null, original.getEnvironment(), original.getArtifacts(),
+                buildspecOverride, original.getEnvironment(), original.getArtifacts(),
                 null, original.getTimeoutInMinutes(), null, null);
+    }
+
+    private Build copyBuild(Build source) {
+        Build copy = new Build();
+        copy.setId(source.getId());
+        copy.setArn(source.getArn());
+        copy.setBuildNumber(source.getBuildNumber());
+        copy.setBuildStatus(source.getBuildStatus());
+        copy.setBuildComplete(source.getBuildComplete());
+        copy.setCurrentPhase(source.getCurrentPhase());
+        copy.setProjectName(source.getProjectName());
+        copy.setInitiator(source.getInitiator());
+        copy.setStartTime(source.getStartTime());
+        copy.setEndTime(source.getEndTime());
+        copy.setSource(source.getSource());
+        copy.setArtifacts(source.getArtifacts());
+        copy.setEnvironment(source.getEnvironment());
+        copy.setLogs(source.getLogs());
+        copy.setPhases(source.getPhases() != null ? new ArrayList<>(source.getPhases()) : null);
+        copy.setTimeoutInMinutes(source.getTimeoutInMinutes());
+        copy.setQueuedTimeoutInMinutes(source.getQueuedTimeoutInMinutes());
+        copy.setEncryptionKey(source.getEncryptionKey());
+        return copy;
     }
 }

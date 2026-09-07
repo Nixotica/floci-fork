@@ -10,7 +10,7 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 - `arn:aws:autoscaling:<region>:<account>:launchConfiguration:<uuid>:launchConfigurationName/<name>`
 - `arn:aws:autoscaling:<region>:<account>:scalingPolicy:<uuid>:autoScalingGroupName/<group>/policyName/<name>`
 
-## Supported Operations (33 total)
+## Supported Operations (45 total)
 
 ### Launch Configurations
 
@@ -24,9 +24,9 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 
 | Operation | Notes |
 |---|---|
-| `CreateAutoScalingGroup` | Creates a group with min/max/desired capacity, AZs, tags; starts capacity reconciliation loop |
-| `DescribeAutoScalingGroups` | Filtered by name list; returns all if no filter; includes current instance list with lifecycle state |
-| `UpdateAutoScalingGroup` | Updates capacity bounds, cooldown, launch configuration, AZs |
+| `CreateAutoScalingGroup` | Creates a group with min/max/desired capacity, AZs, tags, launch configuration, launch template, or mixed instances policy; starts capacity reconciliation loop |
+| `DescribeAutoScalingGroups` | Filtered by name list; returns all if no filter; includes current instance list with lifecycle state and mixed instances policy shape when configured |
+| `UpdateAutoScalingGroup` | Updates capacity bounds, cooldown, launch source, AZs |
 | `DeleteAutoScalingGroup` | `ForceDelete=true` terminates all instances before deletion |
 
 ### Instance Management
@@ -38,6 +38,8 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService` |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
 | `TerminateInstanceInAutoScalingGroup` | Terminates a specific instance; optionally decrements desired capacity |
+| `SuspendProcesses` | Records suspended scaling processes (empty list suspends all); reported back by `DescribeAutoScalingGroups` |
+| `ResumeProcesses` | Clears suspended processes (empty list resumes all) |
 
 ### Load Balancer Attachment
 
@@ -49,6 +51,14 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `AttachLoadBalancers` | Classic ELB attachment (stored; no ELB v1 routing) |
 | `DetachLoadBalancers` | Classic ELB detachment |
 | `DescribeLoadBalancers` | Lists classic ELBs attached to a group |
+
+### Traffic Sources
+
+| Operation | Notes |
+|---|---|
+| `AttachTrafficSources` | Unified elb/elbv2/vpc-lattice attachment API; stored per identifier with its type |
+| `DetachTrafficSources` | Removes a traffic source by identifier |
+| `DescribeTrafficSources` | Lists attached sources, optionally filtered by type; every source reports `InService` |
 
 ### Lifecycle Hooks
 
@@ -64,9 +74,25 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 
 | Operation | Notes |
 |---|---|
-| `PutScalingPolicy` | Creates or updates a policy: `SimpleScaling`, `AdjustmentType`, `ScalingAdjustment`, `Cooldown` |
-| `DescribePolicies` | Lists policies filtered by group or policy name |
+| `PutScalingPolicy` | Creates or updates a policy: `SimpleScaling` fields or `TargetTrackingScaling` with predefined metric, target value, and estimated warmup |
+| `DescribePolicies` | Lists policies filtered by group or policy name, including stored target tracking configuration |
 | `DeletePolicy` | Removes a scaling policy |
+
+### Scheduled Actions
+
+| Operation | Notes |
+|---|---|
+| `PutScheduledUpdateGroupAction` | Creates or updates a schedule: recurrence, time zone, start/end time, capacity bounds |
+| `DescribeScheduledActions` | Lists scheduled actions filtered by group or action name |
+| `DeleteScheduledAction` | Removes a scheduled action |
+
+### Warm Pools
+
+| Operation | Notes |
+|---|---|
+| `PutWarmPool` | Full replace per the wire model: omitted fields reset to defaults; `MaxGroupPreparedCapacity=-1` clears the value |
+| `DescribeWarmPool` | Returns the stored configuration; also embedded in `DescribeAutoScalingGroups` per the AutoScalingGroup shape |
+| `DeleteWarmPool` | Removes the configuration; idempotent when none exists |
 
 ### Activities
 
@@ -92,6 +118,22 @@ Floci runs a background reconciler (10 s fixed rate) that keeps each group's InS
 - **Scale-out**: calls `RunInstances` with the group's launch configuration; new instances are tracked as `Pending` until the EC2 state transitions to `running`, at which point they move to `InService` and are registered with all attached ELB v2 target groups.
 - **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
 - Activity records are written on each scale-out and scale-in event.
+
+## Launch Source Compatibility
+
+Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
+
+- `LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId`
+- `LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName`
+- `LaunchTemplate.LaunchTemplateSpecification.Version`
+- `LaunchTemplate.Overrides.member.N.InstanceType`
+- `InstancesDistribution.OnDemandBaseCapacity`
+- `InstancesDistribution.OnDemandPercentageAboveBaseCapacity`
+- `InstancesDistribution.SpotAllocationStrategy`
+
+## Scaling Policy Compatibility
+
+Target tracking policies preserve `TargetTrackingConfiguration` for predefined metrics. `DescribePolicies` returns `PredefinedMetricSpecification.PredefinedMetricType`, `TargetValue`, and `EstimatedInstanceWarmup` when present.
 
 ## Configuration
 

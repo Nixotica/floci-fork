@@ -30,6 +30,12 @@ ECS emulates clusters, task definitions, tasks, and services. In the default con
 | `DeregisterTaskDefinition` | Mark a revision INACTIVE |
 | `DeleteTaskDefinitions` | Delete one or more task definitions |
 
+`runtimePlatform` and a container's `logConfiguration` are stored and returned exactly as
+registered, so a client that reads back what it wrote (Terraform, or a deploy tool verifying its
+own `RegisterTaskDefinition`) sees no drift. Neither changes how a local task runs: Floci launches
+every task on the host's own architecture, and a task's output stays with its Docker container
+rather than being routed to the configured log driver.
+
 ### Tasks
 
 | Operation | Description |
@@ -49,9 +55,80 @@ ECS emulates clusters, task definitions, tasks, and services. In the default con
 | `CreateService` | Create a long-running service |
 | `UpdateService` | Update desired count, task definition, or deployment config |
 | `DeleteService` | Delete a service (supports `force`) |
-| `DescribeServices` | Describe one or more services |
+| `DescribeServices` | Describe one or more services (includes `deployments`, see below) |
 | `ListServices` | List service ARNs in a cluster |
 | `ListServicesByNamespace` | List services filtered by Cloud Map namespace |
+
+#### Service deployments
+
+An `ACTIVE` service reports exactly one `PRIMARY` entry in `services[].deployments`,
+synthesized from the service's current state rather than tracked as a rollout. This is
+what AWS's `ServicesStable` waiter accepts on, so `aws ecs wait services-stable`, the
+SDK waiters, and Terraform's `aws_ecs_service` all converge normally. A deleted
+(`INACTIVE`) service reports an empty list.
+
+`rolloutState` is `COMPLETED` once `runningCount` reaches `desiredCount`, and
+`IN_PROGRESS` before that. The deployment `id` is derived from the service ARN and its
+task definition, so it is stable across calls and across restarts, and rolls over when
+the task definition changes. `createdAt` tracks the deployment rather than the service:
+it is the service's creation time until a task-definition change starts a new
+deployment, and moves with it thereafter.
+
+Known differences from AWS:
+
+- There is never a second `ACTIVE` deployment draining alongside the `PRIMARY` one.
+  The running tasks *are* rolled onto a changed task definition (replacements on the new
+  revision start first, then the stale tasks are drained, one reconciler tick apart), but
+  the deployments list reports only the single `PRIMARY` throughout.
+- `deployments` is reported for every service. AWS omits it for services that use the
+  `CODE_DEPLOY` or `EXTERNAL` deployment controller; Floci records and echoes
+  `deploymentController` (along with `schedulingStrategy` and
+  `availabilityZoneRebalancing`; AWS defaults `ECS` / `REPLICA` / `ENABLED` on create) but
+  still synthesises the `deployments` list regardless of the controller type.
+- `DAEMON` scheduling runs exactly one task per `ACTIVE` container instance and derives
+  `desiredCount` from that count; it is rejected for the Fargate launch type and for the
+  `CODE_DEPLOY` / `EXTERNAL` controllers, as on AWS. Placement constraints are not evaluated.
+- `pendingCount` is always `0`, matching the top-level service field.
+- `forceNewDeployment` (with an unchanged task definition) mints a new deployment `id`
+  and rolls the running tasks: a replacement on the new deployment starts first, then
+  the task from the previous deployment is drained one reconciler tick later. The
+  `deployments` list still reports a single `PRIMARY` throughout.
+- `updatedAt` equals `createdAt`. AWS advances it as a rollout progresses; Floci has no
+  intermediate rollout state to report.
+
+#### ECS EventBridge events
+
+Floci publishes AWS-shaped lifecycle events to the **default** EventBridge bus
+(`source: aws.ecs`). Rules matching `aws.ecs` fire from ECS activity, in both docker
+and mock mode.
+
+| `detail-type` | When | Key `detail` fields |
+|---|---|---|
+| `ECS Task State Change` | a task starts or stops | `lastStatus`, `desiredStatus`, `taskDefinitionArn`, `group`, `startedBy`, `stoppedReason`, `containers[].exitCode` |
+| `ECS Deployment State Change` | a service deployment starts, is in progress, or reaches steady state | `eventType` (always `INFO`), `eventName`, `deploymentId` |
+
+`eventName` is one of `SERVICE_DEPLOYMENT_STARTED`, `SERVICE_DEPLOYMENT_IN_PROGRESS`,
+`SERVICE_DEPLOYMENT_COMPLETED`.
+
+Known differences from AWS:
+
+- The task phase ladder is **synthesized**. Floci's task model only occupies
+  `PENDING`, `RUNNING` and `STOPPED`, but a start emits
+  `PROVISIONING -> PENDING -> ACTIVATING -> RUNNING` and a stop emits
+  `DEACTIVATING -> STOPPING -> DEPROVISIONING -> STOPPED`, one `ECS Task State Change`
+  per phase, so rules that filter on `detail.lastStatus` behave as on AWS.
+- `SERVICE_DEPLOYMENT_FAILED` and the deployment circuit breaker are not emitted.
+- `SubmitTaskStateChange` / `SubmitContainerStateChange` remain ACK-only; Floci drives
+  the task lifecycle itself rather than via agent submissions.
+
+#### Unknown services
+
+A service reference that does not resolve is returned in `failures` with
+`reason: MISSING` and the ARN the service would have had, rather than being dropped from
+the response. `DescribeServices` therefore returns partial results instead of erroring, as
+AWS does, and `aws ecs wait services-stable` on a nonexistent service fails immediately
+instead of polling for its full timeout. A reference supplied as an ARN is echoed back
+unchanged.
 
 ### Task Sets
 
@@ -129,6 +206,21 @@ ECS emulates clusters, task definitions, tasks, and services. In the default con
 | `FLOCI_SERVICES_ECS_DOCKER_NETWORK` | *(unset)* | Docker network for task containers |
 | `FLOCI_SERVICES_ECS_DEFAULT_MEMORY_MB` | `512` | Default memory (MB) when the task definition omits it |
 | `FLOCI_SERVICES_ECS_DEFAULT_CPU_UNITS` | `256` | Default CPU units when the task definition omits it |
+
+### EFS volume ownership
+
+A task's `efsVolumeConfiguration` volumes are backed by shared local Docker volumes (Floci cannot mount a real EFS file system). A Docker named volume is created `root:root 0755`, so a task whose image runs as a non-root `USER` cannot write it. To emulate an [EFS access point](https://docs.aws.amazon.com/efs/latest/ug/efs-access-points.html)'s `RootDirectory.CreationInfo` and `PosixUser`, configure `floci.storage.efs.*` (all opt-in; the default is a plain named volume, so existing behaviour is unchanged):
+
+| Key (`floci.storage.efs.`) | Env | AWS equivalent | Description |
+|---|---|---|---|
+| `owner-uid` | `FLOCI_STORAGE_EFS_OWNER_UID` | `CreationInfo.OwnerUid` | Owner uid of the volume root (set together with `owner-gid`) |
+| `owner-gid` | `FLOCI_STORAGE_EFS_OWNER_GID` | `CreationInfo.OwnerGid` | Owner gid of the volume root (set together with `owner-uid`) |
+| `root-permissions` | `FLOCI_STORAGE_EFS_ROOT_PERMISSIONS` | `CreationInfo.Permissions` | 3-4 octal digits, e.g. `0777`, or `2775` for the setgid bit |
+| `mount-user` | `FLOCI_STORAGE_EFS_MOUNT_USER` | `PosixUser {Uid,Gid}` | Run mounting containers as `uid[:gid]` |
+| `mount-group-add` | `FLOCI_STORAGE_EFS_MOUNT_GROUP_ADD` | `PosixUser` supplementary | Supplementary gid added to mounting containers |
+| `init-image` | `FLOCI_STORAGE_EFS_INIT_IMAGE` | — | Image for the one-off `chown`/`chmod` of the volume root (default `busybox:stable`) |
+
+`owner-uid` and `owner-gid` must be set together (a partial `CreationInfo` is not valid on AWS). The volume root is initialised once per volume; express the setgid bit through a 4-digit `root-permissions` (e.g. `2775`) so subdirectories inherit the owner gid.
 
 ### Mock mode
 

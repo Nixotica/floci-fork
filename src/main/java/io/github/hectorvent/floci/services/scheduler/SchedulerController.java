@@ -2,12 +2,17 @@ package io.github.hectorvent.floci.services.scheduler;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.scheduler.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.scheduler.model.DeadLetterConfig;
+import io.github.hectorvent.floci.services.scheduler.model.EcsParameters;
+import io.github.hectorvent.floci.services.scheduler.model.EventBridgeParameters;
 import io.github.hectorvent.floci.services.scheduler.model.FlexibleTimeWindow;
+import io.github.hectorvent.floci.services.scheduler.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.scheduler.model.RetryPolicy;
 import io.github.hectorvent.floci.services.scheduler.model.Schedule;
 import io.github.hectorvent.floci.services.scheduler.model.ScheduleGroup;
 import io.github.hectorvent.floci.services.scheduler.model.ScheduleRequest;
+import io.github.hectorvent.floci.services.scheduler.model.SqsParameters;
 import io.github.hectorvent.floci.services.scheduler.model.Target;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -260,6 +265,31 @@ public class SchedulerController {
                 dlc.put("Arn", s.getTarget().getDeadLetterConfig().getArn());
                 t.put("DeadLetterConfig", dlc);
             }
+            if (s.getTarget().getSqsParameters() != null
+                    && s.getTarget().getSqsParameters().getMessageGroupId() != null) {
+                Map<String, Object> sp = new HashMap<>();
+                sp.put("MessageGroupId", s.getTarget().getSqsParameters().getMessageGroupId());
+                t.put("SqsParameters", sp);
+            }
+            if (s.getTarget().getEcsParameters() != null) {
+                Map<String, Object> ep = buildEcsParametersResponse(s.getTarget().getEcsParameters());
+                if (!ep.isEmpty()) {
+                    t.put("EcsParameters", ep);
+                }
+            }
+            if (s.getTarget().getEventBridgeParameters() != null) {
+                EventBridgeParameters ebp = s.getTarget().getEventBridgeParameters();
+                Map<String, Object> eb = new HashMap<>();
+                if (ebp.getDetailType() != null) {
+                    eb.put("DetailType", ebp.getDetailType());
+                }
+                if (ebp.getSource() != null) {
+                    eb.put("Source", ebp.getSource());
+                }
+                if (!eb.isEmpty()) {
+                    t.put("EventBridgeParameters", eb);
+                }
+            }
             r.put("Target", t);
         }
         if (s.getDescription() != null) {
@@ -324,7 +354,12 @@ public class SchedulerController {
         return null;
     }
 
-    private ScheduleRequest parseScheduleRequest(JsonNode node) {
+    /**
+     * Reads the PascalCase CreateSchedule / UpdateSchedule body. The Step Functions
+     * {@code aws-sdk:scheduler:*} Task integrations pass the same shape as {@code Arguments},
+     * so they parse it here instead of restating the mapping.
+     */
+    public ScheduleRequest parseScheduleRequest(JsonNode node) {
         ScheduleRequest req = new ScheduleRequest();
         req.setGroupName(textField(node, "GroupName"));
         req.setScheduleExpression(textField(node, "ScheduleExpression"));
@@ -387,7 +422,239 @@ public class SchedulerController {
             }
             target.setDeadLetterConfig(dlc);
         }
+        if (node.has("SqsParameters") && !node.get("SqsParameters").isNull()) {
+            JsonNode spNode = node.get("SqsParameters");
+            SqsParameters sp = new SqsParameters();
+            if (spNode.has("MessageGroupId") && !spNode.get("MessageGroupId").isNull()) {
+                sp.setMessageGroupId(spNode.get("MessageGroupId").asText());
+            }
+            target.setSqsParameters(sp);
+        }
+        if (node.has("EcsParameters") && !node.get("EcsParameters").isNull()) {
+            target.setEcsParameters(parseEcsParameters(node.get("EcsParameters")));
+        }
+        if (node.has("EventBridgeParameters") && !node.get("EventBridgeParameters").isNull()) {
+            JsonNode ebNode = node.get("EventBridgeParameters");
+            EventBridgeParameters ebp = new EventBridgeParameters();
+            if (
+                ebNode.has("DetailType") &&
+                !ebNode.get("DetailType").isNull() &&
+                !ebNode.get("DetailType").asText().isBlank()
+            ) {
+                ebp.setDetailType(ebNode.get("DetailType").asText());
+            }
+            if (
+                ebNode.has("Source") &&
+                !ebNode.get("Source").isNull() &&
+                !ebNode.get("Source").asText().isBlank()
+            ) {
+                ebp.setSource(ebNode.get("Source").asText());
+            }
+            if (ebp.getDetailType() == null || ebp.getSource() == null) {
+                 throw new AwsException("ValidationException",
+                    "EventBridgeParameters requires both DetailType and Source.", 400);
+            }
+
+            if(ebp.getDetailType().length() > 128) {
+                throw new AwsException("ValidationException",
+                    "EventBridgeParameters DetailType must be less than or equal to 128 characters.", 400);
+            }
+            if(ebp.getSource().length() > 256) {
+                throw new AwsException("ValidationException",
+                    "EventBridgeParameters Source must be less than or equal to 256 characters.", 400);
+            }
+
+            if(ebp.getSource().startsWith("aws.") || ebp.getSource().startsWith("aws:")) {
+                throw new AwsException("ValidationException",
+                    "EventBridgeParameters Source cannot start with 'aws.' or 'aws:'.", 400);
+            }
+
+            target.setEventBridgeParameters(ebp);
+        }
         return target;
+    }
+
+    private EcsParameters parseEcsParameters(JsonNode node) {
+        EcsParameters ecs = new EcsParameters();
+        if (node.has("CapacityProviderStrategy") && !node.get("CapacityProviderStrategy").isNull()) {
+            ecs.setCapacityProviderStrategy(mapList("CapacityProviderStrategy", node.get("CapacityProviderStrategy")));
+        }
+        if (node.has("EnableECSManagedTags") && !node.get("EnableECSManagedTags").isNull()) {
+            ecs.setEnableECSManagedTags(node.get("EnableECSManagedTags").asBoolean());
+        }
+        if (node.has("EnableExecuteCommand") && !node.get("EnableExecuteCommand").isNull()) {
+            ecs.setEnableExecuteCommand(node.get("EnableExecuteCommand").asBoolean());
+        }
+        if (node.has("Group") && !node.get("Group").isNull()) {
+            ecs.setGroup(node.get("Group").asText());
+        }
+        if (node.has("TaskDefinitionArn") && !node.get("TaskDefinitionArn").isNull()) {
+            ecs.setTaskDefinitionArn(node.get("TaskDefinitionArn").asText());
+        }
+        if (node.has("LaunchType") && !node.get("LaunchType").isNull()) {
+            ecs.setLaunchType(node.get("LaunchType").asText());
+        }
+        if (node.has("PlacementConstraints") && !node.get("PlacementConstraints").isNull()) {
+            ecs.setPlacementConstraints(mapList("PlacementConstraints", node.get("PlacementConstraints")));
+        }
+        if (node.has("PlacementStrategy") && !node.get("PlacementStrategy").isNull()) {
+            ecs.setPlacementStrategy(mapList("PlacementStrategy", node.get("PlacementStrategy")));
+        }
+        if (node.has("TaskCount") && !node.get("TaskCount").isNull()) {
+            ecs.setTaskCount(node.get("TaskCount").asInt());
+        }
+        if (node.has("PlatformVersion") && !node.get("PlatformVersion").isNull()) {
+            ecs.setPlatformVersion(node.get("PlatformVersion").asText());
+        }
+        if (node.has("PropagateTags") && !node.get("PropagateTags").isNull()) {
+            ecs.setPropagateTags(node.get("PropagateTags").asText());
+        }
+        if (node.has("ReferenceId") && !node.get("ReferenceId").isNull()) {
+            ecs.setReferenceId(node.get("ReferenceId").asText());
+        }
+        if (node.has("Tags") && !node.get("Tags").isNull()) {
+            ecs.setTags(mapList("Tags", node.get("Tags")));
+        }
+        if (node.has("NetworkConfiguration") && !node.get("NetworkConfiguration").isNull()) {
+            ecs.setNetworkConfiguration(parseNetworkConfiguration(node.get("NetworkConfiguration")));
+        }
+        return ecs;
+    }
+
+    /**
+     * Reads one of the {@code EcsParameters} lists of objects. An element that is not an object is a
+     * malformed body, which AWS answers with 400 {@code SerializationException}, so the conversion
+     * failure is named here instead of escaping as a server error.
+     */
+    private List<Map<String, Object>> mapList(String field, JsonNode node) {
+        if (!node.isArray()) {
+            throw malformedList(field, "objects");
+        }
+        try {
+            return objectMapper.convertValue(node,
+                    objectMapper.getTypeFactory().constructCollectionType(List.class,
+                            objectMapper.getTypeFactory().constructMapType(Map.class, String.class, Object.class)));
+        } catch (IllegalArgumentException e) {
+            throw malformedList(field, "objects");
+        }
+    }
+
+    /**
+     * {@link #mapList(String, JsonNode)} for the {@code awsvpcConfiguration} lists of strings.
+     * A number or a boolean is checked before the conversion because Jackson writes it out as a
+     * string rather than refusing it, which would store a value AWS never accepts.
+     */
+    private List<String> stringList(String field, JsonNode node) {
+        if (!node.isArray()) {
+            throw malformedList(field, "strings");
+        }
+        for (JsonNode element : node) {
+            if (!element.isTextual()) {
+                throw malformedList(field, "strings");
+            }
+        }
+        try {
+            return objectMapper.convertValue(node,
+                    objectMapper.getTypeFactory().constructCollectionType(List.class, String.class));
+        } catch (IllegalArgumentException e) {
+            throw malformedList(field, "strings");
+        }
+    }
+
+    private AwsException malformedList(String field, String elementType) {
+        return new AwsException("SerializationException",
+                "EcsParameters " + field + " must be a list of " + elementType + ".", 400);
+    }
+
+    private NetworkConfiguration parseNetworkConfiguration(JsonNode node) {
+        NetworkConfiguration network = new NetworkConfiguration();
+        if (node.has("awsvpcConfiguration") && !node.get("awsvpcConfiguration").isNull()) {
+            network.setAwsvpcConfiguration(parseAwsVpcConfiguration(node.get("awsvpcConfiguration")));
+        }
+        return network;
+    }
+
+    private AwsVpcConfiguration parseAwsVpcConfiguration(JsonNode node) {
+        AwsVpcConfiguration vpc = new AwsVpcConfiguration();
+        if (node.has("Subnets") && !node.get("Subnets").isNull()) {
+            vpc.setSubnets(stringList("Subnets", node.get("Subnets")));
+        }
+        if (node.has("SecurityGroups") && !node.get("SecurityGroups").isNull()) {
+            vpc.setSecurityGroups(stringList("SecurityGroups", node.get("SecurityGroups")));
+        }
+        if (node.has("AssignPublicIp") && !node.get("AssignPublicIp").isNull()) {
+            vpc.setAssignPublicIp(node.get("AssignPublicIp").asText());
+        }
+        return vpc;
+    }
+
+    private Map<String, Object> buildEcsParametersResponse(EcsParameters ecs) {
+        Map<String, Object> ep = new HashMap<>();
+        if (ecs.getCapacityProviderStrategy() != null && !ecs.getCapacityProviderStrategy().isEmpty()) {
+            ep.put("CapacityProviderStrategy", ecs.getCapacityProviderStrategy());
+        }
+        if (ecs.getEnableECSManagedTags() != null) {
+            ep.put("EnableECSManagedTags", ecs.getEnableECSManagedTags());
+        }
+        if (ecs.getEnableExecuteCommand() != null) {
+            ep.put("EnableExecuteCommand", ecs.getEnableExecuteCommand());
+        }
+        if (ecs.getGroup() != null) {
+            ep.put("Group", ecs.getGroup());
+        }
+        if (ecs.getTaskDefinitionArn() != null) {
+            ep.put("TaskDefinitionArn", ecs.getTaskDefinitionArn());
+        }
+        if (ecs.getLaunchType() != null) {
+            ep.put("LaunchType", ecs.getLaunchType());
+        }
+        if (ecs.getPlacementConstraints() != null && !ecs.getPlacementConstraints().isEmpty()) {
+            ep.put("PlacementConstraints", ecs.getPlacementConstraints());
+        }
+        if (ecs.getPlacementStrategy() != null && !ecs.getPlacementStrategy().isEmpty()) {
+            ep.put("PlacementStrategy", ecs.getPlacementStrategy());
+        }
+        if (ecs.getTaskCount() != null) {
+            ep.put("TaskCount", ecs.getTaskCount());
+        }
+        if (ecs.getPlatformVersion() != null) {
+            ep.put("PlatformVersion", ecs.getPlatformVersion());
+        }
+        if (ecs.getPropagateTags() != null) {
+            ep.put("PropagateTags", ecs.getPropagateTags());
+        }
+        if (ecs.getReferenceId() != null) {
+            ep.put("ReferenceId", ecs.getReferenceId());
+        }
+        if (ecs.getTags() != null && !ecs.getTags().isEmpty()) {
+            ep.put("Tags", ecs.getTags());
+        }
+        if (ecs.getNetworkConfiguration() != null) {
+            Map<String, Object> network = buildNetworkConfigurationResponse(ecs.getNetworkConfiguration());
+            if (!network.isEmpty()) {
+                ep.put("NetworkConfiguration", network);
+            }
+        }
+        return ep;
+    }
+
+    private Map<String, Object> buildNetworkConfigurationResponse(NetworkConfiguration network) {
+        Map<String, Object> result = new HashMap<>();
+        if (network.getAwsvpcConfiguration() != null) {
+            AwsVpcConfiguration vpc = network.getAwsvpcConfiguration();
+            Map<String, Object> awsvpc = new HashMap<>();
+            if (vpc.getSubnets() != null && !vpc.getSubnets().isEmpty()) {
+                awsvpc.put("Subnets", vpc.getSubnets());
+            }
+            if (vpc.getSecurityGroups() != null && !vpc.getSecurityGroups().isEmpty()) {
+                awsvpc.put("SecurityGroups", vpc.getSecurityGroups());
+            }
+            if (vpc.getAssignPublicIp() != null) {
+                awsvpc.put("AssignPublicIp", vpc.getAssignPublicIp());
+            }
+            result.put("awsvpcConfiguration", awsvpc);
+        }
+        return result;
     }
 
     @SuppressWarnings("unchecked")

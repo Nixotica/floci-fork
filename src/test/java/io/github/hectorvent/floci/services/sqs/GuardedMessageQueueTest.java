@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.services.sqs.model.Message;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -148,20 +149,39 @@ class GuardedMessageQueueTest {
     }
 
     @Test
-    void messageCountsReturnsVisibleAndInFlight() {
+    void messageCountsReturnsVisibleInFlightAndDelayed() {
         queue.addMessage(new Message("msg1"));
         queue.addMessage(new Message("msg2"));
         queue.addMessage(new Message("msg3"));
+        Message delayedMessage = new Message("delayed");
+        delayedMessage.setVisibleAt(Instant.now().plusSeconds(60));
+        queue.addMessage(delayedMessage);
 
         var counts = queue.messageCounts();
         assertEquals(3, counts.visible());
         assertEquals(0, counts.inFlight());
+        assertEquals(1, counts.delayed(),
+                "A never-claimed message with a future visibleAt is delayed, not in flight");
 
         queue.claimVisibleMessages(2, 30, false, -1, null);
 
         var afterClaim = queue.messageCounts();
         assertEquals(1, afterClaim.visible());
-        assertEquals(2, afterClaim.inFlight());
+        assertEquals(2, afterClaim.inFlight(),
+                "Claimed messages are in flight, not delayed");
+        assertEquals(1, afterClaim.delayed());
+    }
+
+    @Test
+    void messageCountsDelayedMessageBecomesVisibleAfterDelay() {
+        Message delayedMessage = new Message("delayed");
+        delayedMessage.setVisibleAt(Instant.now().minusSeconds(1));
+        queue.addMessage(delayedMessage);
+
+        var counts = queue.messageCounts();
+        assertEquals(1, counts.visible(),
+                "A message whose delay has elapsed counts as visible");
+        assertEquals(0, counts.delayed());
     }
 
     // --- FIFO ---
@@ -196,6 +216,27 @@ class GuardedMessageQueueTest {
         // All groups now have in-flight messages — second call returns empty
         var second = queue.claimVisibleMessages(10, 30, true, -1, null);
         assertTrue(second.claimed().isEmpty());
+    }
+
+    @Test
+    void fifoDelayedMessageDoesNotLockItsMessageGroup() {
+        // Only in-flight messages (claimed, within their visibility timeout)
+        // lock a FIFO message group. A message still waiting out its
+        // DelaySeconds was never claimed — no receipt handle — and must not
+        // make an already-visible message in the same group unreceivable.
+        Message visible = new Message("visible");
+        visible.setMessageGroupId("group1");
+        Message delayed = new Message("delayed");
+        delayed.setMessageGroupId("group1");
+        delayed.setVisibleAt(Instant.now().plusSeconds(60));
+
+        queue.addMessage(visible);
+        queue.addMessage(delayed);
+
+        var result = queue.claimVisibleMessages(10, 30, true, -1, null);
+        assertEquals(1, result.claimed().size(),
+                "A delayed message must not block its message group");
+        assertEquals("visible", result.claimed().get(0).getBody());
     }
 
     // --- DLQ ---

@@ -5,22 +5,22 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
-import io.github.hectorvent.floci.services.cognito.model.UserPool;
+import io.github.hectorvent.floci.services.acm.AcmService;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.Spliterators;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
 
 class CognitoJsonHandlerTest {
 
@@ -36,9 +36,11 @@ class CognitoJsonHandlerTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                new InMemoryStorage<>(), // revokedTokenStore
                 "http://localhost:4566",
                 regionResolver,
-                null
+                null,
+                mock(AcmService.class)
         );
         handler = new CognitoJsonHandler(service, mapper);
     }
@@ -95,7 +97,7 @@ class CognitoJsonHandlerTest {
         assertEquals("test-pool", pool.get("Name").asText());
         assertTrue(pool.get("Arn").asText().contains("arn:aws:cognito-idp:us-east-1:000000000000:userpool/"));
         assertEquals("Enabled", pool.get("Status").asText());
-        
+
         // Check mandatory blocks for Terraform
         assertNotNull(pool.get("SchemaAttributes"));
         assertEquals(20, pool.get("SchemaAttributes").size(),
@@ -107,6 +109,33 @@ class CognitoJsonHandlerTest {
         assertNotNull(pool.get("AdminCreateUserConfig"));
         assertNotNull(pool.get("AccountRecoverySetting"));
         assertEquals("ESSENTIALS", pool.get("UserPoolTier").asText());
+    }
+
+    @Test
+    void createAndDescribeUserPoolAgreeOnUnconfiguredOptionalBlocks() {
+        // #2200: CreateUserPool and a later DescribeUserPool disagreed on DeviceConfiguration,
+        // EmailConfiguration, and UserPoolAddOns when the request never configured them - an
+        // empty object one moment, filled in or absent the next - so a Terraform apply looked
+        // clean and the very next plan reported perpetual drift.
+        ObjectNode request = mapper.createObjectNode();
+        request.put("PoolName", "minimal-pool");
+
+        JsonNode created = (JsonNode) handler.handle("CreateUserPool", request, "us-east-1").getEntity();
+        JsonNode createdPool = created.get("UserPool");
+
+        ObjectNode describeReq = mapper.createObjectNode();
+        describeReq.put("UserPoolId", createdPool.get("Id").asText());
+        JsonNode described = (JsonNode) handler.handle("DescribeUserPool", describeReq, "us-east-1").getEntity();
+        JsonNode describedPool = described.get("UserPool");
+
+        for (JsonNode pool : java.util.List.of(createdPool, describedPool)) {
+            // AWS's JSON protocol serializes only members with a value provided - an
+            // unconfigured pool omits these keys entirely, it doesn't write a JSON null
+            // (confirmed against moto's DescribeUserPool, which never emits either key unset).
+            assertFalse(pool.has("DeviceConfiguration"));
+            assertFalse(pool.has("UserPoolAddOns"));
+            assertEquals("COGNITO_DEFAULT", pool.get("EmailConfiguration").get("EmailSendingAccount").asText());
+        }
     }
 
     @Test
@@ -270,6 +299,79 @@ class CognitoJsonHandlerTest {
         assertTrue(emailAttr.get("Required").asBoolean(), "email must be required per the override");
     }
 
+    // =========================================================================
+    // Issue #1306 — DescribeUserPoolClient extended configuration
+    // =========================================================================
+
+    @Test
+    void describeUserPoolClientReturnsExtendedConfigurationFields() {
+        ObjectNode poolReq = mapper.createObjectNode();
+        poolReq.put("PoolName", "client-pool");
+        JsonNode poolBody = (JsonNode) handler.handle("CreateUserPool", poolReq, "us-east-1").getEntity();
+        String poolId = poolBody.get("UserPool").get("Id").asText();
+
+        ObjectNode clientReq = mapper.createObjectNode();
+        clientReq.put("UserPoolId", poolId);
+        clientReq.put("ClientName", "extended-client");
+        clientReq.put("GenerateSecret", true);
+        clientReq.put("AllowedOAuthFlowsUserPoolClient", true);
+        clientReq.putArray("AllowedOAuthFlows").add("code");
+        clientReq.putArray("AllowedOAuthScopes").add("openid").add("email");
+        clientReq.putObject("AnalyticsConfiguration")
+                .put("ApplicationId", "d70b2ba36a8c4dc5a04a0451a31a1e12")
+                .put("ExternalId", "my-external-id")
+                .put("RoleArn", "arn:aws:iam::123456789012:role/test-cognitouserpool-role")
+                .put("UserDataShared", true);
+        clientReq.putArray("CallbackURLs").add("https://example.com").add("http://localhost");
+        clientReq.put("DefaultRedirectURI", "https://example.com");
+        clientReq.putArray("ExplicitAuthFlows").add("ALLOW_USER_AUTH").add("ALLOW_REFRESH_TOKEN_AUTH");
+        clientReq.put("AccessTokenValidity", 6);
+        clientReq.put("IdTokenValidity", 7);
+        clientReq.putArray("LogoutURLs").add("https://example.com/logout");
+        clientReq.put("PreventUserExistenceErrors", "ENABLED");
+        clientReq.putArray("ReadAttributes").add("email").add("address");
+        clientReq.put("RefreshTokenValidity", 8);
+        clientReq.putArray("SupportedIdentityProviders").add("COGNITO").add("Google");
+        clientReq.putObject("TokenValidityUnits")
+                .put("AccessToken", "hours")
+                .put("IdToken", "minutes")
+                .put("RefreshToken", "days");
+        clientReq.putArray("WriteAttributes").add("family_name").add("email");
+        clientReq.putObject("RefreshTokenRotation")
+                .put("Feature", "ENABLED")
+                .put("RetryGracePeriodSeconds", 30);
+        clientReq.put("EnableTokenRevocation", true);
+
+        JsonNode clientBody = (JsonNode) handler.handle("CreateUserPoolClient", clientReq, "us-east-1").getEntity();
+        String clientId = clientBody.get("UserPoolClient").get("ClientId").asText();
+
+        ObjectNode describeReq = mapper.createObjectNode();
+        describeReq.put("UserPoolId", poolId);
+        describeReq.put("ClientId", clientId);
+
+        JsonNode describeBody = (JsonNode) handler.handle("DescribeUserPoolClient", describeReq, "us-east-1").getEntity();
+        JsonNode client = describeBody.get("UserPoolClient");
+
+        assertTrue(client.get("AllowedOAuthFlowsUserPoolClient").asBoolean());
+        assertEquals("code", client.get("AllowedOAuthFlows").get(0).asText());
+        assertEquals("openid", client.get("AllowedOAuthScopes").get(0).asText());
+        assertEquals("d70b2ba36a8c4dc5a04a0451a31a1e12", client.get("AnalyticsConfiguration").get("ApplicationId").asText());
+        assertEquals("https://example.com", client.get("CallbackURLs").get(0).asText());
+        assertEquals("https://example.com", client.get("DefaultRedirectURI").asText());
+        assertEquals("ALLOW_USER_AUTH", client.get("ExplicitAuthFlows").get(0).asText());
+        assertEquals(6, client.get("AccessTokenValidity").asInt());
+        assertEquals(7, client.get("IdTokenValidity").asInt());
+        assertEquals("https://example.com/logout", client.get("LogoutURLs").get(0).asText());
+        assertEquals("ENABLED", client.get("PreventUserExistenceErrors").asText());
+        assertEquals("email", client.get("ReadAttributes").get(0).asText());
+        assertEquals(8, client.get("RefreshTokenValidity").asInt());
+        assertEquals("COGNITO", client.get("SupportedIdentityProviders").get(0).asText());
+        assertEquals("hours", client.get("TokenValidityUnits").get("AccessToken").asText());
+        assertEquals("family_name", client.get("WriteAttributes").get(0).asText());
+        assertEquals("ENABLED", client.get("RefreshTokenRotation").get("Feature").asText());
+        assertTrue(client.get("EnableTokenRevocation").asBoolean());
+    }
+
     @Test
     void tagResourceRejectsReservedKey() {
         ObjectNode createRequest = mapper.createObjectNode();
@@ -288,10 +390,151 @@ class CognitoJsonHandlerTest {
         assertEquals("ValidationException", exception.getErrorCode());
     }
 
+    // Issue #1505: CreateUserPoolClient must not emit optional block fields
+    // as empty {} in the JSON response when they were not set
+    @Test
+    void createUserPoolClientDoesNotReturnOptionalBlockKeysWhenNotSet() {
+        ObjectNode poolReq = mapper.createObjectNode();
+        poolReq.put("PoolName", "minimal-pool");
+        JsonNode poolBody = (JsonNode) handler.handle("CreateUserPool", poolReq, "us-east-1").getEntity();
+        String poolId = poolBody.get("UserPool").get("Id").asText();
+
+        ObjectNode clientReq = mapper.createObjectNode();
+        clientReq.put("UserPoolId", poolId);
+        clientReq.put("ClientName", "minimal-client");
+
+        Response createResp = handler.handle("CreateUserPoolClient", clientReq, "us-east-1");
+        assertEquals(200, createResp.getStatus());
+        JsonNode createClient = ((JsonNode) createResp.getEntity()).get("UserPoolClient");
+
+        assertFalse(createClient.has("AnalyticsConfiguration"),
+                "CreateUserPoolClient must not return AnalyticsConfiguration when not set");
+        assertFalse(createClient.has("TokenValidityUnits"),
+                "CreateUserPoolClient must not return TokenValidityUnits when not set");
+        assertFalse(createClient.has("RefreshTokenRotation"),
+                "CreateUserPoolClient must not return RefreshTokenRotation when not set");
+    }
+
+    // Issue #1563 — AdminLinkProviderForUser
+
+    @Test
+    void adminLinkProviderForUserReturnsEmptyBody() {
+        String poolId = createPoolWithUser("link-pool", "alice");
+
+        Response response = handler.handle("AdminLinkProviderForUser",
+                linkRequest(poolId, "alice", "Google", "google-sub-123"), "us-east-1");
+
+        assertEquals(200, response.getStatus());
+        JsonNode body = (JsonNode) response.getEntity();
+        assertTrue(body.isObject());
+        assertTrue(body.isEmpty(), "AdminLinkProviderForUser returns an empty JSON object");
+    }
+
+    @Test
+    void adminLinkProviderForUserIdentitySurfacesInAdminGetUser() {
+        String poolId = createPoolWithUser("link-getuser-pool", "alice");
+        handler.handle("AdminLinkProviderForUser",
+                linkRequest(poolId, "alice", "Google", "google-sub-123"), "us-east-1");
+
+        ObjectNode getUser = mapper.createObjectNode();
+        getUser.put("UserPoolId", poolId);
+        getUser.put("Username", "alice");
+        JsonNode body = (JsonNode) handler.handle("AdminGetUser", getUser, "us-east-1").getEntity();
+
+        String identities = StreamSupport.stream(Spliterators.spliteratorUnknownSize(
+                        body.get("UserAttributes").elements(), 0), false)
+                .filter(n -> "identities".equals(n.get("Name").asText()))
+                .map(n -> n.get("Value").asText())
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("identities attribute missing from AdminGetUser"));
+        assertTrue(identities.contains("\"userId\":\"google-sub-123\""), identities);
+        assertTrue(identities.contains("\"providerName\":\"Google\""), identities);
+    }
+
+    @Test
+    void adminLinkProviderForUserUnknownUserThrows() {
+        String poolId = createPoolWithUser("link-missing-pool", "alice");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                handler.handle("AdminLinkProviderForUser",
+                        linkRequest(poolId, "ghost", "Google", "google-sub-123"), "us-east-1"));
+        assertEquals("UserNotFoundException", exception.getErrorCode());
+    }
+
+    private String createPoolWithUser(String poolName, String username) {
+        ObjectNode poolReq = mapper.createObjectNode();
+        poolReq.put("PoolName", poolName);
+        JsonNode poolBody = (JsonNode) handler.handle("CreateUserPool", poolReq, "us-east-1").getEntity();
+        String poolId = poolBody.get("UserPool").get("Id").asText();
+
+        ObjectNode createUser = mapper.createObjectNode();
+        createUser.put("UserPoolId", poolId);
+        createUser.put("Username", username);
+        handler.handle("AdminCreateUser", createUser, "us-east-1");
+        return poolId;
+    }
+
+    private ObjectNode linkRequest(String poolId, String destinationUsername,
+            String sourceProviderName, String sourceUserId) {
+        ObjectNode request = mapper.createObjectNode();
+        request.put("UserPoolId", poolId);
+        request.putObject("DestinationUser")
+                .put("ProviderName", "Cognito")
+                .put("ProviderAttributeValue", destinationUsername);
+        request.putObject("SourceUser")
+                .put("ProviderName", sourceProviderName)
+                .put("ProviderAttributeName", "Cognito_Subject")
+                .put("ProviderAttributeValue", sourceUserId);
+        return request;
+    }
+
     private Set<String> schemaNames(JsonNode pool) {
         return StreamSupport.stream(
                         Spliterators.spliteratorUnknownSize(pool.get("SchemaAttributes").elements(), 0), false)
                 .map(n -> n.get("Name").asText())
                 .collect(Collectors.toSet());
+    }
+
+    private String createPoolWithPrefixDomain(String domain) {
+        ObjectNode poolReq = mapper.createObjectNode().put("PoolName", "domain-pool");
+        String poolId = ((JsonNode) handler.handle("CreateUserPool", poolReq, "us-east-1").getEntity())
+                .get("UserPool").get("Id").asText();
+        ObjectNode domainReq = mapper.createObjectNode()
+                .put("Domain", domain)
+                .put("UserPoolId", poolId)
+                .put("ManagedLoginVersion", 1);
+        handler.handle("CreateUserPoolDomain", domainReq, "us-east-1");
+        return poolId;
+    }
+
+    @Test
+    void updateUserPoolDomainTreatsANullManagedLoginVersionAsAbsent() {
+        String poolId = createPoolWithPrefixDomain("null-version");
+        ObjectNode updateReq = mapper.createObjectNode().put("Domain", "null-version").put("UserPoolId", poolId);
+        updateReq.putNull("ManagedLoginVersion");
+
+        JsonNode updated = (JsonNode) handler.handle("UpdateUserPoolDomain", updateReq, "us-east-1").getEntity();
+
+        assertEquals(1, updated.get("ManagedLoginVersion").asInt());
+        JsonNode described = (JsonNode) handler.handle("DescribeUserPoolDomain",
+                mapper.createObjectNode().put("Domain", "null-version"), "us-east-1").getEntity();
+        assertEquals(1, described.get("DomainDescription").get("ManagedLoginVersion").asInt());
+    }
+
+    @Test
+    void userPoolDomainRejectsAManagedLoginVersionThatIsNotAnInteger() {
+        String poolId = createPoolWithPrefixDomain("typed-version");
+        ObjectNode updateReq = mapper.createObjectNode()
+                .put("Domain", "typed-version")
+                .put("UserPoolId", poolId)
+                .put("ManagedLoginVersion", "two");
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> handler.handle("UpdateUserPoolDomain", updateReq, "us-east-1"));
+
+        assertEquals("SerializationException", failure.getErrorCode());
+        JsonNode described = (JsonNode) handler.handle("DescribeUserPoolDomain",
+                mapper.createObjectNode().put("Domain", "typed-version"), "us-east-1").getEntity();
+        assertEquals(1, described.get("DomainDescription").get("ManagedLoginVersion").asInt());
     }
 }

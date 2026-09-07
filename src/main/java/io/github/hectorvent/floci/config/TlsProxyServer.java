@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.config;
 
 import io.quarkus.runtime.Startup;
+import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.net.NetClient;
 import io.vertx.core.net.NetServer;
@@ -10,6 +11,12 @@ import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A TCP proxy server that enables HTTP and HTTPS on the same port (LocalStack parity).
@@ -25,6 +32,12 @@ import org.jboss.logging.Logger;
  * <p>This achieves true dual-protocol support on a single port, matching LocalStack's
  * behavior where both {@code http://localhost:4566} and {@code https://localhost:4566}
  * work simultaneously.
+ *
+ * <p>The same protocol-detecting handler is also bound on the configurable
+ * {@code floci.tls.aws-https-port} (443 by default). CDK/CloudFormation custom-resource
+ * {@code cfn-response} callbacks hardcode {@code https://} and ignore the ResponseURL port,
+ * so they PUT to 443 regardless of Floci's configured port; binding 443 lets those callbacks
+ * reach Floci. The extra binding is skipped when the port is {@code 0} or equals the public port.
  *
  * <p>This bean is only active when {@code floci.tls.enabled=true}. When TLS is disabled,
  * Quarkus serves HTTP directly on port 4566 and this proxy is not started.
@@ -43,13 +56,41 @@ public class TlsProxyServer {
 
     private final Vertx vertx;
     private final EmulatorConfig config;
-    private NetServer proxyServer;
+    private final int httpBackendPort;
+    private final int httpsBackendPort;
+    private final List<NetServer> proxyServers = new ArrayList<>();
+    /**
+     * Ports whose bind definitively failed. Absent means bound, or not resolved yet: callers
+     * default to treating the port as the proxy's until the outcome is known, which is what stops
+     * an ELBv2 listener racing the proxy for it during start-up.
+     */
+    // Package-private for TlsProxyServerReservedPortTest, which needs to stage a failed bind.
+    final Set<Integer> failedPorts = ConcurrentHashMap.newKeySet();
+    /**
+     * Notified with a port the proxy has just given up on. A listener that yielded while the bind
+     * was still unresolved has no other way to learn the port came free, and would otherwise stay
+     * registered with nothing serving it.
+     */
+    private final List<java.util.function.IntConsumer> portReleasedHandlers = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /** Registers a callback invoked when a bind fails and the port stops being reserved. */
+    public void onPortReleased(java.util.function.IntConsumer handler) {
+        portReleasedHandlers.add(handler);
+        failedPorts.forEach(handler::accept);
+    }
     private NetClient client;
 
     @Inject
     public TlsProxyServer(Vertx vertx, EmulatorConfig config) {
+        this(vertx, config, HTTP_BACKEND_PORT, HTTPS_BACKEND_PORT);
+    }
+
+    /** Visible for testing — lets tests point the proxy at backends on non-default ports. */
+    TlsProxyServer(Vertx vertx, EmulatorConfig config, int httpBackendPort, int httpsBackendPort) {
         this.vertx = vertx;
         this.config = config;
+        this.httpBackendPort = httpBackendPort;
+        this.httpsBackendPort = httpsBackendPort;
         startIfTlsEnabled();
     }
 
@@ -58,15 +99,72 @@ public class TlsProxyServer {
             return;
         }
 
-        int publicPort = config.port();
-        NetServerOptions options = new NetServerOptions()
-                .setHost("0.0.0.0")
-                .setPort(publicPort);
-
-        proxyServer = vertx.createNetServer(options);
         client = vertx.createNetClient();
+        Handler<NetSocket> connectHandler = buildConnectHandler();
 
-        proxyServer.connectHandler(frontSocket -> {
+        for (int port : listenPorts()) {
+            NetServerOptions options = new NetServerOptions()
+                    .setHost("0.0.0.0")
+                    .setPort(port);
+            NetServer server = vertx.createNetServer(options);
+            server.connectHandler(connectHandler);
+            proxyServers.add(server);
+            server.listen().onComplete(ar -> {
+                if (ar.succeeded()) {
+                    failedPorts.remove(port);
+                    LOG.infov("TLS proxy: listening on port {0} (HTTP→{1}, HTTPS→{2})",
+                            String.valueOf(port), String.valueOf(httpBackendPort), String.valueOf(httpsBackendPort));
+                } else if (port == config.port()) {
+                    LOG.errorv("TLS proxy: failed to start on public port {0}: {1}",
+                            String.valueOf(port), ar.cause().getMessage());
+                } else {
+                    failedPorts.add(port);
+                    portReleasedHandlers.forEach(h -> h.accept(port));
+                    // The extra AWS-HTTPS port (443 by default) is privileged; binding it fails in
+                    // unprivileged environments (e.g. CI/test). Non-fatal — HTTPS on that port is
+                    // simply unavailable. Set floci.tls.aws-https-port=0 to skip the attempt.
+                    LOG.warnv("TLS proxy: could not bind AWS-HTTPS port {0} ({1}); HTTPS on {0} unavailable. "
+                            + "Binding privileged ports needs elevated privileges — set floci.tls.aws-https-port=0 to disable.",
+                            String.valueOf(port), ar.cause().getMessage());
+                }
+            });
+        }
+    }
+
+    /**
+     * Whether the proxy holds, or is still expected to hold, {@code port}.
+     *
+     * <p>False once a bind has definitively failed. That is not fatal for the AWS-HTTPS port: it is
+     * privileged, so binding it fails in unprivileged environments and HTTPS there is simply
+     * unavailable. Anything that yields ports to the proxy has to consult this rather than
+     * configuration alone, or a port the proxy never acquired ends up served by nobody.
+     */
+    public boolean reservesPort(int port) {
+        return config.tls().enabled() && listenPorts().contains(port) && !failedPorts.contains(port);
+    }
+
+    /**
+     * The set of ports the proxy listens on: always the public Floci {@link EmulatorConfig#port()},
+     * plus {@code floci.tls.aws-https-port} (443 by default) so AWS-style HTTPS callbacks reach
+     * Floci. Deduplicated (a coinciding aws-https-port yields a single listener); a non-positive
+     * aws-https-port disables the extra binding.
+     */
+    Set<Integer> listenPorts() {
+        Set<Integer> ports = new LinkedHashSet<>();
+        ports.add(config.port());
+        int awsHttpsPort = config.tls().awsHttpsPort();
+        if (awsHttpsPort > 0) {
+            ports.add(awsHttpsPort);
+        }
+        return ports;
+    }
+
+    /**
+     * Builds the shared connect handler that peeks the first byte to detect TLS and pipes the
+     * connection to the matching backend. A single instance is reused across all listen ports.
+     */
+    private Handler<NetSocket> buildConnectHandler() {
+        return frontSocket -> {
             // Pause incoming data until we've peeked at the first byte
             frontSocket.pause();
 
@@ -79,9 +177,9 @@ public class TlsProxyServer {
                 // Inspect first byte to determine protocol
                 int backendPort;
                 if (buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE) {
-                    backendPort = HTTPS_BACKEND_PORT;
+                    backendPort = httpsBackendPort;
                 } else {
-                    backendPort = HTTP_BACKEND_PORT;
+                    backendPort = httpBackendPort;
                 }
 
                 // Connect to the appropriate backend
@@ -108,23 +206,13 @@ public class TlsProxyServer {
 
             // Resume to receive the first buffer
             frontSocket.resume();
-        });
-
-        proxyServer.listen().onComplete(ar -> {
-            if (ar.succeeded()) {
-                LOG.infov("TLS proxy: listening on port {0} (HTTP→{1}, HTTPS→{2})",
-                        String.valueOf(publicPort), String.valueOf(HTTP_BACKEND_PORT), String.valueOf(HTTPS_BACKEND_PORT));
-            } else {
-                LOG.errorv("TLS proxy: failed to start on port {0}: {1}",
-                        String.valueOf(publicPort), ar.cause().getMessage());
-            }
-        });
+        };
     }
 
     @PreDestroy
     void stop() {
-        if (proxyServer != null) {
-            proxyServer.close();
+        for (NetServer server : proxyServers) {
+            server.close();
         }
         if (client != null) {
             client.close();

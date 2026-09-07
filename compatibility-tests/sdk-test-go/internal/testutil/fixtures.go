@@ -11,17 +11,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
-	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
-	"github.com/aws/aws-sdk-go-v2/service/ecr"
-	"github.com/aws/aws-sdk-go-v2/service/pipes"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
+	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/iot"
+	"github.com/aws/aws-sdk-go-v2/service/iotdataplane"
+	"github.com/aws/aws-sdk-go-v2/service/iotjobsdataplane"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/neptune"
+	"github.com/aws/aws-sdk-go-v2/service/pipes"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
+	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
@@ -84,6 +89,11 @@ func LambdaClient() *lambda.Client {
 	return lambda.NewFromConfig(Config())
 }
 
+// GlueClient returns a new Glue client.
+func GlueClient() *glue.Client {
+	return glue.NewFromConfig(Config())
+}
+
 // IAMClient returns a new IAM client.
 func IAMClient() *iam.Client {
 	return iam.NewFromConfig(Config())
@@ -114,6 +124,11 @@ func CloudWatchClient() *cloudwatch.Client {
 	return cloudwatch.NewFromConfig(Config())
 }
 
+// ResourceGroupsTaggingAPIClient returns a new Resource Groups Tagging API client.
+func ResourceGroupsTaggingAPIClient() *resourcegroupstaggingapi.Client {
+	return resourcegroupstaggingapi.NewFromConfig(Config())
+}
+
 // ACMClient returns a new ACM client.
 func ACMClient() *acm.Client {
 	return acm.NewFromConfig(Config())
@@ -127,6 +142,21 @@ func ECRClient() *ecr.Client {
 // PipesClient returns a new EventBridge Pipes client.
 func PipesClient() *pipes.Client {
 	return pipes.NewFromConfig(Config())
+}
+
+// IoTClient returns a new AWS IoT client.
+func IoTClient() *iot.Client {
+	return iot.NewFromConfig(Config())
+}
+
+// IoTDataClient returns a new AWS IoT Data Plane client.
+func IoTDataClient() *iotdataplane.Client {
+	return iotdataplane.NewFromConfig(Config())
+}
+
+// IoTJobsDataClient returns a new AWS IoT Jobs Data Plane client.
+func IoTJobsDataClient() *iotjobsdataplane.Client {
+	return iotjobsdataplane.NewFromConfig(Config())
 }
 
 // RDSClient returns a new RDS client.

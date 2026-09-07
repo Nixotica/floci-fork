@@ -5,7 +5,9 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -13,7 +15,7 @@ public class Instance {
 
     private String instanceId;
     private String imageId;
-    private InstanceState state;
+    private volatile InstanceState state;
     private String stateTransitionReason;
     private String instanceType;
     private Placement placement;
@@ -23,6 +25,9 @@ public class Instance {
     private String publicIpAddress;
     private String privateDnsName;
     private String publicDnsName;
+    // Whether this instance should be assigned a public IP — true when its subnet
+    // has MapPublicIpOnLaunch (#1984). Instances in private subnets get none.
+    private boolean associatePublicIp = false;
     private String keyName;
     private List<GroupIdentifier> securityGroups = new ArrayList<>();
     private List<InstanceNetworkInterface> networkInterfaces = new ArrayList<>();
@@ -39,6 +44,8 @@ public class Instance {
     private boolean ebsOptimized = false;
     private boolean enaSupport = true;
     private String iamInstanceProfileArn;
+    private String stateReasonCode;
+    private String stateReasonMessage;
     private String region;
     private List<Tag> tags = new ArrayList<>();
 
@@ -56,6 +63,10 @@ public class Instance {
     private String userData;
     private int sshHostPort;
     private long terminatedAt;
+
+    // Security-group ingress ports published on the host via socat sidecars:
+    // container app port -> allocated host port. Not part of the AWS wire format.
+    private Map<Integer, Integer> publishedPorts = new LinkedHashMap<>();
 
     public Instance() {}
 
@@ -94,6 +105,8 @@ public class Instance {
 
     public String getPublicDnsName() { return publicDnsName; }
     public void setPublicDnsName(String publicDnsName) { this.publicDnsName = publicDnsName; }
+    public boolean isAssociatePublicIp() { return associatePublicIp; }
+    public void setAssociatePublicIp(boolean associatePublicIp) { this.associatePublicIp = associatePublicIp; }
 
     public String getKeyName() { return keyName; }
     public void setKeyName(String keyName) { this.keyName = keyName; }
@@ -143,6 +156,12 @@ public class Instance {
     public String getIamInstanceProfileArn() { return iamInstanceProfileArn; }
     public void setIamInstanceProfileArn(String iamInstanceProfileArn) { this.iamInstanceProfileArn = iamInstanceProfileArn; }
 
+    public String getStateReasonCode() { return stateReasonCode; }
+    public void setStateReasonCode(String stateReasonCode) { this.stateReasonCode = stateReasonCode; }
+
+    public String getStateReasonMessage() { return stateReasonMessage; }
+    public void setStateReasonMessage(String stateReasonMessage) { this.stateReasonMessage = stateReasonMessage; }
+
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
 
@@ -163,6 +182,14 @@ public class Instance {
 
     public String getContainerBridgeIp() { return containerBridgeIp; }
     public void setContainerBridgeIp(String containerBridgeIp) { this.containerBridgeIp = containerBridgeIp; }
+
+    public Map<Integer, Integer> getPublishedPorts() {
+        if (publishedPorts == null) {
+            publishedPorts = new LinkedHashMap<>();
+        }
+        return publishedPorts;
+    }
+    public void setPublishedPorts(Map<Integer, Integer> publishedPorts) { this.publishedPorts = publishedPorts; }
 
     public String getRootVolumeId() { return rootVolumeId; }
     public void setRootVolumeId(String rootVolumeId) { this.rootVolumeId = rootVolumeId; }

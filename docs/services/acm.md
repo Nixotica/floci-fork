@@ -5,28 +5,37 @@
 
 ## Supported Actions
 
+<!-- floci:actions:start -->
 | Action | Description |
-|---|---|
+| --- | --- |
 | `RequestCertificate` | Request a new certificate (auto-issued for emulation) |
 | `DescribeCertificate` | Get certificate details and validation status |
 | `GetCertificate` | Retrieve the certificate and chain in PEM format |
 | `ListCertificates` | List all certificates with optional status filtering |
 | `DeleteCertificate` | Delete a certificate |
-| `AddTagsToCertificate` | Add tags to a certificate |
-| `RemoveTagsFromCertificate` | Remove tags from a certificate |
-| `ListTagsForCertificate` | List tags for a certificate |
+| `ImportCertificate` | - |
 | `ExportCertificate` | Export certificate with encrypted private key (PRIVATE type only) |
+| `AddTagsToCertificate` | Add tags to a certificate |
+| `ListTagsForCertificate` | List tags for a certificate |
+| `RemoveTagsFromCertificate` | Remove tags from a certificate |
 | `GetAccountConfiguration` | Get account-level ACM settings |
 | `PutAccountConfiguration` | Update account-level ACM settings |
-| `RenewCertificate` | Trigger certificate renewal |
+| `UpdateCertificateOptions` | - |
+| `RevokeCertificate` | - |
+| `RenewCertificate` | - |
+| `ResendValidationEmail` | - |
+<!-- floci:actions:end -->
 
 ## Emulation Behavior
 
-- **Auto-Issuance:** All requested certificates are immediately issued with status `ISSUED` (no DNS/email validation required)
+- **Auto-Issuance:** All requested certificates are immediately issued with status `ISSUED`, and every entry in `DomainValidationOptions` reports `ValidationStatus: SUCCESS` (no DNS/email validation required). With a validation wait configured, both stay pending until the wait has passed.
 - **Real Cryptography:** Certificates are generated with real RSA/EC keys and valid X.509 structure
-- **Key Algorithms:** Supports `RSA_2048`, `RSA_3072`, `RSA_4096`, `EC_prime256v1`, `EC_secp384r1`, `EC_secp521r1`
+- **One Local CA:** Every issued certificate (`AMAZON_ISSUED` and `PRIVATE`) is signed by Floci's local root CA, and `GetCertificate` returns that CA as `CertificateChain`. Trust it once (`GET /_floci/ca.pem`, see [TLS](../configuration/tls.md)) and both Floci's HTTPS endpoint and every ACM certificate validate. `DescribeCertificate` reports `Issuer` as the CA's name, `CN=Floci Local CA`, where AWS reports `Amazon`. `ImportCertificate` keeps the chain you upload.
+- **CA on First Use:** The CA is created under `{persistent-path}/tls/` the first time a certificate is issued, also with TLS off and in `memory` storage mode, so that directory must be writable. A certificate keeps the chain it was issued with; after a CA regeneration, delete and re-request it.
+- **Key Algorithms:** `RequestCertificate` accepts `RSA_2048`, `EC_prime256v1`, and `EC_secp384r1` and rejects the rest with a `ValidationException`, matching real ACM; the wider list (`RSA_1024`, `RSA_3072`, `RSA_4096`, `EC_secp521r1`) remains valid for `ImportCertificate`
 - **Certificate Types:** `AMAZON_ISSUED` (default) and `PRIVATE` (when `CertificateAuthorityArn` is provided)
 - **Export:** Only `PRIVATE` type certificates can be exported with their private key
+- **In use:** `DescribeCertificate` lists under `InUseBy` the CloudFront distribution of each Cognito custom domain that uses the certificate, and `DeleteCertificate` refuses with `ResourceInUseException` while that list is not empty. Other consumers, such as load balancers and API Gateway domain names, are not tracked yet.
 
 ## Configuration
 

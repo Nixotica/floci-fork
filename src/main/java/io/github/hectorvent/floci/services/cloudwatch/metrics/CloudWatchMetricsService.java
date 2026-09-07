@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -220,7 +221,9 @@ public class CloudWatchMetricsService {
         return results;
     }
 
-    private double resolveStatValue(Datapoint dp, String stat) {
+    /** Shared with {@link AlarmEvaluator}, which resolves the same statistic against
+     * freshly-fetched datapoints when evaluating an alarm's threshold. */
+    public static double resolveStatValue(Datapoint dp, String stat) {
         return switch (stat) {
             case "Average" -> dp.average();
             case "Sum" -> dp.sum();
@@ -238,9 +241,16 @@ public class CloudWatchMetricsService {
         if (alarm.getAlarmArn() == null) {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + alarm.getAlarmName()));
         }
+        alarm.setRegion(region);
         alarm.setAlarmConfigurationUpdatedTimestamp(Instant.now().getEpochSecond());
         alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
         LOG.infov("PutMetricAlarm: {0} in {1}", alarm.getAlarmName(), region);
+    }
+
+    /** Every stored alarm, across all regions. Used by the background {@link AlarmEvaluator}
+     * tick, which has no per-request region to scope a lookup to. */
+    public List<MetricAlarm> allAlarms() {
+        return alarmStore.scan(k -> true);
     }
 
     public List<MetricAlarm> describeAlarms(List<String> alarmNames, String alarmNamePrefix, String region) {
@@ -266,7 +276,7 @@ public class CloudWatchMetricsService {
     public void setAlarmState(String alarmName, String stateValue, String stateReason, String stateReasonData, String region) {
         String key = region + "::" + alarmName;
         MetricAlarm alarm = alarmStore.get(key)
-                .orElseThrow(() -> new RuntimeException("Alarm not found: " + alarmName));
+                .orElseThrow(() -> new AwsException("ResourceNotFound", "Alarm not found: " + alarmName, 404));
 
         alarm.setStateValue(stateValue);
         alarm.setStateReason(stateReason);

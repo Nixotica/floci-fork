@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.pipes;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbStreamService;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.pipes.model.DesiredState;
@@ -19,6 +21,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -31,7 +34,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 @ApplicationScoped
-public class PipesPoller {
+public class PipesPoller implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(PipesPoller.class);
     private static final long POLL_INTERVAL_MS = 1000;
@@ -41,6 +44,7 @@ public class PipesPoller {
     private final SqsService sqsService;
     private final KinesisService kinesisService;
     private final DynamoDbStreamService dynamoDbStreamService;
+    private final PipesKafkaConsumerManager kafkaConsumerManager;
     private final PipesTargetInvoker targetInvoker;
     private final PipesFilterMatcher filterMatcher;
     private final ObjectMapper objectMapper;
@@ -60,6 +64,7 @@ public class PipesPoller {
                        SqsService sqsService,
                        KinesisService kinesisService,
                        DynamoDbStreamService dynamoDbStreamService,
+                       PipesKafkaConsumerManager kafkaConsumerManager,
                        PipesTargetInvoker targetInvoker,
                        PipesFilterMatcher filterMatcher,
                        ObjectMapper objectMapper,
@@ -68,6 +73,7 @@ public class PipesPoller {
         this.sqsService = sqsService;
         this.kinesisService = kinesisService;
         this.dynamoDbStreamService = dynamoDbStreamService;
+        this.kafkaConsumerManager = kafkaConsumerManager;
         this.targetInvoker = targetInvoker;
         this.filterMatcher = filterMatcher;
         this.objectMapper = objectMapper;
@@ -80,6 +86,14 @@ public class PipesPoller {
         timerIds.values().forEach(vertx::cancelTimer);
         timerIds.clear();
         LOG.info("PipesPoller shut down");
+    }
+
+    public void clear() {
+        timerIds.values().forEach(vertx::cancelTimer);
+        timerIds.clear();
+        activePolls.clear();
+        kinesisIterators.clear();
+        dynamoDbIterators.clear();
     }
 
     public void startPolling(Pipe pipe) {
@@ -99,6 +113,7 @@ public class PipesPoller {
             vertx.cancelTimer(timerId);
             kinesisIterators.remove(pipeKey);
             dynamoDbIterators.remove(pipeKey);
+            kafkaConsumerManager.close(pipe);
             LOG.infov("Pipe {0}: stopped polling", pipe.getName());
         }
     }
@@ -125,6 +140,8 @@ public class PipesPoller {
                     pollKinesis(pipe, region);
                 } else if (sourceArn.contains(":dynamodb:")) {
                     pollDynamoDbStreams(pipe, region);
+                } else if (isKafkaSource(sourceArn)) {
+                    pollKafka(pipe, region);
                 } else {
                     LOG.warnv("Pipe {0}: unsupported source type: {1}", pipe.getName(), sourceArn);
                 }
@@ -137,7 +154,7 @@ public class PipesPoller {
         });
     }
 
-    private void pollSqs(Pipe pipe, String region) {
+    void pollSqs(Pipe pipe, String region) {
         String queueUrl = AwsArnUtils.arnToQueueUrl(pipe.getSource(), baseUrl);
         int batchSize = getBatchSize(pipe, "SqsQueueParameters");
         List<Message> messages = sqsService.receiveMessage(queueUrl, batchSize, 30, 0, region);
@@ -171,6 +188,14 @@ public class PipesPoller {
         }
 
         if (filtered.isEmpty()) {
+            return;
+        }
+
+        // AWS EventBridge Pipes: source → filter → ENRICHMENT → target. When an enrichment is
+        // configured it is invoked once with the filtered events (as a bare JSON array, matching the
+        // Lambda's SQSRecord[] input) and its response is forwarded to the target.
+        if (hasEnrichment(pipe)) {
+            deliverEnrichedBatch(pipe, filtered, messages, matchedMessageIds, queueUrl, region);
             return;
         }
 
@@ -224,7 +249,6 @@ public class PipesPoller {
             }
         }
         try {
-            @SuppressWarnings("unchecked")
             Map<String, Object> result = (pipeAccountId != null)
                     ? kinesisService.getRecordsForAccount(pipeAccountId, iterator, batchSize, region)
                     : kinesisService.getRecords(iterator, batchSize, region);
@@ -232,7 +256,6 @@ public class PipesPoller {
             if (nextIterator != null) {
                 kinesisIterators.put(pipeKey, nextIterator);
             }
-            @SuppressWarnings("unchecked")
             List<?> records = (List<?>) result.get("Records");
             if (records == null || records.isEmpty()) {
                 return;
@@ -312,6 +335,177 @@ public class PipesPoller {
         }
     }
 
+    void pollKafka(Pipe pipe, String region) {
+        List<KafkaRecordDto> records = kafkaConsumerManager.poll(pipe);
+        if (records.isEmpty()) {
+            return;
+        }
+
+        LOG.infov("Pipe {0}: received {1} Kafka record(s)", pipe.getName(), records.size());
+        int batchSize = kafkaConsumerManager.resolveBatchSize(pipe, DEFAULT_BATCH_SIZE);
+        Set<KafkaTopicPartition> blockedPartitions = new HashSet<>();
+        for (List<KafkaRecordDto> batch : partition(records, batchSize)) {
+            deliverKafkaBatch(pipe, region, batch, blockedPartitions);
+        }
+    }
+
+    /**
+     * A REST Proxy poll can return more records than one Pipe {@code BatchSize} worth (unlike the
+     * native consumer, it has no per-call record cap), so one poll cycle may deliver several
+     * batches in sequence. {@code blockedPartitions} is shared across that whole sequence: once a
+     * partition fails delivery in one batch, its records in every later batch this cycle are left
+     * uncommitted too, so a later batch's success can never commit past an earlier record that is
+     * still awaiting redelivery.
+     */
+    private void deliverKafkaBatch(Pipe pipe, String region, List<KafkaRecordDto> batch,
+                                    Set<KafkaTopicPartition> blockedPartitions) {
+        List<KafkaRecordDto> deliverable = batch.stream()
+                .filter(record -> !blockedPartitions.contains(new KafkaTopicPartition(record.topic(), record.partition())))
+                .toList();
+        if (deliverable.isEmpty()) {
+            return;
+        }
+
+        List<ObjectNode> deliveryNodes = buildKafkaRecordNodes(deliverable, pipe);
+        List<ObjectNode> filterNodes = buildKafkaFilterNodes(deliveryNodes, deliverable);
+        List<JsonNode> filtered = filterMatcher.applyFilterCriteria(new ArrayList<>(filterNodes), pipe.getSourceParameters());
+        if (filtered.isEmpty()) {
+            commitWholeBatch(pipe, deliverable);
+            return;
+        }
+
+        Map<String, JsonNode> deliveryRecordsByIdentity = new HashMap<>();
+        for (JsonNode record : deliveryNodes) {
+            deliveryRecordsByIdentity.put(kafkaRecordIdentity(record), record);
+        }
+
+        List<JsonNode> deliveryRecords = new ArrayList<>(filtered.size());
+        for (JsonNode record : filtered) {
+            JsonNode deliveryRecord = deliveryRecordsByIdentity.get(kafkaRecordIdentity(record));
+            if (deliveryRecord != null) {
+                deliveryRecords.add(deliveryRecord);
+            }
+        }
+        if (deliveryRecords.isEmpty()) {
+            commitWholeBatch(pipe, deliverable);
+            return;
+        }
+
+        int failed = isLambdaTarget(pipe)
+                ? deliverKafkaLambdaRecords(pipe, region, deliverable, deliveryRecordsByIdentity, filtered, blockedPartitions)
+                : deliverKafkaRecords(pipe, region, deliverable, deliveryRecordsByIdentity, filtered, blockedPartitions);
+        if (failed == 0) {
+            return;
+        }
+
+        LOG.warnv("Pipe {0}: {1} Kafka record(s) not committed because delivery failed",
+                pipe.getName(), failed);
+    }
+
+    private int deliverKafkaLambdaRecords(Pipe pipe,
+                                          String region,
+                                          List<KafkaRecordDto> batch,
+                                          Map<String, JsonNode> deliveryRecordsByIdentity,
+                                          List<JsonNode> filtered,
+                                          Set<KafkaTopicPartition> blockedPartitions) {
+        Set<String> matchedIdentities = new HashSet<>(filtered.size());
+        filtered.forEach(record -> matchedIdentities.add(kafkaRecordIdentity(record)));
+
+        Map<KafkaTopicPartition, Long> offsetsToCommit = new HashMap<>();
+        Map<KafkaTopicPartition, List<KafkaRecordDto>> recordsByPartition = groupKafkaRecordsByPartition(batch);
+        int failed = 0;
+
+        for (Map.Entry<KafkaTopicPartition, List<KafkaRecordDto>> entry : recordsByPartition.entrySet()) {
+            int partitionFailed = deliverKafkaLambdaPartition(pipe, region, entry.getKey(), entry.getValue(),
+                    deliveryRecordsByIdentity, matchedIdentities, offsetsToCommit);
+            if (partitionFailed > 0) {
+                blockedPartitions.add(entry.getKey());
+            }
+            failed += partitionFailed;
+        }
+
+        commitOffsets(pipe, offsetsToCommit);
+        return failed;
+    }
+
+    private int deliverKafkaLambdaPartition(Pipe pipe,
+                                            String region,
+                                            KafkaTopicPartition partition,
+                                            List<KafkaRecordDto> partitionRecords,
+                                            Map<String, JsonNode> deliveryRecordsByIdentity,
+                                            Set<String> matchedIdentities,
+                                            Map<KafkaTopicPartition, Long> offsetsToCommit) {
+        List<JsonNode> pendingBatch = new ArrayList<>();
+        long pendingOffset = -1L;
+
+        for (KafkaRecordDto record : partitionRecords) {
+            String identity = kafkaRecordIdentity(record);
+            if (!matchedIdentities.contains(identity)) {
+                if (!pendingBatch.isEmpty()) {
+                    if (!invokeWithDlq(pipe, wrapRecords(pendingBatch), region)) {
+                        return pendingBatch.size();
+                    }
+                    offsetsToCommit.put(partition, pendingOffset);
+                    pendingBatch.clear();
+                }
+                offsetsToCommit.put(partition, record.offset() + 1);
+                continue;
+            }
+
+            JsonNode deliveryRecord = deliveryRecordsByIdentity.get(identity);
+            if (deliveryRecord != null) {
+                pendingBatch.add(deliveryRecord);
+                pendingOffset = record.offset() + 1;
+            }
+        }
+
+        if (!pendingBatch.isEmpty()) {
+            if (!invokeWithDlq(pipe, wrapRecords(pendingBatch), region)) {
+                return pendingBatch.size();
+            }
+            offsetsToCommit.put(partition, pendingOffset);
+        }
+        return 0;
+    }
+
+    private int deliverKafkaRecords(Pipe pipe,
+                                    String region,
+                                    List<KafkaRecordDto> batch,
+                                    Map<String, JsonNode> deliveryRecordsByIdentity,
+                                    List<JsonNode> filtered,
+                                    Set<KafkaTopicPartition> blockedPartitions) {
+        Set<String> matchedIdentities = new HashSet<>(filtered.size());
+        filtered.forEach(record -> matchedIdentities.add(kafkaRecordIdentity(record)));
+
+        Map<KafkaTopicPartition, Long> offsetsToCommit = new HashMap<>();
+        int failed = 0;
+
+        for (KafkaRecordDto record : batch) {
+            KafkaTopicPartition partition = new KafkaTopicPartition(record.topic(), record.partition());
+            if (blockedPartitions.contains(partition)) {
+                continue;
+            }
+
+            String identity = kafkaRecordIdentity(record);
+            if (!matchedIdentities.contains(identity)) {
+                offsetsToCommit.put(partition, record.offset() + 1);
+                continue;
+            }
+
+            JsonNode deliveryRecord = deliveryRecordsByIdentity.get(identity);
+            if (deliveryRecord != null && invokeWithDlq(pipe, deliveryRecord.toString(), region)) {
+                offsetsToCommit.put(partition, record.offset() + 1);
+                continue;
+            }
+
+            blockedPartitions.add(partition);
+            failed++;
+        }
+
+        commitOffsets(pipe, offsetsToCommit);
+        return failed;
+    }
+
     private String initDynamoDbIterator(String streamArn) {
         try {
             return dynamoDbStreamService.getShardIterator(
@@ -325,6 +519,10 @@ public class PipesPoller {
     // ──────────────────────────── Invocation & DLQ ────────────────────────────
 
     private int deliverRecords(Pipe pipe, List<JsonNode> records, String region) {
+        // Enrichment (source → filter → ENRICHMENT → target) is currently applied only on the SQS
+        // source path (see deliverEnrichedBatch). Kinesis, DynamoDB Streams and Kafka sources
+        // deliver the filtered records straight to the target, so a pipe that configures an
+        // enrichment on those sources bypasses it — see docs/services/pipes.md.
         if (isLambdaTarget(pipe)) {
             return invokeWithDlq(pipe, wrapRecords(records), region) ? 0 : records.size();
         }
@@ -345,6 +543,76 @@ public class PipesPoller {
             LOG.warnv("Pipe {0}: delivery failed: {1} ({2})",
                     pipe.getName(), e.getMessage(), e.getClass().getSimpleName());
             return sendToDeadLetterQueue(pipe, eventJson, region);
+        }
+    }
+
+    private static boolean hasEnrichment(Pipe pipe) {
+        return pipe.getEnrichment() != null && !pipe.getEnrichment().isBlank();
+    }
+
+    /**
+     * Runs the pipe enrichment once over the filtered SQS batch and forwards its response to the
+     * target, then deletes the consumed source messages. The enrichment Lambda receives the events
+     * as a bare JSON array (SQSRecord[]); a null/empty enrichment response skips the target (AWS
+     * behavior) while still consuming the source messages.
+     */
+    private void deliverEnrichedBatch(Pipe pipe, List<JsonNode> filtered, List<Message> messages,
+                                      Set<String> matchedMessageIds, String queueUrl, String region) {
+        String eventsArray = bareArray(filtered);
+        boolean delivered;
+        try {
+            String enriched = targetInvoker.applyEnrichment(pipe, eventsArray, region);
+            if (enriched != null) {
+                // Only a Lambda target expects the batch (JSON array) shape; a Step Functions, SQS,
+                // SNS or EventBridge target must receive the raw enrichment response, matching the
+                // non-enrichment delivery path. Array-wrapping those would corrupt their input.
+                String targetPayload = isLambdaTarget(pipe)
+                        ? asEventArray(objectMapper, enriched)
+                        : enriched;
+                targetInvoker.invoke(pipe, targetPayload, region);
+            }
+            delivered = true;
+        } catch (Exception e) {
+            LOG.warnv("Pipe {0}: enriched delivery failed: {1} ({2})",
+                    pipe.getName(), e.getMessage(), e.getClass().getSimpleName());
+            delivered = sendToDeadLetterQueue(pipe, eventsArray, region);
+        }
+        if (delivered) {
+            for (Message msg : messages) {
+                if (matchedMessageIds.contains(msg.getMessageId())) {
+                    try {
+                        sqsService.deleteMessage(queueUrl, msg.getReceiptHandle(), region);
+                    } catch (Exception e) {
+                        LOG.warnv("Pipe {0}: failed to delete SQS message {1}: {2}",
+                                pipe.getName(), msg.getMessageId(), e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    private String bareArray(List<JsonNode> records) {
+        var arr = objectMapper.createArrayNode();
+        records.forEach(arr::add);
+        return arr.toString();
+    }
+
+    /**
+     * EventBridge Pipes delivers events to a target as a batch (JSON array). An enrichment that
+     * returns a single (non-array) JSON value represents one event, so it is wrapped in a
+     * one-element array; an array response is already a batch and is forwarded unchanged.
+     */
+    static String asEventArray(ObjectMapper objectMapper, String payload) {
+        try {
+            JsonNode node = objectMapper.readTree(payload);
+            if (node.isArray()) {
+                return payload;
+            }
+            return objectMapper.createArrayNode().add(node).toString();
+        } catch (Exception e) {
+            LOG.debugv("Pipe enrichment response was not JSON, wrapping as a single string event: {0}",
+                    e.getMessage());
+            return objectMapper.createArrayNode().add(payload).toString();
         }
     }
 
@@ -412,14 +680,18 @@ public class PipesPoller {
             attrs.put("ApproximateReceiveCount", String.valueOf(msg.getReceiveCount()));
             attrs.put("SentTimestamp", String.valueOf(msg.getSentTimestamp().toEpochMilli()));
             attrs.put("SenderId", AwsArnUtils.accountOrDefault(pipe.getSource(), "000000000000"));
-            attrs.put("ApproximateFirstReceiveTimestamp", String.valueOf(System.currentTimeMillis()));
+            attrs.put("ApproximateFirstReceiveTimestamp",
+                    String.valueOf(msg.getFirstReceiveTimestamp() != null
+                            ? msg.getFirstReceiveTimestamp().toEpochMilli()
+                            : System.currentTimeMillis()));
             ObjectNode msgAttrs = record.putObject("messageAttributes");
             for (Map.Entry<String, MessageAttributeValue> entry : msg.getMessageAttributes().entrySet()) {
                 ObjectNode attrNode = msgAttrs.putObject(entry.getKey());
                 MessageAttributeValue val = entry.getValue();
-                attrNode.put("stringValue", val.getStringValue());
                 if (val.getBinaryValue() != null) {
                     attrNode.put("binaryValue", Base64.getEncoder().encodeToString(val.getBinaryValue()));
+                } else if (val.getStringValue() != null) {
+                    attrNode.put("stringValue", val.getStringValue());
                 }
                 attrNode.putArray("stringListValues");
                 attrNode.putArray("binaryListValues");
@@ -467,6 +739,57 @@ public class PipesPoller {
         return nodes;
     }
 
+    private List<ObjectNode> buildKafkaRecordNodes(List<KafkaRecordDto> records, Pipe pipe) {
+        List<ObjectNode> nodes = new ArrayList<>();
+        String eventSource = pipe.getSource().contains(":kafka:") ? "aws:kafka" : "SelfManagedKafka";
+        String bootstrapServers = kafkaConsumerManager.resolveBootstrapServers(pipe);
+        for (KafkaRecordDto record : records) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("eventSource", eventSource);
+            if (pipe.getSource().contains(":kafka:")) {
+                node.put("eventSourceArn", pipe.getSource());
+            } else {
+                node.put("bootstrapServers", bootstrapServers);
+            }
+            node.put("topic", record.topic());
+            node.put("partition", record.partition());
+            node.put("offset", record.offset());
+            node.put("timestamp", record.timestamp());
+            node.put("timestampType", record.timestampType());
+            putKafkaBinaryField(node, "key", record.key());
+            putKafkaBinaryField(node, "value", record.value());
+
+            var headersNode = node.putArray("headers");
+            for (KafkaHeaderDto header : record.headers()) {
+                ObjectNode headerNode = objectMapper.createObjectNode();
+                byte[] headerValue = header.value();
+                if (headerValue == null) {
+                    headerNode.putNull(header.key());
+                } else {
+                    var values = headerNode.putArray(header.key());
+                    for (byte b : headerValue) {
+                        values.add(b & 0xFF);
+                    }
+                }
+                headersNode.add(headerNode);
+            }
+            nodes.add(node);
+        }
+        return nodes;
+    }
+
+    private List<ObjectNode> buildKafkaFilterNodes(List<ObjectNode> deliveryNodes, List<KafkaRecordDto> records) {
+        List<ObjectNode> nodes = new ArrayList<>(deliveryNodes.size());
+        for (int i = 0; i < deliveryNodes.size(); i++) {
+            ObjectNode node = deliveryNodes.get(i).deepCopy();
+            KafkaRecordDto record = records.get(i);
+            applyDecodedKafkaField(node, "key", record.key());
+            applyDecodedKafkaField(node, "value", record.value());
+            nodes.add(node);
+        }
+        return nodes;
+    }
+
     // ──────────────────────────── Utilities ────────────────────────────
 
     private static boolean isLambdaTarget(Pipe pipe) {
@@ -474,13 +797,96 @@ public class PipesPoller {
         return targetArn.contains(":lambda:") || targetArn.contains(":function:");
     }
 
+    private static boolean isKafkaSource(String sourceArn) {
+        return sourceArn.startsWith("smk://") || sourceArn.contains(":kafka:");
+    }
+
+    private static String base64(byte[] value) {
+        return Base64.getEncoder().encodeToString(value);
+    }
+
+    private static String kafkaRecordIdentity(JsonNode record) {
+        return record.path("topic").asText() + ":"
+                + record.path("partition").asText() + ":"
+                + record.path("offset").asText();
+    }
+
+    private static String kafkaRecordIdentity(KafkaRecordDto record) {
+        return record.topic() + ":" + record.partition() + ":" + record.offset();
+    }
+
+    private void applyDecodedKafkaField(ObjectNode node, String fieldName, byte[] value) {
+        if (value == null) {
+            node.putNull(fieldName);
+            return;
+        }
+        String decoded = new String(value, StandardCharsets.UTF_8);
+        try {
+            JsonNode parsed = objectMapper.readTree(decoded);
+            node.set(fieldName, parsed);
+        } catch (JsonProcessingException e) {
+            LOG.debugv("Kafka {0} is not valid JSON: {1}", fieldName, e.getOriginalMessage());
+            node.put(fieldName, decoded);
+        }
+    }
+
+    private void putKafkaBinaryField(ObjectNode node, String fieldName, byte[] value) {
+        if (value == null) {
+            node.putNull(fieldName);
+            return;
+        }
+        node.put(fieldName, base64(value));
+    }
+
+    private Map<KafkaTopicPartition, List<KafkaRecordDto>> groupKafkaRecordsByPartition(List<KafkaRecordDto> records) {
+        Map<KafkaTopicPartition, List<KafkaRecordDto>> recordsByPartition = new HashMap<>();
+        for (KafkaRecordDto record : records) {
+            KafkaTopicPartition partition = new KafkaTopicPartition(record.topic(), record.partition());
+            recordsByPartition.computeIfAbsent(partition, ignored -> new ArrayList<>()).add(record);
+        }
+        return recordsByPartition;
+    }
+
+    /**
+     * Commits past every record in {@code batch}, for when none of them are being delivered (no
+     * filter match). The REST Proxy has no "commit everything consumed" shortcut (unlike the
+     * native consumer's no-args {@code commitSync()}), so this computes the equivalent explicitly:
+     * the highest offset seen per partition, plus one.
+     */
+    private void commitWholeBatch(Pipe pipe, List<KafkaRecordDto> batch) {
+        Map<KafkaTopicPartition, Long> offsetsToCommit = new HashMap<>();
+        for (KafkaRecordDto record : batch) {
+            KafkaTopicPartition partition = new KafkaTopicPartition(record.topic(), record.partition());
+            offsetsToCommit.merge(partition, record.offset() + 1, Math::max);
+        }
+        commitOffsets(pipe, offsetsToCommit);
+    }
+
+    private void commitOffsets(Pipe pipe, Map<KafkaTopicPartition, Long> offsetsToCommit) {
+        if (offsetsToCommit.isEmpty()) {
+            return;
+        }
+        List<KafkaOffsetDto> offsets = new ArrayList<>(offsetsToCommit.size());
+        offsetsToCommit.forEach((partition, offset) ->
+                offsets.add(new KafkaOffsetDto(partition.topic(), partition.partition(), offset)));
+        kafkaConsumerManager.commit(pipe, offsets);
+    }
+
+    private static <T> List<List<T>> partition(List<T> list, int size) {
+        int step = Math.max(1, size);
+        List<List<T>> partitions = new ArrayList<>();
+        for (int i = 0; i < list.size(); i += step) {
+            partitions.add(list.subList(i, Math.min(i + step, list.size())));
+        }
+        return partitions;
+    }
+
     private static String pipeKey(Pipe pipe) {
         return pipe.getArn();
     }
 
     private static String extractRegionFromArn(String arn) {
-        String[] parts = arn.split(":");
-        return parts.length >= 4 ? parts[3] : "us-east-1";
+        return AwsArnUtils.regionOrDefault(arn, "us-east-1");
     }
 
     private static String extractResourceName(String arn) {

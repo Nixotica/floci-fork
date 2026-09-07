@@ -6,6 +6,8 @@ import javax.crypto.Mac;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
+import javax.net.ssl.SSLSocket;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
@@ -20,19 +22,22 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Handles the PostgreSQL wire protocol auth intercept.
  *
  * <p>Flow:
  * <ol>
- *   <li>Read client StartupMessage (handles SSL rejection)
+ *   <li>Read client StartupMessage (handles PostgreSQL SSL negotiation)
  *   <li>Challenge client with AuthenticationCleartextPassword
  *   <li>Read client password
  *   <li>Validate (IAM SigV4 or plain password)
  *   <li>Connect to backend with MD5 or SCRAM-SHA-256 auth
  *   <li>Buffer backend messages until ReadyForQuery
- *   <li>Send AuthOK + buffered messages to client, then bridge
+ *   <li>For IAM logins, hand the session over to the role named in the token
+ *   <li>Send AuthOK + buffered messages to client, then bridge, guarding an IAM
+ *       session against being handed back to the master role
  * </ol>
  */
 public class PostgresProtocolHandler {
@@ -41,21 +46,30 @@ public class PostgresProtocolHandler {
 
     private static final int SSL_REQUEST_CODE = 80877103;
     private static final int STARTUP_PROTOCOL_VERSION = 196608; // v3.0
+    private static final int MAX_HANDSHAKE_PACKET_LENGTH = 1_048_576;
 
-    public static void handleAuth(Socket client, Socket backend,
-                                  String masterUsername, String masterPassword, String dbName,
-                                  boolean iamEnabled, RdsSigV4Validator sigV4,
-                                  PasswordValidator passwordValidator) throws IOException {
+    /**
+     * An authenticated client connection ready to be bridged. {@code iamRole} is the role an IAM
+     * token named and the session was handed over to, or {@code null} for every other login.
+     */
+    public record AuthenticatedSession(Socket client, String iamRole) {}
 
-        InputStream clientIn = client.getInputStream();
-        OutputStream clientOut = client.getOutputStream();
+    public static AuthenticatedSession authenticate(Socket client, Socket backend,
+                                      String masterUsername, String masterPassword, String dbName,
+                                      boolean iamEnabled, RdsSigV4Validator sigV4,
+                                      RdsProxyTlsCertificates tlsCertificates,
+                                      PasswordValidator passwordValidator) throws IOException {
 
         // Phase 1: Read client startup message (possibly preceded by SSL request)
-        String clientUsername = readStartupMessage(clientIn, clientOut);
-        if (clientUsername == null) {
+        StartupMessage startup = readStartupMessage(client, tlsCertificates);
+        if (startup == null) {
             closeQuietly(client);
-            return;
+            return null;
         }
+        client = startup.socket();
+        String clientUsername = startup.username();
+        InputStream clientIn = client.getInputStream();
+        OutputStream clientOut = client.getOutputStream();
 
         // Phase 2: Challenge client with cleartext password request
         sendMessage(clientOut, 'R', intBytes(3)); // AuthenticationCleartextPassword
@@ -65,7 +79,7 @@ public class PostgresProtocolHandler {
         String clientPassword = readPasswordMessage(clientIn);
         if (clientPassword == null) {
             closeQuietly(client);
-            return;
+            return null;
         }
 
         // Phase 4: Validate credentials.
@@ -83,7 +97,7 @@ public class PostgresProtocolHandler {
                 clientOut.flush();
                 closeQuietly(client);
                 closeQuietly(backend);
-                return;
+                return null;
             }
         } else if (isMaster) {
             if (!passwordValidator.validate(clientUsername, clientPassword)) {
@@ -92,7 +106,7 @@ public class PostgresProtocolHandler {
                 clientOut.flush();
                 closeQuietly(client);
                 closeQuietly(backend);
-                return;
+                return null;
             }
         }
 
@@ -103,7 +117,7 @@ public class PostgresProtocolHandler {
         InputStream backendIn = backend.getInputStream();
         OutputStream backendOut = backend.getOutputStream();
 
-        String effectiveDbName = (dbName != null && !dbName.isBlank()) ? dbName : "postgres";
+        String effectiveDbName = resolveEffectiveDbName(startup.database(), dbName);
         String backendUser = (isIam || isMaster) ? masterUsername : clientUsername;
         String backendPass = (isIam || isMaster) ? masterPassword : clientPassword;
         sendStartupToBackend(backendOut, backendUser, effectiveDbName);
@@ -115,35 +129,68 @@ public class PostgresProtocolHandler {
             clientOut.flush();
             closeQuietly(client);
             closeQuietly(backend);
-            return;
+            return null;
         }
 
         // Buffer all backend messages until ReadyForQuery ('Z')
         List<byte[]> bufferedMessages = readUntilReadyForQuery(backendIn);
 
+        String iamRole = null;
+
+        // Phase 5b: An IAM token is issued for one specific database role, so the session must run
+        // as that role even though the backend connection was opened as master. Handing it over
+        // gives the session the role's own privileges and object ownership, and refuses a token
+        // naming a role the database does not have instead of silently granting a master session.
+        if (isIam && !isMaster && !endsWithErrorResponse(bufferedMessages)) {
+            List<byte[]> roleSwitch = assumeSessionRole(backendIn, backendOut, clientUsername);
+            if (endsWithErrorResponse(roleSwitch)) {
+                sendErrorResponse(clientOut, "FATAL", "28000",
+                        errorMessage(roleSwitch.get(roleSwitch.size() - 1),
+                                "role \"" + clientUsername + "\" does not exist"));
+                clientOut.flush();
+                closeQuietly(client);
+                closeQuietly(backend);
+                return null;
+            }
+            bufferedMessages = applyParameterStatusUpdates(bufferedMessages, roleSwitch);
+            iamRole = clientUsername;
+        }
+
         // Phase 6: Send AuthenticationOK to client, forward buffered messages, then bridge
+        if (endsWithErrorResponse(bufferedMessages)) {
+            for (byte[] msg : bufferedMessages) {
+                clientOut.write(msg);
+            }
+            clientOut.flush();
+            closeQuietly(client);
+            closeQuietly(backend);
+            return null;
+        }
+
         sendMessage(clientOut, 'R', intBytes(0)); // AuthenticationOK
         for (byte[] msg : bufferedMessages) {
             clientOut.write(msg);
         }
         clientOut.flush();
 
-        bridge(client, backend);
+        return new AuthenticatedSession(client, iamRole);
     }
 
     // ── Startup ───────────────────────────────────────────────────────────────
 
-    private static String readStartupMessage(InputStream in, OutputStream out) throws IOException {
+    private static StartupMessage readStartupMessage(Socket socket, RdsProxyTlsCertificates tlsCertificates)
+            throws IOException {
+        Socket currentSocket = socket;
         while (true) {
-            int length = readInt32(in);
-            if (length < 8) {
-                return null;
-            }
+            InputStream in = currentSocket.getInputStream();
+            OutputStream out = currentSocket.getOutputStream();
+            int length = checkedPacketLength(readInt32(in), 8, "startup message");
             int proto = readInt32(in);
 
             if (proto == SSL_REQUEST_CODE) {
-                out.write('N'); // Reject SSL
+                out.write('S');
                 out.flush();
+                currentSocket = acceptSsl(currentSocket, tlsCertificates);
                 continue;
             }
 
@@ -155,8 +202,38 @@ public class PostgresProtocolHandler {
             byte[] payload = new byte[length - 8];
             readFully(in, payload);
             Map<String, String> params = parseStartupParams(payload);
-            return params.getOrDefault("user", "postgres");
+            return new StartupMessage(currentSocket,
+                    params.getOrDefault("user", "postgres"),
+                    params.get("database"));
         }
+    }
+
+    static Socket acceptSsl(Socket socket, RdsProxyTlsCertificates tlsCertificates) throws IOException {
+        try {
+            SSLSocket sslSocket = (SSLSocket) tlsCertificates.sslContext().getSocketFactory()
+                    .createSocket(socket, socket.getInetAddress().getHostAddress(), socket.getPort(), true);
+            sslSocket.setUseClientMode(false);
+            sslSocket.startHandshake();
+            return sslSocket;
+        } catch (Exception e) {
+            throw new IOException("Unable to negotiate PostgreSQL SSL", e);
+        }
+    }
+
+    private record StartupMessage(Socket socket, String username, String database) {}
+
+    static String resolveEffectiveDbName(String clientDatabase, String instanceDbName) {
+        if (clientDatabase != null && !clientDatabase.isBlank()) {
+            return clientDatabase;
+        }
+        if (instanceDbName != null && !instanceDbName.isBlank()) {
+            return instanceDbName;
+        }
+        return "postgres";
+    }
+
+    private static boolean endsWithErrorResponse(List<byte[]> messages) {
+        return !messages.isEmpty() && messages.get(messages.size() - 1)[0] == 'E';
     }
 
     private static Map<String, String> parseStartupParams(byte[] data) {
@@ -218,7 +295,7 @@ public class PostgresProtocolHandler {
             LOG.warnv("Expected PasswordMessage ('p'), got {0}", (char) type);
             return null;
         }
-        int length = readInt32(in);
+        int length = checkedPacketLength(readInt32(in), 5, "password message");
         byte[] data = new byte[length - 4];
         readFully(in, data);
         // Strip trailing null terminator
@@ -239,7 +316,7 @@ public class PostgresProtocolHandler {
             return false;
         }
 
-        int length = readInt32(in);
+        int length = checkedPacketLength(readInt32(in), 8, "backend authentication message");
         int authType = readInt32(in);
 
         if (authType == 0) {
@@ -305,7 +382,7 @@ public class PostgresProtocolHandler {
         if (in.read() != 'R') {
             return false;
         }
-        int len2 = readInt32(in);
+        int len2 = checkedPacketLength(readInt32(in), 8, "SASL continue message");
         if (readInt32(in) != 11) {
             return false;
         }
@@ -346,7 +423,7 @@ public class PostgresProtocolHandler {
         if (in.read() != 'R') {
             return false;
         }
-        int len3 = readInt32(in);
+        int len3 = checkedPacketLength(readInt32(in), 8, "SASL final message");
         if (readInt32(in) != 12) {
             return false;
         }
@@ -422,7 +499,7 @@ public class PostgresProtocolHandler {
             LOG.warnv("Expected AuthenticationOK from backend, got type={0}", type);
             return false;
         }
-        int length = readInt32(in);
+        int length = checkedPacketLength(readInt32(in), 8, "authentication response");
         int authType = readInt32(in);
         if (length > 8) {
             byte[] extra = new byte[length - 8];
@@ -462,7 +539,7 @@ public class PostgresProtocolHandler {
             if (type < 0) {
                 throw new EOFException("Connection closed before ReadyForQuery");
             }
-            int length = readInt32(in);
+            int length = checkedPacketLength(readInt32(in), 4, "backend message");
             byte[] payload = new byte[length - 4];
             readFully(in, payload);
 
@@ -487,9 +564,132 @@ public class PostgresProtocolHandler {
         return messages;
     }
 
-    // ── Bridge ────────────────────────────────────────────────────────────────
+    // ── IAM session role ──────────────────────────────────────────────────────
 
-    private static void bridge(Socket client, Socket backend) {
+    /**
+     * Hands the backend session over to {@code role} so {@code current_user} and
+     * {@code session_user} both report the role named in the IAM token and the session carries
+     * only that role's privileges.
+     *
+     * @return the backend messages the statement produced, up to ReadyForQuery or ErrorResponse
+     */
+    private static List<byte[]> assumeSessionRole(InputStream in, OutputStream out, String role)
+            throws IOException {
+        String sql = "SET SESSION AUTHORIZATION " + quoteIdentifier(role);
+        sendMessage(out, 'Q', sql.getBytes(StandardCharsets.UTF_8), new byte[]{0});
+        out.flush();
+        return readUntilReadyForQuery(in);
+    }
+
+    static String quoteIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
+    /**
+     * Folds the ParameterStatus messages a statement produced into the buffered startup messages,
+     * so the client's view of parameters such as {@code session_authorization} and
+     * {@code is_superuser} matches the session it is handed. Same-named entries are replaced;
+     * new ones are inserted ahead of BackendKeyData/ReadyForQuery.
+     */
+    static List<byte[]> applyParameterStatusUpdates(List<byte[]> buffered, List<byte[]> updates) {
+        List<byte[]> merged = new ArrayList<>(buffered);
+        for (byte[] update : updates) {
+            String name = parameterStatusName(update);
+            if (name == null) {
+                continue;
+            }
+            int existing = indexOfParameterStatus(merged, name);
+            if (existing >= 0) {
+                merged.set(existing, update);
+            } else {
+                merged.add(startupTrailerIndex(merged), update);
+            }
+        }
+        return merged;
+    }
+
+    private static int indexOfParameterStatus(List<byte[]> messages, String name) {
+        for (int i = 0; i < messages.size(); i++) {
+            if (name.equals(parameterStatusName(messages.get(i)))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** Index of the first BackendKeyData/ReadyForQuery: where ParameterStatus messages end. */
+    private static int startupTrailerIndex(List<byte[]> messages) {
+        for (int i = 0; i < messages.size(); i++) {
+            char type = (char) messages.get(i)[0];
+            if (type == 'K' || type == 'Z') {
+                return i;
+            }
+        }
+        return messages.size();
+    }
+
+    /** Name carried by a ParameterStatus message, or {@code null} for any other message. */
+    private static String parameterStatusName(byte[] message) {
+        if (message.length < 6 || message[0] != 'S') {
+            return null;
+        }
+        String[] status = parameterStatus(message, 5);
+        return status == null ? null : status[0];
+    }
+
+    /**
+     * Splits the {@code name}/{@code value} pair a ParameterStatus carries, reading from
+     * {@code offset}, or {@code null} when the message is truncated.
+     */
+    private static String[] parameterStatus(byte[] message, int offset) {
+        int nameEnd = offset;
+        while (nameEnd < message.length && message[nameEnd] != 0) {
+            nameEnd++;
+        }
+        if (nameEnd >= message.length) {
+            return null;
+        }
+        int valueEnd = nameEnd + 1;
+        while (valueEnd < message.length && message[valueEnd] != 0) {
+            valueEnd++;
+        }
+        return new String[] {
+                new String(message, offset, nameEnd - offset, StandardCharsets.UTF_8),
+                new String(message, nameEnd + 1, valueEnd - nameEnd - 1, StandardCharsets.UTF_8)
+        };
+    }
+
+    /** Human-readable 'M' field of an ErrorResponse, or {@code fallback} when it carries none. */
+    static String errorMessage(byte[] errorResponse, String fallback) {
+        int i = 5; // skip type byte and Int32 length
+        while (i < errorResponse.length && errorResponse[i] != 0) {
+            char fieldType = (char) errorResponse[i];
+            i++;
+            int start = i;
+            while (i < errorResponse.length && errorResponse[i] != 0) {
+                i++;
+            }
+            if (fieldType == 'M') {
+                return new String(errorResponse, start, i - start, StandardCharsets.UTF_8);
+            }
+            i++; // skip the field's null terminator
+        }
+        return fallback;
+    }
+
+    /**
+     * Relays the authenticated session until either side closes.
+     *
+     * <p>An IAM session gets its backend→client direction read message by message so the proxy
+     * sees PostgreSQL report the session's identity. The backend connection underneath is the
+     * master one, so a client that talks the session back to the master role, via {@code RESET
+     * SESSION AUTHORIZATION} and its variants, would otherwise regain superuser, which the
+     * token never granted. Watching the server's own {@code session_authorization} report catches
+     * that whatever SQL produced it; the session is then terminated, since a handover that already
+     * happened cannot be taken back.
+     */
+    public static void bridge(AuthenticatedSession session, Socket backend) {
+        Socket client = session.client();
         InputStream clientIn, backendIn;
         OutputStream clientOut, backendOut;
         try {
@@ -502,10 +702,17 @@ public class PostgresProtocolHandler {
             closeQuietly(backend);
             return;
         }
+        AtomicBoolean closed = new AtomicBoolean();
+        Runnable closeBoth = () -> {
+            if (closed.compareAndSet(false, true)) {
+                closeQuietly(client);
+                closeQuietly(backend);
+            }
+        };
         Thread t1 = Thread.ofVirtual().name("rds-pg-c2b")
-                .start(() -> relay(clientIn, backendOut));
+                .start(() -> relay(clientIn, backendOut, closeBoth));
         Thread t2 = Thread.ofVirtual().name("rds-pg-b2c")
-                .start(() -> relay(backendIn, clientOut));
+                .start(() -> relayToClient(backendIn, clientOut, session.iamRole(), closeBoth));
         try {
             t1.join();
             t2.join();
@@ -517,7 +724,89 @@ public class PostgresProtocolHandler {
         }
     }
 
-    private static void relay(InputStream from, OutputStream to) {
+    private static void relayToClient(InputStream from, OutputStream to, String iamRole,
+                                      Runnable onDone) {
+        if (iamRole == null) {
+            relay(from, to, onDone);
+            return;
+        }
+        BufferedOutputStream buffered = new BufferedOutputStream(to, 8192);
+        try {
+            relayGuardingSessionRole(from, buffered, iamRole);
+        } catch (IOException e) {
+            // Either side closing mid-relay is the normal way a session ends, so this stays at
+            // debug: it is one line per connection teardown, not per message.
+            LOG.debugv("RDS IAM session relay for role {0} ended: {1}", iamRole, e.getMessage());
+        } finally {
+            try {
+                buffered.flush();
+            } catch (IOException e) {
+                LOG.debugv("Client for RDS IAM role {0} gone before the last flush: {1}",
+                        iamRole, e.getMessage());
+            }
+            onDone.run();
+        }
+    }
+
+    /**
+     * Copies framed backend messages, stopping the session if PostgreSQL ever reports a
+     * {@code session_authorization} other than {@code iamRole}.
+     */
+    private static void relayGuardingSessionRole(InputStream from, OutputStream to, String iamRole)
+            throws IOException {
+        byte[] buf = new byte[8192];
+        while (true) {
+            int type = from.read();
+            if (type < 0) {
+                return;
+            }
+            byte[] header = new byte[4];
+            readFully(from, header);
+            int length = ((header[0] & 0xFF) << 24) | ((header[1] & 0xFF) << 16)
+                    | ((header[2] & 0xFF) << 8) | (header[3] & 0xFF);
+            if (length < 4) {
+                return;
+            }
+            int remaining = length - 4;
+
+            if (type == 'S') {
+                // ParameterStatus is always small, so reading it whole to inspect costs nothing.
+                byte[] payload = new byte[remaining];
+                readFully(from, payload);
+                String[] status = parameterStatus(payload, 0);
+                if (status != null && "session_authorization".equals(status[0])
+                        && !iamRole.equals(status[1])) {
+                    LOG.warnv("RDS IAM session for role {0} tried to switch to {1}; terminating",
+                            iamRole, status[1]);
+                    sendErrorResponse(to, "FATAL", "42501",
+                            "permission denied to set session authorization");
+                    to.flush();
+                    return;
+                }
+                to.write(type);
+                to.write(header);
+                to.write(payload);
+            } else {
+                to.write(type);
+                to.write(header);
+                while (remaining > 0) {
+                    int n = from.read(buf, 0, Math.min(buf.length, remaining));
+                    if (n < 0) {
+                        return;
+                    }
+                    to.write(buf, 0, n);
+                    remaining -= n;
+                }
+            }
+
+            // Batch while the backend keeps talking, flush as soon as it pauses.
+            if (from.available() == 0) {
+                to.flush();
+            }
+        }
+    }
+
+    private static void relay(InputStream from, OutputStream to, Runnable onDone) {
         try {
             byte[] buf = new byte[8192];
             int n;
@@ -525,7 +814,10 @@ public class PostgresProtocolHandler {
                 to.write(buf, 0, n);
                 to.flush();
             }
-        } catch (IOException ignored) {}
+        } catch (IOException ignored) {
+        } finally {
+            onDone.run();
+        }
     }
 
     // ── Error response ────────────────────────────────────────────────────────
@@ -585,6 +877,18 @@ public class PostgresProtocolHandler {
             throw new EOFException("Connection closed while reading Int32");
         }
         return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+
+    private static int checkedPacketLength(int length, int minimum, String packetName) throws IOException {
+        if (length < minimum) {
+            throw new IOException("PostgreSQL " + packetName + " length is below the "
+                    + minimum + " byte minimum: " + length);
+        }
+        if (length > MAX_HANDSHAKE_PACKET_LENGTH) {
+            throw new IOException("PostgreSQL " + packetName + " length exceeds the "
+                    + MAX_HANDSHAKE_PACKET_LENGTH + " byte limit: " + length);
+        }
+        return length;
     }
 
     private static void readFully(InputStream in, byte[] buf) throws IOException {

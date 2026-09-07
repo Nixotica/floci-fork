@@ -35,15 +35,20 @@ public class AppConfigDataController {
         return Response.status(201).entity(Map.of("InitialConfigurationToken", token)).build();
     }
 
+    // Bound to an internal path rather than the public "/configuration" so that
+    // an S3 bucket named "configuration" is not shadowed by this route (issue
+    // #1294). AppConfigConfigurationRouteFilter rewrites genuine GetLatestConfiguration
+    // requests (those carrying a configuration_token) onto this path; requests
+    // without a token fall through to S3's /{bucket} handler.
     @GET
-    @Path("/configuration")
+    @Path(AppConfigConfigurationRouteFilter.INTERNAL_PATH)
     public Response getLatestConfiguration(@QueryParam("configuration_token") String token) {
         ConfigurationData data = service.getLatestConfiguration(token);
         return Response.ok(data.content())
                 .header("Content-Type", data.contentType())
                 .header("Version-Label", data.configurationVersion())
                 .header("Next-Poll-Configuration-Token", data.nextPollConfigurationToken())
-                .header("Next-Poll-Interval-In-Seconds", 15)
+                .header("Next-Poll-Interval-In-Seconds", data.nextPollIntervalInSeconds())
                 .build();
     }
 }

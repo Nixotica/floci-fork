@@ -4,23 +4,25 @@ Floci publishes images to [Docker Hub (`floci/floci`)](https://hub.docker.com/r/
 
 Every image tag combines two independent choices: **what's inside** (variant) and **how stable it is** (channel).
 
-## Axis 1 — Variant (what's inside)
+## Axis 1: Variant (what's inside)
 
 | Variant | Contents | When to use |
 |---|---|---|
-| **Standard** | Floci native binary only | General use — CI, local dev, Testcontainers **(recommended)** |
+| **Standard** | Floci native binary only | General use: CI, local dev, Testcontainers **(recommended)** |
 | **Compat** | Floci + Python 3 + AWS CLI + boto3 | Workflows that need AWS tooling available inside the container |
 
-The compat image is built on top of the standard image — startup time and memory footprint are identical. Only the image size increases.
+The compat image runs the same native binary as the standard image, so startup time and memory footprint are identical. Only the image size increases.
 
-## Axis 2 — Channel (how stable)
+The standard image is built on Red Hat UBI 9 micro. Besides Floci it contains only bash and coreutils. There is no package manager, curl, grep or sed inside. Pick the compat image when you need tools inside the container.
+
+## Axis 2: Channel (how stable)
 
 | Channel | Source | Published |
 |---|---|---|
-| **Release** | Tagged version (e.g. `1.5.11`) | On every release |
-| **Nightly** | Tip of `main` | Every night at 22:00 CT |
+| **Release** | Tagged version (e.g. `x.y.z`) | 1st and 3rd Tuesday of each month |
+| **Nightly** | Tip of `main` | Every night at 23:00 CT |
 
-Release images are stable and recommended for most use cases. Nightly images track active development and may include unreleased changes.
+Release images are stable and recommended for most use cases. Between trains, `nightly` carries every merged fix from the following morning. Nightly images track active development and may include unreleased changes.
 
 ## Full Tag Matrix
 
@@ -33,7 +35,7 @@ Combining both axes gives the complete set of published tags:
 | **Nightly (floating)** | `nightly` | `nightly-compat` |
 | **Nightly (dated)** | `nightly-mmddyyyy` | `nightly-mmddyyyy-compat` |
 
-Dated nightly tags (e.g. `nightly-05022026`) are fixed and never move — use them for reproducible builds from `main`.
+Dated nightly tags (e.g. `nightly-05022026`) name one night's build of `main`. A same-day rerun of the nightly workflow republishes that day's tag, so for a build you can rely on not changing, pin a release version.
 
 !!! warning
     Nightly images may include unreleased or experimental changes. Use release tags in production-like environments.
@@ -41,16 +43,16 @@ Dated nightly tags (e.g. `nightly-05022026`) are fixed and never move — use th
 ## Quick Reference
 
 ```yaml title="docker-compose.yml"
-# Standard release — recommended
+# Standard release : recommended
 image: floci/floci:latest
 
-# Compat release — includes AWS CLI and boto3
+# Compat release : includes AWS CLI and boto3
 image: floci/floci:latest-compat
 
-# Pinned release — reproducible builds
-image: floci/floci:1.5.11
+# Pinned release : reproducible builds
+image: floci/floci:x.y.z
 
-# Nightly — track main
+# Nightly : track main
 image: floci/floci:nightly
 ```
 
@@ -58,15 +60,74 @@ image: floci/floci:nightly
 
 All images are published as multi-arch manifests supporting `linux/amd64` and `linux/arm64`. Docker selects the correct variant automatically.
 
+## Reusable Image Publishing
+
+The `Build Floci Images` reusable workflow publishes a JVM image for an exact
+branch, tag, or commit by default. This matches the ordinary Maven package and
+the repository's local-development Docker image. A calling repository owns the
+trigger, destination registry, credentials, and package permissions; the shared
+workflow owns the multi-architecture manifest, image labels, and provenance
+output.
+
+For example, a fork can keep this small manual caller on its default branch:
+
+```yaml title=".github/workflows/publish-images.yml"
+name: Publish Floci Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      source-ref:
+        description: Floci branch, tag, or commit to publish
+        required: true
+        type: string
+        default: main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    uses: floci-io/floci/.github/workflows/build-images.yml@main
+    with:
+      source-ref: ${{ inputs.source-ref }}
+      image: ghcr.io/${{ github.repository_owner }}/floci
+```
+
+Pin the reusable workflow to a trusted tag or full commit SHA when the caller
+requires a stable build contract. The caller's `GITHUB_TOKEN` publishes a GHCR
+image only below the caller's repository owner. Calls targeting another OCI
+registry must pass `REGISTRY_USERNAME` and `REGISTRY_TOKEN` through the reusable
+workflow's declared secrets.
+
+The default workflow publishes a build-and-commit-derived convenience tag:
+
+- `<YYYYMMDD.HHMMSS>.<commit-sha-8>` for the JVM image
+
+Callers that also need native artifacts can pass `publish-native: true`. This
+adds `<YYYYMMDD.HHMMSS>.<commit-sha-8>-native` and
+`<YYYYMMDD.HHMMSS>.<commit-sha-8>-native-compat`; it does not change the
+unqualified JVM tag. Timestamps are generated in UTC.
+
+Each workflow invocation produces a new timestamped tag. The workflow returns
+the digest-qualified JVM reference (plus native references when requested) and
+uploads them in a provenance JSON artifact. Downstream tests should use a
+digest-qualified reference when they require an immutable image:
+
+```text
+ghcr.io/example/floci@sha256:...
+```
+
 ## What's in the Compat Image
 
-The compat image installs the following on top of the standard image:
+The compat image adds the following to the standard image contents:
 
 - Python 3 + pip
 - [AWS CLI](https://pypi.org/project/awscli/) (via pip)
 - [boto3](https://pypi.org/project/boto3/) (via pip)
 
-The AWS CLI is pre-configured to talk to the local Floci endpoint — no `--endpoint-url` flag is needed in hook scripts:
+The AWS CLI is pre-configured to talk to the local Floci endpoint, so no `--endpoint-url` flag is needed in hook scripts:
 
 ```sh
 #!/bin/sh
@@ -93,7 +154,10 @@ Override any of them at runtime via `docker run -e` or the Compose `environment`
 
 ## Local Development
 
-The project ships a `docker-compose.yml` at the repository root configured for local development. By default it uses `docker/Dockerfile` (a fast JVM build suited for iteration). Switch the `dockerfile` entry to test the native image locally:
+The project ships a `docker-compose.yml` at the repository root configured for local development.
+By default it uses `docker/Dockerfile`, a fast Ubuntu Noble/glibc JVM image suited for iteration
+with Java 25. The release and nightly images use the native Dockerfiles described above. Switch the
+`dockerfile` entry to test the native image locally:
 
 ```yaml title="docker-compose.yml"
 build:

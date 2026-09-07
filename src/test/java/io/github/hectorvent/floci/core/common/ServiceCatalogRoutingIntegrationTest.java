@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.securityadmin.SecurityAdminController;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
@@ -38,9 +39,47 @@ class ServiceCatalogRoutingIntegrationTest {
     }
 
     @Test
+    void rpcV2ServiceNamesDeriveFromTargetPrefixes() {
+        // The smithy-rpc-v2 path segment is the service shape name == target prefix
+        // without the trailing dot (what the AWS SDKs actually send on the wire).
+        assertEquals("dynamodb", catalog.byCborSdkServiceId("DynamoDB_20120810").orElseThrow().externalKey());
+        assertEquals("dynamodb", catalog.byCborSdkServiceId("DynamoDBStreams_20120810").orElseThrow().externalKey());
+        assertEquals("kinesis", catalog.byCborSdkServiceId("Kinesis_20131202").orElseThrow().externalKey());
+        assertEquals("sqs", catalog.byCborSdkServiceId("AmazonSQS").orElseThrow().externalKey());
+        assertEquals("sns", catalog.byCborSdkServiceId("SNS_20100331").orElseThrow().externalKey());
+        assertEquals("states", catalog.byCborSdkServiceId("AWSStepFunctions").orElseThrow().externalKey());
+    }
+
+    @Test
     void queryProtocolAliasesAreDeclaredOnDescriptors() {
         assertTrue(catalog.byCredentialScope("sesv2").orElseThrow().supportsProtocol(ServiceProtocol.QUERY));
         assertTrue(catalog.byCredentialScope("cognito-idp").orElseThrow().supportsProtocol(ServiceProtocol.QUERY));
+    }
+
+    @Test
+    void rdsDataResolvesAsRestJsonByCredentialScope() {
+        ServiceDescriptor descriptor = catalog.byCredentialScope("rds-data").orElseThrow();
+
+        assertEquals("rds-data", descriptor.externalKey());
+        assertEquals(ServiceProtocol.REST_JSON, descriptor.defaultProtocol());
+        assertTrue(descriptor.supportsProtocol(ServiceProtocol.REST_JSON));
+    }
+
+    @Test
+    void fisResolvesAsRestJsonByCredentialScope() {
+        ServiceDescriptor descriptor = catalog.byCredentialScope("fis").orElseThrow();
+
+        assertEquals("fis", descriptor.externalKey());
+        assertEquals("fis", descriptor.storageKey());
+        assertEquals(ServiceProtocol.REST_JSON, descriptor.defaultProtocol());
+        assertTrue(descriptor.supportsProtocol(ServiceProtocol.REST_JSON));
+    }
+
+    @Test
+    void sharedSecurityAdminRouteResolvesOnlyBySigningScope() {
+        assertTrue(catalog.byResourceClass(SecurityAdminController.class).isEmpty());
+        assertEquals("macie2", catalog.byCredentialScope("macie2").orElseThrow().externalKey());
+        assertEquals("guardduty", catalog.byCredentialScope("guardduty").orElseThrow().externalKey());
     }
 
     @Test

@@ -248,6 +248,56 @@ class S3VirtualHostIntegrationTest {
     }
 
     @Test
+    @Order(17)
+    void listBucketsViaLocalStackS3ServiceHost() {
+        given()
+            .header("Host", "s3.localhost.localstack.cloud")
+        .when()
+            .get("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("ListAllMyBucketsResult"))
+            .body(containsString(BUCKET));
+    }
+
+    @Test
+    @Order(18)
+    void listBucketsViaFlociS3ServiceHost() {
+        given()
+            .header("Host", "s3.localhost.floci.io")
+        .when()
+            .get("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("ListAllMyBucketsResult"))
+            .body(containsString(BUCKET));
+    }
+
+    @Test
+    @Order(19)
+    void objectKeyStartingWithCloudFrontPrefixRemainsReachable() {
+        given()
+            .header("Host", HOST)
+            .contentType("text/plain")
+            .body("ordinary s3 object")
+        .when()
+            .put("/_cloudfront/file.txt")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Host", HOST)
+        .when()
+            .get("/_cloudfront/file.txt")
+        .then()
+            .statusCode(200)
+            .body(equalTo("ordinary s3 object"));
+
+        given().header("Host", HOST).delete("/_cloudfront/file.txt")
+                .then().statusCode(204);
+    }
+
+    @Test
     @Order(20)
     void cleanupAndDeleteBucket() {
         given().header("Host", HOST).delete("/hello.txt");

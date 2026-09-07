@@ -6,6 +6,8 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.util.List;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 
@@ -49,7 +51,22 @@ class SesV2IntegrationTest {
             .post("/v2/email/identities")
         .then()
             .statusCode(200)
-            .body("IdentityType", equalTo("DOMAIN"));
+            .body("IdentityType", equalTo("DOMAIN"))
+            .body("VerifiedForSendingStatus", equalTo(false))
+            .body("DkimAttributes.SigningEnabled", equalTo(true))
+            // CreateEmailIdentity reports NOT_STARTED (SES hasn't begun tracking the CNAMEs yet).
+            .body("DkimAttributes.Status", equalTo("NOT_STARTED"))
+            .body("DkimAttributes.Tokens", not(empty()));
+
+        // A subsequent GetEmailIdentity transitions the DKIM status to PENDING, matching AWS.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/identities/v2example.com")
+        .then()
+            .statusCode(200)
+            .body("DkimAttributes.Status", equalTo("PENDING"));
     }
 
     @Test
@@ -79,7 +96,18 @@ class SesV2IntegrationTest {
             .body("EmailIdentities", notNullValue())
             .body("EmailIdentities.size()", greaterThanOrEqualTo(2))
             .body("EmailIdentities.IdentityName", hasItem("v2sender@example.com"))
-            .body("EmailIdentities.IdentityName", hasItem("v2example.com"));
+            .body("EmailIdentities.IdentityName", hasItem("v2example.com"))
+            // VerificationStatus must be populated per identity (never null), matching AWS.
+            .body("EmailIdentities.VerificationStatus", everyItem(notNullValue()))
+            .body("EmailIdentities.find { it.IdentityName == 'v2sender@example.com' }.VerificationStatus",
+                    equalTo("SUCCESS"))
+            .body("EmailIdentities.find { it.IdentityName == 'v2example.com' }.VerificationStatus",
+                    equalTo("PENDING"))
+            // SendingEnabled tracks verification: SUCCESS -> true, PENDING -> false (matches AWS).
+            .body("EmailIdentities.find { it.IdentityName == 'v2sender@example.com' }.SendingEnabled",
+                    equalTo(true))
+            .body("EmailIdentities.find { it.IdentityName == 'v2example.com' }.SendingEnabled",
+                    equalTo(false));
     }
 
     @Test
@@ -95,6 +123,151 @@ class SesV2IntegrationTest {
             .body("IdentityType", equalTo("EMAIL_ADDRESS"))
             .body("VerifiedForSendingStatus", equalTo(true))
             .body("DkimAttributes", notNullValue());
+    }
+
+    @Test
+    @Order(61)
+    void getEmailIdentity_domainTransitionsToSuccessWhenDkimRecordsExist() {
+        List<String> tokens = given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailIdentity": "v2dkim-success.floci.test"}
+                """)
+        .when()
+            .post("/v2/email/identities")
+        .then()
+            .statusCode(200)
+            .body("VerifiedForSendingStatus", equalTo(false))
+            .extract()
+            .jsonPath()
+            .getList("DkimAttributes.Tokens", String.class);
+
+        String locationHeader = given()
+            .contentType("application/xml")
+            .body("""
+                <?xml version="1.0" encoding="UTF-8"?>
+                <CreateHostedZoneRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
+                  <Name>floci.test</Name>
+                  <CallerReference>ses-v2-dkim-success</CallerReference>
+                </CreateHostedZoneRequest>
+                """)
+        .when()
+            .post("/2013-04-01/hostedzone")
+        .then()
+            .statusCode(201)
+            .extract()
+            .header("Location");
+
+        String zoneId = locationHeader.substring(locationHeader.lastIndexOf('/') + 1);
+        StringBuilder body = new StringBuilder("""
+                <?xml version="1.0" encoding="UTF-8"?>
+                <ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
+                  <ChangeBatch>
+                    <Changes>
+                """);
+        for (String token : tokens) {
+            body.append("""
+                      <Change>
+                        <Action>CREATE</Action>
+                        <ResourceRecordSet>
+                          <Name>""").append(token).append("._domainkey.v2dkim-success.floci.test.</Name>\n")
+                    .append("""
+                          <Type>CNAME</Type>
+                          <TTL>300</TTL>
+                          <ResourceRecords>
+                            <ResourceRecord><Value>""").append(token).append(".dkim.amazonses.com.</Value></ResourceRecord>\n")
+                    .append("""
+                          </ResourceRecords>
+                        </ResourceRecordSet>
+                      </Change>
+                    """);
+        }
+        body.append("""
+                    </Changes>
+                  </ChangeBatch>
+                </ChangeResourceRecordSetsRequest>
+                """);
+
+        given()
+            .contentType("application/xml")
+            .body(body.toString())
+        .when()
+            .post("/2013-04-01/hostedzone/" + zoneId + "/rrset")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/identities/v2dkim-success.floci.test")
+        .then()
+            .statusCode(200)
+            .body("IdentityType", equalTo("DOMAIN"))
+            .body("VerifiedForSendingStatus", equalTo(true))
+            .body("VerificationStatus", equalTo("SUCCESS"))
+            .body("DkimAttributes.SigningEnabled", equalTo(true))
+            .body("DkimAttributes.Status", equalTo("SUCCESS"))
+            .body("DkimAttributes.Tokens", not(empty()));
+
+        // DKIM verification status tracks DNS detection independently of the signing flag: disabling
+        // DKIM keeps Status=SUCCESS while the CNAMEs remain published.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"SigningEnabled": false}
+                """)
+        .when()
+            .put("/v2/email/identities/v2dkim-success.floci.test/dkim")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/identities/v2dkim-success.floci.test")
+        .then()
+            .statusCode(200)
+            .body("DkimAttributes.SigningEnabled", equalTo(false))
+            .body("DkimAttributes.Status", equalTo("SUCCESS"));
+
+        // Re-enable so the key-rotation assertion below starts from the signing-enabled state.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"SigningEnabled": true}
+                """)
+        .when()
+            .put("/v2/email/identities/v2dkim-success.floci.test/dkim")
+        .then()
+            .statusCode(200);
+
+        // Rotating the DKIM key must not revoke the identity's sending verification (matching AWS):
+        // VerificationStatus stays SUCCESS, but DKIM re-pends until the new tokens' records are detected.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"SigningAttributesOrigin":"AWS_SES","SigningAttributes":{"NextSigningKeyLength":"RSA_1024_BIT"}}
+                """)
+        .when()
+            .put("/v2/email/identities/v2dkim-success.floci.test/dkim/signing")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/identities/v2dkim-success.floci.test")
+        .then()
+            .statusCode(200)
+            .body("VerificationStatus", equalTo("SUCCESS"))
+            .body("DkimAttributes.Status", equalTo("PENDING"));
     }
 
     @Test
@@ -415,7 +588,9 @@ class SesV2IntegrationTest {
         .then()
             .statusCode(200)
             .body("DkimAttributes.SigningEnabled", equalTo(true))
-            .body("DkimAttributes.Status", equalTo("SUCCESS"));
+            // example.com is not a DKIM-verified domain identity, so the enabled flag is set but the
+            // DKIM verification status stays NOT_STARTED (status tracks DNS detection, not the flag).
+            .body("DkimAttributes.Status", equalTo("NOT_STARTED"));
     }
 
     @Test
@@ -852,7 +1027,73 @@ class SesV2IntegrationTest {
             .post("/v2/email/outbound-emails")
         .then()
             .statusCode(400)
-            .body("__type", equalTo("BadRequestException"));
+            .body("__type", equalTo("BadRequestException"))
+            .body("message", equalTo("Missing required header 'From'."));
+    }
+
+    // FromEmailAddress is optional in the AWS v2 contract; the per-content-type behavior
+    // below is verified against real AWS (Raw takes its From from the MIME message; Simple
+    // returns a null message; Templated returns "Source cannot be empty").
+
+    @Test
+    @Order(67)
+    void sendEmail_raw_noFromAddress_usesMimeFrom() {
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "Destination": {"ToAddresses": ["r@example.com"]},
+                    "Content": {"Raw": {"Data": "From: raw-from@floci.test\\r\\nTo: r@example.com\\r\\nSubject: s\\r\\n\\r\\nbody"}}
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200)
+            .body("MessageId", notNullValue());
+    }
+
+    @Test
+    @Order(68)
+    void sendEmail_simple_missingFrom() {
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "Destination": {"ToAddresses": ["r@example.com"]},
+                    "Content": {"Simple": {"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "hi"}}}}
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("BadRequestException"))
+            // AWS returns the message key present with a JSON null value.
+            .body("$", hasKey("message"))
+            .body("message", nullValue());
+    }
+
+    @Test
+    @Order(69)
+    void sendEmail_template_missingFrom() {
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "Destination": {"ToAddresses": ["r@example.com"]},
+                    "Content": {"Template": {"TemplateName": "any-tpl", "TemplateData": "{}"}}
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("BadRequestException"))
+            .body("message", equalTo("Source cannot be empty"));
     }
 
     // ──────────────── Inspection endpoint (/_aws/ses) ────────────────
@@ -1189,9 +1430,9 @@ class SesV2IntegrationTest {
             .body("DkimAttributes", notNullValue())
             .body("DkimAttributes.SigningEnabled", notNullValue())
             .body("DkimAttributes.Status", notNullValue())
-            .body("MailFromAttributes", notNullValue())
-            .body("MailFromAttributes.MailFromDomainStatus", equalTo("NOT_STARTED"))
             .body("MailFromAttributes.BehaviorOnMxFailure", equalTo("USE_DEFAULT_VALUE"))
+            .body("MailFromAttributes.MailFromDomain", nullValue())
+            .body("MailFromAttributes.MailFromDomainStatus", nullValue())
             .body("Policies", notNullValue())
             .body("Tags", notNullValue());
     }

@@ -3,6 +3,9 @@ package io.github.hectorvent.floci.services.apigateway.model;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.util.HashMap;
+import java.util.Map;
+
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class ApiKey {
@@ -12,6 +15,8 @@ public class ApiKey {
     private boolean enabled;
     private long createdDate;
     private long lastUpdatedDate;
+    private String description;
+    private Map<String, String> tags = new HashMap<>();
 
     public ApiKey() {}
 
@@ -32,4 +37,10 @@ public class ApiKey {
 
     public long getLastUpdatedDate() { return lastUpdatedDate; }
     public void setLastUpdatedDate(long lastUpdatedDate) { this.lastUpdatedDate = lastUpdatedDate; }
+
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) { this.tags = tags != null ? tags : new HashMap<>(); }
 }

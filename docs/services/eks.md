@@ -13,6 +13,14 @@ EKS uses a standard REST API with JSON bodies — not the JSON 1.1 (`X-Amz-Targe
 | `DescribeCluster` | Describe a cluster by name |
 | `ListClusters` | List all cluster names |
 | `DeleteCluster` | Delete a cluster |
+| `CreateNodegroup` | Create node group metadata for a cluster |
+| `DescribeNodegroup` | Describe a node group by cluster and name |
+| `ListNodegroups` | List node group names for a cluster |
+| `DeleteNodegroup` | Delete a node group |
+| `CreateFargateProfile` | Create Fargate profile metadata for a cluster |
+| `DescribeFargateProfile` | Describe a Fargate profile by cluster and name |
+| `ListFargateProfiles` | List Fargate profile names for a cluster |
+| `DeleteFargateProfile` | Delete a Fargate profile |
 | `TagResource` | Add tags to a cluster |
 | `UntagResource` | Remove tags from a cluster |
 | `ListTagsForResource` | List tags on a cluster |
@@ -38,7 +46,11 @@ aws eks update-kubeconfig --name my-cluster
 kubectl get nodes
 ```
 
-`aws eks update-kubeconfig` wires `aws eks get-token` into the kubeconfig as an exec credential. The bearer token it produces is validated by a **token-authentication webhook** that Floci wires into k3s: the k3s API server POSTs a Kubernetes `TokenReview` to Floci's `/_floci/eks/token-webhook` endpoint, and Floci maps the token to the `system:masters` group (bound to `cluster-admin`). No `aws-iam-authenticator` is required.
+`aws eks update-kubeconfig` wires `aws eks get-token` into the kubeconfig as an exec credential. The bearer token contains a SigV4-presigned STS `GetCallerIdentity` request. Floci validates its signature and 60-second presign expiry, then verifies the signed `x-k8s-aws-id` header against the cluster-specific `/_floci/eks/clusters/<cluster-name>/token-webhook` endpoint before mapping the caller to the `system:masters` group (bound to `cluster-admin`). No `aws-iam-authenticator` is required.
+
+Create an IAM access key before using EKS authentication. The public local-development pairs `test`/`test` and `floci`/`floci` are deliberately rejected because the webhook grants cluster-admin access.
+
+Temporary IAM credentials must include their `AWS_SESSION_TOKEN` when signing the token.
 
 This webhook is enabled by default (`iam-auth-webhook: true`). Set it to `false` to start k3s without it (in which case `aws eks get-token` tokens are rejected with `401`).
 
@@ -65,6 +77,29 @@ services:
 !!! note "No port mapping needed for k3s ports"
     k3s containers bind their API server port (6500–6599) directly on the host via Docker — no `ports:` entry is required in `docker-compose.yml`. See [Ports Reference](../configuration/ports.md#ports-65006599-eks-real-mode) for the full explanation.
 
+#### Clusters survive a restart
+
+With a persistent [storage mode](../configuration/storage.md) (the default), clusters recorded in
+`eks-clusters.json` are **re-latched to their k3s containers when Floci starts**:
+
+- A surviving container (for example after a Docker Desktop / daemon reboot) is adopted and
+  started in place, keeping its published API server port and data volume — deployments come
+  back as they were.
+- A missing container is recreated. Its named k3s data volume (`floci-eks-<name>`; for a
+  [non-default account](../configuration/multi-account.md), `floci-eks-<account>.<name>`) is
+  reused if it survived; volumes follow the global prune policy
+  (`FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE`, default `false`), so they are retained when the
+  container is stopped or the cluster deleted, except in `memory` storage mode.
+- A non-default-account cluster created before account-qualified naming keeps its historical
+  `floci-eks-<name>` container and volume: restoration adopts the surviving container when its
+  `io.floci.account` label matches the owning account, so pre-upgrade workloads are not
+  orphaned.
+
+A restored cluster reports `CREATING` until its API server answers again, then returns to
+`ACTIVE` with a freshly extracted certificate authority. If the container cannot be brought
+back (for example Docker is unavailable), the cluster is marked `FAILED` instead of appearing
+`ACTIVE` while unreachable.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -79,6 +114,51 @@ services:
 | `FLOCI_SERVICES_EKS_KEEP_RUNNING_ON_SHUTDOWN` | `false` | Leave k3s containers running after Floci stops |
 | `FLOCI_SERVICES_EKS_ENDPOINT_MODE` | `host` | `describe-cluster` endpoint: `host` (`localhost:<hostPort>`) or `network` (container DNS) |
 | `FLOCI_SERVICES_EKS_IAM_AUTH_WEBHOOK` | `true` | Wire a token-auth webhook into k3s so `aws eks get-token` works |
+| `FLOCI_SERVICES_EKS_ECR_REGISTRY_MIRROR` | `true` | Inject a containerd `registries.yaml` so pods can pull images pushed to [Floci ECR](ecr.md) |
+
+### Pulling images from Floci ECR
+
+Images pushed to the [Floci ECR registry](ecr.md) use `localhost`-based repository URIs
+(for example `000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:tag`). Inside a k3s
+cluster that hostname would resolve to the k3s container itself, and containerd insists
+on HTTPS for anything it doesn't recognize as loopback — so, out of the box, k3s cannot
+pull from the registry even though `docker push` from the host works.
+
+Floci solves this at cluster creation: each new k3s container gets a generated
+`/etc/rancher/k3s/registries.yaml` that mirrors every repository hostname the emulator
+can mint — the default account across the full region catalog, plus the path-style
+`localhost:<port>` form used by `FLOCI_SERVICES_ECR_URI_STYLE=path` — to the registry
+container's in-network endpoint (`http://floci-ecr-registry:5000`). The same image
+reference then works for the host-side push and the in-cluster pull, with no retagging
+and no manual containerd configuration:
+
+```bash
+aws ecr create-repository --repository-name my-repo
+docker build -t 000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:v1 .
+docker push 000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:v1
+
+aws eks create-cluster --name demo ...
+helm install my-app ./chart \
+  --set image.repository=000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo \
+  --set image.tag=v1
+```
+
+Requirements and limits:
+
+- The k3s and registry containers must share a Docker network — set the global
+  `FLOCI_SERVICES_DOCKER_NETWORK` (as in the standard `docker-compose.yml`) or the
+  per-service network variables.
+- Only Floci-mintable hostnames are mirrored; public registries (docker.io, ghcr.io, …)
+  are never touched.
+- Repository URIs using a non-default `registryId` (account) are not covered.
+- The mirror set is snapshotted when the cluster is created. Clusters created before this
+  feature (or after the registry was re-created on a different port) can be fixed
+  manually — the k3s container filesystem survives a restart:
+
+  ```bash
+  docker cp registries.yaml floci-eks-<cluster>:/etc/rancher/k3s/registries.yaml
+  docker restart floci-eks-<cluster>
+  ```
 
 ### Mock mode (CI / tests)
 
@@ -93,10 +173,109 @@ services:
       FLOCI_SERVICES_EKS_MOCK: "true"
 ```
 
+## IRSA (IAM Roles for Service Accounts)
+
+Every cluster gets an OIDC identity provider, so the full IRSA flow (trust policy, service-account token, `sts:AssumeRoleWithWebIdentity`) works end to end without mocked or hardcoded tokens.
+
+`CreateCluster` generates an RSA-2048 signing keypair and an AWS-shaped issuer URL, returned by `DescribeCluster`:
+
+```json
+{
+  "cluster": {
+    "name": "my-cluster",
+    "identity": { "oidc": { "issuer": "https://oidc.eks.us-east-1.amazonaws.com/id/3F8A…" } }
+  }
+}
+```
+
+The issuer URL is a faithful string for building trust policies, but it is not fetched: Floci's STS resolves the signing key in-process. The private key is held in storage separate from the cluster model and is never returned by any API.
+
+### Minting a service-account token
+
+Real EKS has the kubelet project a token into the pod. Floci has no kubelet, so a local-dev harness requests one and writes it to the file named by `AWS_WEB_IDENTITY_TOKEN_FILE`. Signing happens server-side, so the private key never leaves Floci.
+
+```bash
+curl -sX POST http://localhost:4566/_floci/eks/clusters/my-cluster/oidc-token \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace":"my-namespace","serviceAccount":"my-service-account"}'
+```
+
+```json
+{
+  "token": "eyJhbGciOiJSUzI1NiIs…",
+  "issuer": "https://oidc.eks.us-east-1.amazonaws.com/id/3F8A…",
+  "subject": "system:serviceaccount:my-namespace:my-service-account",
+  "audience": "sts.amazonaws.com"
+}
+```
+
+`audience` (default `sts.amazonaws.com`) and `expirySeconds` (default 24h, max 7d) are optional.
+This is Floci plumbing under `_floci/…`, not an AWS API.
+
+### Trust policy
+
+Note that the OIDC provider ARN and the condition keys use the issuer with the scheme stripped `oidc.eks.<region>.amazonaws.com/id/<id>`, which is how the AWS console, `eksctl`, and Terraform all render it.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::000000000000:oidc-provider/<oidcProvider>"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "<oidcProvider>:sub": "system:serviceaccount:<namespace>:<serviceAccount>",
+        "<oidcProvider>:aud": "sts.amazonaws.com"
+      }
+    }
+  }]
+}
+```
+
+### What STS validates
+
+When `sts:AssumeRoleWithWebIdentity` receives a token whose `iss` names an issuer Floci hosts, it enforces all of:
+
+- the RS256 signature, against that cluster's public key
+- `iss` matches the cluster's issuer exactly
+- `aud` contains `sts.amazonaws.com`
+- `exp` / `nbf`, with 60s of clock-skew tolerance
+- the role's trust policy: `Principal.Federated` and the `Condition` block, comparing `oidc:sub` / `oidc:aud` with exact, case-sensitive equality
+
+The response then carries the token's real claims in `SubjectFromWebIdentityToken`, `Provider`, and `Audience`. Failures return `InvalidIdentityToken` (400) for a bad token or `AccessDenied` (403) when the trust policy does not permit the subject.
+
+A token whose issuer Floci does not host is treated as opaque and accepted, since Floci cannot adjudicate a third-party provider. Validation is therefore automatic for Floci-issued tokens and requires no configuration flag.
+
+### OIDC discovery endpoints
+
+Served for fidelity and debugging, nothing in the IRSA flow dereferences them:
+
+| Route | Description |
+|---|---|
+| `GET /_floci/eks/clusters/<name>/oidc/.well-known/openid-configuration` | OIDC discovery document |
+| `GET /_floci/eks/clusters/<name>/oidc/keys` | JWKS containing the cluster's public key |
+
+These live under `_floci/…` rather than at the AWS-shaped issuer path, which Floci's embedded DNS does not resolve and which would collide with S3's path-style routing.
+
 ## ARN Format
 
 ```
 arn:aws:eks:<region>:<accountId>:cluster/<clusterName>
+```
+
+Node groups use:
+
+```
+arn:aws:eks:<region>:<accountId>:nodegroup/<clusterName>/<nodegroupName>/<id>
+```
+
+Fargate profiles use:
+
+```
+arn:aws:eks:<region>:<accountId>:fargateprofile/<clusterName>/<fargateProfileName>/<id>
 ```
 
 ## Examples
@@ -119,6 +298,59 @@ aws eks describe-cluster --name my-cluster
 
 # List clusters
 aws eks list-clusters
+
+# Create a node group
+curl -s -X POST "$AWS_ENDPOINT_URL/clusters/my-cluster/node-groups" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nodegroupName": "my-nodegroup",
+    "nodeRole": "arn:aws:iam::000000000000:role/eks-node-role",
+    "subnets": ["subnet-123", "subnet-456"],
+    "instanceTypes": ["t3.medium"],
+    "scalingConfig": {
+      "minSize": 1,
+      "maxSize": 3,
+      "desiredSize": 1
+    }
+  }'
+
+# Describe the node group
+curl -s "$AWS_ENDPOINT_URL/clusters/my-cluster/node-groups/my-nodegroup"
+
+# List node groups
+curl -s "$AWS_ENDPOINT_URL/clusters/my-cluster/node-groups"
+
+# Delete the node group
+curl -s -X DELETE "$AWS_ENDPOINT_URL/clusters/my-cluster/node-groups/my-nodegroup"
+
+# Create a Fargate profile
+curl -s -X POST "$AWS_ENDPOINT_URL/clusters/my-cluster/fargate-profiles" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "fargateProfileName": "my-fargate-profile",
+    "podExecutionRoleArn": "arn:aws:iam::000000000000:role/eks-fargate-role",
+    "subnets": ["subnet-123", "subnet-456"],
+    "selectors": [
+      {
+        "namespace": "default",
+        "labels": {
+          "app": "api"
+        }
+      }
+    ],
+    "tags": {
+      "env": "dev"
+    }
+  }'
+
+# Describe the Fargate profile
+curl -s "$AWS_ENDPOINT_URL/clusters/my-cluster/fargate-profiles/my-fargate-profile"
+
+# List Fargate profiles
+curl -s "$AWS_ENDPOINT_URL/clusters/my-cluster/fargate-profiles"
+
+# Delete the Fargate profile
+curl -s -X DELETE "$AWS_ENDPOINT_URL/clusters/my-cluster/fargate-profiles/my-fargate-profile"
 
 # Tag a cluster
 aws eks tag-resource \
@@ -158,6 +390,8 @@ System.out.println(described.cluster().status()); // ACTIVE
 // List clusters
 List<String> names = eks.listClusters(r -> {}).clusters();
 
+// Node group and Fargate profile support are currently exposed through the REST paths.
+
 // Tag resource
 eks.tagResource(r -> r
     .resourceArn(created.cluster().arn())
@@ -171,8 +405,6 @@ eks.deleteCluster(r -> r.name("my-cluster"));
 
 The following EKS features are not yet supported:
 
-- Node groups (`CreateNodegroup`, `DescribeNodegroup`, `ListNodegroups`, `DeleteNodegroup`)
-- Fargate profiles
 - `UpdateClusterConfig` / `UpdateClusterVersion`
 - Add-ons (`CreateAddon`, `DescribeAddon`, `ListAddons`)
 - Identity provider configs

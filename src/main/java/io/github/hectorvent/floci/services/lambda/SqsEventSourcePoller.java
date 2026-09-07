@@ -1,14 +1,17 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.pipes.PipesFilterMatcher;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.vertx.core.Vertx;
@@ -17,7 +20,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,9 +37,12 @@ import java.util.concurrent.Executors;
  * to avoid a circular CDI dependency.
  */
 @ApplicationScoped
-public class SqsEventSourcePoller {
+public class SqsEventSourcePoller implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(SqsEventSourcePoller.class);
+
+    /** AWS SQS default visibility timeout, used as the retry backoff when a queue has none configured. */
+    private static final int DEFAULT_RETRY_VISIBILITY_SECONDS = 30;
 
     private final Vertx vertx;
     private final SqsService sqsService;
@@ -43,6 +52,7 @@ public class SqsEventSourcePoller {
     private final long pollIntervalMs;
     private final String baseUrl;
     private final ObjectMapper objectMapper;
+    private final PipesFilterMatcher filterMatcher;
     private final ConcurrentHashMap<String, Long> timerIds = new ConcurrentHashMap<>();
     // Tracks ESMs with an in-flight poll to prevent concurrent deliveries of the same message
     private final ConcurrentHashMap<String, Boolean> activePolls = new ConcurrentHashMap<>();
@@ -57,7 +67,8 @@ public class SqsEventSourcePoller {
                                 LambdaExecutorService executorService,
                                 LambdaFunctionStore functionStore,
                                 EsmStore esmStore, EmulatorConfig config,
-                                ObjectMapper objectMapper) {
+                                ObjectMapper objectMapper,
+                                PipesFilterMatcher filterMatcher) {
         this.vertx = vertx;
         this.sqsService = sqsService;
         this.executorService = executorService;
@@ -66,6 +77,7 @@ public class SqsEventSourcePoller {
         this.pollIntervalMs = config.services().lambda().pollIntervalMs();
         this.baseUrl = config.effectiveBaseUrl();
         this.objectMapper = objectMapper;
+        this.filterMatcher = filterMatcher;
     }
 
     public void startPersistedPollers() {
@@ -84,6 +96,12 @@ public class SqsEventSourcePoller {
         timerIds.values().forEach(vertx::cancelTimer);
         timerIds.clear();
         LOG.info("SqsEventSourcePoller shut down, all timers cancelled");
+    }
+
+    public void clear() {
+        timerIds.values().forEach(vertx::cancelTimer);
+        timerIds.clear();
+        activePolls.clear();
     }
 
     public void startPolling(EventSourceMapping esm) {
@@ -114,7 +132,8 @@ public class SqsEventSourcePoller {
         }
     }
 
-    private void pollAndInvoke(EventSourceMapping esm) {
+    /** Package-private (not private) only so unit tests can drive a single poll directly. */
+    void pollAndInvoke(EventSourceMapping esm) {
         // Skip this tick if a previous poll for this ESM is still in progress.
         // This prevents concurrent deliveries of the same message when the Lambda
         // cold-start / execution time exceeds the SQS visibility timeout.
@@ -142,10 +161,39 @@ public class SqsEventSourcePoller {
                     return;
                 }
 
-                LOG.infov("ESM {0}: received {1} message(s), invoking {2}",
-                        esm.getUuid(), messages.size(), esm.getFunctionName());
+                LOG.infov("ESM {0}: received {1} message(s)", esm.getUuid(), messages.size());
 
-                String eventJson = buildSqsEvent(messages, esm);
+                // Apply FilterCriteria. AWS consumes (permanently deletes) filtered-out SQS messages, so
+                // non-matching messages are deleted immediately: leaving them would redeliver every
+                // visibility window forever and never reach the DLQ. A batch that matches nothing
+                // short-circuits without invoking.
+                List<Message> matched = messages;
+                JsonNode filterParams = EsmFilterCriteriaUtils.matcherSourceParameters(objectMapper, esm.getFilterCriteria());
+                if (filterParams != null) {
+                    List<JsonNode> recordNodes = new ArrayList<>(messages.size());
+                    for (Message m : messages) {
+                        recordNodes.add(buildSqsRecordNode(m, esm));
+                    }
+                    matched = EsmFilterCriteriaUtils.selectMatched(
+                            messages, recordNodes, filterMatcher.applyFilterCriteria(recordNodes, filterParams));
+                    Set<Message> keep = Collections.newSetFromMap(new IdentityHashMap<>());
+                    keep.addAll(matched);
+                    for (Message m : messages) {
+                        if (!keep.contains(m)) {
+                            try {
+                                sqsService.deleteMessage(esm.getQueueUrl(), m.getReceiptHandle(), esm.getRegion());
+                            } catch (Exception e) {
+                                LOG.warnv("ESM {0}: failed to delete filtered-out message {1}: {2}",
+                                        esm.getUuid(), m.getMessageId(), e.getMessage());
+                            }
+                        }
+                    }
+                    if (matched.isEmpty()) {
+                        return;
+                    }
+                }
+
+                String eventJson = buildSqsEvent(matched, esm);
                 LOG.infov("ESM {0}: invoking function {1}", esm.getUuid(), fn.getFunctionName());
                 InvokeResult result;
                 try {
@@ -161,12 +209,14 @@ public class SqsEventSourcePoller {
                 }
 
                 if (result.getFunctionError() == null) {
+                    // Only the delivered (matched) messages are subject to delete/return here; filtered-out
+                    // messages were already deleted above, so a batchItemFailure id that names one is inert.
                     Set<String> failedIds = extractBatchItemFailures(esm, result);
                     List<Message> toDelete = failedIds.isEmpty()
-                            ? messages
-                            : messages.stream().filter(m -> !failedIds.contains(m.getMessageId())).toList();
-                    LOG.infov("ESM {0}: Lambda succeeded, deleting {1} of {2} message(s) ({3} reported as failed)",
-                            esm.getUuid(), toDelete.size(), messages.size(), failedIds.size());
+                            ? matched
+                            : matched.stream().filter(m -> !failedIds.contains(m.getMessageId())).toList();
+                    LOG.infov("ESM {0}: Lambda succeeded, deleting {1} of {2} delivered message(s) ({3} reported as failed)",
+                            esm.getUuid(), toDelete.size(), matched.size(), failedIds.size());
                     for (Message msg : toDelete) {
                         try {
                             sqsService.deleteMessage(esm.getQueueUrl(),
@@ -176,9 +226,18 @@ public class SqsEventSourcePoller {
                                     msg.getMessageId(), e.getMessage());
                         }
                     }
+                    // Reported partial-batch failures are not deleted; return them to the
+                    // queue immediately so they can be retried/redriven rather than sitting
+                    // in-flight for the full execution-cover visibility window.
+                    if (!failedIds.isEmpty()) {
+                        List<Message> toReturn = matched.stream()
+                                .filter(m -> failedIds.contains(m.getMessageId())).toList();
+                        returnMessagesToQueue(esm, toReturn);
+                    }
                 } else {
-                    LOG.warnv("ESM {0}: Lambda returned error [{1}], messages will return to queue",
-                            esm.getUuid(), result.getFunctionError());
+                    LOG.warnv("ESM {0}: Lambda returned error [{1}], returning {2} delivered message(s) to queue for retry/redrive",
+                            esm.getUuid(), result.getFunctionError(), matched.size());
+                    returnMessagesToQueue(esm, matched);
                 }
             } catch (Exception e) {
                 LOG.warnv("ESM {0}: poll/invoke error: {1} ({2})",
@@ -187,6 +246,51 @@ public class SqsEventSourcePoller {
                 activePolls.remove(esm.getUuid());
             }
         });
+    }
+
+    /**
+     * Returns failed messages to the source queue by resetting their visibility timeout
+     * to the queue's own {@code VisibilityTimeout}. The poller hides messages for
+     * {@code fn.timeout + 30s} to cover execution time, but on failure that long window
+     * would keep the message in-flight (and therefore not redelivered nor redriven) far
+     * longer than the queue's own visibility/redrive policy intends. Shrinking the window
+     * back to the queue's visibility timeout lets the next poll re-receive them — matching
+     * AWS's redelivery cadence rather than spinning a tight retry loop (which resetting to
+     * 0 would cause for a persistently failing function) — so ApproximateReceiveCount
+     * climbs and the queue's RedrivePolicy moves them to the DLQ once
+     * {@code maxReceiveCount} is exceeded.
+     */
+    private void returnMessagesToQueue(EventSourceMapping esm, List<Message> messages) {
+        int retryVisibility = retryVisibilityTimeout(esm);
+        for (Message msg : messages) {
+            try {
+                sqsService.changeMessageVisibility(
+                        esm.getQueueUrl(), msg.getReceiptHandle(), retryVisibility, esm.getRegion());
+            } catch (Exception e) {
+                LOG.warnv("ESM {0}: failed to return message {1} to queue: {2}",
+                        esm.getUuid(), msg.getMessageId(), e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * The visibility timeout to apply when returning a failed message to the queue: the
+     * queue's configured {@code VisibilityTimeout}, or the AWS default of 30s when unset
+     * or unreadable. This governs how soon the message is retried/redriven.
+     */
+    private int retryVisibilityTimeout(EventSourceMapping esm) {
+        try {
+            String vt = sqsService.getQueueAttributes(
+                    esm.getQueueUrl(), List.of("VisibilityTimeout"), esm.getRegion())
+                    .get("VisibilityTimeout");
+            if (vt != null) {
+                return Math.max(0, Integer.parseInt(vt));
+            }
+        } catch (Exception e) {
+            LOG.debugv("ESM {0}: could not read VisibilityTimeout, using default {1}s backoff: {2}",
+                    esm.getUuid(), DEFAULT_RETRY_VISIBILITY_SECONDS, e.getMessage());
+        }
+        return DEFAULT_RETRY_VISIBILITY_SECONDS;
     }
 
     private Set<String> extractBatchItemFailures(EventSourceMapping esm, InvokeResult result) {
@@ -218,21 +322,7 @@ public class SqsEventSourcePoller {
         try {
             var records = objectMapper.createArrayNode();
             for (Message msg : messages) {
-                ObjectNode record = objectMapper.createObjectNode();
-                record.put("messageId", msg.getMessageId());
-                record.put("receiptHandle", msg.getReceiptHandle());
-                record.put("body", msg.getBody());
-                ObjectNode attrs = record.putObject("attributes");
-                attrs.put("ApproximateReceiveCount", String.valueOf(msg.getReceiveCount()));
-                attrs.put("SentTimestamp", String.valueOf(msg.getSentTimestamp().toEpochMilli()));
-                attrs.put("SenderId", AwsArnUtils.accountOrDefault(esm.getEventSourceArn(), "000000000000"));
-                attrs.put("ApproximateFirstReceiveTimestamp", String.valueOf(System.currentTimeMillis()));
-                record.putObject("messageAttributes");
-                record.put("md5OfBody", msg.getMd5OfBody() != null ? msg.getMd5OfBody() : "");
-                record.put("eventSource", "aws:sqs");
-                record.put("eventSourceARN", esm.getEventSourceArn());
-                record.put("awsRegion", esm.getRegion());
-                records.add(record);
+                records.add(buildSqsRecordNode(msg, esm));
             }
             ObjectNode root = objectMapper.createObjectNode();
             root.set("Records", records);
@@ -240,6 +330,59 @@ public class SqsEventSourcePoller {
         } catch (Exception e) {
             return "{\"Records\":[]}";
         }
+    }
+
+    /**
+     * Builds the single SQS record node: top-level {@code body} plus attributes and metadata. This is both
+     * the delivery record shape and the structure an SQS filter pattern matches against (patterns nest under
+     * {@code body}; the matcher auto-reparses a JSON body).
+     */
+    private ObjectNode buildSqsRecordNode(Message msg, EventSourceMapping esm) {
+        ObjectNode record = objectMapper.createObjectNode();
+        record.put("messageId", msg.getMessageId());
+        record.put("receiptHandle", msg.getReceiptHandle());
+        record.put("body", msg.getBody());
+        ObjectNode attrs = record.putObject("attributes");
+        attrs.put("ApproximateReceiveCount", String.valueOf(msg.getReceiveCount()));
+        attrs.put("SentTimestamp", String.valueOf(msg.getSentTimestamp().toEpochMilli()));
+        attrs.put("SenderId", AwsArnUtils.accountOrDefault(esm.getEventSourceArn(), "000000000000"));
+        attrs.put("ApproximateFirstReceiveTimestamp",
+                String.valueOf(msg.getFirstReceiveTimestamp() != null
+                        ? msg.getFirstReceiveTimestamp().toEpochMilli()
+                        : System.currentTimeMillis()));
+        if (msg.getSequenceNumber() > 0) {
+            attrs.put("SequenceNumber", String.valueOf(msg.getSequenceNumber()));
+        }
+        if (msg.getMessageGroupId() != null) {
+            attrs.put("MessageGroupId", msg.getMessageGroupId());
+        }
+        if (msg.getMessageDeduplicationId() != null) {
+            attrs.put("MessageDeduplicationId", msg.getMessageDeduplicationId());
+        }
+        // Populate messageAttributes from the message model
+        ObjectNode msgAttrs = record.putObject("messageAttributes");
+        if (msg.getMessageAttributes() != null) {
+            msg.getMessageAttributes().forEach((name, val) -> {
+                ObjectNode attrNode = msgAttrs.putObject(name);
+                attrNode.put("dataType", val.getDataType() != null ? val.getDataType() : "String");
+                if (val.getBinaryValue() != null) {
+                    attrNode.put("binaryValue",
+                            java.util.Base64.getEncoder().encodeToString(val.getBinaryValue()));
+                } else if (val.getStringValue() != null) {
+                    attrNode.put("stringValue", val.getStringValue());
+                }
+                attrNode.putArray("stringListValues");
+                attrNode.putArray("binaryListValues");
+            });
+        }
+        record.put("md5OfBody", msg.getMd5OfBody() != null ? msg.getMd5OfBody() : "");
+        if (msg.getMd5OfMessageAttributes() != null) {
+            record.put("md5OfMessageAttributes", msg.getMd5OfMessageAttributes());
+        }
+        record.put("eventSource", "aws:sqs");
+        record.put("eventSourceARN", esm.getEventSourceArn());
+        record.put("awsRegion", esm.getRegion());
+        return record;
     }
 
     /**

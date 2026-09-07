@@ -1,9 +1,12 @@
 package com.floci.test;
 
 import org.junit.jupiter.api.*;
+import software.amazon.awssdk.core.waiters.WaiterOverrideConfiguration;
+import software.amazon.awssdk.core.waiters.WaiterResponse;
 import software.amazon.awssdk.services.ecs.EcsClient;
 import software.amazon.awssdk.services.ecs.model.*;
 
+import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.*;
@@ -17,6 +20,7 @@ class EcsTests {
     private static String clusterName;
     private static String family;
     private static String serviceName;
+    private static String secretArn;
     private static Cluster cluster;
     private static TaskDefinition taskDef;
     private static TaskDefinition taskDefRev2;
@@ -30,6 +34,7 @@ class EcsTests {
         clusterName = "sdk-test-cluster-" + suffix;
         family = "sdk-test-task-" + suffix;
         serviceName = "sdk-test-svc-" + suffix;
+        secretArn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:sdk-db-password-AbCdEf";
     }
 
     @AfterAll
@@ -771,6 +776,25 @@ class EcsTests {
         assertThat(services).hasSize(1);
         assertThat(services.get(0).serviceName()).isEqualTo(serviceName);
         assertThat(services.get(0).desiredCount()).isEqualTo(1);
+
+        // An ACTIVE service must report exactly one PRIMARY deployment. AWS's ServicesStable
+        // waiter accepts on length(deployments) == 1, so an empty list silently breaks every
+        // SDK waiter and Terraform's aws_ecs_service (floci-io/floci#2174).
+        List<Deployment> deployments = services.get(0).deployments();
+        assertThat(deployments).hasSize(1);
+        assertThat(deployments.get(0).status()).isEqualTo("PRIMARY");
+        assertThat(deployments.get(0).id()).startsWith("ecs-svc/");
+        assertThat(deployments.get(0).taskDefinition()).isEqualTo(services.get(0).taskDefinition());
+        assertThat(deployments.get(0).desiredCount()).isEqualTo(1);
+        assertThat(deployments.get(0).rolloutState())
+                .isIn(DeploymentRolloutState.COMPLETED, DeploymentRolloutState.IN_PROGRESS);
+
+        // Deployments are synthesized per request, so the id must not drift between calls.
+        List<Service> again = ecs.describeServices(DescribeServicesRequest.builder()
+                .cluster(clusterName)
+                .services(serviceName)
+                .build()).services();
+        assertThat(again.get(0).deployments().get(0).id()).isEqualTo(deployments.get(0).id());
     }
 
     @Test
@@ -805,6 +829,46 @@ class EcsTests {
 
     @Test
     @Order(45)
+    @DisplayName("ServicesStable waiter - reaches stable")
+    void servicesStableWaiter() {
+        // The strongest available check on services[].deployments: this drives AWS's own
+        // waiter acceptor,
+        //   length(services[?!(length(deployments) == `1` && runningCount == desiredCount)]) == `0`
+        // rather than our reading of it. With deployments absent the expression never matches.
+        // waitTimeout is capped so a regression fails in 30s rather than the default 40 x 15s.
+        WaiterResponse<DescribeServicesResponse> response = ecs.waiter().waitUntilServicesStable(
+                DescribeServicesRequest.builder()
+                        .cluster(clusterName)
+                        .services(serviceName)
+                        .build(),
+                WaiterOverrideConfiguration.builder()
+                        .waitTimeout(Duration.ofSeconds(30))
+                        .build());
+
+        assertThat(response.matched().response()).isPresent();
+        assertThat(response.matched().response().get().services().get(0).deployments()).hasSize(1);
+    }
+
+    @Test
+    @Order(46)
+    @DisplayName("DescribeServices - unknown service returns a MISSING failure")
+    void describeServicesReportsMissingService() {
+        // ECS reports an unresolvable service as a failure rather than erroring, and the
+        // ServicesStable waiter fails fast on failures[].reason == MISSING. Dropping it
+        // silently would leave that waiter polling for its full timeout.
+        DescribeServicesResponse response = ecs.describeServices(DescribeServicesRequest.builder()
+                .cluster(clusterName)
+                .services("no-such-service-" + suffix)
+                .build());
+
+        assertThat(response.services()).isEmpty();
+        assertThat(response.failures()).hasSize(1);
+        assertThat(response.failures().get(0).reason()).isEqualTo("MISSING");
+        assertThat(response.failures().get(0).arn()).endsWith("no-such-service-" + suffix);
+    }
+
+    @Test
+    @Order(47)
     @DisplayName("ListServiceDeployments - list deployments")
     void listServiceDeployments() {
         List<ServiceDeploymentBrief> briefs = ecs.listServiceDeployments(
@@ -828,7 +892,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(46)
+    @Order(48)
     @DisplayName("UpdateService - update desiredCount to 0")
     void updateServiceDesiredCount() {
         Service updated = ecs.updateService(UpdateServiceRequest.builder()
@@ -841,7 +905,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(47)
+    @Order(49)
     @DisplayName("UpdateService - update taskDefinition")
     void updateServiceTaskDefinition() {
         Service updated = ecs.updateService(UpdateServiceRequest.builder()
@@ -854,7 +918,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(48)
+    @Order(50)
     @DisplayName("CreateTaskSet - create task set")
     void createTaskSet() {
         software.amazon.awssdk.services.ecs.model.TaskSet ts =
@@ -918,7 +982,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(49)
+    @Order(51)
     @DisplayName("DeleteService - delete service")
     void deleteService() {
         Service deleted = ecs.deleteService(DeleteServiceRequest.builder()
@@ -930,7 +994,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(50)
+    @Order(52)
     @DisplayName("ListServices - service no longer in list")
     void listServicesAfterDelete() {
         List<String> serviceArns = ecs.listServices(ListServicesRequest.builder()
@@ -941,7 +1005,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(51)
+    @Order(53)
     @DisplayName("DeregisterTaskDefinition - deregister revision 1")
     void deregisterTaskDefinition() {
         TaskDefinition deregistered = ecs.deregisterTaskDefinition(
@@ -953,7 +1017,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(52)
+    @Order(54)
     @DisplayName("ListTaskDefinitions - filter by ACTIVE")
     void listTaskDefinitionsActive() {
         List<String> activeArns = ecs.listTaskDefinitions(ListTaskDefinitionsRequest.builder()
@@ -966,7 +1030,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(53)
+    @Order(55)
     @DisplayName("DeleteTaskDefinitions - delete INACTIVE")
     void deleteTaskDefinitions() {
         List<TaskDefinition> deletedDefs = ecs.deleteTaskDefinitions(
@@ -979,7 +1043,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(54)
+    @Order(56)
     @DisplayName("DeleteCluster - fails with running tasks")
     void deleteClusterFailsWithTasks() {
         ecs.runTask(RunTaskRequest.builder()
@@ -994,7 +1058,7 @@ class EcsTests {
     }
 
     @Test
-    @Order(55)
+    @Order(57)
     @DisplayName("DeleteCluster - delete after stopping tasks")
     void deleteCluster() {
         List<String> running = ecs.listTasks(ListTasksRequest.builder()
@@ -1017,10 +1081,41 @@ class EcsTests {
     }
 
     @Test
-    @Order(56)
+    @Order(58)
     @DisplayName("ListClusters - cluster no longer in list")
     void listClustersAfterDelete() {
         List<String> arns = ecs.listClusters(ListClustersRequest.builder().build()).clusterArns();
         assertThat(arns).doesNotContain(cluster.clusterArn());
+    }
+
+    @Test
+    @Order(59)
+    @DisplayName("RegisterTaskDefinition - container secrets round trip")
+    void registerTaskDefinitionWithSecrets() {
+        String secretFamily = family + "-secrets";
+        TaskDefinition secretTaskDef = ecs.registerTaskDefinition(RegisterTaskDefinitionRequest.builder()
+                .family(secretFamily)
+                .containerDefinitions(ContainerDefinition.builder()
+                        .name("app")
+                        .image("alpine:latest")
+                        .essential(true)
+                        .secrets(Secret.builder()
+                                .name("DB_PASSWORD")
+                                .valueFrom(secretArn)
+                                .build())
+                        .build())
+                .build()).taskDefinition();
+
+        assertThat(secretTaskDef.containerDefinitions().get(0).secrets()).hasSize(1);
+        assertThat(secretTaskDef.containerDefinitions().get(0).secrets().get(0).name()).isEqualTo("DB_PASSWORD");
+        assertThat(secretTaskDef.containerDefinitions().get(0).secrets().get(0).valueFrom()).isEqualTo(secretArn);
+
+        TaskDefinition described = ecs.describeTaskDefinition(DescribeTaskDefinitionRequest.builder()
+                .taskDefinition(secretTaskDef.taskDefinitionArn())
+                .build()).taskDefinition();
+
+        assertThat(described.containerDefinitions().get(0).secrets()).hasSize(1);
+        assertThat(described.containerDefinitions().get(0).secrets().get(0).name()).isEqualTo("DB_PASSWORD");
+        assertThat(described.containerDefinitions().get(0).secrets().get(0).valueFrom()).isEqualTo(secretArn);
     }
 }

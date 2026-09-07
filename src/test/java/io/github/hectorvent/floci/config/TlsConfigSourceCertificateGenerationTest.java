@@ -59,7 +59,7 @@ class TlsConfigSourceCertificateGenerationTest {
         new TlsConfigSource();
         
         // Assert
-        Path certFile = tempDir.resolve("tls/floci-selfsigned.crt");
+        Path certFile = tempDir.resolve("tls/floci-server.crt");
         assertTrue(Files.exists(certFile), "Certificate file should exist");
         
         List<String> sans = extractSansFromCertificate(certFile);
@@ -81,7 +81,7 @@ class TlsConfigSourceCertificateGenerationTest {
         new TlsConfigSource();
         
         // Assert
-        Path certFile = tempDir.resolve("tls/floci-selfsigned.crt");
+        Path certFile = tempDir.resolve("tls/floci-server.crt");
         assertTrue(Files.exists(certFile), "Certificate file should exist");
         
         List<String> sans = extractSansFromCertificate(certFile);
@@ -103,7 +103,7 @@ class TlsConfigSourceCertificateGenerationTest {
         new TlsConfigSource();
         
         // Assert
-        Path certFile = tempDir.resolve("tls/floci-selfsigned.crt");
+        Path certFile = tempDir.resolve("tls/floci-server.crt");
         assertTrue(Files.exists(certFile), "Certificate file should exist");
         
         List<String> sans = extractSansFromCertificate(certFile);
@@ -124,7 +124,7 @@ class TlsConfigSourceCertificateGenerationTest {
         new TlsConfigSource();
         
         // Assert
-        Path certFile = tempDir.resolve("tls/floci-selfsigned.crt");
+        Path certFile = tempDir.resolve("tls/floci-server.crt");
         assertTrue(Files.exists(certFile), "Certificate file should exist");
         
         List<String> sans = extractSansFromCertificate(certFile);
@@ -147,7 +147,7 @@ class TlsConfigSourceCertificateGenerationTest {
         new TlsConfigSource();
         
         // Assert
-        Path certFile = tempDir.resolve("tls/floci-selfsigned.crt");
+        Path certFile = tempDir.resolve("tls/floci-server.crt");
         assertTrue(Files.exists(certFile), "Certificate file should exist");
         
         List<String> sans = extractSansFromCertificate(certFile);
@@ -158,9 +158,16 @@ class TlsConfigSourceCertificateGenerationTest {
         assertTrue(sans.contains("0.0.0.0"), 
             "Certificate SANs should include default '0.0.0.0'");
         
+        assertTrue(sans.contains("host.docker.internal"),
+            "Certificate SANs should include default 'host.docker.internal'");
+        assertTrue(sans.contains("*.execute-api.localhost.floci.io"),
+            "Certificate SANs should include API Gateway execution hosts");
+        assertTrue(sans.contains("*.execute-api.localhost.localstack.cloud"),
+            "Certificate SANs should include LocalStack-compatible API Gateway execution hosts");
+
         // Should not contain any custom hostnames
-        assertEquals(6, sans.size(), 
-            "Certificate SANs should contain exactly 6 default entries (localhost, 127.0.0.1, 0.0.0.0, *.localhost, localhost.floci.io, *.localhost.floci.io)");
+        assertEquals(9, sans.size(),
+            "Certificate SANs should contain exactly 9 default entries, including API Gateway execution hosts");
     }
 
     /**
@@ -176,7 +183,7 @@ class TlsConfigSourceCertificateGenerationTest {
         new TlsConfigSource();
         
         // Assert
-        Path certFile = tempDir.resolve("tls/floci-selfsigned.crt");
+        Path certFile = tempDir.resolve("tls/floci-server.crt");
         assertTrue(Files.exists(certFile), "Certificate file should exist");
         
         List<String> sans = extractSansFromCertificate(certFile);
@@ -198,7 +205,7 @@ class TlsConfigSourceCertificateGenerationTest {
         new TlsConfigSource();
         
         // Assert
-        Path metadataFile = tempDir.resolve("tls/floci-selfsigned.metadata.json");
+        Path metadataFile = tempDir.resolve("tls/floci-server.metadata.json");
         assertTrue(Files.exists(metadataFile), "Metadata file should exist");
         
         String json = Files.readString(metadataFile);

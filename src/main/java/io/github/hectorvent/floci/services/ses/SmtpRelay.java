@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ses;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.ses.model.MessageHeader;
 import io.vertx.ext.mail.MailClient;
 import io.vertx.ext.mail.MailConfig;
 import io.vertx.ext.mail.MailMessage;
@@ -127,13 +128,14 @@ public class SmtpRelay {
      */
     public void relay(String from, List<String> toAddresses, List<String> ccAddresses,
                       List<String> bccAddresses, List<String> replyToAddresses,
-                      String subject, String bodyText, String bodyHtml) {
+                      String subject, String bodyText, String bodyHtml,
+                      List<MessageHeader> additionalHeaders) {
         if (!enabled) {
             return;
         }
         try {
             relayExecutor.execute(() -> doRelay(from, toAddresses, ccAddresses,
-                    bccAddresses, replyToAddresses, subject, bodyText, bodyHtml));
+                    bccAddresses, replyToAddresses, subject, bodyText, bodyHtml, additionalHeaders));
         } catch (java.util.concurrent.RejectedExecutionException e) {
             LOG.warnv("SMTP relay skipped (executor shutting down) for from={0}", from);
         }
@@ -141,7 +143,8 @@ public class SmtpRelay {
 
     private void doRelay(String from, List<String> toAddresses, List<String> ccAddresses,
                          List<String> bccAddresses, List<String> replyToAddresses,
-                         String subject, String bodyText, String bodyHtml) {
+                         String subject, String bodyText, String bodyHtml,
+                         List<MessageHeader> additionalHeaders) {
         try {
             MailMessage mail = new MailMessage();
             mail.setFrom(from);
@@ -156,6 +159,16 @@ public class SmtpRelay {
             }
             if (replyToAddresses != null && !replyToAddresses.isEmpty()) {
                 mail.addHeader("Reply-To", String.join(", ", replyToAddresses));
+            }
+            if (additionalHeaders != null) {
+                for (MessageHeader header : additionalHeaders) {
+                    if (header.isSafe()) {
+                        mail.addHeader(header.name(), header.value());
+                    } else {
+                        LOG.warnv("SMTP relay: skipping a header with a blank name or CR/LF in its "
+                                + "name/value (possible header injection) for from={0}", from);
+                    }
+                }
             }
             mail.setSubject(subject != null ? subject : "");
             if (bodyText != null) {
@@ -279,13 +292,14 @@ public class SmtpRelay {
     }
 
     /**
-     * Structured headers extracted from a raw RFC 5322 MIME message:
-     * subject and separate To / Cc / Bcc address lists. Empty fields when the
-     * corresponding header is missing.
+     * Structured headers extracted from a raw RFC 5322 MIME message: the From
+     * address, subject, and separate To / Cc / Bcc address lists. Empty fields
+     * when the corresponding header is missing.
      */
-    public record RawMessageHeaders(String subject, List<String> to, List<String> cc, List<String> bcc) {
+    public record RawMessageHeaders(String from, String subject,
+                                    List<String> to, List<String> cc, List<String> bcc) {
         public static RawMessageHeaders empty() {
-            return new RawMessageHeaders("", List.of(), List.of(), List.of());
+            return new RawMessageHeaders("", "", List.of(), List.of(), List.of());
         }
     }
 
@@ -303,13 +317,15 @@ public class SmtpRelay {
             var builder = new DefaultMessageBuilder();
             var message = builder.parseMessage(new ByteArrayInputStream(mimeBytes));
             String subject = message.getSubject() != null ? message.getSubject() : "";
+            List<String> from = message.getFrom() != null
+                    ? toMailboxAddresses(message.getFrom()) : List.of();
             List<String> to = message.getTo() != null
                     ? toMailboxAddresses(message.getTo().flatten()) : List.of();
             List<String> cc = message.getCc() != null
                     ? toMailboxAddresses(message.getCc().flatten()) : List.of();
             List<String> bcc = message.getBcc() != null
                     ? toMailboxAddresses(message.getBcc().flatten()) : List.of();
-            return new RawMessageHeaders(subject, to, cc, bcc);
+            return new RawMessageHeaders(from.isEmpty() ? "" : from.get(0), subject, to, cc, bcc);
         } catch (Exception e) {
             return RawMessageHeaders.empty();
         }

@@ -35,7 +35,6 @@ just test-awscli
 | [`sdk-test-awscli`](sdk-test-awscli/) | Bash / AWS CLI | bats-core      | `just test-awscli`     |
 | [`sdk-test-java`](sdk-test-java/)     | Java 17        | JUnit 5        | `just test-java`       |
 | [`sdk-test-go`](sdk-test-go/)         | Go 1.24        | go test        | `just test-go`         |
-| [`sdk-test-rust`](sdk-test-rust/)     | Rust           | cargo-nextest  | `just test-rust`       |
 
 ### IaC Compatibility
 
@@ -44,6 +43,8 @@ just test-awscli
 | [`compat-cdk`](compat-cdk/)             | AWS CDK v2 | `./run.sh` |
 | [`compat-opentofu`](compat-opentofu/)   | OpenTofu   | `./run.sh` |
 | [`compat-terraform`](compat-terraform/) | Terraform  | `./run.sh` |
+
+The Terraform suite uses the standard `hashicorp/aws` provider against Floci's local endpoint. It validates `init`, `validate`, `plan`, `apply`, resource reads, and `destroy` without creating resources in a real AWS account. See the [Terraform with Floci guide](../docs/getting-started/terraform.md) for a copy-paste setup.
 
 ## Prerequisites
 
@@ -60,7 +61,6 @@ Per-module requirements:
 | `sdk-test-awscli` | AWS CLI v2, bash, jq                |
 | `sdk-test-java`   | Java 17+, Maven                     |
 | `sdk-test-go`     | Go 1.24+                            |
-| `sdk-test-rust`   | Rust (stable), Cargo, cargo-nextest |
 
 ## Setup
 
@@ -93,6 +93,21 @@ just test-typescript
 
 # AWS CLI (bats-core)
 just test-awscli
+```
+
+### IaC tools
+
+The Terraform, OpenTofu, and CDK suites aren't part of `just test-all` — run them individually by name:
+
+```bash
+# Terraform
+compat-terraform/run.sh
+
+# OpenTofu
+compat-opentofu/run.sh
+
+# AWS CDK
+compat-cdk/run.sh
 ```
 
 Bats-based suites keep their normal console output and also write JUnit XML reports:
