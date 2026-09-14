@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -52,10 +54,18 @@ class GuardedMessageQueue {
         }
     }
 
+    /** If persisting fails the in-memory add is rolled back and the exception propagates, so a
+     *  caller that compensates on the source side does not leave a duplicate here. */
     void addAll(List<Message> toAdd) {
         try (var _ = hold()) {
+            int mark = messages.size();
             messages.addAll(toAdd);
-            persist();
+            try {
+                persist();
+            } catch (RuntimeException e) {
+                messages.subList(mark, messages.size()).clear();
+                throw e;
+            }
         }
     }
 
@@ -119,9 +129,13 @@ class GuardedMessageQueue {
         // message from a previous ReceiveMessage call is blocked until that
         // message is deleted or its visibility expires. Within a single call
         // we may return multiple messages from the same group (preserving
-        // insertion order), up to MaxNumberOfMessages.
+        // insertion order), up to MaxNumberOfMessages. A not-visible message
+        // that was never claimed — no receipt handle — is only waiting out its
+        // DelaySeconds and must not lock its group.
         Set<String> groupsWithInFlight =
-                messages.stream().filter(msg -> !msg.isVisible() && msg.getMessageGroupId() != null)
+                messages.stream()
+                        .filter(msg -> !msg.isVisible() && msg.getReceiptHandle() != null
+                                && msg.getMessageGroupId() != null)
                         .map(Message::getMessageGroupId).collect(Collectors.toSet());
 
         for (Message msg : messages) {
@@ -189,32 +203,55 @@ class GuardedMessageQueue {
         }
     }
 
-    /** Remove and return the first message in insertion order, or null if empty.
-     *  Used by the message-move-task worker so the source queue stays observably
-     *  populated for the duration of a rate-limited move. */
-    Message drainOne() {
+    /** Remove and return the head message if {@code eligible} accepts it; otherwise leave the
+     *  queue untouched and return {@code null}. The check and the removal happen under one lock
+     *  hold so nothing can slip in between. Used by the message-move-task worker so the source
+     *  queue stays observably populated for the duration of a rate-limited move. */
+    Message drainFirstIf(Predicate<Message> eligible) {
         try (var _ = hold()) {
-            if (messages.isEmpty()) {
+            if (messages.isEmpty() || !eligible.test(messages.getFirst())) {
                 return null;
             }
-            Message head = messages.remove(0);
+            Message head = messages.removeFirst();
             persist();
             return head;
         }
     }
 
-    record MessageCounts(long visible, long inFlight) {
+    /** Put a message that could not be delivered back at the head, preserving queue order. */
+    void restoreFirst(Message message) {
+        try (var _ = hold()) {
+            messages.addFirst(message);
+            persist();
+        }
     }
 
+    record MessageCounts(long visible, long inFlight, long delayed) {
+    }
+
+    /**
+     * Splits the queue contents the way AWS SQS reports them in
+     * GetQueueAttributes: visible (ApproximateNumberOfMessages), in flight
+     * (ApproximateNumberOfMessagesNotVisible) and delayed
+     * (ApproximateNumberOfMessagesDelayed). A message that is not visible and
+     * was never claimed — no receipt handle — can only be waiting out its
+     * DelaySeconds, so it counts as delayed rather than in flight.
+     */
     MessageCounts messageCounts() {
         try (var _ = hold()) {
             long visible = 0;
             long inFlight = 0;
+            long delayed = 0;
             for (Message m : messages) {
-                if (m.isVisible()) visible++;
-                else inFlight++;
+                if (m.isVisible()) {
+                    visible++;
+                } else if (m.getReceiptHandle() == null) {
+                    delayed++;
+                } else {
+                    inFlight++;
+                }
             }
-            return new MessageCounts(visible, inFlight);
+            return new MessageCounts(visible, inFlight, delayed);
         }
     }
 
@@ -252,6 +289,33 @@ class GuardedMessageQueue {
         if (closed || messageStore == null || storageKey == null) {
             return;
         }
+        if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
+            String accountId = extractAccountFromStorageKey(storageKey);
+            if (accountId != null) {
+                aware.putForAccount(accountId, storageKey, new ArrayList<>(messages));
+                return;
+            }
+        }
         messageStore.put(storageKey, new ArrayList<>(messages));
+    }
+
+    /**
+     * Extracts the 12-digit account ID from a storage key of the form
+     * {@code region::/accountId/queueName}.
+     */
+    private static String extractAccountFromStorageKey(String storageKey) {
+        if (storageKey == null) {
+            return null;
+        }
+        // storageKey format: "us-east-1::/000000000001/my-queue"
+        int separator = storageKey.indexOf("::");
+        if (separator < 0) {
+            return null;
+        }
+        String path = storageKey.substring(separator + 2); // "/000000000001/my-queue"
+        String trimmed = path.startsWith("/") ? path.substring(1) : path;
+        int slash = trimmed.indexOf('/');
+        String candidate = slash > 0 ? trimmed.substring(0, slash) : trimmed;
+        return candidate.matches("\\d{12}") ? candidate : null;
     }
 }

@@ -35,6 +35,20 @@ public class SqsQueryHandler {
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
         LOG.debugv("SQS action: {0}", action);
 
+        // Wrap like every other Query handler: without this, AwsExceptions escape to the
+        // global JAX-RS mapper, which renders a JSON error body on this XML protocol.
+        try {
+            return dispatch(action, params, region);
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.SQS, e.getHttpStatus());
+        } catch (Exception e) {
+            LOG.errorv(e, "Unexpected error in SQS {0}", action);
+            return AwsQueryResponse.error("InternalError",
+                    "Unexpected error: " + e.getMessage(), AwsNamespaces.SQS, 500);
+        }
+    }
+
+    private Response dispatch(String action, MultivaluedMap<String, String> params, String region) {
         return switch (action) {
             case "CreateQueue" -> handleCreateQueue(params, region);
             case "DeleteQueue" -> handleDeleteQueue(params, region);
@@ -196,7 +210,7 @@ public class SqsQueryHandler {
     private Response handleSendMessage(MultivaluedMap<String, String> params, String region) {
         String queueUrl = getParam(params, "QueueUrl");
         String body = getParam(params, "MessageBody");
-        int delaySeconds = getIntParam(params, "DelaySeconds", 0);
+        Integer delaySeconds = getIntegerParam(params, "DelaySeconds");
         String messageGroupId = getParam(params, "MessageGroupId");
         String messageDeduplicationId = getParam(params, "MessageDeduplicationId");
 
@@ -248,7 +262,7 @@ public class SqsQueryHandler {
         String queueUrl = getParam(params, "QueueUrl");
         int maxMessages = getIntParam(params, "MaxNumberOfMessages", 1);
         int visibilityTimeout = getIntParam(params, "VisibilityTimeout", -1);
-        int waitTimeSeconds = getIntParam(params, "WaitTimeSeconds", 0);
+        Integer waitTimeSeconds = getOptionalIntParam(params, "WaitTimeSeconds");
 
         java.util.Set<String> requestedAttrs = new java.util.LinkedHashSet<>();
         requestedAttrs.addAll(collectIndexed(params, "AttributeName."));
@@ -331,7 +345,7 @@ public class SqsQueryHandler {
         String queueUrl = getParam(params, "QueueUrl");
         var xml = new XmlBuilder();
 
-        record ParsedEntry(String id, String body, int delay, String groupId, String dedupId,
+        record ParsedEntry(String id, String body, Integer delay, String groupId, String dedupId,
                            Map<String, MessageAttributeValue> attributes, String awsTraceHeader) {}
 
         List<ParsedEntry> parsedEntries = new ArrayList<>();
@@ -340,7 +354,7 @@ public class SqsQueryHandler {
             String id = getParam(params, "SendMessageBatchRequestEntry." + i + ".Id");
             if (id == null) break;
             String body = getParam(params, "SendMessageBatchRequestEntry." + i + ".MessageBody");
-            int delaySeconds = getIntParam(params, "SendMessageBatchRequestEntry." + i + ".DelaySeconds", 0);
+            Integer delaySeconds = getIntegerParam(params, "SendMessageBatchRequestEntry." + i + ".DelaySeconds");
             String messageGroupId = getParam(params, "SendMessageBatchRequestEntry." + i + ".MessageGroupId");
             String messageDeduplicationId = getParam(params, "SendMessageBatchRequestEntry." + i + ".MessageDeduplicationId");
 
@@ -550,6 +564,19 @@ public class SqsQueryHandler {
         return params.getFirst(name);
     }
 
+    private Integer getOptionalIntParam(MultivaluedMap<String, String> params, String name) {
+        String value = params.getFirst(name);
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value " + value + " for parameter " + name + " is invalid. Reason: Must be an integer.", 400);
+        }
+    }
+
     private int getIntParam(MultivaluedMap<String, String> params, String name, int defaultValue) {
         String value = params.getFirst(name);
         if (value == null) return defaultValue;
@@ -557,6 +584,17 @@ public class SqsQueryHandler {
             return Integer.parseInt(value);
         } catch (NumberFormatException e) {
             return defaultValue;
+        }
+    }
+
+    private Integer getIntegerParam(MultivaluedMap<String, String> params, String name) {
+        String value = params.getFirst(name);
+        if (value == null) return null;
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value for parameter " + name + " is invalid. Reason: Must be an integer.", 400);
         }
     }
 

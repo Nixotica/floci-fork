@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServer;
 import io.vertx.ext.web.Router;
@@ -11,10 +13,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -33,9 +39,11 @@ public class Ec2MetadataServer {
     private static final Logger LOG = Logger.getLogger(Ec2MetadataServer.class);
     private static final DateTimeFormatter ISO = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
             .withZone(ZoneOffset.UTC);
+    private static final String INSTANCE_TAGS_PREFIX = "/latest/meta-data/tags/instance/";
 
     private final Vertx vertx;
     private final EmulatorConfig config;
+    private final IamService iamService;
 
     /** IMDSv2: token value → Instance */
     private final Map<String, Instance> tokenToInstance = new ConcurrentHashMap<>();
@@ -45,9 +53,10 @@ public class Ec2MetadataServer {
     private volatile HttpServer httpServer;
 
     @Inject
-    public Ec2MetadataServer(Vertx vertx, EmulatorConfig config) {
+    public Ec2MetadataServer(Vertx vertx, EmulatorConfig config, IamService iamService) {
         this.vertx = vertx;
         this.config = config;
+        this.iamService = iamService;
     }
 
     /** Called by Ec2ContainerManager after a container starts to register its IP. */
@@ -59,10 +68,27 @@ public class Ec2MetadataServer {
     }
 
     /** Called by Ec2ContainerManager when a container is terminated. */
-    public void unregisterContainer(String containerIp) {
-        if (containerIp != null) {
-            containerIpToInstance.remove(containerIp);
+    public void unregisterContainer(String containerIp, Instance instance) {
+        if (containerIp != null && instance != null) {
+            containerIpToInstance.remove(containerIp, instance);
         }
+    }
+
+    /** Reconcile every Docker attachment without retaining stale addresses after restart. */
+    void reconcileContainerAddresses(Set<String> addresses, Instance instance) {
+        for (String address : addresses) {
+            registerContainer(address, instance.getInstanceId(), instance);
+        }
+        containerIpToInstance.entrySet().removeIf(entry ->
+                entry.getValue() == instance && !addresses.contains(entry.getKey()));
+    }
+
+    void unregisterInstance(Instance instance) {
+        containerIpToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
+    }
+
+    Optional<Instance> registeredContainer(String containerIp) {
+        return Optional.ofNullable(containerIpToInstance.get(containerIp));
     }
 
     public CompletableFuture<Void> start() {
@@ -92,6 +118,9 @@ public class Ec2MetadataServer {
         router.get("/latest/meta-data/iam/info").handler(ctx -> handleIamInfo(ctx));
         router.get("/latest/meta-data/iam/security-credentials/").handler(ctx -> handleCredentialsList(ctx));
         router.get("/latest/meta-data/iam/security-credentials/:role").handler(ctx -> handleCredentials(ctx));
+        router.get("/latest/meta-data/tags/instance").handler(ctx -> handleInstanceTagKeys(ctx));
+        router.get("/latest/meta-data/tags/instance/").handler(ctx -> handleInstanceTagKeys(ctx));
+        router.getWithRegex("/latest/meta-data/tags/instance/.+").handler(ctx -> handleInstanceTagValue(ctx));
         router.get("/latest/user-data").handler(ctx -> handleUserData(ctx));
         router.get("/latest/dynamic/instance-identity/document").handler(ctx -> handleIdentityDocument(ctx));
 
@@ -127,6 +156,10 @@ public class Ec2MetadataServer {
         String token = UUID.randomUUID().toString().replace("-", "");
         if (inst != null) {
             tokenToInstance.put(token, inst);
+        }
+        else {
+            LOG.debugv("IMDS: token requested from {0}, which is not a registered EC2 container; "
+                    + "metadata requests with this token will fail", ctx.request().remoteAddress().host());
         }
 
         ctx.response()
@@ -216,7 +249,7 @@ public class Ec2MetadataServer {
             ctx.response().setStatusCode(404).end();
             return;
         }
-        String roleName = extractRoleName(profileArn);
+        String roleName = resolveRoleName(profileArn);
         ctx.response().setStatusCode(200)
                 .putHeader("content-type", "text/plain")
                 .end(roleName);
@@ -245,6 +278,36 @@ public class Ec2MetadataServer {
                 .end(body);
     }
 
+    private void handleInstanceTagKeys(RoutingContext ctx) {
+        Instance inst = resolveInstance(ctx);
+        if (inst == null) {
+            return;
+        }
+        ctx.response().setStatusCode(200)
+                .putHeader("content-type", "text/plain")
+                .end(instanceTagKeys(inst));
+    }
+
+    private void handleInstanceTagValue(RoutingContext ctx) {
+        Instance inst = resolveInstance(ctx);
+        if (inst == null) {
+            return;
+        }
+
+        String path = ctx.request().path();
+        String tagKey = path.length() <= INSTANCE_TAGS_PREFIX.length()
+                ? ""
+                : URLDecoder.decode(path.substring(INSTANCE_TAGS_PREFIX.length()), StandardCharsets.UTF_8);
+        Optional<String> value = instanceTagValue(inst, tagKey);
+        if (value.isEmpty()) {
+            ctx.response().setStatusCode(404).end("not-found");
+            return;
+        }
+        ctx.response().setStatusCode(200)
+                .putHeader("content-type", "text/plain")
+                .end(value.get());
+    }
+
     private void handleUserData(RoutingContext ctx) {
         Instance inst = resolveInstance(ctx);
         if (inst == null) {
@@ -265,9 +328,19 @@ public class Ec2MetadataServer {
         if (inst == null) {
             return;
         }
+        String body = instanceIdentityDocument(inst, config.defaultAccountId());
+        ctx.response().setStatusCode(200)
+                .putHeader("content-type", "application/json")
+                .end(body);
+    }
+
+    static String instanceIdentityDocument(Instance inst, String accountId) {
         String az = inst.getPlacement() != null ? inst.getPlacement().getAvailabilityZone() : "us-east-1a";
-        String body = "{\"accountId\":\"" + config.defaultAccountId() + "\","
-                + "\"architecture\":\"x86_64\","
+        String architecture = inst.getArchitecture() == null || inst.getArchitecture().isBlank()
+                ? "x86_64"
+                : inst.getArchitecture();
+        String body = "{\"accountId\":\"" + accountId + "\","
+                + "\"architecture\":\"" + architecture + "\","
                 + "\"availabilityZone\":\"" + az + "\","
                 + "\"imageId\":\"" + inst.getImageId() + "\","
                 + "\"instanceId\":\"" + inst.getInstanceId() + "\","
@@ -275,9 +348,7 @@ public class Ec2MetadataServer {
                 + "\"privateIp\":\"" + nvl(inst.getPrivateIpAddress()) + "\","
                 + "\"region\":\"" + inst.getRegion() + "\","
                 + "\"version\":\"2017-09-30\"}";
-        ctx.response().setStatusCode(200)
-                .putHeader("content-type", "application/json")
-                .end(body);
+        return body;
     }
 
     // ── Instance resolution ───────────────────────────────────────────────────
@@ -301,15 +372,49 @@ public class Ec2MetadataServer {
         String remoteIp = ctx.request().remoteAddress().host();
         Instance inst = containerIpToInstance.get(remoteIp);
         if (inst == null) {
-            LOG.warnv("IMDS: could not identify instance for request from {0}", remoteIp);
-            ctx.response().setStatusCode(404).end("Instance not found");
+            String message = unregisteredContainerMessage(remoteIp);
+            LOG.warnv("IMDS: {0}", message);
+            ctx.response().setStatusCode(404)
+                    .putHeader("content-type", "text/plain")
+                    .end(message);
         }
         return inst;
     }
 
+    /**
+     * Explains why IMDS has nothing to serve for a request coming from {@code remoteIp}.
+     *
+     * <p>IMDS only knows about containers that {@link Ec2ContainerManager} launched through EC2
+     * {@code RunInstances}. Registering a container's SSM agent as a managed instance
+     * ({@code UpdateInstanceInformation}) does not create an EC2 instance record, so a container
+     * that was only registered with SSM ends up here.
+     */
+    static String unregisteredContainerMessage(String remoteIp) {
+        return "Instance not found: no EC2 instance is registered for source IP " + remoteIp + ". "
+                + "IMDS only serves containers launched through EC2 RunInstances; "
+                + "registering a container as an SSM managed instance does not register it with IMDS. "
+                + "Launch the container with RunInstances first, then register its SSM agent.";
+    }
+
     // ── Utilities ─────────────────────────────────────────────────────────────
 
-    private static String extractRoleName(String profileArn) {
+    String resolveRoleName(String profileArn) {
+        if (iamService != null) {
+            String profileName = extractProfileName(profileArn);
+            try {
+                var profile = iamService.getInstanceProfile(profileName);
+                if (profile.getRoleNames() != null && !profile.getRoleNames().isEmpty()) {
+                    return profile.getRoleNames().getFirst();
+                }
+            } catch (AwsException e) {
+                LOG.debugf(e, "IMDS: instance profile %s unavailable; falling back to profile name", profileName);
+                // Fall back to the profile name when only the EC2 profile ARN was modeled.
+            }
+        }
+        return extractProfileName(profileArn);
+    }
+
+    private static String extractProfileName(String profileArn) {
         // arn:aws:iam::000000000000:instance-profile/my-role
         int lastSlash = profileArn.lastIndexOf('/');
         if (lastSlash >= 0 && lastSlash < profileArn.length() - 1) {
@@ -324,5 +429,34 @@ public class Ec2MetadataServer {
 
     private static String nvl(String s) {
         return s != null ? s : "";
+    }
+
+    static String instanceTagKeys(Instance instance) {
+        StringBuilder tags = new StringBuilder();
+        if (instance == null || instance.getTags() == null) {
+            return "";
+        }
+        for (var tag : instance.getTags()) {
+            if (tag.getKey() == null || tag.getKey().isBlank()) {
+                continue;
+            }
+            if (!tags.isEmpty()) {
+                tags.append("\n");
+            }
+            tags.append(tag.getKey());
+        }
+        return tags.toString();
+    }
+
+    static Optional<String> instanceTagValue(Instance instance, String key) {
+        if (instance == null || instance.getTags() == null || key == null) {
+            return Optional.empty();
+        }
+        for (var tag : instance.getTags()) {
+            if (key.equals(tag.getKey())) {
+                return Optional.of(nvl(tag.getValue()));
+            }
+        }
+        return Optional.empty();
     }
 }

@@ -5,23 +5,30 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"net/url"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
-	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
-	"github.com/aws/aws-sdk-go-v2/service/ecr"
-	"github.com/aws/aws-sdk-go-v2/service/pipes"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
+	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/iot"
+	"github.com/aws/aws-sdk-go-v2/service/iotdataplane"
+	"github.com/aws/aws-sdk-go-v2/service/iotjobsdataplane"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/neptune"
+	"github.com/aws/aws-sdk-go-v2/service/pipes"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
+	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
@@ -84,6 +91,11 @@ func LambdaClient() *lambda.Client {
 	return lambda.NewFromConfig(Config())
 }
 
+// GlueClient returns a new Glue client.
+func GlueClient() *glue.Client {
+	return glue.NewFromConfig(Config())
+}
+
 // IAMClient returns a new IAM client.
 func IAMClient() *iam.Client {
 	return iam.NewFromConfig(Config())
@@ -114,6 +126,11 @@ func CloudWatchClient() *cloudwatch.Client {
 	return cloudwatch.NewFromConfig(Config())
 }
 
+// ResourceGroupsTaggingAPIClient returns a new Resource Groups Tagging API client.
+func ResourceGroupsTaggingAPIClient() *resourcegroupstaggingapi.Client {
+	return resourcegroupstaggingapi.NewFromConfig(Config())
+}
+
 // ACMClient returns a new ACM client.
 func ACMClient() *acm.Client {
 	return acm.NewFromConfig(Config())
@@ -127,6 +144,21 @@ func ECRClient() *ecr.Client {
 // PipesClient returns a new EventBridge Pipes client.
 func PipesClient() *pipes.Client {
 	return pipes.NewFromConfig(Config())
+}
+
+// IoTClient returns a new AWS IoT client.
+func IoTClient() *iot.Client {
+	return iot.NewFromConfig(Config())
+}
+
+// IoTDataClient returns a new AWS IoT Data Plane client.
+func IoTDataClient() *iotdataplane.Client {
+	return iotdataplane.NewFromConfig(Config())
+}
+
+// IoTJobsDataClient returns a new AWS IoT Jobs Data Plane client.
+func IoTJobsDataClient() *iotjobsdataplane.Client {
+	return iotjobsdataplane.NewFromConfig(Config())
 }
 
 // RDSClient returns a new RDS client.
@@ -147,18 +179,15 @@ func CognitoClient() *cognitoidentityprovider.Client {
 // ProxyHost returns the host to use for direct TCP connections to RDS/ElastiCache proxies.
 func ProxyHost() string {
 	ep := Endpoint()
-	// Strip scheme — ep is "http://host:port" or "http://host"
-	if len(ep) > 7 && ep[:7] == "http://" {
-		ep = ep[7:]
+	parsed, err := url.Parse(ep)
+	if err != nil {
+		return ep
 	}
-	// Strip port if present
-	if i := len(ep) - 1; i > 0 {
-		for i >= 0 && ep[i] != ':' {
-			i--
-		}
-		if i > 0 {
-			return ep[:i]
-		}
+	if parsed.Hostname() == "" && !strings.Contains(ep, "://") {
+		parsed, err = url.Parse("//" + ep)
+	}
+	if err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname()
 	}
 	return ep
 }

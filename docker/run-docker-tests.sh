@@ -47,6 +47,7 @@ SUITES=(
 
 # results dir
 mkdir -p test-results
+FAILED=0
 
 for suite in "${SUITES[@]}"; do
   echo "=== Running $suite in Docker ==="
@@ -54,7 +55,11 @@ for suite in "${SUITES[@]}"; do
   IMAGE_NAME="compat-$suite"
   
   # Build
-  docker build -q -t "$IMAGE_NAME" "compatibility-tests/$suite"
+  if ! docker build -q -t "$IMAGE_NAME" "compatibility-tests/$suite"; then
+    echo "Test suite $suite failed to build"
+    FAILED=1
+    continue
+  fi
   
   # Build DNS args: if we resolved Floci's IP, inject it as the DNS server so
   # wildcard subdomains like <bucket>.floci resolve inside test containers.
@@ -63,15 +68,29 @@ for suite in "${SUITES[@]}"; do
     DNS_ARGS=(--dns "$FLOCI_IP")
   fi
 
+  # Per-suite extra args, mirroring .github/workflows/compatibility.yml.
+  # sdk-test-java's Lambda hot-reload test needs a host directory that the Docker
+  # daemon can bind-mount into the hot-reload Lambda container.
+  EXTRA_ARGS=()
+  if [ "$suite" = "sdk-test-java" ]; then
+    mkdir -p /tmp/floci-hot-reload
+    EXTRA_ARGS=(-v /tmp/floci-hot-reload:/tmp/floci-hot-reload -e HOT_RELOAD_BASE_DIR=/tmp/floci-hot-reload)
+  fi
+
   # Run
-  docker run --rm --network "$NETWORK" \
-    "${DNS_ARGS[@]}" \
-    -e FLOCI_ENDPOINT=http://floci:4566 \
-    -e FLOCI_S3_VHOST_ENDPOINT=http://floci:4566 \
-    -v "$(pwd)/test-results:/results" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    --group-add "$DOCKER_GID" \
-    "$IMAGE_NAME" || echo "Test suite $suite failed"
+  if ! docker run --rm --network "$NETWORK" \
+      "${DNS_ARGS[@]}" \
+      -e FLOCI_ENDPOINT=http://floci:4566 \
+      -e FLOCI_S3_VHOST_ENDPOINT=http://floci:4566 \
+      -v "$(pwd)/test-results:/results" \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      --group-add "$DOCKER_GID" \
+      "${EXTRA_ARGS[@]}" \
+      "$IMAGE_NAME"; then
+    echo "Test suite $suite failed"
+    FAILED=1
+  fi
 done
 
 echo "=== All Docker tests completed ==="
+exit "$FAILED"

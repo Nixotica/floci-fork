@@ -24,10 +24,27 @@ public class Secret {
     private List<Tag> tags;
     private Map<String, SecretVersion> versions;
     private String currentVersionId;
+    private String rotationLambdaArn;
+    private RotationRules rotationRules;
+    private Instant lastRotatedDate;
+    private Instant nextRotationDate;
+    private String targetAttachmentOwner;
+    /** The AWS service that owns this secret and rotates it itself, such as {@code rds}. */
+    private String owningService;
+    /** Resource-based policy JSON attached via PutResourcePolicy, or null when none is attached. */
+    private String resourcePolicy;
+
+    @RegisterForReflection
+    public record RotationRules(
+            @JsonProperty("AutomaticallyAfterDays") Integer automaticallyAfterDays,
+            @JsonProperty("Duration") String duration,
+            @JsonProperty("ScheduleExpression") String scheduleExpression) {
+    }
 
     public Secret() {
     }
 
+    @RegisterForReflection
     public record Tag(
             @JsonProperty("Key") String key,
             @JsonProperty("Value") String value) {
@@ -127,5 +144,61 @@ public class Secret {
 
     public void setCurrentVersionId(String currentVersionId) {
         this.currentVersionId = currentVersionId;
+    }
+
+    public String getRotationLambdaArn() {
+        return rotationLambdaArn;
+    }
+
+    public void setRotationLambdaArn(String rotationLambdaArn) {
+        this.rotationLambdaArn = rotationLambdaArn;
+    }
+
+    public RotationRules getRotationRules() {
+        return rotationRules;
+    }
+
+    public void setRotationRules(RotationRules rotationRules) {
+        this.rotationRules = rotationRules;
+    }
+
+    public Instant getLastRotatedDate() {
+        return lastRotatedDate;
+    }
+
+    public void setLastRotatedDate(Instant lastRotatedDate) {
+        this.lastRotatedDate = lastRotatedDate;
+    }
+
+    public Instant getNextRotationDate() {
+        return nextRotationDate;
+    }
+
+    public void setNextRotationDate(Instant nextRotationDate) {
+        this.nextRotationDate = nextRotationDate;
+    }
+
+    public String getTargetAttachmentOwner() {
+        return targetAttachmentOwner;
+    }
+
+    public void setTargetAttachmentOwner(String targetAttachmentOwner) {
+        this.targetAttachmentOwner = targetAttachmentOwner;
+    }
+
+    public String getOwningService() {
+        return owningService;
+    }
+
+    public void setOwningService(String owningService) {
+        this.owningService = owningService;
+    }
+
+    public String getResourcePolicy() {
+        return resourcePolicy;
+    }
+
+    public void setResourcePolicy(String resourcePolicy) {
+        this.resourcePolicy = resourcePolicy;
     }
 }

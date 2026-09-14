@@ -1,13 +1,20 @@
 name: Release
 
 # Triggered when a version tag (e.g. 1.2.3) is pushed.
-# Builds native (amd64 + arm64) Docker images and pushes them to Docker Hub.
+# Builds native (amd64 + arm64) Docker images and pushes them to Docker Hub
+# and Amazon ECR Public.
 #
 # Published tags:
 #   Native:  floci/floci:1.2.3        floci/floci:latest
+#            public.ecr.aws/floci/floci:1.2.3        public.ecr.aws/floci/floci:latest
+#   Cedar:   floci/floci:1.2.3-cedar floci/floci:latest-cedar
+#            public.ecr.aws/floci/floci:1.2.3-cedar public.ecr.aws/floci/floci:latest-cedar
+#   Baseline: floci/floci:1.2.3-baseline floci/floci:latest-baseline
+#             public.ecr.aws/floci/floci:1.2.3-baseline public.ecr.aws/floci/floci:latest-baseline
 #   Compat:  floci/floci:1.2.3-compat floci/floci:latest-compat
+#            public.ecr.aws/floci/floci:1.2.3-compat public.ecr.aws/floci/floci:latest-compat
 #
-# Required secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+# Required secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, AWS_ROLE_ARN
 
 on:
   push:
@@ -16,6 +23,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 # Per-tag concurrency. Back-to-back tag pushes (e.g. 1.5.3 and 1.6.0 landing
 # minutes apart) resolve to different ${{ github.ref }} values, so they run
@@ -33,9 +41,9 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: graalvm/setup-graalvm@bef4b0e916c7dd079bf60fb95d49139f67e32c5f # v1
+      - uses: graalvm/setup-graalvm@5298d94fb55a4f185c602eeac5de1b553882abe2 # v1
         with:
           java-version: '25'
           distribution: 'mandrel'
@@ -43,9 +51,14 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build native executable
-        run: mvn clean package -Dnative -DskipTests -B -Dquarkus.native.additional-build-args-append="-march=x86-64-v2"
+        # Quarkus 3.39 switches on -H:+AOTSingleCallsiteInline for Mandrel 25.0.4+. The generated
+        # REST invokers for AwsQueryController.dispatch and AwsJson11Controller.handle are each the
+        # single call site of a very large method; inlined, the method outgrows the aarch64
+        # conditional-branch range and the build dies with BranchTargetOutOfBoundsException.
+        # The flag only exists on Mandrel, so it is passed here rather than in application.yml.
+        run: mvn clean package -Dnative -DskipTests -B -Dquarkus.native.additional-build-args-append="-march=x86-64-v2,-H:-AOTSingleCallsiteInline"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-amd64
           path: |
@@ -62,9 +75,9 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: graalvm/setup-graalvm@bef4b0e916c7dd079bf60fb95d49139f67e32c5f # v1
+      - uses: graalvm/setup-graalvm@5298d94fb55a4f185c602eeac5de1b553882abe2 # v1
         with:
           java-version: '25'
           distribution: 'mandrel'
@@ -72,11 +85,48 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build native executable
-        run: mvn clean package -Dnative -DskipTests -B
+        # Quarkus 3.39 switches on -H:+AOTSingleCallsiteInline for Mandrel 25.0.4+. The generated
+        # REST invokers for AwsQueryController.dispatch and AwsJson11Controller.handle are each the
+        # single call site of a very large method; inlined, the method outgrows the aarch64
+        # conditional-branch range and the build dies with BranchTargetOutOfBoundsException.
+        # The flag only exists on Mandrel, so it is passed here rather than in application.yml.
+        run: mvn clean package -Dnative -DskipTests -B -Dquarkus.native.additional-build-args-append="-H:-AOTSingleCallsiteInline"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-arm64
+          path: |
+            target/*-runner
+            target/*.properties
+            target/*.so
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ── Build baseline native artifact — arm64 only ─────────────────────────
+  build-native-arm64-baseline:
+    name: Build baseline native artifact (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: graalvm/setup-graalvm@5298d94fb55a4f185c602eeac5de1b553882abe2 # v1
+        with:
+          java-version: '25'
+          distribution: 'mandrel'
+          cache: maven
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ARMv8.0 baseline native executable
+        # Keep the normal arm64 artifact optimized as before. This additional release-only build
+        # targets ARMv8.0 explicitly so older cores such as Raspberry Pi 4's Cortex-A72 do not
+        # inherit optional AArch64 features (notably LSE) from the GitHub-hosted build runner.
+        run: mvn clean package -Dnative -DskipTests -B -Dquarkus.native.additional-build-args-append="-march=armv8-a,-H:-AOTSingleCallsiteInline"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-arm64-baseline
           path: |
             target/*-runner
             target/*.properties
@@ -87,12 +137,12 @@ jobs:
   # ── Push native + compat Docker images ───────────────────────────────────
   push-native:
     name: Push native and compat Docker images
-    needs: [build-native-amd64, build-native-arm64]
+    needs: [build-native-amd64, build-native-arm64, build-native-arm64-baseline]
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Extract version
         id: version
@@ -106,28 +156,47 @@ jobs:
         id: source_date
         run: echo "epoch=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: native-amd64
           path: native/amd64/
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: native-arm64
           path: native/arm64/
 
-      - name: Make binaries executable
-        run: chmod +x native/amd64/*-runner native/arm64/*-runner
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-arm64-baseline
+          path: native-baseline/arm64/
 
-      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Stage binaries under a fixed name
+        run: |
+          for arch in amd64 arm64; do
+            mv native/$arch/*-runner native/$arch/application
+          done
 
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+        with:
+          registry-type: public
+
       - name: Build and push native multi-arch image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         env:
           SOURCE_DATE_EPOCH: ${{ steps.source_date.outputs.epoch }}
         with:
@@ -135,9 +204,13 @@ jobs:
           file: docker/Dockerfile.native-package
           platforms: linux/amd64,linux/arm64
           push: true
+          provenance: mode=max
+          sbom: true
           tags: |
             floci/floci:${{ steps.version.outputs.version }}
             floci/floci:latest
+            public.ecr.aws/floci/floci:${{ steps.version.outputs.version }}
+            public.ecr.aws/floci/floci:latest
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
           labels: |
@@ -150,8 +223,75 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Ordering matters: this step wipes native/ and replaces it with the arm64-only
+      # baseline binary. It is safe only because it runs AFTER the multi-arch image
+      # above has been pushed, and nothing that follows reads native/ from the build
+      # context: the Cedar sidecar builds from sidecars/cedar/ only, and the compat
+      # image pulls its base (BASE_IMAGE) from the registry. Moving this step above
+      # the multi-arch push would silently publish `latest` from the baseline binary.
+      - name: Stage ARMv8.0 baseline artifact under the native package path
+        run: |
+          rm -rf native/amd64 native/arm64
+          mkdir -p native/arm64
+          cp -a native-baseline/arm64/. native/arm64/
+          mv native/arm64/*-runner native/arm64/application
+
+      - name: Build and push ARMv8.0 baseline image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.source_date.outputs.epoch }}
+        with:
+          context: .
+          file: docker/Dockerfile.native-package
+          platforms: linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            floci/floci:${{ steps.version.outputs.version }}-baseline
+            floci/floci:latest-baseline
+            public.ecr.aws/floci/floci:${{ steps.version.outputs.version }}-baseline
+            public.ecr.aws/floci/floci:latest-baseline
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.created.outputs.created }}
+            version=${{ steps.version.outputs.version }}
+            build-date=${{ steps.created.outputs.created }}
+            vcs-ref=${{ github.sha }}
+          cache-from: type=gha,scope=floci-arm64-baseline
+          cache-to: type=gha,scope=floci-arm64-baseline,mode=max
+
+      - name: Build and push Cedar sidecar multi-arch image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.source_date.outputs.epoch }}
+        with:
+          context: .
+          file: sidecars/cedar/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            floci/floci:${{ steps.version.outputs.version }}-cedar
+            floci/floci:latest-cedar
+            public.ecr.aws/floci/floci:${{ steps.version.outputs.version }}-cedar
+            public.ecr.aws/floci/floci:latest-cedar
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.created.outputs.created }}
+            version=${{ steps.version.outputs.version }}
+            build-date=${{ steps.created.outputs.created }}
+            vcs-ref=${{ github.sha }}
+          cache-from: type=gha,scope=floci-cedar
+          cache-to: type=gha,scope=floci-cedar,mode=max
+
       - name: Build and push compat multi-arch image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         env:
           SOURCE_DATE_EPOCH: ${{ steps.source_date.outputs.epoch }}
         with:
@@ -159,9 +299,13 @@ jobs:
           file: docker/Dockerfile.compat
           platforms: linux/amd64,linux/arm64
           push: true
+          provenance: mode=max
+          sbom: true
           tags: |
             floci/floci:${{ steps.version.outputs.version }}-compat
             floci/floci:latest-compat
+            public.ecr.aws/floci/floci:${{ steps.version.outputs.version }}-compat
+            public.ecr.aws/floci/floci:latest-compat
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
           labels: |

@@ -8,6 +8,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -159,7 +160,20 @@ class SesIdentityAttributesV1IntegrationTest {
 
     @Test
     @Order(12)
-    void setIdentityFeedbackForwardingEnabled_missingForwardingEnabled_returnsInvalidParameterValue() {
+    void setIdentityFeedbackForwardingEnabled_missingForwardingEnabled_defaultsToFalse() {
+        // Real AWS treats an absent Query-protocol boolean member as false instead of
+        // rejecting the request (probed 2026-09-05): the call succeeds and disables forwarding.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "SetIdentityFeedbackForwardingEnabled")
+            .formParam("Identity", "v1-attrs.floci.test")
+            .formParam("ForwardingEnabled", "true")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH)
@@ -168,40 +182,124 @@ class SesIdentityAttributesV1IntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(400)
-            .body(containsString("InvalidParameterValue"));
+            .statusCode(200)
+            .body(containsString("SetIdentityFeedbackForwardingEnabledResponse"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "GetIdentityNotificationAttributes")
+            .formParam("Identities.member.1", "v1-attrs.floci.test")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<ForwardingEnabled>false</ForwardingEnabled>"));
     }
 
     @Test
     @Order(13)
-    void setIdentityHeadersInNotificationsEnabled_missingEnabled_returnsInvalidParameterValue() {
+    void setIdentityHeadersInNotificationsEnabled_missingEnabled_defaultsToFalse() {
+        // Same absent-boolean default as Order(12); Delivery is used so the Bounce flag
+        // set in Order(6) and asserted in Order(17) stays untouched.
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH)
             .formParam("Action", "SetIdentityHeadersInNotificationsEnabled")
             .formParam("Identity", "v1-attrs.floci.test")
-            .formParam("NotificationType", "Bounce")
+            .formParam("NotificationType", "Delivery")
+            .formParam("Enabled", "true")
         .when()
             .post("/")
         .then()
-            .statusCode(400)
-            .body(containsString("InvalidParameterValue"));
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "SetIdentityHeadersInNotificationsEnabled")
+            .formParam("Identity", "v1-attrs.floci.test")
+            .formParam("NotificationType", "Delivery")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "GetIdentityNotificationAttributes")
+            .formParam("Identities.member.1", "v1-attrs.floci.test")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<HeadersInDeliveryNotificationsEnabled>false</HeadersInDeliveryNotificationsEnabled>"));
     }
 
     @Test
     @Order(14)
-    void setIdentityFeedbackForwardingEnabled_invalidBoolean_returnsInvalidParameterValue() {
+    void setIdentityFeedbackForwardingEnabled_invalidBoolean_returnsMalformedInput() {
+        // Probed against real AWS 2026-09-05: anything but case-sensitive true/false/1/0
+        // (even "TRUE") is MalformedInput, not InvalidParameterValue.
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH)
             .formParam("Action", "SetIdentityFeedbackForwardingEnabled")
             .formParam("Identity", "v1-attrs.floci.test")
-            .formParam("ForwardingEnabled", "yes")
+            .formParam("ForwardingEnabled", "TRUE")
         .when()
             .post("/")
         .then()
             .statusCode(400)
-            .body(containsString("InvalidParameterValue"));
+            .body(containsString("<Code>MalformedInput</Code>"))
+            .body(containsString("boolean must follow xsd1.1 definition"));
+    }
+
+    @Test
+    @Order(24)
+    void setIdentityFeedbackForwardingEnabled_emptyBoolean_returnsMalformedInput() {
+        // Probed against real AWS 2026-09-05: a present-but-empty boolean value is its
+        // own MalformedInput message, distinct from both the absent and malformed cases.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "SetIdentityFeedbackForwardingEnabled")
+            .formParam("Identity", "v1-attrs.floci.test")
+            .formParam("ForwardingEnabled", "")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>MalformedInput</Code>"))
+            .body(containsString("missing value for boolean type"));
+    }
+
+    @Test
+    @Order(25)
+    void setIdentityFeedbackForwardingEnabled_numericBoolean_isAccepted() {
+        // xsd 1.1 booleans: "1" is true (probed against real AWS 2026-09-05).
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "SetIdentityFeedbackForwardingEnabled")
+            .formParam("Identity", "v1-attrs.floci.test")
+            .formParam("ForwardingEnabled", "1")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "GetIdentityNotificationAttributes")
+            .formParam("Identities.member.1", "v1-attrs.floci.test")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<ForwardingEnabled>true</ForwardingEnabled>"));
     }
 
     @Test
@@ -326,5 +424,43 @@ class SesIdentityAttributesV1IntegrationTest {
             .body(containsString("<HeadersInBounceNotificationsEnabled>true</HeadersInBounceNotificationsEnabled>"))
             .body(containsString("<HeadersInComplaintNotificationsEnabled>false</HeadersInComplaintNotificationsEnabled>"))
             .body(containsString("<HeadersInDeliveryNotificationsEnabled>false</HeadersInDeliveryNotificationsEnabled>"));
+    }
+
+    @Test
+    @Order(22)
+    void getIdentityNotificationAttributes_unknownIdentity_omittedFromMap() {
+        // Real AWS returns an empty NotificationAttributes map for an identity
+        // that doesn't exist, rather than an entry with empty values
+        // (verified against real AWS SES on 2026-06-13).
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "GetIdentityNotificationAttributes")
+            .formParam("Identities.member.1", "ghost-notif.floci.test")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("GetIdentityNotificationAttributesResponse"))
+            .body(containsString("<NotificationAttributes></NotificationAttributes>"))
+            .body(not(containsString("ghost-notif.floci.test")));
+    }
+
+    @Test
+    @Order(23)
+    void getIdentityNotificationAttributes_mixedKnownAndUnknown_returnsOnlyKnown() {
+        // The unknown identity is dropped from the map; the known one stays.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "GetIdentityNotificationAttributes")
+            .formParam("Identities.member.1", "v1-attrs.floci.test")
+            .formParam("Identities.member.2", "ghost-notif2.floci.test")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<key>v1-attrs.floci.test</key>"))
+            .body(not(containsString("ghost-notif2.floci.test")));
     }
 }

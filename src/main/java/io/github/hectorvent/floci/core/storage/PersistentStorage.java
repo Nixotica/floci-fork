@@ -91,7 +91,11 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
             store.putAll(data);
             LOG.infov("Loaded {0} entries from {1}", store.size(), filePath);
         } catch (IOException e) {
-            LOG.errorv(e, "Failed to load data from {0}", filePath);
+            // Starting empty here silently drops all persisted state for this store, which can leave
+            // other services (e.g. CloudFormation) referencing resources that now appear missing
+            // (see issue #1634). Quarantine the unreadable file and log loudly so the data loss is
+            // detectable rather than masquerading as an empty store.
+            StorageQuarantine.quarantine(filePath, e, LOG);
         }
     }
 

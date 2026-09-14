@@ -32,6 +32,21 @@ public class Identity {
     @JsonProperty("DkimVerificationStatus")
     private String dkimVerificationStatus;
 
+    @JsonProperty("DkimTokens")
+    private List<String> dkimTokens;
+
+    @JsonProperty("DkimSigningAttributesOrigin")
+    private String dkimSigningAttributesOrigin = "AWS_SES"; // "AWS_SES" (Easy DKIM) or "EXTERNAL" (BYODKIM)
+
+    @JsonProperty("DkimNextSigningKeyLength")
+    private String dkimNextSigningKeyLength = "RSA_2048_BIT";
+
+    @JsonProperty("DkimCurrentSigningKeyLength")
+    private String dkimCurrentSigningKeyLength = "RSA_2048_BIT";
+
+    @JsonProperty("DkimLastKeyGenerationTimestamp")
+    private Instant dkimLastKeyGenerationTimestamp;
+
     @JsonProperty("NotificationAttributes")
     private Map<String, String> notificationAttributes = new HashMap<>();
 
@@ -46,6 +61,9 @@ public class Identity {
 
     @JsonProperty("MailFromDomainStatus")
     private String mailFromDomainStatus = "Pending";
+
+    @JsonProperty("ConfigurationSetName")
+    private String configurationSetName;
 
     @JsonProperty("HeadersInNotificationsEnabled")
     private Map<String, Boolean> headersInNotificationsEnabled = new HashMap<>();
@@ -86,6 +104,21 @@ public class Identity {
     public String getDkimVerificationStatus() { return dkimVerificationStatus; }
     public void setDkimVerificationStatus(String dkimVerificationStatus) { this.dkimVerificationStatus = dkimVerificationStatus; }
 
+    public List<String> getDkimTokens() { return dkimTokens; }
+    public void setDkimTokens(List<String> dkimTokens) { this.dkimTokens = dkimTokens; }
+
+    public String getDkimSigningAttributesOrigin() { return dkimSigningAttributesOrigin; }
+    public void setDkimSigningAttributesOrigin(String origin) { this.dkimSigningAttributesOrigin = origin; }
+
+    public String getDkimNextSigningKeyLength() { return dkimNextSigningKeyLength; }
+    public void setDkimNextSigningKeyLength(String len) { this.dkimNextSigningKeyLength = len; }
+
+    public String getDkimCurrentSigningKeyLength() { return dkimCurrentSigningKeyLength; }
+    public void setDkimCurrentSigningKeyLength(String len) { this.dkimCurrentSigningKeyLength = len; }
+
+    public Instant getDkimLastKeyGenerationTimestamp() { return dkimLastKeyGenerationTimestamp; }
+    public void setDkimLastKeyGenerationTimestamp(Instant ts) { this.dkimLastKeyGenerationTimestamp = ts; }
+
     public Map<String, String> getNotificationAttributes() { return notificationAttributes; }
     public void setNotificationAttributes(Map<String, String> notificationAttributes) { this.notificationAttributes = notificationAttributes; }
 
@@ -100,6 +133,9 @@ public class Identity {
 
     public String getMailFromDomainStatus() { return mailFromDomainStatus; }
     public void setMailFromDomainStatus(String mailFromDomainStatus) { this.mailFromDomainStatus = mailFromDomainStatus; }
+
+    public String getConfigurationSetName() { return configurationSetName; }
+    public void setConfigurationSetName(String configurationSetName) { this.configurationSetName = configurationSetName; }
 
     public Map<String, Boolean> getHeadersInNotificationsEnabled() { return headersInNotificationsEnabled; }
     public void setHeadersInNotificationsEnabled(Map<String, Boolean> headersInNotificationsEnabled) { this.headersInNotificationsEnabled = headersInNotificationsEnabled; }

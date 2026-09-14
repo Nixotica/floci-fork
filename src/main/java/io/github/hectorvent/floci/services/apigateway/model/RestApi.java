@@ -1,17 +1,21 @@
 package io.github.hectorvent.floci.services.apigateway.model;
 
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 
 import java.util.HashMap;
 import java.util.Map;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
+@RegisterForReflection
 public class RestApi {
 
     private String id;
     private String name;
     private String description;
     private long createdDate;
+    private String rootResourceId;
     private Map<String, String> tags = new HashMap<>();
     private EndpointConfiguration endpointConfiguration;
 
@@ -46,6 +50,14 @@ public class RestApi {
 
     public void setCreatedDate(long createdDate) {
         this.createdDate = createdDate;
+    }
+
+    public String getRootResourceId() {
+        return rootResourceId;
+    }
+
+    public void setRootResourceId(String rootResourceId) {
+        this.rootResourceId = rootResourceId;
     }
 
     public Map<String, String> getTags() {

@@ -3,9 +3,12 @@ package io.github.hectorvent.floci.services.dynamodb;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 
@@ -147,8 +150,13 @@ final class ExpressionEvaluator {
                 continue;
             }
 
+            int nearStart = Math.max(0, i - 15);
+            int nearEnd = Math.min(expression.length(), i + 15);
+            
+            String near = expression.substring(nearStart, nearEnd);
+
             throw new IllegalArgumentException(
-                    "Unexpected character '%c' at position %d in expression: %s".formatted(c, i, expression));
+                    "token: \"%c\", near: \"%s\"".formatted(c, near));
         }
 
         tokens.add(new Token(TokenType.EOF, "", len));
@@ -371,6 +379,204 @@ final class ExpressionEvaluator {
                             .formatted(parser.peek().value(), parser.peek().pos()));
         }
         return expr;
+    }
+
+    // ── Structural / semantic validation ──
+
+    /**
+     * Validates an expression for the structural and semantic errors that DynamoDB rejects
+     * at parse time with a ValidationException, independent of the item being evaluated:
+     *   - redundant parentheses, e.g. {@code ((a = b))}
+     *   - {@code contains(x, x)} where the first operand is not distinct from the second
+     *   - {@code begins_with(path, value)} where the value operand is not a string/binary
+     *
+     * {@code exprType} is the label used in the {@code "Invalid <exprType>: ..."} prefix
+     * (e.g. "ConditionExpression", "FilterExpression", "KeyConditionExpression").
+     */
+    static void validateExpression(String expression, String exprType,
+                                   JsonNode exprAttrNames, JsonNode exprAttrValues) {
+        if (expression == null || expression.isBlank()) return;
+        List<Token> tokens;
+        Expr expr;
+        try {
+            tokens = tokenize(expression.trim());
+            checkRedundantParentheses(tokens, exprType);
+            expr = parse(expression);
+        } catch (IllegalArgumentException e) {
+            String detail = e.getMessage();
+            
+            if (detail.startsWith("token:")) {
+                throw new AwsException("ValidationException", 
+                    "Invalid " + exprType + ": Syntax error; " + detail, 400);
+            } else {
+                throw new AwsException("ValidationException", 
+                    "Invalid " + exprType + ": Syntax error", 400);
+            }
+        }
+        validateSemantics(expr, exprType, exprAttrNames, exprAttrValues);
+    }
+
+    // A pair of parentheses is redundant when its entire content is itself a single
+    // parenthesised group — i.e. "( ( ... ) )". Single wraps "(x)" and full wraps
+    // "(a AND b)" are legal; only the doubled form is rejected.
+    private static void checkRedundantParentheses(List<Token> tokens, String exprType) {
+        for (int i = 0; i + 1 < tokens.size(); i++) {
+            if (tokens.get(i).type() == TokenType.LPAREN
+                    && tokens.get(i + 1).type() == TokenType.LPAREN) {
+                int innerClose = matchingParen(tokens, i + 1);
+                if (innerClose >= 0 && innerClose + 1 < tokens.size()
+                        && tokens.get(innerClose + 1).type() == TokenType.RPAREN) {
+                    throw new AwsException("ValidationException",
+                            "Invalid " + exprType + ": The expression has redundant parentheses;", 400);
+                }
+            }
+        }
+    }
+
+    // Index of the RPAREN that matches the LPAREN at openIdx (function-call parens included).
+    private static int matchingParen(List<Token> tokens, int openIdx) {
+        int depth = 0;
+        for (int i = openIdx; i < tokens.size(); i++) {
+            if (tokens.get(i).type() == TokenType.LPAREN) depth++;
+            else if (tokens.get(i).type() == TokenType.RPAREN) {
+                if (--depth == 0) return i;
+            }
+        }
+        return -1;
+    }
+
+    private static void validateSemantics(Expr expr, String exprType,
+                                          JsonNode names, JsonNode values) {
+        if (expr == null) return;
+        switch (expr) {
+            case AndExpr a -> a.operands().forEach(o -> validateSemantics(o, exprType, names, values));
+            case OrExpr o -> o.operands().forEach(x -> validateSemantics(x, exprType, names, values));
+            case NotExpr n -> validateSemantics(n.operand(), exprType, names, values);
+            case FunctionCallExpr f -> validateFunction(f, exprType, names, values);
+            case BetweenExpr b -> validateBetween(b, exprType, values);
+            default -> {}
+        }
+    }
+
+    // AWS rejects a BETWEEN whose bounds are the wrong way round when it parses the
+    // expression, rather than letting the condition fail at evaluation time.
+    private static void validateBetween(BetweenExpr between, String exprType, JsonNode values) {
+        var low = placeholderValue(between.low(), values);
+        var high = placeholderValue(between.high(), values);
+        if (low == null || high == null) {
+            return;
+        }
+        var lowType = low.fieldNames().next();
+        if (!lowType.equals(high.fieldNames().next()) || compareBoundValues(low, high) <= 0) {
+            return;
+        }
+        // AWS wraps the ConditionExpression form in its validation-error envelope, but reports
+        // the FilterExpression and KeyConditionExpression forms on their own.
+        String envelope = "ConditionExpression".equals(exprType) ? "1 validation error detected: " : "";
+        throw new AwsException("ValidationException", envelope
+                + "Invalid " + exprType + ": The BETWEEN operator requires upper bound to be greater than "
+                + "or equal to lower bound; lower bound operand: " + displayAttributeValue(low)
+                + ", upper bound operand: " + displayAttributeValue(high), 400);
+    }
+
+    // DynamoDB orders strings by their UTF-8 bytes, which differs from Java's UTF-16
+    // ordering above the basic plane: U+E000 sorts before U+10000 on AWS but after it here.
+    private static int compareBoundValues(JsonNode low, JsonNode high) {
+        if (low.has("S") && high.has("S")) {
+            return Arrays.compareUnsigned(
+                    low.get("S").asText().getBytes(StandardCharsets.UTF_8),
+                    high.get("S").asText().getBytes(StandardCharsets.UTF_8));
+        }
+        if (low.has("B") && high.has("B")) {
+            return Arrays.compareUnsigned(decodeBinaryBound(low), decodeBinaryBound(high));
+        }
+        return compareAttributeValues(low, high);
+    }
+
+    // A binary value that is not valid base64 never reaches a comparison on AWS: the request
+    // fails to deserialize first, with a 400 SerializationException.
+    private static byte[] decodeBinaryBound(JsonNode bound) {
+        try {
+            return Base64.getDecoder().decode(bound.get("B").asText());
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("SerializationException",
+                    "Unexpected value type in payload", 400);
+        }
+    }
+
+    private static JsonNode placeholderValue(Operand operand, JsonNode values) {
+        if (operand instanceof PlaceholderOperand(String name) && values != null) {
+            var value = values.get(name);
+            if (value != null && value.isObject() && value.fieldNames().hasNext()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static String displayAttributeValue(JsonNode value) {
+        var type = value.fieldNames().next();
+        return "AttributeValue: {" + type + ":" + value.get(type).asText() + "}";
+    }
+
+    private static void validateFunction(FunctionCallExpr f, String exprType,
+                                         JsonNode names, JsonNode values) {
+        String name = f.functionName().toLowerCase();
+        if (name.equals("contains") && f.args().size() >= 2
+                && operandsIdentical(f.args().get(0), f.args().get(1), names)) {
+            throw new AwsException("ValidationException",
+                    "Invalid " + exprType + ": The first operand must be distinct from the remaining operands "
+                    + "for this operator or function; operator: contains, first operand: "
+                    + displayOperand(f.args().get(0), names), 400);
+        }
+        if (name.equals("begins_with") && f.args().size() >= 2) {
+            String type = operandValueType(f.args().get(1), values);
+            if (type != null && !type.equals("S") && !type.equals("B")) {
+                throw new AwsException("ValidationException",
+                        "Invalid " + exprType + ": Incorrect operand type for operator or function; "
+                        + "operator or function: begins_with, operand type: " + type, 400);
+            }
+        }
+    }
+
+    private static boolean operandsIdentical(Operand a, Operand b, JsonNode names) {
+        if (a instanceof PathOperand pa && b instanceof PathOperand pb) {
+            return resolvePathString(pa, names).equals(resolvePathString(pb, names));
+        }
+        if (a instanceof PlaceholderOperand xa && b instanceof PlaceholderOperand xb) {
+            return xa.name().equals(xb.name());
+        }
+        return false;
+    }
+
+    // The DynamoDB type code (S, N, B, ...) of a placeholder value operand, or null
+    // when the operand is a document path whose type can only be known at runtime.
+    private static String operandValueType(Operand operand, JsonNode values) {
+        if (operand instanceof PlaceholderOperand p && values != null) {
+            JsonNode v = values.get(p.name());
+            if (v != null && v.isObject() && v.fieldNames().hasNext()) {
+                return v.fieldNames().next();
+            }
+        }
+        return null;
+    }
+
+    // Renders a path operand the way DynamoDB does in operand errors, e.g. "[data]" or "[a, b]".
+    private static String displayOperand(Operand operand, JsonNode names) {
+        if (operand instanceof PathOperand path) {
+            var parts = new ArrayList<String>();
+            for (String seg : path.segments()) {
+                if (seg.startsWith("[")) {
+                    if (!parts.isEmpty()) parts.set(parts.size() - 1, parts.getLast() + seg);
+                    else parts.add(seg);
+                } else {
+                    parts.add(resolveAttributeName(seg, names));
+                }
+            }
+            return "[" + String.join(", ", parts) + "]";
+        }
+        if (operand instanceof PlaceholderOperand p) return p.name();
+        return operand.toString();
     }
 
     // ── Key condition splitting ──
@@ -859,7 +1065,9 @@ final class ExpressionEvaluator {
         if (a.has("NS") && b.has("NS")) {
             JsonNode aArr = a.get("NS"), bArr = b.get("NS");
             if (aArr.size() != bArr.size()) return false;
-            var aSet = new java.util.HashSet<BigDecimal>();
+            // TreeSet membership goes through compareTo, so 1 and 1.0 are the same member.
+            // BigDecimal.equals() is scale-sensitive and would treat them as different.
+            var aSet = new java.util.TreeSet<BigDecimal>();
             try {
                 aArr.forEach(e -> aSet.add(new BigDecimal(e.asText())));
                 for (JsonNode e : bArr) { if (!aSet.contains(new BigDecimal(e.asText()))) return false; }
@@ -888,8 +1096,8 @@ final class ExpressionEvaluator {
             }
         }
         if (a.has("B") && b.has("B")) {
-            byte[] aBytes = Base64.getDecoder().decode(a.get("B").asText());
-            byte[] bBytes = Base64.getDecoder().decode(b.get("B").asText());
+            var aBytes = decodeBinaryBound(a);
+            var bBytes = decodeBinaryBound(b);
             int minLen = Math.min(aBytes.length, bBytes.length);
             for (int i = 0; i < minLen; i++) {
                 int diff = (aBytes[i] & 0xFF) - (bBytes[i] & 0xFF);

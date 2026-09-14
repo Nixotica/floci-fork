@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.s3;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.s3.model.CopyObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
@@ -8,6 +9,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -194,12 +196,30 @@ class S3VersioningServiceTest {
         S3Object v1 = diskService.putObject("versioned-bucket", "test.txt",
                 "v1".getBytes(StandardCharsets.UTF_8), "text/plain", null);
 
-        Path versionedPath = tempDir.resolve(".versions")
+        Path versionedPath = tempDir.resolve(".accounts")
+                .resolve("000000000000")
+                .resolve(".versions")
                 .resolve("versioned-bucket")
                 .resolve("test.txt")
                 .resolve(v1.getVersionId() + ".s3data");
         assertTrue(Files.exists(versionedPath),
                 "versioned file should be stored with .s3data suffix");
+    }
+
+    @Test
+    void openObjectStreamReadsSpecificVersionFromDisk() throws Exception {
+        S3Service diskService = new S3Service(new InMemoryStorage<>(), new InMemoryStorage<>(), tempDir, false);
+        diskService.createBucket("versioned-bucket", "us-east-1");
+        diskService.putBucketVersioning("versioned-bucket", "Enabled");
+        S3Object v1 = diskService.putObject("versioned-bucket", "stream.txt",
+                "first-version".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        diskService.putObject("versioned-bucket", "stream.txt",
+                "second-version".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+
+        try (InputStream stream = diskService.openObjectStream(
+                "versioned-bucket", "stream.txt", v1.getVersionId())) {
+            assertEquals("first-version", new String(stream.readAllBytes(), StandardCharsets.UTF_8));
+        }
     }
 
     @Test
@@ -331,6 +351,24 @@ class S3VersioningServiceTest {
         S3Object result = s3Service.getObject("versioned-bucket", "key");
         assertEquals("v1", new String(result.getData(), StandardCharsets.UTF_8),
                 "getObject should return the promoted version's content after deleting the latest");
+    }
+
+    @Test
+    void deleteObjectsWithExplicitVersionIdsPermanentlyDeletesVersions() {
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+
+        S3Object v1 = s3Service.putObject("versioned-bucket", "key",
+                "v1".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        S3Object v2 = s3Service.putObject("versioned-bucket", "key",
+                "v2".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+
+        s3Service.deleteObjects("versioned-bucket", List.of(
+                new XmlParser.KeyVersion("key", v1.getVersionId()),
+                new XmlParser.KeyVersion("key", v2.getVersionId())));
+
+        S3Service.ListVersionsResult result = s3Service.listObjectVersions("versioned-bucket", null, 100, null);
+        assertTrue(result.versions().isEmpty(),
+                "batch delete with explicit VersionIds should permanently remove those versions, not place a delete marker");
     }
 
 }

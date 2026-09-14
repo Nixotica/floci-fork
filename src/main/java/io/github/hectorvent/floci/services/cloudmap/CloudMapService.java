@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.cloudmap.model.Instance;
 import io.github.hectorvent.floci.services.cloudmap.model.Namespace;
 import io.github.hectorvent.floci.services.cloudmap.model.Operation;
 import io.github.hectorvent.floci.services.cloudmap.model.Service;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -38,7 +39,8 @@ public class CloudMapService {
 
     private static final Logger LOG = Logger.getLogger(CloudMapService.class);
     private static final String ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789";
-    private static final SecureRandom RANDOM = new SecureRandom();
+
+    private final SecureRandom random = new SecureRandom();
 
     private final StorageBackend<String, Namespace> namespaceStore;
     private final StorageBackend<String, Service> serviceStore;
@@ -68,6 +70,13 @@ public class CloudMapService {
                     return t;
                 })
                 : null;
+    }
+
+    @PreDestroy
+    void stop() {
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+        }
     }
 
     // ──────────────────────────── Namespaces ────────────────────────────
@@ -540,7 +549,7 @@ public class CloudMapService {
     private String randomId(int length) {
         StringBuilder sb = new StringBuilder(length);
         for (int i = 0; i < length; i++) {
-            sb.append(ALNUM.charAt(RANDOM.nextInt(ALNUM.length())));
+            sb.append(ALNUM.charAt(random.nextInt(ALNUM.length())));
         }
         return sb.toString();
     }
@@ -549,7 +558,7 @@ public class CloudMapService {
         StringBuilder sb = new StringBuilder("Z");
         String chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         for (int i = 0; i < 13; i++) {
-            sb.append(chars.charAt(RANDOM.nextInt(chars.length())));
+            sb.append(chars.charAt(random.nextInt(chars.length())));
         }
         return sb.toString();
     }

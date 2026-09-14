@@ -33,12 +33,17 @@ public class SesInspectionController {
     }
 
     @GET
-    public Response getEmails(@QueryParam("id") String messageId) {
+    public Response getEmails(@QueryParam("id") String messageId,
+                              @QueryParam("email") String recipient) {
         List<SentEmail> emails = sesService.getEmails();
 
         ArrayNode messages = objectMapper.createArrayNode();
         for (SentEmail email : emails) {
             if (messageId != null && !messageId.equals(email.getMessageId())) {
+                continue;
+            }
+            if (recipient != null && (email.getToAddresses() == null
+                    || !email.getToAddresses().contains(recipient))) {
                 continue;
             }
             ObjectNode node = objectMapper.createObjectNode();
@@ -49,6 +54,9 @@ public class SesInspectionController {
                 node.putNull("Region");
             }
             node.put("Source", email.getSource());
+            if (email.getReturnPath() != null) {
+                node.put("ReturnPath", email.getReturnPath());
+            }
 
             if (email.isRaw()) {
                 // LocalStack returns RawData for raw emails, without
@@ -87,6 +95,15 @@ public class SesInspectionController {
                 } else {
                     body.putNull("html_part");
                 }
+            }
+
+            if (email.getHeaders() != null && !email.getHeaders().isEmpty()) {
+                ArrayNode headers = node.putArray("Headers");
+                email.getHeaders().forEach(h -> {
+                    ObjectNode ho = headers.addObject();
+                    ho.put("Name", h.name());
+                    ho.put("Value", h.value());
+                });
             }
 
             if (email.getSentAt() != null) {

@@ -1,7 +1,6 @@
 package io.github.hectorvent.floci.services.apigatewayv2.proxy;
 
 import com.sun.net.httpserver.Headers;
-import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
 import org.junit.jupiter.api.AfterEach;
@@ -11,9 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -114,6 +111,41 @@ class HttpProxyInvokerTest {
         new HttpProxyInvoker().invoke(integration, ctx);
 
         assertEquals("u-42", received.get().headers().getFirst("X-User-Id"));
+    }
+
+    @Test
+    void appliesRequestParametersHostHeaderOverride() {
+        Integration integration = httpProxyIntegration(
+                "http://127.0.0.1:" + backendPort + "/public/{proxy}",
+                Map.of("overwrite:header.Host", "lb.localhost.test"));
+        RequestContext ctx = ctxFor("GET", "/wallet/balance", "balance",
+                Map.of("Host", "client.example.test"), Map.of(), null, Map.of());
+
+        new HttpProxyInvoker().invoke(integration, ctx);
+
+        assertEquals("lb.localhost.test", received.get().headers().getFirst("Host"));
+    }
+
+    @Test
+    void hostHeaderOverrideDecodesChunkedResponse() {
+        backend.removeContext("/");
+        backend.createContext("/", exchange -> {
+            byte[] resp = "chunked-body".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, 0);
+            exchange.getResponseBody().write(resp);
+            exchange.close();
+        });
+        Integration integration = httpProxyIntegration(
+                "http://127.0.0.1:" + backendPort + "/public/{proxy}",
+                Map.of("overwrite:header.Host", "lb.localhost.test"));
+        RequestContext ctx = ctxFor("GET", "/wallet/balance", "balance",
+                Map.of("Host", "client.example.test"), Map.of(), null, Map.of());
+
+        ProxyResult result = new HttpProxyInvoker().invoke(integration, ctx);
+
+        assertEquals(200, result.statusCode());
+        assertEquals("chunked-body", new String(result.body(), StandardCharsets.UTF_8));
+        assertFalse(result.headers().containsKey("Transfer-encoding"));
     }
 
     @Test

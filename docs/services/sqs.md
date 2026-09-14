@@ -5,28 +5,33 @@
 
 ## Supported Actions
 
+<!-- floci:actions:start -->
 | Action | Description |
-|---|---|
+| --- | --- |
 | `CreateQueue` | Create a standard or FIFO queue |
 | `DeleteQueue` | Delete a queue |
 | `ListQueues` | List all queues |
 | `GetQueueUrl` | Look up a queue URL by name |
 | `GetQueueAttributes` | Get queue configuration attributes |
-| `SetQueueAttributes` | Update queue configuration |
 | `SendMessage` | Send a message to a queue |
-| `SendMessageBatch` | Send up to 10 messages in one call |
 | `ReceiveMessage` | Poll for messages |
 | `DeleteMessage` | Acknowledge and delete a message |
 | `DeleteMessageBatch` | Delete multiple messages at once |
+| `SendMessageBatch` | Send up to 10 messages in one call |
 | `ChangeMessageVisibility` | Extend or reset a message's visibility timeout |
 | `ChangeMessageVisibilityBatch` | Change visibility for multiple messages |
-| `PurgeQueue` | Delete all messages in a queue |
+| `SetQueueAttributes` | Update queue configuration |
 | `TagQueue` | Add tags to a queue |
 | `UntagQueue` | Remove tags from a queue |
 | `ListQueueTags` | List tags on a queue |
+| `PurgeQueue` | Delete all messages in a queue |
 | `ListDeadLetterSourceQueues` | Find queues that use this queue as DLQ |
 | `StartMessageMoveTask` | Start a DLQ redrive task |
 | `ListMessageMoveTasks` | List DLQ redrive tasks |
+| `CancelMessageMoveTask` | - |
+| `AddPermission` | - |
+| `RemovePermission` | - |
+<!-- floci:actions:end -->
 
 ## Local Inspection Endpoint
 
@@ -75,13 +80,25 @@ curl "http://localhost:4566/_aws/sqs/messages?QueueUrl=$QUEUE_URL"
 curl -X DELETE "http://localhost:4566/_aws/sqs/messages?QueueUrl=$QUEUE_URL"
 ```
 
+## Long Polling
+
+`ReceiveMessage` waits up to `WaitTimeSeconds` (0 to 20) for a message to arrive and returns as soon as one is available. Values outside that range are rejected with `InvalidParameterValue`. When the request omits `WaitTimeSeconds`, the queue's `ReceiveMessageWaitTimeSeconds` attribute applies (default `0`, short polling), matching AWS.
+
+```bash
+# Enable long polling for every consumer of the queue
+aws sqs set-queue-attributes \
+  --queue-url $QUEUE_URL \
+  --attributes ReceiveMessageWaitTimeSeconds=20 \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_SQS_ENABLED` | `true` | Enable or disable the service |
 | `FLOCI_SERVICES_SQS_DEFAULT_VISIBILITY_TIMEOUT` | `30` | Default message visibility timeout (seconds) |
-| `FLOCI_SERVICES_SQS_MAX_MESSAGE_SIZE` | `262144` | Maximum message size in bytes (256 KB) |
+| `FLOCI_SERVICES_SQS_MAX_MESSAGE_SIZE` | `1048576` | Maximum message size in bytes (1 MB) |
 | `FLOCI_SERVICES_SQS_CLEAR_FIFO_DEDUPLICATION_CACHE_ON_PURGE` | `false` | When `true`, `PurgeQueue` also clears the FIFO deduplication cache for the queue and any SNS FIFO topics subscribed to it |
 
 ## Examples

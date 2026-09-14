@@ -1,14 +1,18 @@
 package io.github.hectorvent.floci.services.transfer.model;
 
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
+@RegisterForReflection
 public class Server {
 
     private String serverId;
     private String arn;
     private String state;
+    private String domain;
     private List<String> protocols;
     private String endpointType;
     private Map<String, Object> endpointDetails;
@@ -30,6 +34,9 @@ public class Server {
 
     public String getState() { return state; }
     public void setState(String state) { this.state = state; }
+
+    public String getDomain() { return domain; }
+    public void setDomain(String domain) { this.domain = domain; }
 
     public List<String> getProtocols() { return protocols; }
     public void setProtocols(List<String> protocols) { this.protocols = protocols; }

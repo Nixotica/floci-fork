@@ -11,8 +11,12 @@ import org.jboss.logging.Logger;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Factory that creates {@link AccountAwareStorageBackend} instances based on configuration.
@@ -28,8 +32,15 @@ public class StorageFactory {
     private final EmulatorConfig config;
     private final ServiceConfigAccess serviceConfigAccess;
     private final List<StorageBackend<?, ?>> allBackends = new ArrayList<>();
+    // A file path identifies one logical store: callers sharing a path are expected to agree on
+    // its value type and storage mode. The first create() wins; repeat calls reuse that backend.
+    private final Map<Path, StorageBackend<?, ?>> backendsByPath = new HashMap<>();
     private final List<HybridStorage<?, ?>> hybridBackends = new ArrayList<>();
     private final List<WalStorage<?, ?>> walBackends = new ArrayList<>();
+    // Backends whose initial load has completed. create() loads each backend exactly once and
+    // loadAll() only picks up backends that were never loaded, so neither path replays a store
+    // that is already live or opens a second WAL writer on top of the first.
+    private final Set<StorageBackend<?, ?>> loadedBackends = Collections.newSetFromMap(new IdentityHashMap<>());
 
     @Inject
     Instance<RequestContext> requestContextInstance;
@@ -50,12 +61,23 @@ public class StorageFactory {
      * @param fileName      the JSON file name for persistent storage
      * @param typeReference Jackson type reference for deserialization
      */
-    public <V> StorageBackend<String, V> create(String serviceName, String fileName,
+    public synchronized <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
                                                  TypeReference<Map<String, V>> typeReference) {
         String mode = resolveMode(serviceName);
         long flushInterval = resolveFlushInterval(serviceName);
         Path basePath = Path.of(config.storage().persistentPath());
         Path filePath = basePath.resolve(fileName);
+
+        // Reuse an existing backend for the same file. Handing out a second backend bound to the
+        // same path creates a duplicate in-memory store; on shutdown the stale duplicate flushes
+        // after the active instance and clobbers persisted state (issue #1921).
+        StorageBackend<?, ?> existing = backendsByPath.get(filePath);
+        if (existing != null) {
+            LOG.debugv("Reusing existing {0} storage for service {1} (file: {2})", mode, serviceName, filePath);
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<V> typed = (AccountAwareStorageBackend<V>) existing;
+            return typed;
+        }
 
         LOG.debugv("Creating {0} storage for service {1} (file: {2})", mode, serviceName, filePath);
 
@@ -78,37 +100,60 @@ public class StorageFactory {
             default -> throw new IllegalArgumentException("Unknown storage mode: " + mode);
         };
 
-        inner.load();
-
         AccountAwareStorageBackend<V> backend = new AccountAwareStorageBackend<>(
                 inner, requestContextInstance, config.defaultAccountId());
+        // create() owns the initial load. Most services are lazily instantiated and only reach
+        // this point after the lifecycle's loadAll() has already run, so a backend that is not
+        // loaded here would serve an empty store and (for WAL) never open its writer (#71).
+        loadOnce(backend);
         allBackends.add(backend);
+        backendsByPath.put(filePath, backend);
         return backend;
     }
 
-    /** Load all storage backends from disk. */
-    public void loadAll() {
+    /** Load every managed backend that has not been loaded yet. Safe to call repeatedly. */
+    public synchronized void loadAll() {
         for (StorageBackend<?, ?> backend : allBackends) {
-            backend.load();
+            loadOnce(backend);
         }
     }
 
+    private void loadOnce(StorageBackend<?, ?> backend) {
+        if (loadedBackends.contains(backend)) {
+            return;
+        }
+        backend.load();
+        loadedBackends.add(backend);
+    }
+
     /** Flush all storage backends to disk. */
-    public void flushAll() {
+    public synchronized void flushAll() {
         for (StorageBackend<?, ?> backend : allBackends) {
             backend.flush();
         }
     }
 
-    /** Shutdown all managed backends (stop schedulers, close connections). */
-    public void shutdownAll() {
+    /** Clear all storage backends. */
+    public synchronized void clearAll() {
+        for (StorageBackend<?, ?> backend : allBackends) {
+            backend.clear();
+        }
+        flushAll();
+    }
+
+    /**
+     * Shutdown all managed backends (stop schedulers, close connections). The final flush runs
+     * first: a WAL flush compacts and reopens the writer, so flushing after shutdown would leave
+     * every WAL backend with an open writer that nothing closes.
+     */
+    public synchronized void shutdownAll() {
+        flushAll();
         for (HybridStorage<?, ?> hybrid : hybridBackends) {
             hybrid.shutdown();
         }
         for (WalStorage<?, ?> wal : walBackends) {
             wal.shutdown();
         }
-        flushAll();
     }
 
     private String resolveMode(String serviceName) {

@@ -62,7 +62,40 @@ public class ContainerBuilder {
      * @return a new Builder instance
      */
     public Builder newContainer(String image) {
-        return new Builder(image, config, dockerHostResolver, embeddedDnsServer, currentContainerNetworkResolver);
+        return new Builder(resolveImage(image), config, dockerHostResolver, embeddedDnsServer, currentContainerNetworkResolver);
+    }
+
+    public String resolveImage(String image) {
+        return resolveImage(image, configuredImageRegistryBase(config));
+    }
+
+    static String resolveImage(String image, Optional<String> imageRegistryBase) {
+        if (image == null || image.isBlank()) {
+            return image;
+        }
+        return normalizeImageRegistryBase(imageRegistryBase)
+                .filter(base -> !image.startsWith(base + "/"))
+                .map(base -> base + "/" + image)
+                .orElse(image);
+    }
+
+    private static Optional<String> configuredImageRegistryBase(EmulatorConfig config) {
+        if (config == null || config.docker() == null) {
+            return Optional.empty();
+        }
+        return config.docker().imageRegistryBase();
+    }
+
+    private static Optional<String> normalizeImageRegistryBase(Optional<String> imageRegistryBase) {
+        return imageRegistryBase
+                .map(String::trim)
+                .filter(value -> !value.isBlank())
+                .map(value -> {
+                    while (value.endsWith("/")) {
+                        value = value.substring(0, value.length() - 1);
+                    }
+                    return value;
+                });
     }
 
     /**
@@ -87,8 +120,12 @@ public class ContainerBuilder {
         private final List<Mount> mounts = new ArrayList<>();
         private final List<Bind> binds = new ArrayList<>();
         private final List<String> extraHosts = new ArrayList<>();
+        private final Map<String, String> labels = new HashMap<>();
         private LogConfig logConfig;
         private boolean privileged;
+        private String cgroupnsMode;
+        private String user;
+        private final List<String> groupAdd = new ArrayList<>();
         private final List<String> dnsServers = new ArrayList<>();
 
         Builder(String image, EmulatorConfig config, DockerHostResolver dockerHostResolver,
@@ -237,13 +274,21 @@ public class ContainerBuilder {
         }
 
         /**
-         * Adds a named volume mount.
+         * Adds a read-write named volume mount.
          */
         public Builder withNamedVolume(String volumeName, String containerPath) {
+            return withNamedVolume(volumeName, containerPath, false);
+        }
+
+        /**
+         * Adds a named volume mount, read-only when {@code readOnly} is true.
+         */
+        public Builder withNamedVolume(String volumeName, String containerPath, boolean readOnly) {
             this.mounts.add(new Mount()
                     .withType(MountType.VOLUME)
                     .withSource(volumeName)
-                    .withTarget(containerPath));
+                    .withTarget(containerPath)
+                    .withReadOnly(readOnly));
             return this;
         }
 
@@ -272,6 +317,24 @@ public class ContainerBuilder {
          */
         public Builder withExtraHost(String hostname, String ip) {
             this.extraHosts.add(hostname + ":" + ip);
+            return this;
+        }
+
+        /**
+         * Adds a single Docker label. Merged over the default floci-aws labels at
+         * container creation; a per-spec label wins on key conflicts.
+         */
+        public Builder withLabel(String key, String value) {
+            this.labels.put(key, value);
+            return this;
+        }
+
+        /**
+         * Adds multiple Docker labels. Merged over the default floci-aws labels at
+         * container creation; per-spec labels win on key conflicts.
+         */
+        public Builder withLabels(Map<String, String> labels) {
+            this.labels.putAll(labels);
             return this;
         }
 
@@ -315,6 +378,33 @@ public class ContainerBuilder {
             return this;
         }
 
+        public Builder withCgroupnsMode(String cgroupnsMode) {
+            this.cgroupnsMode = cgroupnsMode;
+            return this;
+        }
+
+        /**
+         * Sets the user the container process runs as, formatted {@code "uid[:gid]"}
+         * (Docker's top-level container user). Null or blank leaves the image {@code USER}
+         * in effect.
+         */
+        public Builder withUser(String user) {
+            this.user = user;
+            return this;
+        }
+
+        /**
+         * Adds a supplementary group id to the container process (Docker {@code --group-add}),
+         * so it can access group-owned resources without changing its primary uid/gid. Blank
+         * ids are ignored.
+         */
+        public Builder withGroupAdd(String groupId) {
+            if (groupId != null && !groupId.isBlank()) {
+                this.groupAdd.add(groupId);
+            }
+            return this;
+        }
+
         /**
          * Injects Floci's embedded DNS server into the container so virtual-hosted
          * S3 hostnames (my-bucket.localhost.floci.io) resolve to Floci's Docker
@@ -355,10 +445,14 @@ public class ContainerBuilder {
                     List.copyOf(mounts),
                     List.copyOf(binds),
                     List.copyOf(extraHosts),
+                    Map.copyOf(labels),
                     logConfig,
                     privileged,
+                    cgroupnsMode,
                     List.copyOf(dnsServers),
-                    workingDir
+                    workingDir,
+                    user,
+                    List.copyOf(groupAdd)
             );
         }
     }

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.elbv2;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -16,6 +17,8 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.hamcrest.Matchers.anyOf;
 import static org.hamcrest.Matchers.equalTo;
 
@@ -48,6 +51,7 @@ class ElbV2LambdaTargetDataPlaneIntegrationTest {
     private static final int LISTENER_PORT = 7782;
 
     private static String lbArn;
+    private static String lbDnsName;
     private static String tgArn;
     private static String listenerArn;
     private static String functionArn;
@@ -58,7 +62,16 @@ class ElbV2LambdaTargetDataPlaneIntegrationTest {
         try (ZipOutputStream zos = new ZipOutputStream(baos)) {
             zos.putNextEntry(new ZipEntry("index.py"));
             zos.write((
+                "invocations = 0\n" +
                 "def handler(event, context):\n" +
+                "    global invocations\n" +
+                "    invocations += 1\n" +
+                "    if event.get(\"path\") == \"/invocation-count\":\n" +
+                "        return {\"statusCode\": 200, \"body\": str(invocations)}\n" +
+                "    if event.get(\"path\") == \"/response-at-limit\":\n" +
+                "        return {\"statusCode\": 200, \"body\": \"x\" * (1024 * 1024)}\n" +
+                "    if event.get(\"path\") == \"/response-oversized\":\n" +
+                "        return {\"statusCode\": 200, \"headers\": {\"Content-Length\": \"1048577\"}, \"body\": \"x\" * (1024 * 1024 + 1)}\n" +
                 "    return {\"statusCode\": 200, \"body\": \"ok\"}\n"
             ).getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
@@ -96,7 +109,7 @@ class ElbV2LambdaTargetDataPlaneIntegrationTest {
     @Test
     @Order(2)
     void createLoadBalancer() {
-        lbArn = given()
+        Response response = given()
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "alb-dataplane-lb")
                 .formParam("Type", "application")
@@ -106,7 +119,9 @@ class ElbV2LambdaTargetDataPlaneIntegrationTest {
             .then()
                 .statusCode(200)
                 .extract()
-                .path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn");
+                .response();
+        lbArn = response.path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn");
+        lbDnsName = response.path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.DNSName");
     }
 
     @Test
@@ -165,7 +180,7 @@ class ElbV2LambdaTargetDataPlaneIntegrationTest {
     @Order(5)
     void httpRequestThroughListenerInvokesLambda() {
         given()
-                .baseUri("http://localhost")
+                .baseUri("http://" + lbDnsName)
                 .port(LISTENER_PORT)
                 .contentType("text/plain")
                 .body("hello")
@@ -174,6 +189,85 @@ class ElbV2LambdaTargetDataPlaneIntegrationTest {
             .then()
                 .statusCode(200)
                 .body(equalTo("ok"));
+    }
+
+    @Test
+    @Order(6)
+    void requestBodyAtOneMiBIsAccepted() {
+        byte[] exactLimit = new byte[1024 * 1024];
+
+        given()
+                .baseUri("http://" + lbDnsName)
+                .port(LISTENER_PORT)
+                .contentType("application/octet-stream")
+                .body(exactLimit)
+            .when()
+                .post("/exact")
+            .then()
+                .statusCode(200)
+                .body(equalTo("ok"));
+    }
+
+    @Test
+    @Order(7)
+    void oversizedRequestBodyIsRejectedBeforeLambdaInvocation() {
+        byte[] oversized = new byte[1024 * 1024 + 1];
+        int invocationCountBefore = Integer.parseInt(given()
+                .baseUri("http://" + lbDnsName)
+                .port(LISTENER_PORT)
+            .when()
+                .get("/invocation-count")
+            .then()
+                .statusCode(200)
+                .extract()
+                .asString());
+
+        given()
+                .baseUri("http://" + lbDnsName)
+                .port(LISTENER_PORT)
+                .contentType("application/octet-stream")
+                .body(oversized)
+            .when()
+                .post("/oversized")
+            .then()
+                .statusCode(413);
+
+        int invocationCountAfter = Integer.parseInt(given()
+                .baseUri("http://" + lbDnsName)
+                .port(LISTENER_PORT)
+            .when()
+                .get("/invocation-count")
+            .then()
+                .statusCode(200)
+                .extract()
+                .asString());
+        assertEquals(invocationCountBefore + 1, invocationCountAfter);
+    }
+
+    @Test
+    @Order(8)
+    void lambdaResponseBodyAtOneMiBIsAccepted() {
+        given()
+                .baseUri("http://" + lbDnsName)
+                .port(LISTENER_PORT)
+            .when()
+                .get("/response-at-limit")
+            .then()
+                .statusCode(200)
+                .body(org.hamcrest.Matchers.hasLength(1024 * 1024));
+    }
+
+    @Test
+    @Order(9)
+    void oversizedLambdaResponseIsRejected() {
+        Response response = given()
+                .baseUri("http://" + lbDnsName)
+                .port(LISTENER_PORT)
+            .when()
+                .get("/response-oversized");
+
+        response.then().statusCode(502);
+        assertNotEquals("1048577", response.getHeader("Content-Length"));
     }
 
     /**

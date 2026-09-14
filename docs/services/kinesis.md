@@ -5,8 +5,9 @@
 
 ## Supported Actions
 
+<!-- floci:actions:start -->
 | Action | Description |
-|---|---|
+| --- | --- |
 | `CreateStream` | Create a stream |
 | `DeleteStream` | Delete a stream |
 | `ListStreams` | List all streams |
@@ -17,19 +18,38 @@
 | `DescribeStreamConsumer` | Get consumer details |
 | `ListStreamConsumers` | List consumers for a stream |
 | `SubscribeToShard` | Subscribe to a shard for enhanced fan-out |
+| `AddTagsToStream` | Tag a stream |
+| `RemoveTagsFromStream` | Remove tags |
+| `ListTagsForStream` | List tags |
+| `StartStreamEncryption` | Enable KMS encryption |
+| `StopStreamEncryption` | Disable encryption |
+| `SplitShard` | Split a shard into two |
+| `MergeShards` | Merge two adjacent shards |
 | `PutRecord` | Write a single record |
 | `PutRecords` | Write up to 500 records |
 | `GetShardIterator` | Get an iterator for reading |
 | `GetRecords` | Read records from a shard |
-| `SplitShard` | Split a shard into two |
-| `MergeShards` | Merge two adjacent shards |
-| `AddTagsToStream` | Tag a stream |
-| `RemoveTagsFromStream` | Remove tags |
-| `ListTagsForStream` | List tags |
+| `ListShards` | - |
 | `IncreaseStreamRetentionPeriod` | Increase retention up to 8760 hours (365 days) |
 | `DecreaseStreamRetentionPeriod` | Decrease retention down to 24 hours |
-| `StartStreamEncryption` | Enable KMS encryption |
-| `StopStreamEncryption` | Disable encryption |
+| `EnableEnhancedMonitoring` | - |
+| `DisableEnhancedMonitoring` | - |
+| `UpdateStreamMode` | - |
+| `UpdateMaxRecordSize` | - |
+| `UpdateShardCount` | - |
+<!-- floci:actions:end -->
+
+## Local Inspection Endpoints
+
+These endpoints are Floci-local read-only helpers for the UI and tests. AWS SDK
+traffic should continue to use the JSON 1.1 Kinesis API on `/`.
+
+| Endpoint | Description |
+|---|---|
+| `GET /_aws/kinesis/streams` | List streams in the resolved region with shard, mode, tag, and record counts |
+| `GET /_aws/kinesis/records?StreamName=<name>` | Peek up to 100 stream records with shard attribution without consuming them |
+| `GET /_aws/kinesis/records?StreamName=<name>&Limit=<n>` | Peek up to `n` records, capped at 1000 |
+| `GET /_aws/kinesis/records?StreamName=<name>&ShardId=<id>` | Peek records for one shard |
 
 ## Stream Addressing
 
@@ -43,13 +63,39 @@ aws kinesis describe-stream --stream-name events --endpoint-url $AWS_ENDPOINT_UR
 aws kinesis describe-stream --stream-arn arn:aws:kinesis:us-east-1:000000000000:stream/events --endpoint-url $AWS_ENDPOINT_URL
 ```
 
+## Shard Iterators
+
+`GetShardIterator` supports all five iterator types: `TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`.
+
+A `LATEST` iterator is positioned at the shard tip at the moment the iterator is created, matching AWS: records written after the iterator was obtained are returned, records written before are not. This supports the standard tailing pattern: obtain a `LATEST` iterator, trigger the action that produces the record, then poll `GetRecords` following `NextShardIterator`.
+
+## Record Routing
+
+`PutRecord` and `PutRecords` honor `ExplicitHashKey` when it is provided. The value must be a decimal integer in the Kinesis hash-key space, and records are written to the open shard whose `HashKeyRange` contains that value. Without `ExplicitHashKey`, Floci keeps using the partition key to choose a shard.
+
+## Shard Scaling (UpdateShardCount)
+
+`UpdateShardCount` enforces the documented default limits: at most double the current
+open shard count per call, at most ten calls per rolling 24-hour period per stream, a
+10000-shard ceiling, and the asymmetric rule that a stream already above 10000 shards can
+only move to a target strictly below it.
+
+The minimum bound (`TargetShardCount` cannot go below half the current open shard count)
+rounds up for an odd current count, so `current=5` accepts `target=3` but rejects
+`target=2`. AWS's documentation says only "below half" with no stated rounding, so which
+direction an odd count rounds is Floci's own call rather than observed AWS behavior; this
+is the more conservative reading (fewer shards allowed, not more).
+
+AWS also documents a separate 10 TPS call-rate limit on this action ("Make over 10 TPS.
+TPS over 10 will trigger the LimitExceededException"), independent of the ten-calls-per-24h
+limit above. Floci does not simulate real-time request throttling for this or any other
+action, so that limit is intentionally unenforced here.
+
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_KINESIS_ENABLED` | `true` | Enable or disable the service |
-
-## Examples
 
 ## Enhanced Fan-Out (EFO)
 

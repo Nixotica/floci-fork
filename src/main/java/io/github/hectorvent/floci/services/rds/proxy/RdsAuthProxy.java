@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 
@@ -21,11 +22,12 @@ public class RdsAuthProxy {
     private final String instanceId;
     private final String backendHost;
     private final String masterUsername;
-    private final String masterPassword;
+    private volatile String masterPassword;
     private final String dbName;
     private final DatabaseEngine engine;
     private final RdsSigV4Validator sigV4;
-    private final PasswordValidator passwordValidator;
+    private final RdsProxyTlsCertificates tlsCertificates;
+    private final MasterPasswordCheck passwordValidator;
 
     private volatile boolean running;
     private ServerSocket serverSocket;
@@ -33,7 +35,8 @@ public class RdsAuthProxy {
     public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
                         DatabaseEngine engine, boolean iamEnabled,
                         String masterUsername, String masterPassword, String dbName,
-                        RdsSigV4Validator sigV4, PasswordValidator passwordValidator) {
+                        RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
+                        MasterPasswordCheck passwordValidator) {
         this.instanceId = instanceId;
         this.backendHost = backendHost;
         this.backendPort = backendPort;
@@ -43,15 +46,23 @@ public class RdsAuthProxy {
         this.masterPassword = masterPassword;
         this.dbName = dbName;
         this.sigV4 = sigV4;
+        this.tlsCertificates = tlsCertificates;
         this.passwordValidator = passwordValidator;
     }
 
     public void start(int proxyPort) throws IOException {
-        serverSocket = new ServerSocket(proxyPort);
+        serverSocket = new ServerSocket();
+        serverSocket.setReuseAddress(true);
+        serverSocket.bind(new InetSocketAddress(proxyPort));
         running = true;
         Thread.ofVirtual().name("rds-proxy-accept-" + instanceId).start(this::acceptLoop);
         LOG.infov("RDS proxy started for instance {0} on port {1} → {2}:{3}",
                 instanceId, String.valueOf(proxyPort), backendHost, String.valueOf(backendPort));
+    }
+
+    /** Swap the master-password snapshot after a rotation; new connections authenticate against it. */
+    public void updateMasterPassword(String newPassword) {
+        this.masterPassword = newPassword;
     }
 
     public void stop() {
@@ -61,8 +72,9 @@ public class RdsAuthProxy {
                 serverSocket.close();
             }
         } catch (IOException e) {
-            LOG.warnv("Error closing RDS proxy server socket for instance {0}: {1}",
-                    instanceId, e.getMessage());
+            LOG.warnv(e, "Error closing RDS proxy server socket for instance {0}", instanceId);
+            throw new RuntimeException(
+                    "Failed to stop RDS proxy for instance " + instanceId, e);
         }
     }
 
@@ -81,34 +93,65 @@ public class RdsAuthProxy {
     }
 
     private void handleConnection(Socket client) {
+        Socket backend = null;
         try {
             client.setTcpNoDelay(true);
-            Socket backend = new Socket(backendHost, backendPort);
+            backend = new Socket(backendHost, backendPort);
             backend.setTcpNoDelay(true);
 
+            // RDS only proxy-validates the master user; a non-master user passes through so the
+            // backend enforces its own credentials.
+            PasswordValidator authAdapter = (user, pass) -> {
+                if (!masterUsername.equals(user)) {
+                    return PasswordValidator.AuthResult.PASSTHROUGH;
+                }
+                return passwordValidator.validate(user, pass)
+                        ? PasswordValidator.AuthResult.MASTER_EQUIVALENT
+                        : PasswordValidator.AuthResult.REJECT;
+            };
+
             switch (engine) {
-                case POSTGRES -> PostgresProtocolHandler.handleAuth(
-                        client, backend, masterUsername, masterPassword, dbName,
-                        iamEnabled, sigV4, passwordValidator::validate);
+                case POSTGRES -> {
+                    PostgresProtocolHandler.AuthenticatedSession session =
+                            PostgresProtocolHandler.authenticate(
+                                    client, backend, masterUsername, masterPassword, dbName,
+                                    iamEnabled, sigV4, tlsCertificates, authAdapter);
+                    if (session != null) {
+                        PostgresProtocolHandler.bridge(session, backend);
+                    }
+                }
                 case MYSQL, MARIADB -> MySqlProtocolHandler.handleAuth(
                         client, backend, masterUsername, masterPassword,
-                        iamEnabled, sigV4, passwordValidator::validate);
+                        iamEnabled, sigV4, tlsCertificates, authAdapter);
             }
         } catch (Exception e) {
             LOG.debugv("RDS connection error for instance {0}: {1}", instanceId, e.getMessage());
+        } finally {
+            // A handler's success path bridges then closes both sockets; every other path
+            // (early return on a bare probe, auth failure, thrown IOException) can leave the
+            // backend DB connection open. Closing here is idempotent.
             closeQuietly(client);
+            if (backend != null) {
+                closeQuietly(backend);
+            }
         }
     }
 
     private static void closeQuietly(Socket s) {
-        try { s.close(); } catch (IOException ignored) {}
+        try {
+            s.close();
+        } catch (IOException e) {
+            LOG.debugv(e, "Error closing RDS proxy client socket");
+        }
     }
 
     /**
-     * Callback for password validation — implemented by RdsService.
+     * Callback for master-password validation, implemented by RdsService. Returns true when the
+     * supplied master credentials are current. Non-master users are never asked here: the backend
+     * database is the authority for their passwords.
      */
     @FunctionalInterface
-    public interface PasswordValidator {
+    public interface MasterPasswordCheck {
         boolean validate(String username, String password);
     }
 }

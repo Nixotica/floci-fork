@@ -1,25 +1,34 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.EfsVolumeConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.MountPoint;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.ecs.model.Volume;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -46,6 +55,8 @@ class EcsContainerManagerVolumesTest {
     private ContainerBuilder containerBuilder;
     private ContainerBuilder.Builder builder;
     private ContainerLifecycleManager lifecycleManager;
+    private LaunchedContainerAwsEnv awsEnv;
+    private EcrRegistryManager ecrRegistryManager;
     private EcsContainerManager manager;
 
     @BeforeEach
@@ -62,9 +73,21 @@ class EcsContainerManagerVolumesTest {
         ContainerDetector containerDetector = mock(ContainerDetector.class);
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         RegionResolver regionResolver = mock(RegionResolver.class);
+        awsEnv = mock(LaunchedContainerAwsEnv.class);
+        when(awsEnv.sdkBaselineEnv(any(), any())).thenReturn(List.of());
+        SsmService ssmService = mock(SsmService.class);
+        SecretsManagerService secretsManagerService = mock(SecretsManagerService.class);
+        ecrRegistryManager = mock(EcrRegistryManager.class);
+        when(ecrRegistryManager.rewriteImageUri(anyString())).thenAnswer(inv -> inv.getArgument(0));
+
+        // These tests bind-mount hand-built "/host/abs/..." paths that don't sit under any
+        // real approved root, so opt out of the fail-closed default explicitly; the Docker
+        // socket ancestor block still applies regardless (see the rejection test below).
+        when(config.services().ecs().allowUnsafeHostVolumes()).thenReturn(true);
 
         manager = new EcsContainerManager(containerBuilder, lifecycleManager, logStreamer,
-                containerDetector, config, regionResolver);
+                containerDetector, config, regionResolver, awsEnv, ssmService, secretsManagerService,
+                ecrRegistryManager, new HostVolumePolicy(config));
     }
 
     @Test
@@ -105,5 +128,143 @@ class EcsContainerManagerVolumesTest {
 
         // The unresolved "missing-vol" mountPoint contributes no bind beyond the two above.
         verify(builder, never()).withBind("/app/nope", "/app/nope");
+    }
+
+    /**
+     * Each EFS volume resolves to a shared local Docker named volume keyed by file system id
+     * AND effective root (here: rootDirectory, since neither volume sets an accessPointId),
+     * read-write or read-only per the mountPoint.
+     */
+    @Test
+    void efsVolumeMountPointsResolveToSharedNamedVolumesByAccessMode() {
+        ContainerDefinition app = new ContainerDefinition();
+        app.setName("app");
+        app.setImage("app:latest");
+        app.setMountPoints(List.of(
+                new MountPoint("customer-data", "/mnt/efs", false),    // read-write
+                new MountPoint("shared-ro", "/mnt/shared", true)));    // read-only
+
+        TaskDefinition taskDef = new TaskDefinition();
+        taskDef.setFamily("efs-family");
+        taskDef.setContainerDefinitions(List.of(app));
+        taskDef.setVolumes(List.of(
+                new Volume("customer-data", null,
+                        new EfsVolumeConfiguration("fs-0123456789abcdef0", "/dps", "ENABLED", null, null, null)),
+                new Volume("shared-ro", null,
+                        new EfsVolumeConfiguration("fs-00000000000000001", null, null, null, null, null))));
+
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/test-cluster/efs1");
+
+        manager.startTask(task, taskDef, List.of(), "us-east-1");
+
+        verify(builder, times(1)).withNamedVolume(
+                EcsContainerManager.efsVolumeName("fs-0123456789abcdef0", null, "/dps"), "/mnt/efs", false);
+        verify(builder, times(1)).withNamedVolume(
+                EcsContainerManager.efsVolumeName("fs-00000000000000001", null, null), "/mnt/shared", true);
+
+        // EFS volumes are never bind-mounted as host paths.
+        verify(builder, never()).withBind(any(), any());
+        verify(builder, never()).withReadOnlyBind(any(), any());
+    }
+
+    @Test
+    void efsVolumesInitialiseSharedVolumeOwnershipFromConfig() {
+        // Rebuild the manager with an EFS config that emulates an access point's CreationInfo +
+        // PosixUser (owner 1001:1001, "2775" — 0775 plus the setgid special bit via the 4-digit
+        // octal). The EFS mount must initialise the shared volume root with exactly those values
+        // before mounting it.
+        EmulatorConfig cfg = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(cfg.storage().efs().ownerUid()).thenReturn(OptionalInt.of(1001));
+        when(cfg.storage().efs().ownerGid()).thenReturn(OptionalInt.of(1001));
+        when(cfg.storage().efs().rootPermissions()).thenReturn(Optional.of("2775"));
+        when(cfg.storage().efs().initImage()).thenReturn("busybox:stable");
+        EcsContainerManager configured = new EcsContainerManager(containerBuilder, lifecycleManager,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class), cfg,
+                mock(RegionResolver.class), awsEnv, mock(SsmService.class),
+                mock(SecretsManagerService.class), ecrRegistryManager, new HostVolumePolicy(cfg));
+
+        ContainerDefinition app = new ContainerDefinition();
+        app.setName("app");
+        app.setImage("app:latest");
+        app.setMountPoints(List.of(new MountPoint("customer-data", "/mnt/efs", false)));
+
+        TaskDefinition taskDef = new TaskDefinition();
+        taskDef.setFamily("efs-family");
+        taskDef.setContainerDefinitions(List.of(app));
+        taskDef.setVolumes(List.of(new Volume("customer-data", null,
+                new EfsVolumeConfiguration("fs-abc", "/dps", "ENABLED", null, null, null))));
+
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/test-cluster/efsown");
+
+        configured.startTask(task, taskDef, List.of(), "us-east-1");
+
+        verify(lifecycleManager, times(1)).ensureSharedVolume(
+                EcsContainerManager.efsVolumeName("fs-abc", null, "/dps"),
+                OptionalInt.of(1001), OptionalInt.of(1001), Optional.of("2775"), "busybox:stable");
+    }
+
+    @Test
+    void efsMountAppliesConfiguredPosixUserAndGroupToContainer() {
+        // Rebuild with an EFS config carrying a PosixUser (mount-user 1001:1001) and a supplementary
+        // group (mount-group-add 2000). A container mounting the EFS volume must run under that user
+        // and add that group, emulating the access point's PosixUser squashing — otherwise the
+        // container keeps its image USER and cannot write the volume owned by ownerUid/ownerGid.
+        EmulatorConfig cfg = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(cfg.storage().efs().mountUser()).thenReturn(Optional.of("1001:1001"));
+        when(cfg.storage().efs().mountGroupAdd()).thenReturn(OptionalInt.of(2000));
+        EcsContainerManager configured = new EcsContainerManager(containerBuilder, lifecycleManager,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class), cfg,
+                mock(RegionResolver.class), awsEnv, mock(SsmService.class),
+                mock(SecretsManagerService.class), ecrRegistryManager, new HostVolumePolicy(cfg));
+
+        ContainerDefinition app = new ContainerDefinition();
+        app.setName("app");
+        app.setImage("app:latest");
+        app.setMountPoints(List.of(new MountPoint("customer-data", "/mnt/efs", false)));
+
+        TaskDefinition taskDef = new TaskDefinition();
+        taskDef.setFamily("efs-family");
+        taskDef.setContainerDefinitions(List.of(app));
+        taskDef.setVolumes(List.of(new Volume("customer-data", null,
+                new EfsVolumeConfiguration("fs-abc", "/dps", "ENABLED", null, null, null))));
+
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/test-cluster/efsposix");
+
+        configured.startTask(task, taskDef, List.of(), "us-east-1");
+
+        verify(builder, times(1)).withUser("1001:1001");
+        verify(builder, times(1)).withGroupAdd("2000");
+    }
+
+    /**
+     * The host-volume policy is enforced again at mount time, immediately before the bind
+     * call, not only once at RegisterTaskDefinition time. A mount whose source is an ancestor
+     * of the Docker socket (here {@code /var/run}, which contains {@code docker.sock}) must be
+     * rejected even though this test class's setUp already allows unsafe host volumes: the
+     * socket-ancestor block applies unconditionally. The rejection must propagate out of
+     * startTask (not be swallowed) and no bind must have been issued for it.
+     */
+    @Test
+    void startTaskRejectsMountThatExposesDockerSocketEvenWhenUnsafeVolumesAllowed() {
+        ContainerDefinition app = new ContainerDefinition();
+        app.setName("app");
+        app.setImage("app:latest");
+        app.setMountPoints(List.of(new MountPoint("run-vol", "/host-run", false)));
+
+        TaskDefinition taskDef = new TaskDefinition();
+        taskDef.setFamily("socket-family");
+        taskDef.setContainerDefinitions(List.of(app));
+        taskDef.setVolumes(List.of(new Volume("run-vol", "/var/run")));
+
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/test-cluster/socket1");
+
+        assertThrows(AwsException.class, () -> manager.startTask(task, taskDef, List.of(), "us-east-1"));
+
+        verify(builder, never()).withBind(any(), any());
+        verify(builder, never()).withReadOnlyBind(any(), any());
     }
 }

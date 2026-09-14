@@ -21,6 +21,9 @@ public class SentEmail {
     @JsonProperty("Source")
     private String source;
 
+    @JsonProperty("ReturnPath")
+    private String returnPath;
+
     @JsonProperty("Destination")
     private List<String> toAddresses;
 
@@ -45,6 +48,9 @@ public class SentEmail {
 
     @JsonProperty("RawData")
     private String rawData;
+
+    @JsonProperty("Headers")
+    private List<MessageHeader> headers;
 
     @JsonProperty("SentAt")
     private Instant sentAt;
@@ -89,6 +95,9 @@ public class SentEmail {
     public String getSource() { return source; }
     public void setSource(String source) { this.source = source; }
 
+    public String getReturnPath() { return returnPath; }
+    public void setReturnPath(String returnPath) { this.returnPath = returnPath; }
+
     public List<String> getToAddresses() { return toAddresses; }
     public void setToAddresses(List<String> toAddresses) { this.toAddresses = toAddresses; }
 
@@ -112,6 +121,9 @@ public class SentEmail {
 
     public String getRawData() { return rawData; }
     public void setRawData(String rawData) { this.rawData = rawData; }
+
+    public List<MessageHeader> getHeaders() { return headers; }
+    public void setHeaders(List<MessageHeader> headers) { this.headers = headers; }
 
     public boolean isRaw() { return rawData != null; }
 

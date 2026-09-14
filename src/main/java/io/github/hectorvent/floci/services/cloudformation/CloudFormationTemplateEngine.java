@@ -6,16 +6,21 @@ import com.fasterxml.jackson.databind.node.TextNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
+import java.util.regex.Pattern;
 
 /**
  * Resolves CloudFormation intrinsic functions and pseudo-parameters in template nodes.
  * Supported: Ref, Fn::Sub, Fn::Join, Fn::Select, Fn::If, Fn::Split, Fn::Base64,
- * Fn::GetAtt, Condition.
+ * Fn::GetAtt, Fn::GetAZs, Fn::Cidr, Fn::FindInMap, Fn::ImportValue, Condition.
  */
 public class CloudFormationTemplateEngine {
 
@@ -32,6 +37,7 @@ public class CloudFormationTemplateEngine {
     private final Map<String, JsonNode> mappings;
     private final ObjectMapper objectMapper;
     private final Function<String, String> importValueResolver;
+    private final UnaryOperator<String> dynamicReferenceResolver;
 
     CloudFormationTemplateEngine(String accountId, String region, String stackName, String stackId,
                                  Map<String, String> parameters,
@@ -41,6 +47,29 @@ public class CloudFormationTemplateEngine {
                                  Map<String, JsonNode> mappings,
                                  ObjectMapper objectMapper,
                                  Function<String, String> importValueResolver) {
+        this(accountId, region, stackName, stackId, parameters, physicalIds, resourceAttributes,
+                conditions, mappings, objectMapper, importValueResolver, null);
+    }
+
+    /**
+     * @param dynamicReferenceResolver resolves a value that may contain CloudFormation dynamic
+     *                                 references ({@code {{resolve:ssm:...}}},
+     *                                 {@code {{resolve:secretsmanager:...}}}) against the live
+     *                                 services, leaving a value with no dynamic reference syntax
+     *                                 untouched. {@code null} skips this stage entirely, which
+     *                                 keeps template values that only ever contain intrinsics
+     *                                 (tests, Cloud Control desired-state resolution) free of the
+     *                                 dependency.
+     */
+    CloudFormationTemplateEngine(String accountId, String region, String stackName, String stackId,
+                                 Map<String, String> parameters,
+                                 Map<String, String> physicalIds,
+                                 Map<String, Map<String, String>> resourceAttributes,
+                                 Map<String, Boolean> conditions,
+                                 Map<String, JsonNode> mappings,
+                                 ObjectMapper objectMapper,
+                                 Function<String, String> importValueResolver,
+                                 UnaryOperator<String> dynamicReferenceResolver) {
         this.accountId = accountId;
         this.region = region;
         this.stackName = stackName;
@@ -52,9 +81,33 @@ public class CloudFormationTemplateEngine {
         this.mappings = mappings;
         this.objectMapper = objectMapper;
         this.importValueResolver = importValueResolver;
+        this.dynamicReferenceResolver = dynamicReferenceResolver;
     }
 
+    /**
+     * Resolves a property value, including CloudFormation dynamic reference syntax
+     * ({@code {{resolve:ssm:...}}}, {@code {{resolve:secretsmanager:...}}}) in the result, the same
+     * way {@link #resolveNode} does. This is the entry point every scalar-property resolution in
+     * this codebase goes through, directly or via {@link #resolveNode}, so a dynamic reference is
+     * substituted regardless of which of the two a caller uses.
+     */
     public String resolve(JsonNode node) {
+        return resolveDynamicReferences(resolveIntrinsic(node)).asText();
+    }
+
+    /**
+     * Resolves intrinsics only, leaving any {@code {{resolve:...}}} dynamic reference syntax in the
+     * result untouched. For the one property family where {@code ssm-secure} is a valid dynamic
+     * reference service (RDS {@code MasterUsername}/{@code MasterUserPassword}): {@link #resolve}
+     * rejects {@code ssm-secure} outright since it is invalid everywhere else, so that property has
+     * to skip the general dynamic-reference stage and resolve it separately, with the permission
+     * only that property is allowed.
+     */
+    public String resolveWithoutDynamicReferences(JsonNode node) {
+        return resolveIntrinsic(node);
+    }
+
+    private String resolveIntrinsic(JsonNode node) {
         if (node == null || node.isNull() || node.isMissingNode()) {
             return "";
         }
@@ -89,6 +142,12 @@ public class CloudFormationTemplateEngine {
             if (node.has("Fn::Split")) {
                 return resolve(node.get("Fn::Split").get(1));
             }
+            if (node.has("Fn::GetAZs")) {
+                return String.join(",", resolveAvailabilityZones(node.get("Fn::GetAZs")));
+            }
+            if (node.has("Fn::Cidr")) {
+                return String.join(",", resolveCidr(node.get("Fn::Cidr")));
+            }
             if (node.has("Fn::GetAtt")) {
                 return resolveGetAtt(node.get("Fn::GetAtt"));
             }
@@ -106,13 +165,28 @@ public class CloudFormationTemplateEngine {
         if (node == null || node.isNull() || node.isMissingNode()) {
             return node;
         }
-        if (node.isTextual() || node.isNumber() || node.isBoolean()) {
+        if (node.isTextual()) {
+            return resolveDynamicReferences(node.textValue());
+        }
+        if (node.isNumber() || node.isBoolean()) {
             return node;
         }
         if (node.isObject()) {
+            if (node.has("Fn::If")) {
+                // Unlike the other intrinsics below, Fn::If's two branches can be any JSON shape
+                // (array, object, or scalar) - it just forwards one of them verbatim. Collapsing it
+                // through resolve() like the scalar-only intrinsics would stringify a chosen array or
+                // object instead of preserving it, so a conditional list (e.g. a Tags property) reads
+                // as unresolvable everywhere a caller checks isArray() on the result.
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                return branch == null ? TextNode.valueOf("") : resolveNode(branch);
+            }
+            if (node.has("Fn::Split") || node.has("Fn::GetAZs") || node.has("Fn::Cidr")) {
+                return objectMapper.valueToTree(resolveList(node));
+            }
             if (node.has("Ref") || node.has("Fn::Sub") || node.has("Fn::Join") ||
-                    node.has("Fn::Select") || node.has("Fn::If") || node.has("Fn::Base64") ||
-                    node.has("Fn::GetAtt") || node.has("Fn::ImportValue") || node.has("Fn::Split")) {
+                    node.has("Fn::Select") || node.has("Fn::Base64") ||
+                    node.has("Fn::GetAtt") || node.has("Fn::ImportValue") || node.has("Fn::FindInMap")) {
                 return TextNode.valueOf(resolve(node));
             }
             // Plain object — resolve each field
@@ -132,6 +206,42 @@ public class CloudFormationTemplateEngine {
             return arr;
         }
         return node;
+    }
+
+    /**
+     * Resolves a value against {@link #dynamicReferenceResolver} when it carries CloudFormation
+     * dynamic reference syntax ({@code {{resolve:ssm:...}}}, {@code {{resolve:secretsmanager:...}}}).
+     * CloudFormation substitutes these for any string property in a template, not only the RDS
+     * master-credential properties that first needed them (see
+     * <a href="https://github.com/floci-io/floci/issues/2213">#2213</a>), so {@link #resolveNode}
+     * applies this to every textual result: a literal string carrying the syntax outright, and the
+     * text an intrinsic function (e.g. {@code Fn::Sub}) produces.
+     */
+    private TextNode resolveDynamicReferences(String value) {
+        if (dynamicReferenceResolver == null || value == null || !value.contains("{{resolve:")) {
+            return TextNode.valueOf(value);
+        }
+        return TextNode.valueOf(dynamicReferenceResolver.apply(value));
+    }
+
+    /**
+     * Resolves a node that must be stored as a JSON document (SNS/SQS RedrivePolicy and
+     * FilterPolicy, Step Functions definitions, IAM policy documents) to its string form.
+     * <p>
+     * resolveNode collapses intrinsics such as Fn::Join into a {@link TextNode}. Calling
+     * {@code toString()} on that node re-quotes and re-escapes the already-serialized JSON
+     * (e.g. CDK's Fn::Join-spliced RedrivePolicy), so the value is double-encoded and the
+     * downstream service can no longer parse it. Unwrapping textual results preserves the
+     * literal JSON while non-textual nodes (plain objects) keep the normal serialization.
+     *
+     * @see <a href="https://github.com/floci-io/floci/issues/2317">#2317</a>
+     */
+    public String resolveJsonAttribute(JsonNode node) {
+        JsonNode resolved = resolveNode(node);
+        if (resolved == null || resolved.isNull() || resolved.isMissingNode()) {
+            return null;
+        }
+        return resolved.isTextual() ? resolved.asText() : resolved.toString();
     }
 
     private String resolveRef(String name) {
@@ -205,36 +315,219 @@ public class CloudFormationTemplateEngine {
             return "";
         }
         String delimiter = join.get(0).asText("");
-        JsonNode parts = join.get(1);
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < parts.size(); i++) {
-            if (i > 0) {
-                sb.append(delimiter);
-            }
-            sb.append(resolve(parts.get(i)));
-        }
-        return sb.toString();
+        return String.join(delimiter, resolveList(join.get(1)));
     }
 
     private String resolveSelect(JsonNode select) {
         if (!select.isArray() || select.size() < 2) {
             return "";
         }
-        int index = select.get(0).asInt(0);
-        JsonNode list = select.get(1);
-        if (list.isArray() && index < list.size()) {
-            return resolve(list.get(index));
+        int index = parseInt(resolve(select.get(0)), 0);
+        List<String> items = resolveList(select.get(1));
+        if (index >= 0 && index < items.size()) {
+            return items.get(index);
         }
         return "";
     }
 
+    /**
+     * Resolves a node that represents a list — a literal array, a list-producing intrinsic
+     * ({@code Fn::GetAZs}, {@code Fn::Cidr}, {@code Fn::Split}), an {@code Fn::If} choosing between
+     * two such lists, or a comma-delimited scalar (e.g. a {@code Ref} to a {@code List<>} parameter).
+     */
+    private List<String> resolveList(JsonNode node) {
+        List<String> out = new ArrayList<>();
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return out;
+        }
+        if (node.isArray()) {
+            return resolveListElements(node);
+        }
+        if (node.isObject()) {
+            if (node.has("Fn::If")) {
+                // Fn::If's branch can itself be any of the shapes this method already handles
+                // (literal array, Fn::Split, ...), so recurse into it rather than falling through
+                // to the scalar branch below, which would stringify a list-shaped branch instead
+                // of splitting it.
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                return branch == null ? out : resolveList(branch);
+            }
+            if (node.has("Fn::GetAZs")) {
+                return resolveAvailabilityZones(node.get("Fn::GetAZs"));
+            }
+            if (node.has("Fn::Cidr")) {
+                return resolveCidr(node.get("Fn::Cidr"));
+            }
+            if (node.has("Fn::Split")) {
+                return resolveSplit(node.get("Fn::Split"));
+            }
+        }
+        String scalar = resolve(node);
+        if (!scalar.isEmpty()) {
+            out.addAll(Arrays.asList(scalar.split(",", -1)));
+        }
+        return out;
+    }
+
+    /**
+     * Expands a literal array's elements, recursing into any element that is itself a
+     * list-valued intrinsic ({@code Fn::Split}, {@code Fn::GetAZs}, {@code Fn::Cidr}, or an
+     * {@code Fn::If} evaluating to one) so it contributes its own elements rather than one
+     * comma-joined string. Unlike {@link #resolveStringList}, this keeps blank entries: a
+     * literal array is positional (consumed by {@code Fn::Select} via {@link #resolveList}),
+     * so dropping a blank element ahead of the selected index would shift every later index.
+     */
+    private List<String> resolveListElements(JsonNode node) {
+        List<String> out = new ArrayList<>();
+        for (JsonNode element : node) {
+            if (isListValuedIntrinsic(element)) {
+                out.addAll(resolveList(element));
+            } else {
+                out.add(resolve(element));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Resolves a node to a flat list of strings, expanding list-valued intrinsics
+     * ({@code Fn::Split}, {@code Fn::GetAZs}, {@code Fn::Cidr}, or an {@code Fn::If} evaluating
+     * to one) whether the node itself is one or they appear as elements of a literal array,
+     * and dropping blank entries.
+     *
+     * <p>Provisioners read list properties (SubnetIds, VPCZoneIdentifier, …) with this so a
+     * cross-stack {@code Fn::Split} over {@code Fn::ImportValue} — the shape CDK emits when a
+     * VPC exports its subnet ids as one comma-joined value — resolves to the real ids instead
+     * of a single comma-joined string or an empty list (issue #2937).
+     */
+    public List<String> resolveStringList(JsonNode node) {
+        List<String> out = new ArrayList<>();
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return out;
+        }
+        if (node.isArray()) {
+            out.addAll(resolveListElements(node));
+        } else {
+            out.addAll(resolveList(node));
+        }
+        out.removeIf(value -> value == null || value.isBlank());
+        return out;
+    }
+
+    private boolean isListValuedIntrinsic(JsonNode node) {
+        if (node == null) {
+            return false;
+        }
+        if (node.isArray()) {
+            return true;
+        }
+        if (node.isObject()) {
+            if (node.has("Fn::Split") || node.has("Fn::GetAZs") || node.has("Fn::Cidr")) {
+                return true;
+            }
+            if (node.has("Fn::If")) {
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                return branch != null && isListValuedIntrinsic(branch);
+            }
+        }
+        return false;
+    }
+
+    private List<String> resolveSplit(JsonNode split) {
+        if (!split.isArray() || split.size() < 2) {
+            return List.of();
+        }
+        String delimiter = resolve(split.get(0));
+        String source = resolve(split.get(1));
+        if (delimiter.isEmpty()) {
+            return List.of(source);
+        }
+        return Arrays.asList(source.split(Pattern.quote(delimiter), -1));
+    }
+
+    /**
+     * {@code Fn::GetAZs} — returns the Availability Zones for a region. The argument is the region
+     * (empty string means the stack's region). Floci seeds three default zones per region.
+     */
+    private List<String> resolveAvailabilityZones(JsonNode arg) {
+        String r = (arg == null || arg.isNull()) ? region : resolve(arg);
+        if (r == null || r.isBlank()) {
+            r = region;
+        }
+        return List.of(r + "a", r + "b", r + "c");
+    }
+
+    /**
+     * {@code Fn::Cidr} — splits an IPv4 CIDR block into {@code count} subnets, each with
+     * {@code cidrBits} host bits (i.e. a /{@code (32 - cidrBits)} mask). IPv6 is not supported.
+     */
+    private List<String> resolveCidr(JsonNode args) {
+        if (!args.isArray() || args.size() < 2) {
+            return List.of();
+        }
+        String ipBlock = resolve(args.get(0));
+        int count = parseInt(resolve(args.get(1)), 0);
+        int cidrBits = args.size() > 2 ? parseInt(resolve(args.get(2)), 8) : 8;
+        int slash = ipBlock.indexOf('/');
+        if (slash < 0 || count <= 0 || cidrBits <= 0 || cidrBits > 32) {
+            return List.of();
+        }
+        long base = ipv4ToLong(ipBlock.substring(0, slash));
+        if (base < 0) {
+            return List.of();
+        }
+        int newPrefix = 32 - cidrBits;
+        long step = 1L << cidrBits;
+        List<String> out = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            out.add(longToIpv4(base + (long) i * step) + "/" + newPrefix);
+        }
+        return out;
+    }
+
+    private static int parseInt(String value, int fallback) {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private static long ipv4ToLong(String ip) {
+        String[] octets = ip.trim().split("\\.");
+        if (octets.length != 4) {
+            return -1;
+        }
+        long result = 0;
+        for (String octet : octets) {
+            int value = parseInt(octet, -1);
+            if (value < 0 || value > 255) {
+                return -1;
+            }
+            result = (result << 8) | value;
+        }
+        return result;
+    }
+
+    private static String longToIpv4(long value) {
+        return ((value >> 24) & 0xFF) + "." + ((value >> 16) & 0xFF) + "."
+                + ((value >> 8) & 0xFF) + "." + (value & 0xFF);
+    }
+
     private String resolveIf(JsonNode ifNode) {
+        JsonNode branch = selectIfBranch(ifNode);
+        return branch == null ? "" : resolve(branch);
+    }
+
+    /** Picks Fn::If's true/false branch without resolving it further, so the caller decides
+     *  whether to collapse it to a scalar ({@link #resolve}) or preserve its shape ({@link #resolveNode}). */
+    private JsonNode selectIfBranch(JsonNode ifNode) {
         if (!ifNode.isArray() || ifNode.size() < 3) {
-            return "";
+            return null;
         }
         String conditionName = ifNode.get(0).asText();
         boolean condValue = conditions.getOrDefault(conditionName, false);
-        return resolve(condValue ? ifNode.get(1) : ifNode.get(2));
+        return condValue ? ifNode.get(1) : ifNode.get(2);
     }
 
     private String resolveGetAtt(JsonNode getAtt) {

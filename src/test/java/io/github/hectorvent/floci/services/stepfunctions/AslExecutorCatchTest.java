@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
@@ -9,11 +10,16 @@ import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
+import io.quarkus.test.junit.QuarkusTest;
+import io.vertx.mutiny.core.Vertx;
 import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -31,6 +37,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@QuarkusTest
 class AslExecutorCatchTest {
 
     private static final String REGION = "us-east-2";
@@ -39,6 +46,8 @@ class AslExecutorCatchTest {
     private static final String CLEANUP_FUNCTION_NAME = "cleanup-lambda";
     private static final String FAILING_FUNCTION_ARN = lambdaArn(FAILING_FUNCTION_NAME);
     private static final String CLEANUP_FUNCTION_ARN = lambdaArn(CLEANUP_FUNCTION_NAME);
+    private static final String ERROR_PAYLOAD =
+            "{\"errorType\":\"ContractFailure\",\"errorMessage\":\"forced failure\"}";
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private LambdaExecutorService lambdaExecutor;
@@ -46,6 +55,9 @@ class AslExecutorCatchTest {
     private LambdaFunction failingFunction;
     private LambdaFunction cleanupFunction;
     private AslExecutor executor;
+
+    @Inject
+    Vertx vertx;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -73,10 +85,18 @@ class AslExecutorCatchTest {
                 functionStore,
                 mock(DynamoDbService.class),
                 mock(DynamoDbJsonHandler.class),
-                mock(SqsJsonHandler.class),
+                mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
+                mock(io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler.class),
+                mock(io.github.hectorvent.floci.services.ec2.Ec2Service.class),
+                mock(S3Service.class),
+                mock(io.github.hectorvent.floci.services.ecs.EcsService.class),
+                mock(io.github.hectorvent.floci.services.ecs.EcsJsonHandler.class),
+                mock(io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler.class),
+                mock(io.github.hectorvent.floci.services.scheduler.SchedulerService.class),
+                mock(io.github.hectorvent.floci.services.scheduler.SchedulerController.class),
                 objectMapper,
                 new JsonataEvaluator(objectMapper),
-                mock(Instance.class));
+                mock(Instance.class), mock(EmulatorConfig.class), vertx, null);
     }
 
     @Test
@@ -134,8 +154,8 @@ class AslExecutorCatchTest {
                 """.formatted(FAILING_FUNCTION_ARN));
 
         assertEquals("FAILED", execution.getStatus());
-        assertEquals("Lambda.AWSLambdaException", execution.getError());
-        assertEquals("Handled", execution.getCause());
+        assertEquals("ContractFailure", execution.getError());
+        assertEquals(ERROR_PAYLOAD, execution.getCause());
         verify(lambdaExecutor).invoke(eq(failingFunction), any(byte[].class), eq(InvocationType.RequestResponse));
         verify(lambdaExecutor, never()).invoke(eq(cleanupFunction), any(byte[].class), eq(InvocationType.RequestResponse));
     }
@@ -160,7 +180,7 @@ class AslExecutorCatchTest {
     }
 
     private byte[] errorPayload() {
-        return "{\"errorType\":\"ContractFailure\",\"errorMessage\":\"forced failure\"}".getBytes(StandardCharsets.UTF_8);
+        return ERROR_PAYLOAD.getBytes(StandardCharsets.UTF_8);
     }
 
     private static LambdaFunction lambdaFunction(String name, String arn) {

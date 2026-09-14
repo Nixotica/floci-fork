@@ -5,6 +5,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.*;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.hamcrest.Matchers.*;
 
 @QuarkusTest
@@ -224,7 +225,10 @@ class SqsIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("<Attribute>"))
-            .body(containsString("QueueArn"));
+            .body(containsString("QueueArn"))
+            .body(containsString("ApproximateNumberOfMessages"))
+            .body(containsString("ApproximateNumberOfMessagesNotVisible"))
+            .body(containsString("ApproximateNumberOfMessagesDelayed"));
     }
 
     @Test
@@ -394,7 +398,7 @@ class SqsIntegrationTest {
             .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
 
         try {
-            String bigBody = "x".repeat(100_000);
+            String bigBody = "x".repeat(400_000);
             given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "SendMessageBatch")
@@ -480,7 +484,10 @@ class SqsIntegrationTest {
             .post("/")
         .then()
             .statusCode(400)
-            .body(containsString("QueueNameExists"));
+            // Query protocol renders the XML ErrorResponse with the legacy Query code;
+            // QueueNameExists is its JSON-protocol __type equivalent (see AwsException).
+            .contentType(containsString("xml"))
+            .body("ErrorResponse.Error.Code", equalTo("QueueAlreadyExists"));
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -610,6 +617,25 @@ class SqsIntegrationTest {
     }
 
     @Test
+    void queryProtocolErrorsAreXmlNotJson() {
+        // Regression: AwsExceptions escaping SqsQueryHandler used to reach the global
+        // JAX-RS mapper and render a JSON body on this XML protocol.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetQueueUrl")
+            .formParam("QueueName", "does-not-exist-queue")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .contentType(containsString("xml"))
+            .body("ErrorResponse.Error.Type", equalTo("Sender"))
+            .body("ErrorResponse.Error.Code", equalTo("AWS.SimpleQueueService.NonExistentQueue"))
+            .body("ErrorResponse.Error.Message",
+                    equalTo("The specified queue does not exist for this wsdl version."));
+    }
+
+    @Test
     void sendMessageBatch_queryProtocol_persistsAwsTraceHeaderPerEntry() {
         String traceQueueName = "query-batch-trace-queue";
         String traceQueueUrl = given()
@@ -651,6 +677,80 @@ class SqsIntegrationTest {
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DeleteQueue")
                 .formParam("QueueUrl", traceQueueUrl)
+            .when().post("/");
+        }
+    }
+
+
+    @Test
+    void receiveMessageWithoutWaitTimeSecondsHonoursQueueReceiveMessageWaitTimeSeconds() {
+        String longPollQueueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", "query-long-poll-attr-queue")
+            .formParam("Attribute.1.Name", "ReceiveMessageWaitTimeSeconds")
+            .formParam("Attribute.1.Value", "1")
+        .when().post("/").then().statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            long start = System.nanoTime();
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", longPollQueueUrl)
+            .when().post("/").then().statusCode(200)
+                .body(not(containsString("<Message>")));
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(elapsedMs >= 900,
+                    "Omitting WaitTimeSeconds must long poll for the queue's ReceiveMessageWaitTimeSeconds, but returned after " + elapsedMs + "ms");
+
+            start = System.nanoTime();
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", longPollQueueUrl)
+                .formParam("WaitTimeSeconds", "0")
+            .when().post("/").then().statusCode(200)
+                .body(not(containsString("<Message>")));
+            elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(elapsedMs < 1000,
+                    "WaitTimeSeconds=0 must override the queue attribute, but returned after " + elapsedMs + "ms");
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", longPollQueueUrl)
+            .when().post("/");
+        }
+    }
+
+    @Test
+    void receiveMessageRejectsInvalidWaitTimeSeconds() {
+        String rangeQueueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", "query-wait-time-range-queue")
+        .when().post("/").then().statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            for (String invalid : new String[]{"-1", "21", "1.5", "abc"}) {
+                given()
+                    .contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", "ReceiveMessage")
+                    .formParam("QueueUrl", rangeQueueUrl)
+                    .formParam("WaitTimeSeconds", invalid)
+                .when().post("/").then()
+                    .statusCode(400)
+                    .body(containsString("<Code>InvalidParameterValue</Code>"))
+                    .body(containsString("WaitTimeSeconds"));
+            }
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", rangeQueueUrl)
             .when().post("/");
         }
     }

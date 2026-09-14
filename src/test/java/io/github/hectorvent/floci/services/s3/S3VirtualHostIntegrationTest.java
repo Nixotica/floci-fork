@@ -248,7 +248,85 @@ class S3VirtualHostIntegrationTest {
     }
 
     @Test
+    @Order(17)
+    void listBucketsViaLocalStackS3ServiceHost() {
+        given()
+            .header("Host", "s3.localhost.localstack.cloud")
+        .when()
+            .get("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("ListAllMyBucketsResult"))
+            .body(containsString(BUCKET));
+    }
+
+    @Test
+    @Order(18)
+    void listBucketsViaFlociS3ServiceHost() {
+        given()
+            .header("Host", "s3.localhost.floci.io")
+        .when()
+            .get("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("ListAllMyBucketsResult"))
+            .body(containsString(BUCKET));
+    }
+
+    @Test
+    @Order(19)
+    void objectKeyStartingWithCloudFrontPrefixRemainsReachable() {
+        given()
+            .header("Host", HOST)
+            .contentType("text/plain")
+            .body("ordinary s3 object")
+        .when()
+            .put("/_cloudfront/file.txt")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Host", HOST)
+        .when()
+            .get("/_cloudfront/file.txt")
+        .then()
+            .statusCode(200)
+            .body(equalTo("ordinary s3 object"));
+
+        given().header("Host", HOST).delete("/_cloudfront/file.txt")
+                .then().statusCode(204);
+    }
+
+    @Test
     @Order(20)
+    void createMultipartUploadViaVirtualHost() {
+        String key = "virtual-multipart.zip";
+        var response = given()
+            .header("Host", HOST)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260912/us-east-1/s3/aws4_request, Signature=fake")
+            .contentType("application/x-www-form-urlencoded")
+            .queryParam("uploads", "")
+        .when()
+            .post("/" + key)
+        .then()
+            .statusCode(200)
+            .body(containsString("<Bucket>" + BUCKET + "</Bucket>"))
+            .body(containsString("<Key>" + key + "</Key>"))
+            .extract().response();
+
+        String uploadId = response.xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        given()
+            .header("Host", HOST)
+            .queryParam("uploadId", uploadId)
+        .when()
+            .delete("/" + key)
+        .then()
+            .statusCode(204);
+    }
+
+    @Test
+    @Order(21)
     void cleanupAndDeleteBucket() {
         given().header("Host", HOST).delete("/hello.txt");
         given().header("Host", HOST).delete("/path/to/nested.json");

@@ -23,10 +23,14 @@ import java.util.Map;
  * @param mounts Volume mounts (named volumes, bind mounts, tmpfs)
  * @param binds Legacy bind mounts (prefer mounts for new code)
  * @param extraHosts Extra /etc/hosts entries as "hostname:ip" strings
+ * @param labels Container labels merged over the default floci-aws labels
  * @param logConfig Docker log driver configuration (null = daemon default)
  * @param privileged Whether to run the container in privileged mode (required for k3s)
+ * @param cgroupnsMode Docker cgroup namespace mode (for example, "host")
  * @param dnsServers DNS server IPs to inject into the container (e.g. Floci's embedded DNS)
  * @param workingDir Working directory inside the container (overrides image WORKDIR)
+ * @param user User the container process runs as, formatted "uid[:gid]" (null = image USER)
+ * @param groupAdd Supplementary group IDs added to the container process
  */
 public record ContainerSpec(
         String image,
@@ -41,17 +45,21 @@ public record ContainerSpec(
         List<Mount> mounts,
         List<Bind> binds,
         List<String> extraHosts,
+        Map<String, String> labels,
         LogConfig logConfig,
         boolean privileged,
+        String cgroupnsMode,
         List<String> dnsServers,
-        String workingDir
+        String workingDir,
+        String user,
+        List<String> groupAdd
 ) {
     /**
      * Creates a minimal spec with just the image name.
      * All other fields will be null or empty lists.
      */
     public ContainerSpec(String image) {
-        this(image, null, List.of(), null, null, null, Map.of(), List.of(), null, List.of(), List.of(), List.of(), null, false, List.of(), null);
+        this(image, null, List.of(), null, null, null, Map.of(), List.of(), null, List.of(), List.of(), List.of(), Map.of(), null, false, null, List.of(), null, null, List.of());
     }
 
     /**
