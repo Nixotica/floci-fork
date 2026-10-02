@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.eventbridge.model.Replay;
 import io.github.hectorvent.floci.services.eventbridge.model.Rule;
 import io.github.hectorvent.floci.services.eventbridge.model.RuleState;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
+import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
 import io.vertx.core.Vertx;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -19,6 +20,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.util.List;
 import java.util.Optional;
 
@@ -41,14 +43,17 @@ class EventBridgeSchedulerIntegrationTest {
         StorageBackend<String, List<Target>> targetStore = new InMemoryStorage<>();
 
         EventBridgeInvoker invoker = new EventBridgeInvoker(null, null, null, new ObjectMapper(), createConfig());
-        scheduler = new RuleScheduler(vertx, createConfig(), new ObjectMapper(), invoker);
+        TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, "http://localhost:4566", Clock.systemUTC(), null);
+        scheduler = new RuleScheduler(vertx, createConfig(), new ObjectMapper(), dispatcher);
 
         ReplayDispatcher replayDispatcher = new ReplayDispatcher(vertx);
         eventBridgeService = new EventBridgeService(
                 busStore, ruleStore, targetStore,
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 new RegionResolver(REGION, ACCOUNT),
-                new ObjectMapper(), scheduler, invoker, replayDispatcher);
+                new ObjectMapper(), scheduler, dispatcher, replayDispatcher,
+                new ResourceGroupsTaggingService(null));
     }
 
     @AfterEach
@@ -293,11 +298,22 @@ class EventBridgeSchedulerIntegrationTest {
             @Override
             public String defaultAccountId() { return ACCOUNT; }
             @Override
-            public int maxRequestSize() { return 512; }
+            public PartitionsConfig partitions() {
+                return new PartitionsConfig() {
+                    @Override
+                    public Optional<String> id() { return Optional.empty(); }
+                    @Override
+                    public boolean allowUnknownRegions() { return false; }
+                    @Override
+                    public boolean strict() { return false; }
+                };
+            }
             @Override
-            public String ecrBaseUri() { return ""; }
+            public Optional<String> aiMockConfigFile() { return Optional.empty(); }
             @Override
             public StorageConfig storage() { return null; }
+            @Override
+            public NetworkConfig network() { return null; }
             @Override
             public DnsConfig dns() {
                 return new DnsConfig() {
@@ -307,6 +323,8 @@ class EventBridgeSchedulerIntegrationTest {
                     public boolean containerFallbackEnabled() { return true; }
                     @Override
                     public List<String> containerFallbackServers() { return List.of("8.8.8.8", "8.8.4.4"); }
+                    @Override
+                    public boolean spoofAwsEndpoints() { return false; }
                 };
             }
             @Override
@@ -320,12 +338,21 @@ class EventBridgeSchedulerIntegrationTest {
             @Override
             public EmulatorConfig.InitHooksConfig initHooks() { return null; }
             @Override
+            public ProtocolsConfig protocols() {
+                return new ProtocolsConfig() {
+                    @Override public int maxRequestSize() { return 512; }
+                    @Override public boolean strictClaiming() { return false; }
+                    @Override public boolean rejectUnknownServiceScope() { return true; }
+                };
+            }
+            @Override
             public TlsConfig tls() {
                 return new TlsConfig() {
                     @Override public boolean enabled() { return false; }
                     @Override public Optional<String> certPath() { return Optional.empty(); }
                     @Override public Optional<String> keyPath() { return Optional.empty(); }
                     @Override public boolean selfSigned() { return true; }
+                    @Override public int awsHttpsPort() { return 443; }
                 };
             }
         };

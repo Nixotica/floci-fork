@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.dynamodb.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
@@ -30,6 +31,7 @@ public class TableDefinition {
     private Map<String, String> tags;
     private List<GlobalSecondaryIndex> globalSecondaryIndexes;
     private List<LocalSecondaryIndex> localSecondaryIndexes;
+    private List<VectorIndex> vectorIndexes;
     private String billingMode; // "PROVISIONED" or "PAY_PER_REQUEST"
     private String ttlAttributeName;
     private boolean ttlEnabled;
@@ -43,6 +45,19 @@ public class TableDefinition {
     private String sseType;
     private String kmsMasterKeyArn;
     private List<KinesisStreamingDestination> kinesisStreamingDestinations;
+    private String tableId;
+    private String tableClass; // "STANDARD" or "STANDARD_INFREQUENT_ACCESS"
+    private Integer onDemandMaxReadRequestUnits;
+    private Integer onDemandMaxWriteRequestUnits;
+    // Replica regions for a global table (single-process emulator backs them all with this table's
+    // data; the list drives the DescribeTable Replicas/GlobalTableVersion projection).
+    private List<String> replicaRegions;
+    private String globalTableHomeRegion;
+    // Resource-based policy attached via PutResourcePolicy (JSON policy document text), and the
+    // opaque revision id AWS hands back so callers can pass ExpectedRevisionId for optimistic
+    // concurrency on subsequent Put/DeleteResourcePolicy calls. Null when no policy is attached.
+    private String resourcePolicy;
+    private String resourcePolicyRevisionId;
 
     public TableDefinition() {
         this.keySchema = new ArrayList<>();
@@ -50,14 +65,16 @@ public class TableDefinition {
         this.tags = new HashMap<>();
         this.globalSecondaryIndexes = new ArrayList<>();
         this.localSecondaryIndexes = new ArrayList<>();
+        this.vectorIndexes = new ArrayList<>();
         this.pointInTimeRecoveryRecoveryPeriodInDays = 35;
         this.kinesisStreamingDestinations = new ArrayList<>();
+        this.replicaRegions = new ArrayList<>();
     }
 
     public TableDefinition(String tableName,
                             List<KeySchemaElement> keySchema,
                             List<AttributeDefinition> attributeDefinitions) {
-        this(tableName, keySchema, attributeDefinitions, "us-east-1", "000000000000");
+        this(tableName, keySchema, attributeDefinitions, "us-east-1", "000000000000"); // partition-literal: test-shaped constructor default
     }
 
     public TableDefinition(String tableName,
@@ -72,12 +89,15 @@ public class TableDefinition {
         this.itemCount = 0;
         this.tableSizeBytes = 0;
         this.tableArn = AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/" + tableName).toString();
+        this.tableId = java.util.UUID.randomUUID().toString();
         this.provisionedThroughput = new ProvisionedThroughput(5, 5);
         this.tags = new HashMap<>();
         this.globalSecondaryIndexes = new ArrayList<>();
         this.localSecondaryIndexes = new ArrayList<>();
+        this.vectorIndexes = new ArrayList<>();
         this.pointInTimeRecoveryRecoveryPeriodInDays = 35;
         this.kinesisStreamingDestinations = new ArrayList<>();
+        this.replicaRegions = new ArrayList<>();
     }
 
     public String getTableName() { return tableName; }
@@ -118,6 +138,16 @@ public class TableDefinition {
     public List<LocalSecondaryIndex> getLocalSecondaryIndexes() { return localSecondaryIndexes; }
     public void setLocalSecondaryIndexes(List<LocalSecondaryIndex> localSecondaryIndexes) {
         this.localSecondaryIndexes = localSecondaryIndexes != null ? localSecondaryIndexes : new ArrayList<>();
+    }
+
+    public List<VectorIndex> getVectorIndexes() {
+        if (vectorIndexes == null) {
+            vectorIndexes = new ArrayList<>();
+        }
+        return vectorIndexes;
+    }
+    public void setVectorIndexes(List<VectorIndex> vectorIndexes) {
+        this.vectorIndexes = vectorIndexes != null ? vectorIndexes : new ArrayList<>();
     }
 
     public String getBillingMode() { return billingMode; }
@@ -174,6 +204,42 @@ public class TableDefinition {
     }
 
     /** Returns the partition key attribute name. */
+    public String getTableId() {
+        if (tableId == null) tableId = java.util.UUID.randomUUID().toString();
+        return tableId;
+    }
+    public void setTableId(String tableId) { this.tableId = tableId; }
+
+    public String getTableClass() { return tableClass; }
+    public void setTableClass(String tableClass) { this.tableClass = tableClass; }
+
+    public List<String> getReplicaRegions() {
+        return replicaRegions != null ? replicaRegions : new ArrayList<>();
+    }
+    public void setReplicaRegions(List<String> replicaRegions) {
+        this.replicaRegions = replicaRegions != null ? replicaRegions : new ArrayList<>();
+    }
+
+    // The region that owns the table once it has become a global table. On AWS a global table lists
+    // its own home region as an ACTIVE replica alongside the others; null means a plain table.
+    public String getGlobalTableHomeRegion() { return globalTableHomeRegion; }
+    public void setGlobalTableHomeRegion(String globalTableHomeRegion) {
+        this.globalTableHomeRegion = globalTableHomeRegion;
+    }
+
+    public Integer getOnDemandMaxReadRequestUnits() { return onDemandMaxReadRequestUnits; }
+    public void setOnDemandMaxReadRequestUnits(Integer v) { this.onDemandMaxReadRequestUnits = v; }
+
+    public Integer getOnDemandMaxWriteRequestUnits() { return onDemandMaxWriteRequestUnits; }
+    public void setOnDemandMaxWriteRequestUnits(Integer v) { this.onDemandMaxWriteRequestUnits = v; }
+
+    public String getResourcePolicy() { return resourcePolicy; }
+    public void setResourcePolicy(String resourcePolicy) { this.resourcePolicy = resourcePolicy; }
+
+    public String getResourcePolicyRevisionId() { return resourcePolicyRevisionId; }
+    public void setResourcePolicyRevisionId(String resourcePolicyRevisionId) { this.resourcePolicyRevisionId = resourcePolicyRevisionId; }
+
+    @JsonIgnore
     public String getPartitionKeyName() {
         return keySchema.stream()
                 .filter(k -> "HASH".equals(k.getKeyType()))
@@ -183,12 +249,30 @@ public class TableDefinition {
     }
 
     /** Returns the sort key attribute name, or null if none. */
+    @JsonIgnore
     public String getSortKeyName() {
         return keySchema.stream()
                 .filter(k -> "RANGE".equals(k.getKeyType()))
                 .map(KeySchemaElement::getAttributeName)
                 .findFirst()
                 .orElse(null);
+    }
+
+    /**
+     * Returns all sort key attribute names in key-schema order. For a composite sort key this
+     * contains more than one element; ordering must consider all of them, not just the first.
+     *
+     * <p>{@code @JsonIgnore}d: it is derived from {@code keySchema} (redundant with
+     * {@link #getSortKeyName()}), and without a backing setter Jackson's getter-as-setter
+     * fallback tries to append into the immutable list this method returns, throwing
+     * {@code UnsupportedOperationException} on deserialization whenever the table has a sort key.
+     */
+    @JsonIgnore
+    public List<String> getSortKeyNames() {
+        return keySchema.stream()
+                .filter(k -> "RANGE".equals(k.getKeyType()))
+                .map(KeySchemaElement::getAttributeName)
+                .toList();
     }
 
     public Optional<GlobalSecondaryIndex> findGsi(String indexName) {
@@ -206,6 +290,16 @@ public class TableDefinition {
         }
         return localSecondaryIndexes.stream()
                 .filter(l -> indexName.equals(l.getIndexName()))
+                .findFirst();
+    }
+
+    @JsonIgnore
+    public Optional<VectorIndex> findVectorIndex(String indexName) {
+        if (vectorIndexes == null || vectorIndexes.isEmpty() || indexName == null) {
+            return Optional.empty();
+        }
+        return vectorIndexes.stream()
+                .filter(v -> indexName.equals(v.getIndexName()))
                 .findFirst();
     }
 }

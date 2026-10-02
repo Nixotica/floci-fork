@@ -12,6 +12,8 @@
 | `ListTopics` | List all topics |
 | `GetTopicAttributes` | Get topic configuration |
 | `SetTopicAttributes` | Update topic configuration |
+| `GetSMSAttributes` | Read account SMS preferences in this region |
+| `SetSMSAttributes` | Set account SMS preferences in this region |
 | `Subscribe` | Subscribe an endpoint (SQS, HTTP, Lambda, email) |
 | `Unsubscribe` | Remove a subscription |
 | `ListSubscriptions` | List all subscriptions |
@@ -34,6 +36,12 @@
 | `GetEndpointAttributes` | Read endpoint attributes |
 | `SetEndpointAttributes` | Update endpoint attributes (e.g. `Enabled=false` to simulate token expiry) |
 | `ListEndpointsByPlatformApplication` | List endpoints under a platform app |
+
+SMS preferences are stored per account and region. `GetSMSAttributes` can select individual
+names; omitting the list returns all configured preferences. In Floci, setting an empty value
+clears that preference. SMS delivery
+remains mocked, so these settings do not generate delivery
+reports or CloudWatch delivery logs.
 
 ## Configuration
 
@@ -80,12 +88,122 @@ aws sqs receive-message \
 
 ## SNS → SQS Fan-Out
 
-Floci supports real SNS → SQS fan-out. When you publish to a topic, all SQS-subscribed queues receive the message immediately.
+Floci supports real SNS → SQS fan-out. When you publish to a topic, every SQS-subscribed queue receives the message.
 
 Supported subscription protocols:
-- `sqs` — delivers to a Floci SQS queue
-- `lambda` — invokes a Floci Lambda function
-- `http` / `https` — posts to an HTTP endpoint
+- `sqs`: delivers to a Floci SQS queue
+- `lambda`: invokes a Floci Lambda function
+- `firehose`: puts records to a Floci Firehose delivery stream; `Subscribe` requires a valid IAM
+  `SubscriptionRoleArn` attribute, which is returned by `GetSubscriptionAttributes`
+- `http` / `https`: posts to an HTTP endpoint
+- `application`: fans out to a mobile push platform endpoint (see [Mobile push](#mobile-push-mock))
+
+For `FilterPolicyScope=MessageBody`, nested policy objects descend into JSON objects and arrays.
+An object inside an array matches when one array element satisfies the complete nested policy.
+
+For SQS subscriptions, Floci retries a failed delivery up to three times total, with two immediate
+retries. If all attempts fail and the subscription has a `RedrivePolicy` containing a valid
+`deadLetterTargetArn` for an SQS queue, Floci sends the original notification to that queue. SNS
+`Publish` still returns its message ID after downstream delivery fails. This is a bounded local
+policy; it does not reproduce AWS delivery retry timing or scale.
+
+## HTTP and HTTPS endpoint addresses
+
+Floci posts the `SubscriptionConfirmation` and every notification to a subscribed `http`/`https`
+endpoint itself, so it screens where that request may go.
+
+`Subscribe` resolves the endpoint's host and refuses it with `InvalidParameter` when it resolves to
+a link-local or cloud instance-metadata address (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`).
+This is the check that judges a hostname. Loopback and private addresses stay allowed, since
+delivering to a neighbouring container is the normal case here. An endpoint whose host does not
+resolve yet is accepted, as it is on AWS.
+
+Delivery screens only an endpoint that names an address outright, an IPv4 or bracketed IPv6
+literal, which covers a subscription stored before `Subscribe` began refusing them. **It does not
+resolve a hostname again**, so a hostname that passed `Subscribe` and later resolves to a metadata
+address is not screened at delivery: Floci's HTTP client resolves the name itself when it connects
+and cannot be given the result of an earlier check, so a lookup there could not decide where the
+request goes. Treat the `Subscribe` check as the boundary, not the delivery one.
+
+## Message size
+
+`MaximumMessageSize` is the per-topic limit, in bytes, on a published payload. It accepts `1024`
+to `1048576` (1 MiB) and defaults to `262144` (256 KiB). AWS raised the maximum in September 2026
+but left the default alone, so a topic that never sets the attribute behaves exactly as it did
+before. `GetTopicAttributes` omits the attribute until it is set rather than reporting the
+default.
+
+```bash
+aws sns set-topic-attributes --topic-arn $TOPIC_ARN \
+  --attribute-name MaximumMessageSize --attribute-value 1048576 \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+The limit counts the message body plus, per message attribute, its name, data type and value.
+`Subject` is not counted. `PublishBatch` counts the sum of all its entries against the same
+limit and fails the whole call rather than individual entries.
+
+A topic above `262144` is restricted: at most 100 subscriptions, every one of them `sqs`,
+`firehose` or `lambda`. Floci enforces the protocol rule on `Subscribe` and `SetTopicAttributes`
+alike, and the subscription count on `SetTopicAttributes` only — matching AWS, which lets an
+already-raised topic drift past 100 and catches it the next time the attribute is set. Pending
+confirmations count towards both.
+
+| Action | Condition | Error code | HTTP |
+|---|---|---|---|
+| `CreateTopic`, `SetTopicAttributes` | `MaximumMessageSize` not an integer between 1024 and 1048576 | `InvalidParameter` | 400 |
+| `SetTopicAttributes` | Raised above 262144 with a subscription that is not `sqs`, `firehose` or `lambda` | `InvalidParameter` | 400 |
+| `SetTopicAttributes` | Raised above 262144 with more than 100 subscriptions | `InvalidParameter` | 400 |
+| `Subscribe` | Unsupported protocol on a topic above 262144 | `InvalidParameter` | 400 |
+| `Publish` | Payload exceeds the topic's `MaximumMessageSize` | `InvalidParameter` | 400 |
+| `PublishBatch` | Entries sum to more than the topic's `MaximumMessageSize` | `BatchRequestTooLong` | 400 |
+
+CloudFormation carries the setting through: `AWS::SNS::Topic` forwards `MaximumMessageSize`, and
+an update that drops the property returns the topic to the default.
+
+A raised topic fanning out to SQS needs headroom. The notification envelope wraps the body in a
+few hundred bytes of JSON, so a publish at 1 MiB no longer fits a queue at the SQS maximum and is
+dropped on delivery — silently, as any delivery failure is. Keep the topic below the queue's own
+`MaximumMessageSize`, or subscribe with `RawMessageDelivery=true` so the body is forwarded
+unwrapped.
+
+## FIFO topics
+
+A topic whose name ends in `.fifo` is a FIFO topic. `Publish` and `PublishBatch` require a
+`MessageGroupId`, and a message is deduplicated against its `MessageDeduplicationId` for five
+minutes. Set `ContentBasedDeduplication` on the topic to derive that id from the message body.
+
+The `FifoThroughputScope` attribute decides how wide that deduplication reaches:
+
+| Value | Deduplication scope |
+|---|---|
+| `Topic` (default) | Across the whole topic: the same `MessageDeduplicationId` is a duplicate no matter which message group it arrives under |
+| `MessageGroup` | Within a single message group: the same `MessageDeduplicationId` under two different `MessageGroupId`s is two distinct messages |
+
+`MessageGroup` is what a fan-out that reuses one deduplication id per group needs, for example
+publishing the same event to a topic once per tenant with the tenant as the message group.
+
+```bash
+aws sns create-topic --name events.fifo \
+  --attributes FifoTopic=true,FifoThroughputScope=MessageGroup \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+When the topic forwards to an SQS FIFO queue, set the matching queue attributes
+(`DeduplicationScope=messageGroup` and `FifoThroughputLimit=perMessageGroupId`), otherwise the
+queue deduplicates topic-wide on the way in.
+
+CloudFormation carries both settings through: `AWS::SNS::Topic` forwards `FifoThroughputScope` and
+`ContentBasedDeduplication`, and a FIFO topic left unnamed gets a generated name ending in `.fifo`.
+
+## Control Tower managed topic
+
+AWS Control Tower creates the regional
+`aws-controltower-AggregateSecurityNotifications` topic before Landing Zone
+Accelerator deploys its audit notification forwarder. Floci lazily materializes that
+exact same-account managed topic when `Subscribe` first references it, matching the
+Control Tower prerequisite without weakening normal SNS validation. Subscribing to
+any other missing topic still returns `NotFound`.
 
 ## Mobile push (mock)
 
@@ -121,6 +239,42 @@ aws sns publish --target-arn $ENDPOINT_ARN --message-structure json \
 When `MessageStructure="json"`, Floci picks the key matching the endpoint's platform
 (`APNS`, `APNS_SANDBOX`, `GCM`, or `FCM`), falling back to `default`. The envelope
 must be a JSON object and must include `default` — otherwise `InvalidParameter`.
+
+### Broadcast to devices via a topic
+
+Subscribe platform endpoints to a topic with `Protocol="application"`, then publish to
+the topic to fan out to every subscribed device — each endpoint is captured exactly as
+if you had published to it directly (same platform-payload resolution, same `Enabled`
+gating). A disabled endpoint in the fan-out is skipped; the rest still receive the push.
+
+```bash
+aws sns subscribe --topic-arn $TOPIC_ARN \
+  --protocol application --notification-endpoint $ENDPOINT_ARN \
+  --endpoint-url http://localhost:4566
+
+aws sns publish --topic-arn $TOPIC_ARN --message-structure json \
+  --message '{"default":"market open","GCM":"{\"notification\":{\"body\":\"market alert\"}}"}' \
+  --endpoint-url http://localhost:4566
+```
+
+Broadcast pushes surface in the same retrospection API, keyed by `EndpointArn`.
+
+### Per-protocol payloads on topic publish
+
+`MessageStructure="json"` resolves per subscriber, not just for mobile endpoints. Each
+subscription receives the value under its own protocol key — `sqs`, `lambda`, `http`,
+`https`, `email`, `email-json`, `sms`, or the push platform (`APNS`, `GCM`, …) for
+`application` — falling back to `default` when that key is absent.
+
+```bash
+aws sns publish --topic-arn $TOPIC_ARN --message-structure json \
+  --message '{"default":"hello","sqs":"hi sqs","GCM":"{\"notification\":{\"body\":\"hi device\"}}"}' \
+  --endpoint-url http://localhost:4566
+```
+
+The SQS subscriber receives `hi sqs`, the platform endpoint receives the `GCM` payload,
+and every other subscriber receives `hello`. As with any topic publish, the envelope must
+be a JSON object carrying `default`, validated before fan-out begins.
 
 ### Inspecting captured pushes
 

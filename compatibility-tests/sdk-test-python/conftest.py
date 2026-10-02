@@ -110,9 +110,27 @@ def kinesis_client(aws_config, client_config):
 
 
 @pytest.fixture
+def firehose_client(aws_config, client_config):
+    """Create Firehose client."""
+    return boto3.client("firehose", config=client_config, **aws_config)
+
+
+@pytest.fixture
 def cloudwatch_client(aws_config, client_config):
     """Create CloudWatch client."""
     return boto3.client("cloudwatch", config=client_config, **aws_config)
+
+
+@pytest.fixture
+def glue_client(aws_config, client_config):
+    """Create Glue client."""
+    return boto3.client("glue", config=client_config, **aws_config)
+
+
+@pytest.fixture
+def resourcegroupstaggingapi_client(aws_config, client_config):
+    """Create Resource Groups Tagging API client."""
+    return boto3.client("resourcegroupstaggingapi", config=client_config, **aws_config)
 
 
 @pytest.fixture
@@ -131,6 +149,12 @@ def cognito_client(aws_config, client_config):
 def cloudformation_client(aws_config, client_config):
     """Create CloudFormation client."""
     return boto3.client("cloudformation", config=client_config, **aws_config)
+
+
+@pytest.fixture
+def config_client(aws_config, client_config):
+    """Create AWS Config client."""
+    return boto3.client("config", config=client_config, **aws_config)
 
 
 @pytest.fixture
@@ -167,6 +191,24 @@ def ses_client(aws_config, client_config):
 def sesv2_client(aws_config, client_config):
     """Create SES v2 client."""
     return boto3.client("sesv2", config=client_config, **aws_config)
+
+
+@pytest.fixture
+def iot_client(aws_config, client_config):
+    """Create AWS IoT client."""
+    return boto3.client("iot", config=client_config, **aws_config)
+
+
+@pytest.fixture
+def iot_data_client(aws_config, client_config):
+    """Create AWS IoT Data client."""
+    return boto3.client("iot-data", config=client_config, **aws_config)
+
+
+@pytest.fixture
+def iot_jobs_data_client(aws_config, client_config):
+    """Create AWS IoT Jobs Data client."""
+    return boto3.client("iot-jobs-data", config=client_config, **aws_config)
 
 
 # ============================================

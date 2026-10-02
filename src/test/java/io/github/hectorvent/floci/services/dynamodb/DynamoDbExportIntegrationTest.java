@@ -10,7 +10,6 @@ import java.io.ByteArrayInputStream;
 import java.io.InputStreamReader;
 import java.io.BufferedReader;
 import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.zip.GZIPInputStream;
 
 import static io.restassured.RestAssured.given;
@@ -70,7 +69,7 @@ class DynamoDbExportIntegrationTest {
     }
 
     @Test
-    void exportTableToPointInTime_returnsInProgressOrCompleted() {
+    void exportTableToPointInTime_returnsInProgress() {
         String exportArn = given()
             .header("X-Amz-Target", "DynamoDB_20120810.ExportTableToPointInTime")
             .contentType(DYNAMODB_CONTENT_TYPE)
@@ -86,7 +85,7 @@ class DynamoDbExportIntegrationTest {
             .then()
             .statusCode(200)
             .body("ExportDescription.ExportArn", notNullValue())
-            .body("ExportDescription.ExportStatus", oneOf("IN_PROGRESS", "COMPLETED"))
+            .body("ExportDescription.ExportStatus", equalTo("IN_PROGRESS"))
             .body("ExportDescription.TableArn", equalTo(TABLE_ARN))
             .body("ExportDescription.S3Bucket", equalTo(BUCKET_NAME))
             .body("ExportDescription.ExportFormat", equalTo("DYNAMODB_JSON"))

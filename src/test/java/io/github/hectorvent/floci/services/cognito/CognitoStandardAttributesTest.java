@@ -2,7 +2,6 @@ package io.github.hectorvent.floci.services.cognito;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -23,6 +22,15 @@ class CognitoStandardAttributesTest {
         assertEquals(20, CognitoStandardAttributes.DEFAULTS.size());
         Set<String> names = names(CognitoStandardAttributes.DEFAULTS);
         assertEquals(EXPECTED_NAMES, names);
+    }
+
+    @Test
+    void isStandardRecognisesEveryDefaultAndNothingElse() {
+        EXPECTED_NAMES.forEach(name ->
+                assertTrue(CognitoStandardAttributes.isStandard(name), name + " is a standard attribute"));
+        assertFalse(CognitoStandardAttributes.isStandard("EmployeeId"));
+        assertFalse(CognitoStandardAttributes.isStandard("custom:email"));
+        assertFalse(CognitoStandardAttributes.isStandard(null));
     }
 
     @Test

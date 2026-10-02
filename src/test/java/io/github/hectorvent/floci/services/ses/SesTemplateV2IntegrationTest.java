@@ -11,9 +11,12 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.stream.Stream;
 
+import static io.github.hectorvent.floci.services.ses.SesV2TimestampMatchers.DECIMAL_NUMBERS;
+import static io.github.hectorvent.floci.services.ses.SesV2TimestampMatchers.epochSecondsWithMillis;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.everyItem;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.notNullValue;
 
@@ -165,6 +168,7 @@ class SesTemplateV2IntegrationTest {
     @Order(8)
     void listTemplates_includesCreated() {
         given()
+            .config(DECIMAL_NUMBERS)
             .contentType("application/json")
             .header("Authorization", AUTH_HEADER)
         .when()
@@ -172,7 +176,8 @@ class SesTemplateV2IntegrationTest {
         .then()
             .statusCode(200)
             .body("TemplatesMetadata", notNullValue())
-            .body("TemplatesMetadata.TemplateName", hasItem("v2-welcome"));
+            .body("TemplatesMetadata.TemplateName", hasItem("v2-welcome"))
+            .body("TemplatesMetadata.CreatedTimestamp", everyItem(epochSecondsWithMillis()));
     }
 
     @Test
@@ -631,6 +636,37 @@ class SesTemplateV2IntegrationTest {
             .body("TemplateContent.Subject", equalTo("S2"))
             .body("Tags.find { it.Key == 'env' }.Value", equalTo("stg"))
             .body("Tags.find { it.Key == 'team' }.Value", equalTo("platform"));
+    }
+
+    @Test
+    @Order(24)
+    void createTemplate_invalidTags_returns400_andNotPersisted() {
+        // Route-level coverage: CreateEmailTemplate must reject an invalid tag set (here duplicate
+        // keys) atomically, before the template is persisted.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                  "TemplateName": "v2-badtags",
+                  "TemplateContent": {"Subject": "S", "Text": "T"},
+                  "Tags": [{"Key": "dup", "Value": "1"}, {"Key": "dup", "Value": "2"}]
+                }
+                """)
+        .when()
+            .post("/v2/email/templates")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("BadRequestException"))
+            .body("message", equalTo("Cannot provide multiple tags with the same key"));
+
+        // The failed create must leave no template behind.
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/templates/v2-badtags")
+        .then()
+            .statusCode(404);
     }
 
     @ParameterizedTest(name = "{0}")

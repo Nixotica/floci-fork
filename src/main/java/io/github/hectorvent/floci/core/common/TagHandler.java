@@ -76,6 +76,19 @@ public interface TagHandler {
         return false;
     }
 
+    /** AWS error code used when strict tag payload validation fails. */
+    default String tagValidationErrorCode() {
+        return "ValidationException";
+    }
+
+    /**
+     * Whether an {@code UntagResource} request may omit the tag-key query parameter.
+     * Defaults to {@code false} so strict handlers retain their existing validation.
+     */
+    default boolean allowEmptyTagKeys() {
+        return false;
+    }
+
     /**
      * Query parameter name for {@code UntagResource}. Defaults to lowercase
      * {@code "tagKeys"}, which matches the great majority of AWS services — including
@@ -96,6 +109,34 @@ public interface TagHandler {
      */
     default boolean tagResourceUsesPut() {
         return false;
+    }
+
+    /**
+     * JSON member name for a tag entry's key when {@link #tagsBodyIsList()} is {@code true}.
+     * Defaults to {@code "Key"}, matching the great majority of list-shaped AWS services.
+     * Override to {@code "key"} for services that lowercase entry members (CodeArtifact).
+     */
+    default String tagEntryKeyName() {
+        return "Key";
+    }
+
+    /**
+     * JSON member name for a tag entry's value when {@link #tagsBodyIsList()} is {@code true}.
+     * Defaults to {@code "Value"}, matching the great majority of list-shaped AWS services.
+     * Override to {@code "value"} for services that lowercase entry members (CodeArtifact).
+     */
+    default String tagEntryValueName() {
+        return "Value";
+    }
+
+    /** HTTP status for successful path-based TagResource requests. */
+    default int tagResourceSuccessStatus() {
+        return 204;
+    }
+
+    /** HTTP status for successful path-based UntagResource requests. */
+    default int untagResourceSuccessStatus() {
+        return 204;
     }
 
     Map<String, String> listTags(String region, String arn);

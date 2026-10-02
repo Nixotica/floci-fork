@@ -273,6 +273,25 @@ class LambdaPermissionTagLayerIntegrationTest {
             .body("Tags.team", equalTo("platform"));
     }
 
+    @Test
+    @Order(16)
+    void tagResource_keyOutsideTheAwsPattern_returns400() {
+        given()
+            .contentType("application/json")
+            .body("""
+                {"Tags": {"a,b": "x"}}
+                """)
+        .when()
+            .post("/2017-03-31/tags/" + FN_ARN)
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("1 validation error detected: Value '{a,b=x}' at 'tags' failed to satisfy"
+                    + " constraint: Map keys must satisfy constraint: [Member must have length less than or"
+                    + " equal to 128, Member must have length greater than or equal to 1, Member must satisfy"
+                    + " regular expression pattern: ([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)]"));
+    }
+
     // ── ListLayers / ListLayerVersions ────────────────────────────────────────
 
     @Test
@@ -295,6 +314,26 @@ class LambdaPermissionTagLayerIntegrationTest {
         .then()
             .statusCode(200)
             .body("LayerVersions", empty());
+    }
+
+    // ── GetFunction tags ──────────────────────────────────────────────────────
+
+    /**
+     * The Terraform provider and the SDKs read a function's tags from GetFunction rather than by
+     * calling ListTags, so omitting the field made a tagged function read back untagged and diff
+     * on every plan. Runs after the untag above, so it also pins that GetFunction reflects a
+     * removed tag rather than serving a stale set.
+     */
+    @Test
+    @Order(19)
+    void getFunction_includesTags() {
+        given()
+        .when()
+            .get("/2015-03-31/functions/" + FN)
+        .then()
+            .statusCode(200)
+            .body("Tags.team", equalTo("platform"))
+            .body("Tags.env", nullValue());
     }
 
     // ── cleanup ───────────────────────────────────────────────────────────────

@@ -28,15 +28,25 @@ public class MetricAlarm {
     private String namespace;
     private String statistic;
     private List<Dimension> dimensions = new ArrayList<>();
-    private int period;
+    /** Single-metric period; absent for alarms whose periods are defined in Metrics. */
+    private Integer period;
+    private List<AlarmMetricDataQuery> metrics = new ArrayList<>();
     private String unit;
     private int evaluationPeriods;
-    private int datapointsToAlarm;
+    /**
+     * The M of an "M out of N" alarm, exactly as the caller set it, or null when the caller set
+     * nothing. It stays nullable so a response can tell the two apart: AWS omits the member from
+     * DescribeAlarms for an alarm that never carried one, and echoing a number nobody asked for
+     * reads as drift to any client that re-plans. {@link AlarmEvaluator} supplies EvaluationPeriods
+     * for the evaluation maths instead of storing it here.
+     */
+    private Integer datapointsToAlarm;
     private double threshold;
     private String comparisonOperator;
     private String treatMissingData = "missing";
     private String evaluateLowSampleCountPercentile;
     private Map<String, String> tags = new HashMap<>();
+    private String region;
 
     public MetricAlarm() {
         long now = Instant.now().getEpochSecond();
@@ -92,8 +102,13 @@ public class MetricAlarm {
     public List<Dimension> getDimensions() { return dimensions; }
     public void setDimensions(List<Dimension> dimensions) { this.dimensions = dimensions; }
 
-    public int getPeriod() { return period; }
-    public void setPeriod(int period) { this.period = period; }
+    public Integer getPeriod() { return period; }
+    public void setPeriod(Integer period) { this.period = period; }
+
+    public List<AlarmMetricDataQuery> getMetrics() { return metrics; }
+    public void setMetrics(List<AlarmMetricDataQuery> metrics) {
+        this.metrics = metrics == null ? new ArrayList<>() : new ArrayList<>(metrics);
+    }
 
     public String getUnit() { return unit; }
     public void setUnit(String unit) { this.unit = unit; }
@@ -101,8 +116,8 @@ public class MetricAlarm {
     public int getEvaluationPeriods() { return evaluationPeriods; }
     public void setEvaluationPeriods(int evaluationPeriods) { this.evaluationPeriods = evaluationPeriods; }
 
-    public int getDatapointsToAlarm() { return datapointsToAlarm; }
-    public void setDatapointsToAlarm(int datapointsToAlarm) { this.datapointsToAlarm = datapointsToAlarm; }
+    public Integer getDatapointsToAlarm() { return datapointsToAlarm; }
+    public void setDatapointsToAlarm(Integer datapointsToAlarm) { this.datapointsToAlarm = datapointsToAlarm; }
 
     public double getThreshold() { return threshold; }
     public void setThreshold(double threshold) { this.threshold = threshold; }
@@ -118,4 +133,9 @@ public class MetricAlarm {
 
     public Map<String, String> getTags() { return tags; }
     public void setTags(Map<String, String> tags) { this.tags = tags; }
+
+    /** Not part of the AWS shape; set by {@code putMetricAlarm} so a background evaluator
+     * that only holds the alarm object still knows which region's metric data to query. */
+    public String getRegion() { return region; }
+    public void setRegion(String region) { this.region = region; }
 }

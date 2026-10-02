@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
@@ -47,6 +49,15 @@ public class CloudWatchMetricsService {
     }
 
     public void putMetricData(String namespace, List<MetricDatum> datums, String region) {
+        putMetricDataForAccount(null, namespace, datums, region);
+    }
+
+    /**
+     * Stores the datums in {@code accountId}'s partition rather than the caller's, for writers that
+     * run outside a request, such as a metric filter publishing for a log batch a container
+     * streamed on another account's behalf. A null account is the caller's own.
+     */
+    public void putMetricDataForAccount(String accountId, String namespace, List<MetricDatum> datums, String region) {
         long nowSeconds = Instant.now().getEpochSecond();
         for (MetricDatum datum : datums) {
             datum.setNamespace(namespace);
@@ -61,13 +72,48 @@ public class CloudWatchMetricsService {
                 datum.setMaximum(datum.getValue());
             }
 
-            String dimKey = buildDimKey(datum.getDimensions());
-            String key = region + "::" + namespace + "::" + datum.getMetricName()
-                    + "::" + dimKey + "::"
-                    + String.format("%013d", datum.getTimestamp()) + "::" + UUID.randomUUID();
-            metricStore.put(key, datum);
+            storeDatum(accountId, namespace, datum, region, UUID.randomUUID().toString());
         }
         LOG.debugv("PutMetricData: {0} datums for namespace {1}", datums.size(), namespace);
+    }
+
+    /**
+     * Internal scalar publication, not an AWS PutMetricData operation. The publisher supplies a
+     * canonical account, an explicit event timestamp (including epoch zero), and a stable ID for
+     * this one contribution. Retrying a partially/ambiguously committed write replaces the same
+     * key instead of appending another sample. Distinct contributions must have distinct IDs.
+     * The caller's snapshot is never mutated or retained by the store.
+     */
+    public void publishMetricForAccount(String accountId, String namespace, MetricDatum datum,
+                                        String region, String publicationId) {
+        if (accountId == null || accountId.isBlank() || publicationId == null || publicationId.isBlank()) {
+            throw new IllegalArgumentException("Internal publication requires an explicit account and publication ID");
+        }
+        MetricDatum sample = new MetricDatum();
+        sample.setNamespace(namespace);
+        sample.setMetricName(datum.getMetricName());
+        sample.setUnit(datum.getUnit());
+        sample.setDimensions(List.copyOf(datum.getDimensions()));
+        sample.setTimestamp(datum.getTimestamp());
+        sample.setValue(datum.getValue());
+        sample.setSampleCount(1);
+        sample.setSum(datum.getValue());
+        sample.setMinimum(datum.getValue());
+        sample.setMaximum(datum.getValue());
+        storeDatum(accountId, namespace, sample, region, "publication-" + publicationId);
+    }
+
+    private void storeDatum(String accountId, String namespace, MetricDatum datum, String region, String id) {
+        String key = region + "::" + namespace + "::" + datum.getMetricName()
+                + "::" + buildDimKey(datum.getDimensions()) + "::"
+                + String.format("%013d", datum.getTimestamp()) + "::" + id;
+        if (accountId != null && metricStore instanceof AccountAwareStorageBackend<?> rawAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<MetricDatum> aware = (AccountAwareStorageBackend<MetricDatum>) rawAware;
+            aware.putForAccount(accountId, key, datum);
+        } else {
+            metricStore.put(key, datum);
+        }
     }
 
     public record MetricIdentity(String namespace, String metricName, List<Dimension> dimensions) {}
@@ -220,7 +266,9 @@ public class CloudWatchMetricsService {
         return results;
     }
 
-    private double resolveStatValue(Datapoint dp, String stat) {
+    /** Shared with {@link AlarmEvaluator}, which resolves the same statistic against
+     * freshly-fetched datapoints when evaluating an alarm's threshold. */
+    public static double resolveStatValue(Datapoint dp, String stat) {
         return switch (stat) {
             case "Average" -> dp.average();
             case "Sum" -> dp.sum();
@@ -238,9 +286,16 @@ public class CloudWatchMetricsService {
         if (alarm.getAlarmArn() == null) {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + alarm.getAlarmName()));
         }
+        alarm.setRegion(region);
         alarm.setAlarmConfigurationUpdatedTimestamp(Instant.now().getEpochSecond());
         alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
         LOG.infov("PutMetricAlarm: {0} in {1}", alarm.getAlarmName(), region);
+    }
+
+    /** Every stored alarm, across all regions. Used by the background {@link AlarmEvaluator}
+     * tick, which has no per-request region to scope a lookup to. */
+    public List<MetricAlarm> allAlarms() {
+        return alarmStore.scan(k -> true);
     }
 
     public List<MetricAlarm> describeAlarms(List<String> alarmNames, String alarmNamePrefix, String region) {
@@ -266,7 +321,7 @@ public class CloudWatchMetricsService {
     public void setAlarmState(String alarmName, String stateValue, String stateReason, String stateReasonData, String region) {
         String key = region + "::" + alarmName;
         MetricAlarm alarm = alarmStore.get(key)
-                .orElseThrow(() -> new RuntimeException("Alarm not found: " + alarmName));
+                .orElseThrow(() -> new AwsException("ResourceNotFound", "Alarm not found: " + alarmName, 404));
 
         alarm.setStateValue(stateValue);
         alarm.setStateReason(stateReason);
@@ -277,35 +332,43 @@ public class CloudWatchMetricsService {
         LOG.infov("SetAlarmState: {0} -> {1}", alarmName, stateValue);
     }
 
-    public Map<String, String> listTagsForResource(String resourceArn, String region) {
+    /**
+     * Resolves the alarm an ARN names, or reports that nothing does.
+     *
+     * <p>CloudWatch's three tag operations each declare {@code ResourceNotFoundException},
+     * which is a different shape from the {@code ResourceNotFound} that {@code SetAlarmState}
+     * and {@code GetDashboard} declare; the SDK maps the two codes to two exception classes,
+     * so the tag path uses the longer one rather than the code used elsewhere in this service.
+     *
+     * <p>The message names the ARN rather than asserting it was an alarm, because both tag
+     * handlers route every ARN that is not a dashboard and not a metric stream here. That
+     * includes kinds AWS considers taggable and Floci does not serve, a Contributor Insights
+     * {@code insight-rule/} ARN being the one AWS documents; reporting that no resource
+     * matches the ARN is true of those, where "alarm not found" would not be.
+     */
+    private MetricAlarm requireAlarm(String resourceArn, String region) {
         return alarmStore.scan(k -> k.startsWith(region + "::"))
                 .stream()
-                .filter(a -> resourceArn.equals(a.getAlarmArn()))
+                .filter(a -> a.getAlarmArn() != null && a.getAlarmArn().equals(resourceArn))
                 .findFirst()
-                .map(MetricAlarm::getTags)
-                .orElse(Map.of());
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "No CloudWatch resource matches the ARN " + resourceArn + ".", 404));
+    }
+
+    public Map<String, String> listTagsForResource(String resourceArn, String region) {
+        return requireAlarm(resourceArn, region).getTags();
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags, String region) {
-        alarmStore.scan(k -> k.startsWith(region + "::"))
-                .stream()
-                .filter(a -> resourceArn.equals(a.getAlarmArn()))
-                .findFirst()
-                .ifPresent(alarm -> {
-                    alarm.getTags().putAll(tags);
-                    alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
-                });
+        MetricAlarm alarm = requireAlarm(resourceArn, region);
+        alarm.getTags().putAll(tags);
+        alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
     }
 
     public void untagResource(String resourceArn, List<String> tagKeys, String region) {
-        alarmStore.scan(k -> k.startsWith(region + "::"))
-                .stream()
-                .filter(a -> resourceArn.equals(a.getAlarmArn()))
-                .findFirst()
-                .ifPresent(alarm -> {
-                    tagKeys.forEach(alarm.getTags()::remove);
-                    alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
-                });
+        MetricAlarm alarm = requireAlarm(resourceArn, region);
+        tagKeys.forEach(alarm.getTags()::remove);
+        alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
     }
 
     // ──────────────────────────── Helpers ────────────────────────────

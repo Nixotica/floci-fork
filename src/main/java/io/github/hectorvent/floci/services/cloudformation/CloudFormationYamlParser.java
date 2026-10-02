@@ -26,7 +26,7 @@ public class CloudFormationYamlParser {
 
     private final ObjectMapper objectMapper;
 
-    CloudFormationYamlParser(ObjectMapper objectMapper) {
+    public CloudFormationYamlParser(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
     }
 
@@ -56,6 +56,8 @@ public class CloudFormationYamlParser {
             register("!Base64",     n -> fnMap("Fn::Base64", n));
             register("!FindInMap",  n -> fnMap("Fn::FindInMap", n));
             register("!Split",      n -> fnMap("Fn::Split", n));
+            register("!Cidr",       n -> fnMap("Fn::Cidr", n));
+            register("!GetAZs",     n -> fnMap("Fn::GetAZs", n));
             register("!ImportValue",n -> fnMap("Fn::ImportValue", n));
             register("!Condition",  n -> scalarMap("Condition", scalar(n)));
             register("!And",        n -> fnMap("Fn::And", n));

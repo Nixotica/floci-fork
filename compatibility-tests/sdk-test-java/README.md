@@ -51,11 +51,41 @@ just test-java
 
 ## Configuration
 
-| Variable         | Default                 | Description             |
-| ---------------- | ----------------------- | ----------------------- |
-| `FLOCI_ENDPOINT` | `http://localhost:4566` | Floci emulator endpoint |
+| Variable         | Default                 | Description                                        |
+| ---------------- | ----------------------- | -------------------------------------------------- |
+| `FLOCI_ENDPOINT` | `http://localhost:4566` | Floci emulator endpoint                            |
+| `AWS_REGION`     | `us-east-1`             | Region the `TestFixtures` clients sign for         |
 
-AWS credentials are always `test` / `test` / `us-east-1`.
+AWS credentials are always `test` / `test`. Setting `AWS_REGION=cn-north-1` (with Floci started
+with `FLOCI_DEFAULT_REGION=cn-north-1`) runs the suite in the China partition; the nightly
+Partition Compatibility workflow does exactly that, and tolerates only the failures listed in
+`.github/ci/compat-partition-allowlist-cn-north-1.txt`. Tests that build their own client with an
+explicit region keep that region.
+
+## Metric filter publishing checks
+
+`CloudWatchLogsMetricFilterTest` and `CloudFormationLogsMetricFilterTest` run
+with the rest of the suite. Against a server on another port:
+
+```bash
+# From compatibility-tests/sdk-test-java
+FLOCI_ENDPOINT=http://127.0.0.1:18084 ../../mvnw test \
+  -Dtest=CloudWatchLogsMetricFilterTest,CloudFormationLogsMetricFilterTest
+```
+
+The publishing tests read their expected values from
+`src/test/resources/cloudwatchlogs/metric-filter-publishing-aws.json`, a
+byte-identical copy of the root fixture recorded from AWS. `MetricFilterFixturePackagingTest`
+checks the copy loads from the classpath, and the root
+`CloudWatchLogsMetricFilterFixturePackagingTest` fails when either SDK module
+copy drifts from the root file. The SDK selects the CloudWatch JSON protocol;
+`MetricFilterQueryAssertions` signs the same reads as legacy form-encoded Query
+requests, so `GetMetricStatistics` and `GetMetricData` on both wire formats are
+asserted against every statistic the fixture records (Sum, SampleCount, Minimum,
+Maximum). Reads poll for the sample, since the server publishes it shortly after
+`PutLogEvents` returns. Passing
+these tests shows Floci matches the recorded values; it is not live AWS
+verification. For the opt-in replay against AWS see `../sdk-test-python/README.md`.
 
 ## Docker
 

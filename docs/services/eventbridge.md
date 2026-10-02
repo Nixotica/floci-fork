@@ -5,8 +5,9 @@
 
 ## Supported Actions
 
+<!-- floci:actions:start -->
 | Action | Description |
-|---|---|
+| --- | --- |
 | `CreateEventBus` | Create a custom event bus |
 | `DeleteEventBus` | Delete an event bus |
 | `DescribeEventBus` | Get event bus details |
@@ -23,6 +24,26 @@
 | `ListTargetsByRule` | List targets for a rule |
 | `PutEvents` | Publish custom events to an event bus |
 | `TestEventPattern` | Test whether a sample event matches a given pattern (no targets fired) |
+| `ListTagsForResource` | - |
+| `TagResource` | - |
+| `UntagResource` | - |
+| `PutPermission` | - |
+| `RemovePermission` | - |
+| `CreateArchive` | - |
+| `DescribeArchive` | - |
+| `UpdateArchive` | - |
+| `DeleteArchive` | - |
+| `ListArchives` | - |
+| `CreateConnection` | Create a connection for API destinations (credential values are stored but never returned) |
+| `DescribeConnection` | Get connection details with credential values stripped |
+| `UpdateConnection` | Update connection description, auth type, or auth parameters |
+| `DeleteConnection` | Delete a connection |
+| `ListConnections` | List connections, optionally filtered by name prefix or state |
+| `StartReplay` | - |
+| `DescribeReplay` | - |
+| `CancelReplay` | - |
+| `ListReplays` | - |
+<!-- floci:actions:end -->
 
 ## Configuration
 
@@ -82,3 +103,59 @@ aws events put-events \
   --entries '[{"Source":"myapp","DetailType":"test","Detail":"{}"}]' \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+## Event Bus Targets
+
+A rule can target another event bus by ARN: the event is republished there, and that bus's own rules evaluate it and fan out normally. `Source`, `DetailType`, `Resources` and the originating `account`/`region` carry over, and each hop gets a new event id.
+
+```bash
+aws events put-targets \
+  --rule order-placed-rule \
+  --event-bus-name my-bus \
+  --targets '[{
+    "Id": "forward-to-domain-bus",
+    "Arn": "arn:aws:events:us-east-1:000000000000:event-bus/domain-bus"
+  }]' \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+## Step Functions Targets
+
+A matching rule can start an unqualified Step Functions state machine ARN. The target supports the
+full event as the default input, plus `Input`, `InputPath`, and `InputTransformer`. Floci resolves
+the state machine from the account and region in its ARN.
+
+State machine aliases and versions are not supported as EventBridge targets.
+
+## Target Retry and Dead-Letter Queues
+
+A target's `RetryPolicy` and `DeadLetterConfig` are validated by `PutTargets`, stored with the target, returned by `ListTargetsByRule`, and applied to delivery from `PutEvents` and scheduled rules.
+
+```bash
+aws events put-targets \
+  --rule order-placed-rule \
+  --event-bus-name my-bus \
+  --targets '[{
+    "Id": "orders-queue",
+    "Arn": "arn:aws:sqs:us-east-1:000000000000:orders",
+    "RetryPolicy": {"MaximumRetryAttempts": 4, "MaximumEventAgeInSeconds": 3600},
+    "DeadLetterConfig": {"Arn": "arn:aws:sqs:us-east-1:000000000000:orders-dlq"}
+  }]' \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+- The first attempt is immediate. Throttling, server-side errors from the target, and internal errors are retried with exponential backoff (1 second doubling, capped at 5 minutes) until `MaximumRetryAttempts` or `MaximumEventAgeInSeconds` runs out. The AWS defaults, 185 attempts and 86400 seconds, apply when a field is omitted.
+- A missing target resource, a permission error, or any other client error is not retried.
+- An exhausted or non-retryable event is sent to the `DeadLetterConfig` queue with the original event as the body and the `RULE_ARN`, `TARGET_ARN`, `ERROR_CODE`, `ERROR_MESSAGE`, `EXHAUSTED_RETRY_CONDITION` and `RETRY_ATTEMPTS` message attributes. `EXHAUSTED_RETRY_CONDITION` is omitted for a non-retryable error, since no retry limit was reached. The `ERROR_CODE` value is Floci's best mapping of the underlying failure.
+- The dead-letter queue must be a standard SQS queue in the rule's region, as in AWS. It may be in another account. Any other queue, and any failure to send to it, is logged as a `WARN`.
+- A retry uses the target's current definition, so `PutTargets` changes apply to pending retries, and a target removed with `RemoveTargets` stops being retried.
+- An accepted asynchronous Lambda invocation counts as delivered. A later function error is handled by Lambda's own retry and destination settings, not by the rule.
+- Pending retries are kept in memory and are dropped by an emulator reset or restart.
+
+## Current Behavior
+
+- `PutEvents` reports success once the source bus accepts an event. Target delivery failures are retried and dead-lettered as described above, and otherwise surface only as a `WARN` in the Floci logs.
+- A `Detail` forwarded to an event bus must be a JSON object, as in AWS; anything else is dropped, including an `InputPath` selecting a scalar such as `$.detail.orderId` or an envelope carrying `"detail": null`.
+- A bus ARN naming another account is forwarded under that account, so the target bus and its rules resolve there.
+- Onward delivery from that bus follows each target type: SQS and Step Functions resolve cross-account, while Lambda, SNS, Batch and Firehose resolve in the caller's account.
+- An event is forwarded between buses only once, matching AWS: a bus that received an event from another bus does not forward it on to a third. The second hop is dropped with only a `WARN` rather than reported to the caller.

@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.config;
 
+import io.github.hectorvent.floci.services.acm.CertificateGenerator;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -8,7 +11,11 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.Security;
+import java.security.cert.X509Certificate;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -40,6 +47,7 @@ class TlsConfigSourceCertificateReuseTest {
         System.clearProperty("floci.tls.enabled");
         System.clearProperty("floci.tls.self-signed");
         System.clearProperty("floci.storage.persistent-path");
+        System.clearProperty("floci.dns.spoof-aws-endpoints");
     }
 
     /**
@@ -57,8 +65,8 @@ class TlsConfigSourceCertificateReuseTest {
         new TlsConfigSource();
 
         Path tlsDir = tempDir.resolve("tls");
-        Path certFile = tlsDir.resolve("floci-selfsigned.crt");
-        Path metadataFile = tlsDir.resolve("floci-selfsigned.metadata.json");
+        Path certFile = tlsDir.resolve("floci-server.crt");
+        Path metadataFile = tlsDir.resolve("floci-server.metadata.json");
 
         // Verify initial certificate and metadata exist
         assertTrue(Files.exists(certFile), "Initial certificate should be generated");
@@ -107,8 +115,8 @@ class TlsConfigSourceCertificateReuseTest {
         new TlsConfigSource();
 
         Path tlsDir = tempDir.resolve("tls");
-        Path certFile = tlsDir.resolve("floci-selfsigned.crt");
-        Path metadataFile = tlsDir.resolve("floci-selfsigned.metadata.json");
+        Path certFile = tlsDir.resolve("floci-server.crt");
+        Path metadataFile = tlsDir.resolve("floci-server.metadata.json");
 
         // Verify initial certificate and metadata exist
         assertTrue(Files.exists(certFile), "Initial certificate should be generated");
@@ -150,8 +158,8 @@ class TlsConfigSourceCertificateReuseTest {
         new TlsConfigSource();
 
         Path tlsDir = tempDir.resolve("tls");
-        Path certFile = tlsDir.resolve("floci-selfsigned.crt");
-        Path metadataFile = tlsDir.resolve("floci-selfsigned.metadata.json");
+        Path certFile = tlsDir.resolve("floci-server.crt");
+        Path metadataFile = tlsDir.resolve("floci-server.metadata.json");
 
         // Verify initial certificate and metadata exist
         assertTrue(Files.exists(certFile), "Initial certificate should be generated");
@@ -175,8 +183,118 @@ class TlsConfigSourceCertificateReuseTest {
 
         assertEquals(initialModifiedTime, newModifiedTime, 
             "Certificate should be reused (same timestamp)");
-        assertEquals(initialMetadata, newMetadata, 
+        assertEquals(initialMetadata, newMetadata,
             "Metadata should be unchanged");
+    }
+
+    @Test
+    void legacyServerLeafWithoutKeyIdentifiersIsReissued() throws Exception {
+        System.setProperty("floci.tls.enabled", "true");
+        System.setProperty("floci.tls.self-signed", "true");
+        System.setProperty("floci.storage.persistent-path", tempDir.toString());
+        new TlsConfigSource();
+
+        Path tlsDir = tempDir.resolve("tls");
+        Path certFile = tlsDir.resolve("floci-server.crt");
+        Path keyFile = tlsDir.resolve("floci-server.key");
+        FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(tlsDir);
+        KeyPair keyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+        CertificateGenerator generator = new CertificateGenerator();
+        X509Certificate legacy = generator.signCertificate(new X500Name("CN=localhost"), keyPair.getPublic(),
+                new X500Name("CN=Floci Local CA"), ca.key(), List.of("localhost"), false,
+                CertificateGenerator.LeafUsage.SERVER, 365);
+        Files.writeString(certFile, generator.toPem(legacy));
+        Files.writeString(keyFile, generator.toPem(keyPair.getPrivate()));
+        assertNull(legacy.getExtensionValue(Extension.authorityKeyIdentifier.getId()));
+
+        new TlsConfigSource();
+
+        X509Certificate reissued = generator.parseCertificate(Files.readString(certFile));
+        assertNotEquals(legacy, reissued);
+        assertNotNull(reissued.getExtensionValue(Extension.subjectKeyIdentifier.getId()));
+        assertNotNull(reissued.getExtensionValue(Extension.authorityKeyIdentifier.getId()));
+        reissued.verify(ca.certificate().getPublicKey());
+    }
+
+    /**
+     * Regression: TlsConfigSource is a MicroProfile ConfigSource, so it runs before CDI and before
+     * the security provider is registered — BouncyCastle is NOT yet available. Previously
+     * parseCertificate then failed with "no such provider: BC", isSelfSigned returned false, and the
+     * persisted certificate was regenerated on every restart. The constructor now registers
+     * BouncyCastle up front, so an existing certificate is reused even when BC was not pre-registered.
+     */
+    @Test
+    void testCertificateReusedWhenBouncyCastleNotPreRegistered() throws Exception {
+        System.setProperty("floci.hostname", "floci");
+        System.setProperty("floci.tls.enabled", "true");
+        System.setProperty("floci.tls.self-signed", "true");
+        System.setProperty("floci.storage.persistent-path", tempDir.toString());
+
+        // First boot: generate the certificate.
+        new TlsConfigSource();
+        Path certFile = tempDir.resolve("tls").resolve("floci-server.crt");
+        assertTrue(Files.exists(certFile), "Initial certificate should be generated");
+        long initialModifiedTime = Files.getLastModifiedTime(certFile).toMillis();
+        String initialCert = Files.readString(certFile);
+
+        // Ensure a regeneration would be detectable via timestamp.
+        Thread.sleep(100);
+
+        // Second boot with BouncyCastle NOT registered — mirrors the real ConfigSource-before-CDI
+        // ordering. The constructor must register it and REUSE the existing cert (not regenerate).
+        boolean wasRegistered = Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) != null;
+        Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME);
+        try {
+            new TlsConfigSource();
+        } finally {
+            if (wasRegistered && Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+                Security.addProvider(new BouncyCastleProvider());
+            }
+        }
+
+        assertEquals(initialModifiedTime, Files.getLastModifiedTime(certFile).toMillis(),
+            "Certificate should be reused (same timestamp) even when BouncyCastle was not pre-registered");
+        assertEquals(initialCert, Files.readString(certFile),
+            "Certificate content should be unchanged (reused, not regenerated)");
+    }
+
+    /**
+     * Test that certificate is regenerated when the spoof-aws-endpoints flag flips
+     */
+    @Test
+    void certificateIsRegeneratedWhenTheSpoofFlagFlips() throws Exception {
+        // Arrange: Generate initial certificate without AWS endpoint spoofing
+        System.setProperty("floci.tls.enabled", "true");
+        System.setProperty("floci.tls.self-signed", "true");
+        System.setProperty("floci.storage.persistent-path", tempDir.toString());
+
+        // Act: Create TlsConfigSource - this generates the initial certificate
+        new TlsConfigSource();
+
+        Path tlsDir = tempDir.resolve("tls");
+        Path certFile = tlsDir.resolve("floci-server.crt");
+        Path metadataFile = tlsDir.resolve("floci-server.metadata.json");
+
+        assertTrue(Files.exists(certFile), "Initial certificate should be generated");
+        assertTrue(Files.exists(metadataFile), "Initial metadata should be generated");
+        assertFalse(Files.readString(metadataFile).contains("*.amazonaws.com"),
+            "Initial metadata should not contain the AWS wildcard");
+
+        String initialCert = Files.readString(certFile);
+
+        // Enable AWS endpoint spoofing
+        System.setProperty("floci.dns.spoof-aws-endpoints", "true");
+
+        // Act: Create new TlsConfigSource - should regenerate certificate
+        new TlsConfigSource();
+
+        // Assert: Certificate and metadata should be regenerated with the AWS wildcards.
+        // Comparing content (rather than mtime after a sleep) keeps this deterministic on
+        // filesystems with coarse timestamp resolution.
+        assertNotEquals(initialCert, Files.readString(certFile),
+            "Certificate should be regenerated when the spoof flag flips (content changed)");
+        assertTrue(Files.readString(metadataFile).contains("*.amazonaws.com"),
+            "New metadata should contain the AWS wildcard");
     }
 
     /**
@@ -194,8 +312,8 @@ class TlsConfigSourceCertificateReuseTest {
         new TlsConfigSource();
 
         Path tlsDir = tempDir.resolve("tls");
-        Path certFile = tlsDir.resolve("floci-selfsigned.crt");
-        Path metadataFile = tlsDir.resolve("floci-selfsigned.metadata.json");
+        Path certFile = tlsDir.resolve("floci-server.crt");
+        Path metadataFile = tlsDir.resolve("floci-server.metadata.json");
 
         // Verify initial certificate and metadata exist
         assertTrue(Files.exists(certFile), "Initial certificate should be generated");

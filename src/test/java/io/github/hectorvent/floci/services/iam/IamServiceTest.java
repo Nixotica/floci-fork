@@ -1,18 +1,34 @@
 package io.github.hectorvent.floci.services.iam;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.Totp;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
+import io.github.hectorvent.floci.services.iam.model.AccountPasswordPolicy;
+import io.github.hectorvent.floci.services.iam.model.CallerContext;
+import io.github.hectorvent.floci.services.iam.model.CredentialReport;
 import io.github.hectorvent.floci.services.iam.model.IamGroup;
 import io.github.hectorvent.floci.services.iam.model.IamPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.iam.model.LoginProfile;
+import io.github.hectorvent.floci.services.iam.model.OpenIDConnectProvider;
+import io.github.hectorvent.floci.services.iam.model.OrganizationRootFeatures;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.PolicyVersion;
+import io.github.hectorvent.floci.services.iam.model.SessionCredential;
+import io.github.hectorvent.floci.services.iam.model.VirtualMfaDevice;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
@@ -24,16 +40,192 @@ class IamServiceTest {
 
     @BeforeEach
     void setUp() {
-        iamService = new IamService(
+        iamService = iamService(false);
+    }
+
+    private static IamService iamService(boolean seedDeployerPrincipal) {
+        return iamService(seedDeployerPrincipal, new InMemoryStorage<>());
+    }
+
+    private static IamService iamService(boolean seedDeployerPrincipal, StorageBackend<String, AccessKey> accessKeys) {
+        return iamService(seedDeployerPrincipal, accessKeys, new InMemoryStorage<>());
+    }
+
+    private static IamService iamService(boolean seedDeployerPrincipal, StorageBackend<String, AccessKey> accessKeys,
+                                         StorageBackend<String, SessionCredential> sessions) {
+        return iamService(seedDeployerPrincipal, accessKeys, sessions, new RegionResolver("us-east-1", "000000000000"));
+    }
+
+    private static IamService iamService(boolean seedDeployerPrincipal, StorageBackend<String, AccessKey> accessKeys,
+                                         StorageBackend<String, SessionCredential> sessions,
+                                         RegionResolver regionResolver) {
+        return new IamService(
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                accessKeys,
                 new InMemoryStorage<>(),
-                new InMemoryStorage<>(),
-                new InMemoryStorage<>(),
-                new RegionResolver("us-east-1", "000000000000")
+                sessions,
+                regionResolver,
+                seedDeployerPrincipal
         );
+    }
+
+    /** The STS global endpoint, and so the token version it reports, exists only in the commercial partition. */
+    @Test
+    void accountSummaryReportsTheGlobalEndpointTokenVersionOnlyWhereStsHasAGlobalHost() {
+        assertEquals(1L, iamService.getAccountSummary().get("GlobalEndpointTokenVersion"));
+
+        IamService china = iamService(false, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("cn-north-1", "000000000000"));
+        assertFalse(china.getAccountSummary().containsKey("GlobalEndpointTokenVersion"));
+        assertEquals(0L, china.getAccountSummary().get("Users"));
+    }
+
+    @Test
+    void credentialReportRootRowCarriesThePartition() {
+        IamService china = iamService(false, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("cn-north-1", "000000000000"));
+        china.generateCredentialReport();
+
+        String report = new String(Base64.getDecoder().decode(china.getCredentialReport().base64Content()),
+                StandardCharsets.UTF_8);
+        assertTrue(report.contains("<root_account>,arn:aws-cn:iam::000000000000:root,"), report);
+    }
+
+    @Test
+    void ec2SessionUsesInstanceIdentityTokenAndOwningAccount() {
+        SessionCredential session = new SessionCredential("ASIAEC2SESSION", "secret", "token",
+                "arn:aws:iam::123456789012:role/path/worker", Instant.now().plusSeconds(3600), null, "123456789012");
+        session.setEc2InstanceId("i-worker");
+        AccountAwareStorageBackend<SessionCredential> stored = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        iamService = iamService(false, new InMemoryStorage<>(), stored);
+        iamService.registerEc2InstanceSession(session);
+        assertTrue(stored.getForAccount("000000000000", session.getAccessKeyId()).isEmpty());
+        assertEquals("i-worker", stored.getForAccount("123456789012", session.getAccessKeyId())
+                .orElseThrow().getEc2InstanceId());
+        assertEquals("123456789012", iamService.resolveAccountId(session.getAccessKeyId()).orElseThrow());
+        assertEquals("arn:aws:sts::123456789012:assumed-role/worker/i-worker",
+                iamService.resolveCallerArn(session.getAccessKeyId()).orElseThrow());
+        assertEquals("secret", iamService.findSecretKey(session.getAccessKeyId(), "token").orElseThrow());
+        assertTrue(iamService.findSecretKey(session.getAccessKeyId(), "wrong-token").isEmpty());
+        assertTrue(iamService.findSecretKey(session.getAccessKeyId(), null).isEmpty());
+        iamService.registerSession("ASIAOTHER", "other-secret", "other-token", session.getRoleArn(),
+                Instant.now().plusSeconds(3600), null);
+        assertEquals(1, iamService.sweepOrphanedEc2InstanceSessions());
+        assertTrue(iamService.findSecretKey(session.getAccessKeyId(), "token").isEmpty());
+        assertTrue(iamService.findSecretKey("ASIAOTHER", "other-token").isPresent());
+    }
+
+    @Test
+    void assumedRoleSessionIdentitySurvivesPersistence() throws Exception {
+        String accessKeyId = "ASIAASSUMEDROLESESSION";
+        InMemoryStorage<String, SessionCredential> sessions = new InMemoryStorage<>();
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.registerSession(accessKeyId, "secret", "token",
+                "arn:aws:iam::123456789012:role/TestRole", Instant.now().plusSeconds(3600),
+                null, "123456789012", "my-custom-session-name",
+                "AROATESTROLEID:my-custom-session-name");
+
+        SessionCredential stored = sessions.get(accessKeyId).orElseThrow();
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        SessionCredential restored = mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class);
+        assertEquals("my-custom-session-name", restored.getRoleSessionName());
+        assertEquals("AROATESTROLEID:my-custom-session-name", restored.getAssumedRoleId());
+        sessions.put(accessKeyId, restored);
+        assertEquals("arn:aws:sts::123456789012:assumed-role/TestRole/my-custom-session-name",
+                service.resolveCallerArn(accessKeyId).orElseThrow());
+        assertEquals(restored.getAssumedRoleId(), service.resolveCallerUserId(accessKeyId).orElseThrow());
+    }
+
+    @Test
+    void resolveCallerArnPreservesPartitionFromRoleArn() {
+        String accessKeyId = "ASIACHINASESSION";
+        InMemoryStorage<String, SessionCredential> sessions = new InMemoryStorage<>();
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.registerSession(accessKeyId, "secret", "token",
+                "arn:aws-cn:iam::123456789012:role/ChinaRole", Instant.now().plusSeconds(3600),
+                null, "123456789012", "china-session",
+                "AROAEXAMPLE:china-session");
+
+        assertEquals("arn:aws-cn:sts::123456789012:assumed-role/ChinaRole/china-session",
+                service.resolveCallerArn(accessKeyId).orElseThrow());
+    }
+
+    @Test
+    void aSessionsCallerAndPrincipalArnsComeFromOneLookup() {
+        IamService service = iamService(false, new InMemoryStorage<>(), new InMemoryStorage<>());
+        service.registerSession("ASIALIVESESSION", "secret", "token",
+                "arn:aws:iam::123456789012:role/team/TestRole", Instant.now().plusSeconds(3600),
+                null, "123456789012", "s", "AROATESTROLEID:s");
+        service.registerSession("ASIAEXPIREDSESSION", "secret", "token",
+                "arn:aws:iam::123456789012:role/team/TestRole", Instant.now().minusSeconds(1),
+                null, "123456789012", "s", "AROATESTROLEID:s");
+
+        // The session ARN carries only the role's name; aws:PrincipalArn is the role's own ARN.
+        assertEquals(new IamService.CallerArns("arn:aws:sts::123456789012:assumed-role/TestRole/s",
+                        "arn:aws:iam::123456789012:role/team/TestRole"),
+                service.resolveCallerArns("ASIALIVESESSION").orElseThrow());
+        // An expired session answers for neither, never for one and not the other.
+        assertTrue(service.resolveCallerArns("ASIAEXPIREDSESSION").isEmpty());
+    }
+
+    @Test
+    void ec2SessionMarkerSurvivesPersistenceAndExpiredCredentialsCannotAuthenticate() throws Exception {
+        SessionCredential expired = new SessionCredential("ASIAEXPIREDEC2", "secret", "token",
+                "arn:aws:iam::123456789012:role/worker", Instant.now().minusSeconds(1), null, "123456789012");
+        expired.setEc2InstanceId("i-expired");
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        SessionCredential restored = mapper.readValue(mapper.writeValueAsBytes(expired), SessionCredential.class);
+        assertEquals("i-expired", restored.getEc2InstanceId());
+        AccountAwareStorageBackend<SessionCredential> stored = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), stored);
+        service.registerEc2InstanceSession(restored);
+        assertTrue(service.findSecretKey(restored.getAccessKeyId(), "token").isEmpty());
+        IamService restarted = iamService(false, new InMemoryStorage<>(), stored);
+        assertEquals(1, restarted.sweepOrphanedEc2InstanceSessions());
+        assertTrue(stored.getForAccount("123456789012", restored.getAccessKeyId()).isEmpty());
+    }
+
+    @Test
+    void ecsTaskRoleSessionUsesTaskIdentityTokenAndOwningAccount() {
+        SessionCredential session = new SessionCredential("ASIAECSSESSION", "secret", "token",
+                "arn:aws:iam::123456789012:role/path/worker", Instant.now().plusSeconds(3600), null, "123456789012");
+        session.setEcsTaskArn("arn:aws:ecs:us-east-1:123456789012:task/cluster/abc123");
+        AccountAwareStorageBackend<SessionCredential> stored = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        iamService = iamService(false, new InMemoryStorage<>(), stored);
+        iamService.registerEcsTaskRoleSession(session);
+        assertTrue(stored.getForAccount("000000000000", session.getAccessKeyId()).isEmpty());
+        assertEquals("arn:aws:ecs:us-east-1:123456789012:task/cluster/abc123",
+                stored.getForAccount("123456789012", session.getAccessKeyId()).orElseThrow().getEcsTaskArn());
+
+        iamService.registerSession("ASIAOTHER", "other-secret", "other-token", session.getRoleArn(),
+                Instant.now().plusSeconds(3600), null);
+        assertEquals(1, iamService.sweepOrphanedEcsTaskRoleSessions());
+        assertTrue(iamService.findSecretKey(session.getAccessKeyId(), "token").isEmpty());
+        assertTrue(iamService.findSecretKey("ASIAOTHER", "other-token").isPresent());
+    }
+
+    @Test
+    void ecsTaskRoleSessionMarkerSurvivesPersistenceAndExpiredCredentialsCannotAuthenticate() throws Exception {
+        SessionCredential expired = new SessionCredential("ASIAEXPIREDECS", "secret", "token",
+                "arn:aws:iam::123456789012:role/worker", Instant.now().minusSeconds(1), null, "123456789012");
+        expired.setEcsTaskArn("arn:aws:ecs:us-east-1:123456789012:task/cluster/expired");
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        SessionCredential restored = mapper.readValue(mapper.writeValueAsBytes(expired), SessionCredential.class);
+        assertEquals("arn:aws:ecs:us-east-1:123456789012:task/cluster/expired", restored.getEcsTaskArn());
+        AccountAwareStorageBackend<SessionCredential> stored = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), stored);
+        service.registerEcsTaskRoleSession(restored);
+        assertTrue(service.findSecretKey(restored.getAccessKeyId(), "token").isEmpty());
+        IamService restarted = iamService(false, new InMemoryStorage<>(), stored);
+        assertEquals(1, restarted.sweepOrphanedEcsTaskRoleSessions());
+        assertTrue(stored.getForAccount("123456789012", restored.getAccessKeyId()).isEmpty());
     }
 
     // =========================================================================
@@ -53,9 +245,44 @@ class IamServiceTest {
     }
 
     @Test
+    void accountSummaryUsesAwsDefaultQuotasAndTracksProviders() {
+        Map<String, Long> empty = iamService.getAccountSummary();
+
+        assertEquals(300L, empty.get("GroupsQuota"));
+        assertEquals(1000L, empty.get("RolesQuota"));
+        assertEquals(1500L, empty.get("PoliciesQuota"));
+        assertEquals(1000L, empty.get("InstanceProfilesQuota"));
+        assertEquals(10L, empty.get("AttachedPoliciesPerUserQuota"));
+        assertEquals(10L, empty.get("AttachedPoliciesPerGroupQuota"));
+        assertEquals(20L, empty.get("AttachedPoliciesPerRoleQuota"));
+        assertEquals(6144L, empty.get("PolicySizeQuota"));
+        assertEquals(0L, empty.get("Providers"));
+        assertEquals(0L, empty.get("AccountAccessKeysPresent"));
+
+        iamService.createUser("summary-user", "/");
+        iamService.createAccessKey("summary-user");
+        iamService.createOpenIDConnectProvider(
+                "https://oidc.example.com/id/SUMMARY", List.of(), List.of("thumbprint"), Map.of());
+
+        assertEquals(1L, iamService.getAccountSummary().get("Providers"));
+        assertEquals(0L, iamService.getAccountSummary().get("AccountAccessKeysPresent"));
+    }
+
+    @Test
     void createUserDuplicateFails() {
         iamService.createUser("alice", "/");
         assertThrows(AwsException.class, () -> iamService.createUser("alice", "/"));
+    }
+
+    @Test
+    void createUserRejectsNameThatDiffersOnlyByCase() {
+        iamService.createUser("CaseUser", "/");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.createUser("caseuser", "/"));
+
+        assertEquals("EntityAlreadyExists", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
     }
 
     @Test
@@ -104,6 +331,29 @@ class IamServiceTest {
     }
 
     @Test
+    void updateUserRejectsAnotherUserNameThatDiffersOnlyByCase() {
+        iamService.createUser("CaseUser", "/");
+        iamService.createUser("Other", "/");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.updateUser("Other", "CASEUSER", null));
+
+        assertEquals("EntityAlreadyExists", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals("Other", iamService.getUser("Other").getUserName());
+    }
+
+    @Test
+    void updateUserAllowsChangingOnlyItsOwnNameCase() {
+        iamService.createUser("CaseUser", "/");
+
+        iamService.updateUser("CaseUser", "caseuser", null);
+
+        assertEquals("caseuser", iamService.getUser("caseuser").getUserName());
+        assertThrows(AwsException.class, () -> iamService.getUser("CaseUser"));
+    }
+
+    @Test
     void tagAndUntagUser() {
         iamService.createUser("alice", "/");
         iamService.tagUser("alice", Map.of("env", "prod", "team", "eng"));
@@ -115,6 +365,223 @@ class IamServiceTest {
         Map<String, String> tags2 = iamService.listUserTags("alice");
         assertFalse(tags2.containsKey("team"));
         assertTrue(tags2.containsKey("env"));
+    }
+
+    @Test
+    void tagUserCleansUpPreExistingDuplicateCasedTags() {
+        IamUser user = iamService.createUser("dup-tags-user", "/");
+        user.getTags().put("Department", "finance");
+        user.getTags().put("department", "old-hr");
+        assertEquals(2, user.getTags().size());
+
+        iamService.tagUser("dup-tags-user", Map.of("department", "new-hr"));
+        Map<String, String> tags = iamService.listUserTags("dup-tags-user");
+        assertEquals(1, tags.size());
+        assertEquals("new-hr", tags.get("Department"));
+    }
+
+    // =========================================================================
+    // Login Profiles
+    // =========================================================================
+
+    @Test
+    void createGetUpdateAndDeleteLoginProfile() {
+        iamService.createUser("alice", "/");
+
+        LoginProfile created = iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+        assertEquals("alice", created.getUserName());
+        assertFalse(created.isPasswordResetRequired());
+
+        LoginProfile fetched = iamService.getLoginProfile("alice");
+        assertEquals("Sup3r$ecret!", fetched.getPassword());
+
+        iamService.updateLoginProfile("alice", "NewP4ssword!", true);
+        LoginProfile updated = iamService.getLoginProfile("alice");
+        assertEquals("NewP4ssword!", updated.getPassword());
+        assertTrue(updated.isPasswordResetRequired());
+
+        iamService.deleteLoginProfile("alice");
+        assertThrows(AwsException.class, () -> iamService.getLoginProfile("alice"));
+    }
+
+    @Test
+    void createLoginProfileTwiceIsEntityAlreadyExists() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.createLoginProfile("alice", "AnotherP4ss!", false));
+        assertEquals("EntityAlreadyExists", ex.getErrorCode());
+    }
+
+    @Test
+    void createLoginProfileForUnknownUserIsNoSuchEntity() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.createLoginProfile("ghost", "Sup3r$ecret!", false));
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+    }
+
+    @Test
+    void getLoginProfileForUserWithNoneIsNoSuchEntity() {
+        iamService.createUser("alice", "/");
+
+        AwsException ex = assertThrows(AwsException.class, () -> iamService.getLoginProfile("alice"));
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+    }
+
+    @Test
+    void deleteLoginProfileForUserWithNoneIsNoSuchEntity() {
+        iamService.createUser("alice", "/");
+
+        AwsException ex = assertThrows(AwsException.class, () -> iamService.deleteLoginProfile("alice"));
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+    }
+
+    @Test
+    void updateLoginProfileLeavesAnOmittedFieldUnchanged() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", true);
+
+        // Only PasswordResetRequired supplied: the stored password must survive untouched.
+        iamService.updateLoginProfile("alice", null, false);
+        LoginProfile afterFlagOnly = iamService.getLoginProfile("alice");
+        assertEquals("Sup3r$ecret!", afterFlagOnly.getPassword());
+        assertFalse(afterFlagOnly.isPasswordResetRequired());
+
+        // Only Password supplied: the reset-required flag must survive untouched.
+        iamService.updateLoginProfile("alice", "NewP4ssword!", null);
+        LoginProfile afterPasswordOnly = iamService.getLoginProfile("alice");
+        assertEquals("NewP4ssword!", afterPasswordOnly.getPassword());
+        assertFalse(afterPasswordOnly.isPasswordResetRequired());
+    }
+
+    @Test
+    void updateLoginProfileForUserWithNoneIsNoSuchEntity() {
+        iamService.createUser("alice", "/");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.updateLoginProfile("alice", "NewP4ssword!", null));
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+    }
+
+    @Test
+    void createLoginProfileRejectsPasswordViolatingAccountPolicy() {
+        iamService.createUser("alice", "/");
+        AccountPasswordPolicy policy = new AccountPasswordPolicy();
+        policy.setMinimumPasswordLength(12);
+        policy.setRequireSymbols(true);
+        policy.setRequireNumbers(true);
+        iamService.updateAccountPasswordPolicy(policy);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.createLoginProfile("alice", "short", false));
+        assertEquals("PasswordPolicyViolation", ex.getErrorCode());
+    }
+
+    @Test
+    void createLoginProfileAcceptsPasswordSatisfyingAccountPolicy() {
+        iamService.createUser("alice", "/");
+        AccountPasswordPolicy policy = new AccountPasswordPolicy();
+        policy.setMinimumPasswordLength(12);
+        policy.setRequireSymbols(true);
+        policy.setRequireNumbers(true);
+        iamService.updateAccountPasswordPolicy(policy);
+
+        LoginProfile profile = iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+        assertEquals("alice", profile.getUserName());
+    }
+
+    @Test
+    void deleteUserWithLoginProfileIsDeleteConflict() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+
+        AwsException ex = assertThrows(AwsException.class, () -> iamService.deleteUser("alice"));
+        assertEquals("DeleteConflict", ex.getErrorCode());
+        assertEquals("alice", iamService.getUser("alice").getUserName());
+
+        iamService.deleteLoginProfile("alice");
+        iamService.deleteUser("alice");
+        iamService.createUser("alice", "/");
+        assertThrows(AwsException.class, () -> iamService.getLoginProfile("alice"));
+    }
+
+    @Test
+    void deleteUserWithInlinePolicyIsDeleteConflict() {
+        iamService.createUser("alice", "/");
+        iamService.putUserPolicy("alice", "inline-1", "{\"Version\":\"2012-10-17\"}");
+
+        AwsException ex = assertThrows(AwsException.class, () -> iamService.deleteUser("alice"));
+        assertEquals("DeleteConflict", ex.getErrorCode());
+
+        iamService.deleteUserPolicy("alice", "inline-1");
+        iamService.deleteUser("alice");
+    }
+
+    @Test
+    void deleteUserWithAccessKeyIsDeleteConflict() {
+        iamService.createUser("alice", "/");
+        String keyId = iamService.createAccessKey("alice").getAccessKeyId();
+
+        AwsException ex = assertThrows(AwsException.class, () -> iamService.deleteUser("alice"));
+        assertEquals("DeleteConflict", ex.getErrorCode());
+        assertEquals("alice", iamService.getUser("alice").getUserName());
+
+        iamService.deleteAccessKey("alice", keyId);
+        iamService.deleteUser("alice");
+    }
+
+    @Test
+    void renamingAUserMovesItsAccessKeys() {
+        iamService.createUser("alice", "/");
+        String keyId = iamService.createAccessKey("alice").getAccessKeyId();
+
+        iamService.updateUser("alice", "alicia", null);
+
+        assertEquals(1, iamService.listAccessKeys("alicia").size());
+        assertEquals("alicia", iamService.listAccessKeys("alicia").get(0).getUserName());
+        iamService.createUser("alice", "/");
+        assertTrue(iamService.listAccessKeys("alice").isEmpty());
+        assertEquals("alicia", iamService.findUserNameByAccessKeyId(keyId).orElseThrow());
+    }
+
+    @Test
+    void renamingAUserUpdatesItsGroupMembership() {
+        iamService.createUser("alice", "/");
+        iamService.createGroup("devs", "/");
+        iamService.addUserToGroup("devs", "alice");
+
+        iamService.updateUser("alice", "alicia", null);
+
+        assertEquals(List.of("alicia"), iamService.getGroup("devs").getUserNames());
+        iamService.removeUserFromGroup("devs", "alicia");
+        iamService.deleteGroup("devs");
+        iamService.deleteUser("alicia");
+    }
+
+    @Test
+    void renamingAUserMovesItsLoginProfile() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", true);
+
+        iamService.updateUser("alice", "alicia", null);
+
+        LoginProfile moved = iamService.getLoginProfile("alicia");
+        assertEquals("alicia", moved.getUserName());
+        assertEquals("Sup3r$ecret!", moved.getPassword());
+        assertTrue(moved.isPasswordResetRequired());
+        iamService.createUser("alice", "/");
+        AwsException ex = assertThrows(AwsException.class, () -> iamService.getLoginProfile("alice"));
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+    }
+
+    @Test
+    void createLoginProfileRejectsPasswordOutsideWireCharacterSet() {
+        iamService.createUser("alice", "/");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.createLoginProfile("alice", "badpassword", false));
+        assertEquals("ValidationError", ex.getErrorCode());
     }
 
     // =========================================================================
@@ -129,6 +596,17 @@ class IamServiceTest {
         assertEquals("/", group.getPath());
         assertTrue(group.getGroupId().startsWith("AGPA"));
         assertEquals("arn:aws:iam::000000000000:group/developers", group.getArn());
+    }
+
+    @Test
+    void createGroupRejectsNameThatDiffersOnlyByCase() {
+        iamService.createGroup("CaseGroup", "/");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.createGroup("casegroup", "/"));
+
+        assertEquals("EntityAlreadyExists", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
     }
 
     @Test
@@ -175,6 +653,42 @@ class IamServiceTest {
     // =========================================================================
 
     @Test
+    void createServiceLinkedRoleForEc2AutoScalingUsesAwsCanonicalName() {
+        IamRole role = iamService.createServiceLinkedRole(
+                "autoscaling.amazonaws.com", null, "EC2 Auto Scaling SLR");
+
+        assertEquals("AWSServiceRoleForAutoScaling", role.getRoleName());
+        assertEquals(
+                "arn:aws:iam::000000000000:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling",
+                role.getArn());
+    }
+
+    @Test
+    void createServiceLinkedRoleAcceptsTheLegacyPartitionFormOfThePrincipal() {
+        // AWS still honours the pre-universal China principal; the derived name, the path and the
+        // trust policy are the universal ones either way.
+        IamRole role = iamService.createServiceLinkedRole("autoscaling.amazonaws.com.cn", null, null);
+        assertEquals("AWSServiceRoleForAutoScaling", role.getRoleName());
+        assertEquals("/aws-service-role/autoscaling.amazonaws.com/", role.getPath());
+        assertTrue(role.getAssumeRolePolicyDocument().contains("\"Service\":\"autoscaling.amazonaws.com\""),
+                role.getAssumeRolePolicyDocument());
+
+        IamRole es = iamService.createServiceLinkedRole("es.amazonaws.com.cn", null, null);
+        assertEquals("AWSServiceRoleForEs", es.getRoleName());
+    }
+
+    @Test
+    void createServiceLinkedRoleForCloud9UsesAwsCanonicalName() {
+        IamRole role = iamService.createServiceLinkedRole(
+                "cloud9.amazonaws.com", null, "Cloud9 SLR");
+
+        assertEquals("AWSServiceRoleForAWSCloud9", role.getRoleName());
+        assertEquals(
+                "arn:aws:iam::000000000000:role/aws-service-role/cloud9.amazonaws.com/AWSServiceRoleForAWSCloud9",
+                role.getArn());
+    }
+
+    @Test
     void createAndGetRole() {
         String trustPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
         IamRole role = iamService.createRole("LambdaExec", "/", trustPolicy, "Lambda role", 3600, null);
@@ -185,6 +699,87 @@ class IamServiceTest {
         assertEquals("arn:aws:iam::000000000000:role/LambdaExec", role.getArn());
         assertEquals(trustPolicy, role.getAssumeRolePolicyDocument());
         assertEquals("Lambda role", role.getDescription());
+    }
+
+    @Test
+    void createRoleRejectsNameThatDiffersOnlyByCase() {
+        iamService.createRole("CaseRole", "/", "{}", null, 3600, null);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.createRole("caserole", "/", "{}", null, 3600, null));
+
+        assertEquals("EntityAlreadyExists", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+    }
+
+    @Test
+    void updateAssumeRolePolicyWithMatchingExpectedIdApplies() {
+        IamRole role = iamService.createRole("LambdaExec", "/", "{}", null, 3600, null);
+        String newDoc = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\"}]}";
+
+        iamService.updateAssumeRolePolicy("LambdaExec", newDoc, role.getRoleId());
+
+        assertEquals(newDoc, iamService.getRole("LambdaExec").getAssumeRolePolicyDocument());
+    }
+
+    @Test
+    void updateAssumeRolePolicyWithNullExpectedIdSkipsCheck() {
+        iamService.createRole("LambdaExec", "/", "{}", null, 3600, null);
+        String newDoc = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\"}]}";
+
+        iamService.updateAssumeRolePolicy("LambdaExec", newDoc, null);
+
+        assertEquals(newDoc, iamService.getRole("LambdaExec").getAssumeRolePolicyDocument());
+    }
+
+    @Test
+    void updateAssumeRolePolicyRejectsMismatchedExpectedId() {
+        // github.com/floci-io/floci/issues/2084 (Greptile follow-up) — if the role named here was
+        // deleted and recreated under the same name since the caller last verified its identity,
+        // the recreated role has a different RoleId. The update must be refused rather than
+        // silently applied to a role the caller never actually verified owning.
+        IamRole role = iamService.createRole("LambdaExec", "/", "{}", null, 3600, null);
+        String originalDoc = role.getAssumeRolePolicyDocument();
+        String newDoc = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\"}]}";
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.updateAssumeRolePolicy("LambdaExec", newDoc, "AROAWRONGID"));
+        assertEquals("EntityAlreadyExists", ex.getErrorCode());
+        assertEquals(originalDoc, iamService.getRole("LambdaExec").getAssumeRolePolicyDocument(),
+                "rejected update must not have changed the role's trust policy");
+    }
+
+    @Test
+    void createServiceLinkedRoleForAccessAnalyzer() {
+        IamRole role = iamService.createServiceLinkedRole(
+                "access-analyzer.amazonaws.com", null, "Access Analyzer SLR");
+
+        assertEquals("AWSServiceRoleForAccessAnalyzer", role.getRoleName());
+        assertEquals("/aws-service-role/access-analyzer.amazonaws.com/", role.getPath());
+        assertTrue(role.getRoleId().startsWith("AROA"));
+        assertEquals(
+                "arn:aws:iam::000000000000:role/aws-service-role/access-analyzer.amazonaws.com/AWSServiceRoleForAccessAnalyzer",
+                role.getArn());
+        assertTrue(role.getAssumeRolePolicyDocument().contains("access-analyzer.amazonaws.com"),
+                "trust policy should allow the service principal");
+    }
+
+    @Test
+    void createServiceLinkedRoleWithCustomSuffix() {
+        IamRole role = iamService.createServiceLinkedRole(
+                "access-analyzer.amazonaws.com", "myapp", null);
+        assertEquals("AWSServiceRoleForAccessAnalyzer_myapp", role.getRoleName());
+    }
+
+    @Test
+    void createServiceLinkedRoleRejectsCaseInsensitiveRoleNameCollisionAsInvalidInput() {
+        iamService.createRole("awsserviceroleforaccessanalyzer", "/", "{}", null, 0, null);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.createServiceLinkedRole("access-analyzer.amazonaws.com", null, null));
+
+        assertEquals("InvalidInput", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
     }
 
     @Test
@@ -225,6 +820,93 @@ class IamServiceTest {
     }
 
     @Test
+    void createPolicyRejectsCaseInsensitiveNameAcrossPaths() {
+        iamService.createPolicy("CasePolicy", "/first/", null, "{}", null);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.createPolicy("casepolicy", "/second/", null, "{}", null));
+
+        assertEquals("EntityAlreadyExists", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+    }
+
+    @Test
+    void awsManagedReadOnlyPolicyAllowsReadsButDeniesWrites() {
+        String arn = AwsManagedPolicies.arnPrefix("aws") + "/AmazonS3ReadOnlyAccess";
+        IamPolicy policy = iamService.getPolicy(arn);
+
+        assertEquals("AmazonS3ReadOnlyAccess", policy.getPolicyName());
+        assertEquals("v3", policy.getDefaultVersionId());
+        assertEquals(IamPolicyEvaluator.Decision.ALLOW,
+                new IamPolicyEvaluator(new com.fasterxml.jackson.databind.ObjectMapper())
+                        .evaluate(List.of(policy.getDefaultDocument()), "s3:GetObject", "arn:aws:s3:::bucket/key"));
+        assertEquals(IamPolicyEvaluator.Decision.DENY,
+                new IamPolicyEvaluator(new com.fasterxml.jackson.databind.ObjectMapper())
+                        .evaluate(List.of(policy.getDefaultDocument()), "s3:PutObject", "arn:aws:s3:::bucket/key"));
+    }
+
+    @Test
+    void serviceScopedAndAdministratorManagedPoliciesUseTheirDocumentedScopes() {
+        IamPolicy s3ReadOnly = iamService.getPolicy(
+                AwsManagedPolicies.arnPrefix("aws") + "/AmazonS3ReadOnlyAccess");
+        IamPolicy administrator = iamService.getPolicy(
+                AwsManagedPolicies.arnPrefix("aws") + "/AdministratorAccess");
+        IamPolicyEvaluator evaluator = new IamPolicyEvaluator(new ObjectMapper());
+
+        assertEquals(IamPolicyEvaluator.Decision.DENY,
+                evaluator.evaluate(List.of(s3ReadOnly.getDefaultDocument()),
+                        "ec2:RunInstances", "*"));
+        assertEquals(IamPolicyEvaluator.Decision.ALLOW,
+                evaluator.evaluate(List.of(administrator.getDefaultDocument()),
+                        "s3:PutObject", "arn:aws:s3:::bucket/key"));
+        assertEquals(IamPolicyEvaluator.Decision.ALLOW,
+                evaluator.evaluate(List.of(administrator.getDefaultDocument()),
+                        "ec2:RunInstances", "*"));
+    }
+
+    @Test
+    void managedPolicyActsAsPermissionsBoundary() {
+        IamUser user = iamService.createUser("boundary-user", "/");
+        String adminArn = AwsManagedPolicies.arnPrefix("aws") + "/AdministratorAccess";
+        String boundaryArn = AwsManagedPolicies.arnPrefix("aws") + "/AmazonS3ReadOnlyAccess";
+        iamService.attachUserPolicy(user.getUserName(), adminArn);
+        iamService.putUserPermissionsBoundary(user.getUserName(), boundaryArn);
+
+        CallerContext caller = iamService.resolvePrincipalContext(user.getArn());
+        IamPolicyEvaluator evaluator = new IamPolicyEvaluator(new ObjectMapper());
+
+        assertEquals(IamPolicyEvaluator.Decision.ALLOW,
+                evaluator.evaluate(caller, null, "s3:GetObject", "arn:aws:s3:::bucket/key", null));
+        assertEquals(IamPolicyEvaluator.Decision.DENY,
+                evaluator.evaluate(caller, null, "s3:PutObject", "arn:aws:s3:::bucket/key", null));
+        assertEquals(IamPolicyEvaluator.Decision.DENY,
+                evaluator.evaluate(caller, null, "ec2:RunInstances", "*", null));
+    }
+
+    @Test
+    void managedPolicyRetrievalPreservesFieldsAndUnavailableVersionFailsWithNoSuchEntity() {
+        String arn = AwsManagedPolicies.arnPrefix("aws") + "/AmazonS3ReadOnlyAccess";
+        IamPolicy policy = iamService.getPolicy(arn);
+        assertEquals("AmazonS3ReadOnlyAccess", policy.getPolicyName());
+        assertEquals(arn, policy.getArn());
+        // AWS revised this policy twice; a real account reports v3, not v1.
+        assertEquals("v3", policy.getDefaultVersionId());
+        assertTrue(policy.getDefaultDocument().contains("s3:Get*"));
+
+        PolicyVersion current = iamService.getPolicyVersion(arn, "v3");
+        assertTrue(current.isDefaultVersion());
+        assertEquals(policy.getDefaultDocument(), current.getDocument());
+
+        // Neither a future version nor a superseded one whose document is not bundled resolves.
+        for (String versionId : new String[] {"v9", "v1"}) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> iamService.getPolicyVersion(arn, versionId));
+            assertEquals("NoSuchEntity", error.getErrorCode());
+            assertEquals(404, error.getHttpStatus());
+        }
+    }
+
+    @Test
     void createPolicyVersionAndSetDefault() {
         String doc1 = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\"}]}";
         String doc2 = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\"}]}";
@@ -257,6 +939,130 @@ class IamServiceTest {
         }
         assertThrows(AwsException.class,
                 () -> iamService.createPolicyVersion(arn, "{\"v\":6}", false));
+    }
+
+    @Test
+    void createPolicyVersionAfterDeletionDoesNotReuseVersionIds() {
+        IamPolicy policy = iamService.createPolicy("P", "/", null, "{}", null);
+        String arn = policy.getArn();
+        for (int i = 2; i <= 5; i++) {
+            iamService.createPolicyVersion(arn, "{\"v\":" + i + "}", true);
+        }
+        // Prune the oldest non-default version (what CloudFormation does at the cap) and
+        // create another. AWS version ids are monotonic — a deleted id is never reissued,
+        // so the new version must be v6, not a rewrite of the surviving v5.
+        iamService.deletePolicyVersion(arn, "v1");
+        PolicyVersion next = iamService.createPolicyVersion(arn, "{\"v\":6}", true);
+        assertEquals("v6", next.getVersionId());
+        assertEquals("{\"v\":5}", iamService.getPolicyVersion(arn, "v5").getDocument());
+    }
+
+    @Test
+    void createPolicyVersionAfterDeletingHighestSurvivingIdDoesNotReuseIt() {
+        // Deleting the HIGHEST surviving version (not the oldest, as above) is the case that
+        // breaks a "derive from the live keys" implementation: with v5 gone, the live max is v4,
+        // so a naive next-id computation reissues v5 rather than advancing to v6.
+        IamPolicy policy = iamService.createPolicy("P", "/", null, "{}", null);
+        String arn = policy.getArn();
+        for (int i = 2; i <= 5; i++) {
+            iamService.createPolicyVersion(arn, "{\"v\":" + i + "}", false);
+        }
+        iamService.deletePolicyVersion(arn, "v5");
+        PolicyVersion next = iamService.createPolicyVersion(arn, "{\"v\":6}", false);
+        assertEquals("v6", next.getVersionId());
+        assertEquals("{\"v\":4}", iamService.getPolicyVersion(arn, "v4").getDocument());
+    }
+
+    @Test
+    void createPolicyVersionOnLegacyRehydratedPolicyDoesNotReuseADeletedTopVersion() {
+        // Simulates a policy persisted by a Floci version that predates nextVersionNumber: the
+        // field is absent from the old JSON, so it rehydrates at the class's fresh-policy default
+        // (2) regardless of how many versions actually existed historically. Here we seed the
+        // versions map directly (bypassing createPolicyVersion, which is the only path that would
+        // have kept nextVersionNumber honest) to reproduce exactly that rehydrated shape: v1-v4
+        // live, as if v5 had been created and deleted before this field ever existed on disk.
+        IamPolicy policy = iamService.createPolicy("LegacyP", "/", null, "{\"v\":1}", null);
+        String arn = policy.getArn();
+        for (int i = 2; i <= 4; i++) {
+            policy.getVersions().put("v" + i,
+                    new io.github.hectorvent.floci.services.iam.model.PolicyVersion(
+                            "v" + i, "{\"v\":" + i + "}", false));
+        }
+        policy.setNextVersionNumber(null); // Jackson leaves this null when absent from old JSON
+        PolicyVersion next = iamService.createPolicyVersion(arn, "{\"v\":next}", false);
+        assertNotEquals("v5", next.getVersionId(),
+                "a legacy-rehydrated policy must not reissue the id of a version deleted before upgrade");
+    }
+
+    @Test
+    void updateGroupRejectsAnotherGroupNameThatDiffersOnlyByCase() {
+        IamGroup target = iamService.createGroup("CaseGroup", "/");
+        IamGroup source = iamService.createGroup("OtherGroup", "/original/");
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> iamService.updateGroup("OtherGroup", "casegroup", "/changed/"));
+
+        assertEquals("EntityAlreadyExists", exception.getErrorCode());
+        assertEquals(source.getGroupId(), iamService.getGroup("OtherGroup").getGroupId());
+        assertEquals("/original/", iamService.getGroup("OtherGroup").getPath());
+        assertEquals(target.getGroupId(), iamService.getGroup("CaseGroup").getGroupId());
+    }
+
+    @Test
+    void updateGroupAllowsChangingOnlyItsOwnNameCaseAndPreservesMembers() {
+        IamGroup original = iamService.createGroup("CaseGroup", "/original/");
+        iamService.createUser("case-group-member", "/");
+        iamService.addUserToGroup("CaseGroup", "case-group-member");
+
+        iamService.updateGroup("CaseGroup", "casegroup", "/changed/");
+
+        IamGroup renamed = iamService.getGroup("casegroup");
+        assertEquals(original.getGroupId(), renamed.getGroupId());
+        assertEquals("/changed/", renamed.getPath());
+        assertEquals(List.of("case-group-member"), renamed.getUserNames());
+        assertEquals(List.of("casegroup"), iamService.getUser("case-group-member").getGroupNames());
+        assertThrows(AwsException.class, () -> iamService.getGroup("CaseGroup"));
+    }
+
+    @Test
+    void updateGroupMalformedNewGroupNameIsRejected() {
+        iamService.createGroup("orig-group", "/");
+        assertThrows(AwsException.class,
+                () -> iamService.updateGroup("orig-group", "not a valid name!", null));
+    }
+
+    @Test
+    void groupRenamePreservesPolicyResolutionForExistingMembers() {
+        iamService.createGroup("g-rename", "/");
+        iamService.putGroupPolicy("g-rename", "p",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}");
+        iamService.createUser("member-user", "/");
+        iamService.addUserToGroup("g-rename", "member-user");
+        AccessKey key = iamService.createAccessKey("member-user");
+
+        iamService.updateGroup("g-rename", "g-renamed", null);
+
+        List<String> policies = iamService.resolveCallerPolicies(key.getAccessKeyId());
+        assertNotNull(policies);
+        assertTrue(policies.stream().anyMatch(doc -> doc.contains("\"Resource\":\"*\"")),
+                "group policy should still resolve for the member after the group is renamed");
+        assertTrue(iamService.listGroupsForUser("member-user").stream()
+                        .anyMatch(g -> g.getGroupName().equals("g-renamed")),
+                "ListGroupsForUser should reflect the new group name");
+    }
+
+    @Test
+    void instanceProfileSetTagsRejectsNullAndDefensivelyCopies() {
+        InstanceProfile profile = new InstanceProfile("AIPAX", "p", "/", "arn:aws:iam::111111111111:instance-profile/p");
+        profile.setTags(null);
+        assertNotNull(profile.getTags());
+        assertTrue(profile.getTags().isEmpty());
+
+        Map<String, String> source = new java.util.HashMap<>(Map.of("k", "v"));
+        profile.setTags(source);
+        source.put("k2", "v2");
+        assertFalse(profile.getTags().containsKey("k2"),
+                "setTags should defensively copy, not alias the caller's map");
     }
 
     @Test
@@ -371,6 +1177,18 @@ class IamServiceTest {
     }
 
     @Test
+    void accessKeySecretsAreFortyCharsAndUnique() {
+        iamService.createUser("alice", "/");
+        iamService.createUser("bob", "/");
+        AccessKey first = iamService.createAccessKey("alice");
+        AccessKey second = iamService.createAccessKey("bob");
+
+        assertEquals(40, first.getSecretAccessKey().length());
+        assertEquals(40, second.getSecretAccessKey().length());
+        assertNotEquals(first.getSecretAccessKey(), second.getSecretAccessKey());
+    }
+
+    @Test
     void createThirdAccessKeyFails() {
         iamService.createUser("alice", "/");
         iamService.createAccessKey("alice");
@@ -391,6 +1209,209 @@ class IamServiceTest {
         assertTrue(iamService.listAccessKeys("alice").isEmpty());
     }
 
+    @Test
+    void getSessionTokenStyleSessionBypassesEnforcementResolution() {
+        iamService.registerSession(
+                "ASIAIOSFODNN7EXAMPLE",
+                "temporary-secret",
+                null,
+                Instant.now().plusSeconds(3600),
+                null
+        );
+
+        assertNull(iamService.resolveCallerContext("ASIAIOSFODNN7EXAMPLE"));
+        assertNull(iamService.resolveCallerPolicies("ASIAIOSFODNN7EXAMPLE"));
+    }
+
+    @Test
+    void findSecretKeyRequiresTheTemporaryCredentialSessionToken() {
+        String accessKeyId = "ASIASESSIONTOKENMATCH";
+        iamService.registerSession(
+                accessKeyId,
+                "temporary-secret",
+                "session-token",
+                null,
+                Instant.now().plusSeconds(3600),
+                null
+        );
+
+        assertEquals("temporary-secret", iamService.findSecretKey(accessKeyId, "session-token").orElseThrow());
+        assertTrue(iamService.findSecretKey(accessKeyId).isPresent());
+        assertTrue(iamService.findSecretKey(accessKeyId, "wrong-token").isEmpty());
+        assertTrue(iamService.findSecretKey(accessKeyId, null).isEmpty());
+    }
+
+    // =========================================================================
+    // Session account routing (SessionAccountLookup)
+    // =========================================================================
+
+    @Test
+    void resolveAccountIdUsesRoleArnAccount() {
+        iamService.registerSession(
+                "ASIACROSSACCOUNT",
+                "temp-secret",
+                "arn:aws:iam::222233334444:role/CrossAccountAccess",
+                Instant.now().plusSeconds(3600),
+                null,
+                "111122223333"
+        );
+
+        assertEquals("222233334444", iamService.resolveAccountId("ASIACROSSACCOUNT").orElseThrow());
+    }
+
+    @Test
+    void resolveAccountIdFallsBackToOriginAccountWhenNoRoleArn() {
+        iamService.registerSession(
+                "ASIASESSIONTOKEN",
+                "temp-secret",
+                null,
+                Instant.now().plusSeconds(3600),
+                null,
+                "111122223333"
+        );
+
+        assertEquals("111122223333", iamService.resolveAccountId("ASIASESSIONTOKEN").orElseThrow());
+    }
+
+    @Test
+    void resolveAccountIdEmptyForUnknownKey() {
+        assertTrue(iamService.resolveAccountId("ASIANOTREGISTERED").isEmpty());
+        assertTrue(iamService.resolveAccountId(null).isEmpty());
+    }
+
+    @Test
+    void resolveAccountIdUsesLongTermAccessKeyOwnerAccount() {
+        AccountAwareStorageBackend<AccessKey> accessKeys = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        AccessKey accessKey = new AccessKey("AKIAIOSFODNN7EXAMPLE", "secret", "worker");
+        accessKeys.putForAccount("111122223333", accessKey.getAccessKeyId(), accessKey);
+
+        IamService service = iamService(false, accessKeys, new InMemoryStorage<>());
+
+        assertEquals("111122223333", service.resolveAccountId(accessKey.getAccessKeyId()).orElseThrow());
+    }
+
+    @Test
+    void resolveAccountIdIgnoresInactiveLongTermAccessKey() {
+        AccountAwareStorageBackend<AccessKey> accessKeys = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        AccessKey accessKey = new AccessKey("AKIAINACTIVEEXAMPLE", "secret", "worker");
+        accessKey.setStatus("Inactive");
+        accessKeys.putForAccount("111122223333", accessKey.getAccessKeyId(), accessKey);
+
+        IamService service = iamService(false, accessKeys, new InMemoryStorage<>());
+
+        assertTrue(service.resolveAccountId(accessKey.getAccessKeyId()).isEmpty());
+    }
+
+    private static final class CountingAccountAwareSessionStorage
+            extends AccountAwareStorageBackend<SessionCredential> {
+
+        private int scanAllAccountsAsMapCalls;
+
+        private CountingAccountAwareSessionStorage() {
+            super(new InMemoryStorage<>(), null, "000000000000");
+        }
+
+        @Override
+        public Map<String, SessionCredential> scanAllAccountsAsMap() {
+            scanAllAccountsAsMapCalls++;
+            return super.scanAllAccountsAsMap();
+        }
+    }
+
+    @Test
+    void resolveAccountIdEmptyForExpiredSession() {
+        iamService.registerSession(
+                "ASIAEXPIRED",
+                "temp-secret",
+                "arn:aws:iam::222233334444:role/CrossAccountAccess",
+                Instant.now().minusSeconds(60),
+                null,
+                "111122223333"
+        );
+
+        assertTrue(iamService.resolveAccountId("ASIAEXPIRED").isEmpty());
+    }
+
+    @Test
+    void resolveCallerContextDeletesExpiredCrossAccountSessionFromOriginAccount() {
+        String accessKeyId = "ASIAEXPIREDCROSSACCOUNT";
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "222233334444");
+        sessions.putForAccount("111122223333", accessKeyId, new SessionCredential(
+                accessKeyId,
+                "temp-secret",
+                "arn:aws:iam::222233334444:role/CrossAccountAccess",
+                Instant.now().minusSeconds(60),
+                null,
+                "111122223333"));
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+
+        assertNull(service.resolveCallerContext(accessKeyId));
+
+        assertTrue(sessions.getForAccount("111122223333", accessKeyId).isEmpty());
+    }
+
+    @Test
+    void lambdaExecutionRoleSessionUsesExplicitAccountAndHasNoExpiration() {
+        String accountId = "222233334444";
+        String accessKeyId = "ASIALAMBDAEXPLICIT";
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+
+        service.registerLambdaExecutionRoleSession(
+                accountId, accessKeyId, "lambda-secret",
+                "arn:aws:iam::222233334444:role/LambdaRole");
+
+        SessionCredential stored = sessions.getForAccount(accountId, accessKeyId).orElseThrow();
+        assertEquals(accountId, stored.getOriginAccountId());
+        assertNull(stored.getExpiration());
+        assertTrue(stored.isLambdaExecutionRole());
+        assertTrue(sessions.getForAccount("000000000000", accessKeyId).isEmpty());
+
+        service.unregisterSession(accountId, accessKeyId);
+        assertTrue(sessions.getForAccount(accountId, accessKeyId).isEmpty());
+    }
+
+    @Test
+    void temporarySessionUsesExplicitAccountNamespace() {
+        String accountId = "222233334444";
+        String accessKeyId = "ASIASIGNINEXPLICIT";
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+
+        service.registerSessionForAccount(
+                accountId, accessKeyId, "signin-secret",
+                "arn:aws:iam::222233334444:root", Instant.now().plusSeconds(900), null);
+
+        SessionCredential stored = sessions.getForAccount(accountId, accessKeyId).orElseThrow();
+        assertEquals(accountId, stored.getOriginAccountId());
+        assertEquals("signin-secret", stored.getSecretAccessKey());
+        assertTrue(sessions.getForAccount("000000000000", accessKeyId).isEmpty());
+        assertEquals(accountId, service.resolveAccountId(accessKeyId).orElseThrow());
+    }
+
+    @Test
+    void lambdaExecutionRoleSessionSweepPreservesStsSessions() {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.registerLambdaExecutionRoleSession(
+                "222233334444", "ASIALAMBDAORPHAN", "lambda-secret",
+                "arn:aws:iam::222233334444:role/LambdaRole");
+        service.registerSession(
+                "ASIASTSSESSION", "sts-secret", "arn:aws:iam::000000000000:role/StsRole",
+                Instant.now().plusSeconds(3600), null, "000000000000");
+
+        assertEquals(1, service.sweepOrphanedLambdaExecutionRoleSessions());
+
+        assertTrue(sessions.getForAccount("222233334444", "ASIALAMBDAORPHAN").isEmpty());
+        assertTrue(sessions.getForAccount("000000000000", "ASIASTSSESSION").isPresent());
+    }
+
     // =========================================================================
     // Instance Profiles
     // =========================================================================
@@ -402,6 +1423,17 @@ class IamServiceTest {
         assertEquals("MyProfile", profile.getInstanceProfileName());
         assertTrue(profile.getInstanceProfileId().startsWith("AIPA"));
         assertEquals("arn:aws:iam::000000000000:instance-profile/MyProfile", profile.getArn());
+    }
+
+    @Test
+    void createInstanceProfileRejectsNameThatDiffersOnlyByCase() {
+        iamService.createInstanceProfile("CaseProfile", "/");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.createInstanceProfile("caseprofile", "/"));
+
+        assertEquals("EntityAlreadyExists", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
     }
 
     @Test
@@ -462,10 +1494,81 @@ class IamServiceTest {
         assertTrue(admin.getPolicyId().startsWith("ANPA"));
         assertEquals("v1", admin.getDefaultVersionId());
 
+        // Referenced by the roles `cdk bootstrap` and the aws-bench scenario stacks create.
+        // A missing entry surfaces as "Policy <arn> does not exist" on the consuming role,
+        // which rolls the whole stack back.
+        for (String name : new String[] {
+                "AWSCloudFormationReadOnlyAccess", "AmazonAthenaFullAccess",
+                "AmazonRedshiftFullAccess", "AmazonS3TablesReadOnlyAccess" }) {
+            IamPolicy seeded = iamService.getPolicy("arn:aws:iam::aws:policy/" + name);
+            assertEquals(name, seeded.getPolicyName());
+            assertEquals("/", seeded.getPath());
+        }
+
         IamPolicy lambda = iamService.getPolicy(
                 "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole");
         assertEquals("AWSLambdaBasicExecutionRole", lambda.getPolicyName());
         assertEquals("/service-role/", lambda.getPath());
+
+        IamPolicy ssm = iamService.getPolicy("arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore");
+        assertEquals("AmazonSSMManagedInstanceCore", ssm.getPolicyName());
+        assertEquals("/", ssm.getPath());
+
+        IamPolicy cloudWatchAgent = iamService.getPolicy("arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy");
+        assertEquals("CloudWatchAgentServerPolicy", cloudWatchAgent.getPolicyName());
+        assertEquals("/", cloudWatchAgent.getPath());
+
+        IamPolicy ecrReadOnly = iamService.getPolicy("arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly");
+        assertEquals("AmazonEC2ContainerRegistryReadOnly", ecrReadOnly.getPolicyName());
+        assertEquals("/", ecrReadOnly.getPath());
+
+        IamPolicy rdsMonitoring = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole");
+        assertEquals("AmazonRDSEnhancedMonitoringRole", rdsMonitoring.getPolicyName());
+        assertEquals("/service-role/", rdsMonitoring.getPath());
+
+        IamPolicy bedrock = iamService.getPolicy("arn:aws:iam::aws:policy/AmazonBedrockFullAccess");
+        assertEquals("AmazonBedrockFullAccess", bedrock.getPolicyName());
+        assertEquals("/", bedrock.getPath());
+
+        IamPolicy bedrockReadOnly = iamService.getPolicy("arn:aws:iam::aws:policy/AmazonBedrockReadOnly");
+        assertEquals("AmazonBedrockReadOnly", bedrockReadOnly.getPolicyName());
+        assertEquals("/", bedrockReadOnly.getPath());
+
+        // LZA's OperationsStack attaches these to its AWS Backup service roles.
+        IamPolicy backup = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup");
+        assertEquals("AWSBackupServiceRolePolicyForBackup", backup.getPolicyName());
+        assertEquals("/service-role/", backup.getPath());
+
+        IamPolicy restore = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores");
+        assertEquals("AWSBackupServiceRolePolicyForRestores", restore.getPolicyName());
+        assertEquals("/service-role/", restore.getPath());
+
+        // The S3 variants live at the root path in real AWS, not /service-role/.
+        IamPolicy s3Backup = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Backup");
+        assertEquals("AWSBackupServiceRolePolicyForS3Backup", s3Backup.getPolicyName());
+        assertEquals("/", s3Backup.getPath());
+
+        IamPolicy s3Restore = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore");
+        assertEquals("AWSBackupServiceRolePolicyForS3Restore", s3Restore.getPolicyName());
+        assertEquals("/", s3Restore.getPath());
+    }
+
+    @Test
+    void attachAmazonBedrockFullAccessToRole() {
+        // Regression: AmazonBedrockFullAccess was absent from the seed catalog, so
+        // AttachRolePolicy (the Terraform path — CloudFormation attaches inline and
+        // never calls it) 404'd with NoSuchEntity. Attaching it must now succeed.
+        iamService.createRole("BedrockRole", "/", "{}", null, 0, null);
+        iamService.attachRolePolicy("BedrockRole", "arn:aws:iam::aws:policy/AmazonBedrockFullAccess");
+
+        List<String> attached = iamService.listAttachedRolePolicies("BedrockRole", null).stream()
+                .map(IamPolicy::getArn).toList();
+        assertTrue(attached.contains("arn:aws:iam::aws:policy/AmazonBedrockFullAccess"));
     }
 
     @Test
@@ -480,6 +1583,53 @@ class IamServiceTest {
     }
 
     @Test
+    void seedDefaultsDoesNotCreateDefaultDeployerPrincipalByDefault() {
+        iamService.seedDefaults();
+
+        assertThrows(AwsException.class, () -> iamService.getUser("floci-deployer"));
+        assertTrue(iamService.resolveCallerArn("floci").isEmpty());
+    }
+
+    @Test
+    void seedDefaultsCreatesConfiguredDefaultDeployerPrincipal() {
+        iamService = iamService(true);
+        iamService.seedDefaults();
+
+        IamUser user = iamService.getUser("floci-deployer");
+        assertEquals("arn:aws:iam::000000000000:user/floci-deployer", user.getArn());
+        assertTrue(user.getAttachedPolicyArns().contains("arn:aws:iam::aws:policy/AdministratorAccess"));
+        assertEquals(
+                "arn:aws:iam::000000000000:user/floci-deployer",
+                iamService.resolveCallerArn("floci").orElseThrow());
+        assertNotNull(iamService.resolveCallerContext("floci"));
+        assertNotNull(iamService.resolvePrincipalContext(user.getArn()));
+    }
+
+    @Test
+    void simulatePrincipalPolicyRejectsUnsupportedPrincipalArnType() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.resolvePrincipalContext("arn:aws:iam::000000000000:group/admins"));
+
+        assertEquals("InvalidInput", ex.getErrorCode());
+        assertEquals("PolicySourceArn must identify an IAM user or role.", ex.getMessage());
+    }
+
+    @Test
+    void seedDefaultsDoesNotReplaceExistingDeployerAccessKey() {
+        InMemoryStorage<String, AccessKey> accessKeys = new InMemoryStorage<>();
+        iamService = iamService(true, accessKeys);
+        iamService.createUser("existing", "/");
+        accessKeys.put("floci", new AccessKey("floci", "existing-secret", "existing"));
+
+        iamService.seedDefaults();
+
+        assertEquals(
+                "arn:aws:iam::000000000000:user/existing",
+                iamService.resolveCallerArn("floci").orElseThrow());
+        assertEquals("existing-secret", iamService.findSecretKey("floci").orElseThrow());
+    }
+
+    @Test
     void attachManagedPolicyToRole() {
         iamService.seedAwsManagedPolicies();
         iamService.createRole("LambdaExec", "/", "{}", null, 0, null);
@@ -488,6 +1638,58 @@ class IamServiceTest {
         iamService.attachRolePolicy("LambdaExec", policyArn);
 
         List<IamPolicy> attached = iamService.listAttachedRolePolicies("LambdaExec", null);
+        assertEquals(1, attached.size());
+        assertEquals(policyArn, attached.getFirst().getArn());
+    }
+
+    @Test
+    void attachSsmManagedInstanceCorePolicyToRole() {
+        iamService.seedAwsManagedPolicies();
+        iamService.createRole("Ec2Exec", "/", "{}", null, 0, null);
+
+        String policyArn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore";
+        iamService.attachRolePolicy("Ec2Exec", policyArn);
+
+        List<IamPolicy> attached = iamService.listAttachedRolePolicies("Ec2Exec", null);
+        assertEquals(1, attached.size());
+        assertEquals(policyArn, attached.getFirst().getArn());
+    }
+
+    @Test
+    void attachCloudWatchAgentServerPolicyToRole() {
+        iamService.seedAwsManagedPolicies();
+        iamService.createRole("Ec2Exec", "/", "{}", null, 0, null);
+
+        String policyArn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy";
+        iamService.attachRolePolicy("Ec2Exec", policyArn);
+
+        List<IamPolicy> attached = iamService.listAttachedRolePolicies("Ec2Exec", null);
+        assertEquals(1, attached.size());
+        assertEquals(policyArn, attached.getFirst().getArn());
+    }
+
+    @Test
+    void attachEcrReadOnlyPolicyToRole() {
+        iamService.seedAwsManagedPolicies();
+        iamService.createRole("Ec2Exec", "/", "{}", null, 0, null);
+
+        String policyArn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly";
+        iamService.attachRolePolicy("Ec2Exec", policyArn);
+
+        List<IamPolicy> attached = iamService.listAttachedRolePolicies("Ec2Exec", null);
+        assertEquals(1, attached.size());
+        assertEquals(policyArn, attached.getFirst().getArn());
+    }
+
+    @Test
+    void attachRdsEnhancedMonitoringRolePolicyToRole() {
+        iamService.seedAwsManagedPolicies();
+        iamService.createRole("RdsMonitor", "/", "{}", null, 0, null);
+
+        String policyArn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole";
+        iamService.attachRolePolicy("RdsMonitor", policyArn);
+
+        List<IamPolicy> attached = iamService.listAttachedRolePolicies("RdsMonitor", null);
         assertEquals(1, attached.size());
         assertEquals(policyArn, attached.getFirst().getArn());
     }
@@ -543,5 +1745,589 @@ class IamServiceTest {
 
         List<IamPolicy> all = iamService.listPolicies(null, "/");
         assertEquals(awsOnly.size() + localOnly.size(), all.size());
+    }
+
+    // =========================================================================
+    // OIDC Identity Providers
+    // =========================================================================
+
+    private static final String OIDC_URL =
+            "https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E";
+    private static final String OIDC_HOST =
+            "oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E";
+    private static final String THUMBPRINT = "9e99a48a9960b14926bb7f3b02e22da2b0ab7280";
+
+    @Test
+    void createOpenIDConnectProviderStripsTheSchemeFromUrlAndArn() {
+        OpenIDConnectProvider provider = iamService.createOpenIDConnectProvider(
+                OIDC_URL, List.of("sts.amazonaws.com"), List.of(THUMBPRINT), Map.of());
+
+        assertEquals(OIDC_HOST, provider.getUrl());
+        assertEquals("arn:aws:iam::000000000000:oidc-provider/" + OIDC_HOST, provider.getArn());
+        assertEquals(List.of("sts.amazonaws.com"), provider.getClientIdList());
+        assertEquals(List.of(THUMBPRINT), provider.getThumbprintList());
+        assertNotNull(provider.getCreateDate());
+    }
+
+    @Test
+    void createOpenIDConnectProviderRequiresHttps() {
+        AwsException error = assertThrows(AwsException.class, () -> iamService.createOpenIDConnectProvider(
+                "http://oidc.example.com/id/1", List.of(), List.of(), Map.of()));
+        assertEquals("ValidationError", error.getErrorCode());
+    }
+
+    @Test
+    void createDuplicateOpenIDConnectProviderFails() {
+        iamService.createOpenIDConnectProvider(OIDC_URL, List.of(), List.of(THUMBPRINT), Map.of());
+
+        AwsException error = assertThrows(AwsException.class, () -> iamService.createOpenIDConnectProvider(
+                OIDC_URL, List.of(), List.of(THUMBPRINT), Map.of()));
+        assertEquals("EntityAlreadyExists", error.getErrorCode());
+    }
+
+    @Test
+    void getOpenIDConnectProviderNotFoundThrows() {
+        AwsException error = assertThrows(AwsException.class, () -> iamService.getOpenIDConnectProvider(
+                "arn:aws:iam::000000000000:oidc-provider/missing.example.com"));
+        assertEquals("NoSuchEntity", error.getErrorCode());
+    }
+
+    @Test
+    void listOpenIDConnectProviders() {
+        assertTrue(iamService.listOpenIDConnectProviders().isEmpty());
+        OpenIDConnectProvider provider =
+                iamService.createOpenIDConnectProvider(OIDC_URL, List.of(), List.of(THUMBPRINT), Map.of());
+
+        List<OpenIDConnectProvider> all = iamService.listOpenIDConnectProviders();
+        assertEquals(1, all.size());
+        assertEquals(provider.getArn(), all.getFirst().getArn());
+    }
+
+    @Test
+    void deleteOpenIDConnectProvider() {
+        OpenIDConnectProvider provider =
+                iamService.createOpenIDConnectProvider(OIDC_URL, List.of(), List.of(THUMBPRINT), Map.of());
+
+        iamService.deleteOpenIDConnectProvider(provider.getArn());
+
+        assertTrue(iamService.listOpenIDConnectProviders().isEmpty());
+        assertThrows(AwsException.class, () -> iamService.getOpenIDConnectProvider(provider.getArn()));
+    }
+
+    @Test
+    void addAndRemoveClientId() {
+        OpenIDConnectProvider provider = iamService.createOpenIDConnectProvider(
+                OIDC_URL, List.of("sts.amazonaws.com"), List.of(THUMBPRINT), Map.of());
+
+        iamService.addClientIdToOpenIDConnectProvider(provider.getArn(), "extra.audience");
+        assertEquals(List.of("sts.amazonaws.com", "extra.audience"),
+                iamService.getOpenIDConnectProvider(provider.getArn()).getClientIdList());
+
+        iamService.removeClientIdFromOpenIDConnectProvider(provider.getArn(), "extra.audience");
+        assertEquals(List.of("sts.amazonaws.com"),
+                iamService.getOpenIDConnectProvider(provider.getArn()).getClientIdList());
+    }
+
+    /**
+     * Verified against a live AWS account: adding a client ID that is already present and removing
+     * one that was never added both succeed and change nothing.
+     */
+    @Test
+    void clientIdAddAndRemoveAreIdempotent() {
+        OpenIDConnectProvider provider = iamService.createOpenIDConnectProvider(
+                OIDC_URL, List.of("sts.amazonaws.com"), List.of(THUMBPRINT), Map.of());
+
+        iamService.addClientIdToOpenIDConnectProvider(provider.getArn(), "sts.amazonaws.com");
+        assertEquals(List.of("sts.amazonaws.com"),
+                iamService.getOpenIDConnectProvider(provider.getArn()).getClientIdList());
+
+        iamService.removeClientIdFromOpenIDConnectProvider(provider.getArn(), "never.added");
+        assertEquals(List.of("sts.amazonaws.com"),
+                iamService.getOpenIDConnectProvider(provider.getArn()).getClientIdList());
+    }
+
+    @Test
+    void updateThumbprintReplacesTheList() {
+        OpenIDConnectProvider provider =
+                iamService.createOpenIDConnectProvider(OIDC_URL, List.of(), List.of(THUMBPRINT), Map.of());
+
+        iamService.updateOpenIDConnectProviderThumbprint(provider.getArn(), List.of("aaaa", "bbbb"));
+
+        assertEquals(List.of("aaaa", "bbbb"),
+                iamService.getOpenIDConnectProvider(provider.getArn()).getThumbprintList());
+    }
+
+    @Test
+    void openIdConnectProviderUrlIsCappedAt255Characters() {
+        String longUrl = "https://oidc.example.com/id/" + "a".repeat(255);
+
+        AwsException error = assertThrows(AwsException.class, () ->
+                iamService.createOpenIDConnectProvider(longUrl, List.of(), List.of(THUMBPRINT), Map.of()));
+        assertEquals("ValidationError", error.getErrorCode());
+    }
+
+    @Test
+    void thumbprintListIsCappedAtFive() {
+        // Five is accepted; six is not, and AWS reports InvalidInput rather than LimitExceeded.
+        iamService.createOpenIDConnectProvider(OIDC_URL, List.of(),
+                List.of("a", "b", "c", "d", "e"), Map.of());
+
+        AwsException error = assertThrows(AwsException.class, () -> iamService.createOpenIDConnectProvider(
+                "https://oidc.example.com/id/six", List.of(), List.of("a", "b", "c", "d", "e", "f"), Map.of()));
+        assertEquals("InvalidInput", error.getErrorCode());
+    }
+
+    /**
+     * A missing required parameter must fail as a ValidationError before any lookup. A null
+     * ClientID would otherwise read as "not in the list" and report a no-op success, and a null
+     * ARN as a missing provider.
+     */
+    @Test
+    void oidcMutatorsRejectMissingRequiredParameters() {
+        OpenIDConnectProvider provider = iamService.createOpenIDConnectProvider(
+                OIDC_URL, List.of("sts.amazonaws.com"), List.of(THUMBPRINT), Map.of());
+
+        assertEquals("ValidationError", assertThrows(AwsException.class, () ->
+                iamService.removeClientIdFromOpenIDConnectProvider(provider.getArn(), null)).getErrorCode());
+        assertEquals("ValidationError", assertThrows(AwsException.class, () ->
+                iamService.addClientIdToOpenIDConnectProvider(provider.getArn(), "  ")).getErrorCode());
+        assertEquals("ValidationError", assertThrows(AwsException.class, () ->
+                iamService.deleteOpenIDConnectProvider(null)).getErrorCode());
+        assertEquals("ValidationError", assertThrows(AwsException.class, () ->
+                iamService.updateOpenIDConnectProviderThumbprint(null, List.of("aaaa"))).getErrorCode());
+
+        // The provider and its client IDs are untouched by any of the rejected calls.
+        assertEquals(List.of("sts.amazonaws.com"),
+                iamService.getOpenIDConnectProvider(provider.getArn()).getClientIdList());
+    }
+
+    @Test
+    void clientIdListIsCappedAtOneHundred() {
+        List<String> tooMany = java.util.stream.IntStream.range(0, 101)
+                .mapToObj(i -> "client-" + i).toList();
+
+        AwsException error = assertThrows(AwsException.class, () ->
+                iamService.createOpenIDConnectProvider(OIDC_URL, tooMany, List.of(THUMBPRINT), Map.of()));
+        assertEquals("LimitExceeded", error.getErrorCode());
+    }
+
+    /**
+     * Verified against a live AWS account: AWS does not normalize the URL, so a trailing slash or
+     * a case difference yields a separate provider rather than a duplicate.
+     */
+    @Test
+    void providerUrlsAreNotNormalized() {
+        iamService.createOpenIDConnectProvider(OIDC_URL, List.of(), List.of(THUMBPRINT), Map.of());
+        iamService.createOpenIDConnectProvider(OIDC_URL + "/", List.of(), List.of(THUMBPRINT), Map.of());
+        iamService.createOpenIDConnectProvider(
+                "https://OIDC.eks.eu-central-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E",
+                List.of(), List.of(THUMBPRINT), Map.of());
+
+        assertEquals(3, iamService.listOpenIDConnectProviders().size());
+    }
+
+    /**
+     * Verified against a live AWS account: an empty tag map or key list is rejected as InvalidInput
+     * rather than accepted as a no-op.
+     */
+    @Test
+    void oidcTagMutatorsRejectEmptyCollections() {
+        OpenIDConnectProvider provider = iamService.createOpenIDConnectProvider(
+                OIDC_URL, List.of(), List.of(THUMBPRINT), Map.of("env", "prod"));
+
+        assertEquals("InvalidInput", assertThrows(AwsException.class, () ->
+                iamService.tagOpenIDConnectProvider(provider.getArn(), Map.of())).getErrorCode());
+        assertEquals("InvalidInput", assertThrows(AwsException.class, () ->
+                iamService.untagOpenIDConnectProvider(provider.getArn(), List.of())).getErrorCode());
+        assertEquals("ValidationError", assertThrows(AwsException.class, () ->
+                iamService.tagOpenIDConnectProvider(null, Map.of("k", "v"))).getErrorCode());
+
+        // The rejected calls leave the existing tags alone.
+        assertEquals(Map.of("env", "prod"), iamService.listOpenIDConnectProviderTags(provider.getArn()));
+    }
+
+    @Test
+    void tagAndUntagOpenIDConnectProvider() {
+        OpenIDConnectProvider provider = iamService.createOpenIDConnectProvider(
+                OIDC_URL, List.of(), List.of(THUMBPRINT), Map.of("env", "prod"));
+
+        assertEquals("prod", iamService.listOpenIDConnectProviderTags(provider.getArn()).get("env"));
+
+        iamService.tagOpenIDConnectProvider(provider.getArn(), Map.of("team", "platform"));
+        assertEquals(2, iamService.listOpenIDConnectProviderTags(provider.getArn()).size());
+
+        iamService.untagOpenIDConnectProvider(provider.getArn(), List.of("env"));
+        Map<String, String> remaining = iamService.listOpenIDConnectProviderTags(provider.getArn());
+        assertEquals(1, remaining.size());
+        assertEquals("platform", remaining.get("team"));
+    }
+    // =========================================================================
+    // Account Aliases
+    // =========================================================================
+
+    @Test
+    void createAndGetAccountAlias() {
+        assertTrue(iamService.getAccountAlias().isEmpty());
+
+        iamService.createAccountAlias("my-account");
+
+        assertEquals("my-account", iamService.getAccountAlias().orElseThrow());
+    }
+
+    /**
+     * Verified against a live AWS account: creating a free alias while another is set replaces it
+     * rather than failing, which is how the one-alias-per-account rule is actually enforced.
+     */
+    @Test
+    void createAccountAliasReplacesAnExistingOne() {
+        iamService.createAccountAlias("my-account");
+
+        iamService.createAccountAlias("other-account");
+
+        assertEquals("other-account", iamService.getAccountAlias().orElseThrow());
+    }
+
+    /** Re-creating the alias the account already holds is the case AWS rejects. */
+    @Test
+    void createAccountAliasRejectsTheAliasAlreadyHeld() {
+        iamService.createAccountAlias("my-account");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.createAccountAlias("my-account"));
+        assertEquals("EntityAlreadyExists", ex.getErrorCode());
+        assertTrue(ex.getMessage().contains("my-account"));
+        assertEquals("my-account", iamService.getAccountAlias().orElseThrow());
+    }
+
+    @Test
+    void deleteAccountAliasRejectsAMalformedValue() {
+        iamService.createAccountAlias("my-account");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.deleteAccountAlias("Bad_Alias"));
+        assertEquals("ValidationError", ex.getErrorCode());
+        assertEquals("my-account", iamService.getAccountAlias().orElseThrow());
+    }
+
+    @Test
+    void deleteAccountAlias() {
+        iamService.createAccountAlias("my-account");
+
+        iamService.deleteAccountAlias("my-account");
+
+        assertTrue(iamService.getAccountAlias().isEmpty());
+    }
+
+    @Test
+    void deleteAccountAliasWithMismatchedNameFails() {
+        iamService.createAccountAlias("my-account");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.deleteAccountAlias("some-other-alias"));
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+        assertEquals("my-account", iamService.getAccountAlias().orElseThrow());
+    }
+
+    @Test
+    void deleteAccountAliasWhenNoneSetFails() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.deleteAccountAlias("my-account"));
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+    }
+
+    @Test
+    void malformedAccountAliasesAreRejected() {
+        for (String alias : List.of("ab", "-leading", "trailing-", "Upper", "under_score", "a".repeat(64))) {
+            AwsException ex = assertThrows(AwsException.class,
+                    () -> iamService.createAccountAlias(alias), "expected rejection for: " + alias);
+            assertEquals("ValidationError", ex.getErrorCode(), "wrong code for: " + alias);
+        }
+        assertThrows(AwsException.class, () -> iamService.createAccountAlias(null));
+    }
+
+    /**
+     * AWS documents the pattern as {@code ^[a-z0-9]([a-z0-9]|-(?!-)){1,61}[a-z0-9]$} — consecutive
+     * dashes are rejected, which a plain character class would let through.
+     */
+    @Test
+    void accountAliasRejectsConsecutiveDashes() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.createAccountAlias("my--account"));
+        assertEquals("ValidationError", ex.getErrorCode());
+        assertTrue(iamService.getAccountAlias().isEmpty());
+
+        iamService.createAccountAlias("my-account");
+        assertEquals("my-account", iamService.getAccountAlias().orElseThrow());
+    }
+
+    @Test
+    void accountAliasBoundaryLengthsAreAccepted() {
+        iamService.createAccountAlias("abc");
+        iamService.deleteAccountAlias("abc");
+
+        iamService.createAccountAlias("a".repeat(63));
+        assertEquals("a".repeat(63), iamService.getAccountAlias().orElseThrow());
+    }
+
+    // =========================================================================
+    // GetAccountAuthorizationDetails
+    // =========================================================================
+
+    @Test
+    void accountAuthorizationDetailsAlwaysIncludesLocalPoliciesEvenUnattached() {
+        IamPolicy unattached = iamService.createPolicy("aad-unattached", "/", null,
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}",
+                null);
+
+        IamService.AccountAuthorizationDetails details = iamService.getAccountAuthorizationDetails();
+
+        assertTrue(details.policies().stream().anyMatch(p -> p.getArn().equals(unattached.getArn())));
+    }
+
+    @Test
+    void accountAuthorizationDetailsExcludesAnAwsManagedPolicyNotAttachedToAnything() {
+        IamService.AccountAuthorizationDetails details = iamService.getAccountAuthorizationDetails();
+
+        // A freshly constructed IamService has attached nothing, so a well-known AWS-managed
+        // policy this test never touches must not appear.
+        assertTrue(details.policies().stream()
+                .noneMatch(p -> p.getArn().equals("arn:aws:iam::aws:policy/AdministratorAccess")));
+    }
+
+    @Test
+    void accountAuthorizationDetailsIncludesAnAwsManagedPolicyOnceAttachedToAUser() {
+        iamService.createUser("aad-user", "/");
+        iamService.attachUserPolicy("aad-user", "arn:aws:iam::aws:policy/AdministratorAccess");
+
+        IamService.AccountAuthorizationDetails details = iamService.getAccountAuthorizationDetails();
+
+        assertTrue(details.policies().stream()
+                .anyMatch(p -> p.getArn().equals("arn:aws:iam::aws:policy/AdministratorAccess")));
+    }
+
+    /**
+     * AttachmentCount is computed by scanning this account's own users, groups and roles, not
+     * read off {@code IamPolicy.getAttachmentCount()}: for an AWS-managed policy that field is
+     * shared process-wide across every {@code IamService} instance's account, so a second,
+     * independent instance attaching the same ARN must not change what this instance reports.
+     */
+    @Test
+    void attachmentCountIsScopedToThisAccountNotTheSharedAwsManagedPolicyObject() {
+        String arn = "arn:aws:iam::aws:policy/AdministratorAccess";
+        iamService.createUser("aad-scoped-user", "/");
+        iamService.attachUserPolicy("aad-scoped-user", arn);
+
+        IamService other = iamService(false);
+        other.createUser("other-account-user", "/");
+        other.attachUserPolicy("other-account-user", arn);
+        other.createUser("other-account-user-2", "/");
+        other.attachUserPolicy("other-account-user-2", arn);
+
+        IamService.AccountAuthorizationDetails details = iamService.getAccountAuthorizationDetails();
+
+        assertEquals(1, details.attachmentCounts().get(arn));
+    }
+
+    @Test
+    void attachmentCountTalliesAcrossUsersGroupsAndRoles() {
+        String arn = "arn:aws:iam::aws:policy/ReadOnlyAccess";
+        iamService.createUser("aad-tally-user", "/");
+        iamService.attachUserPolicy("aad-tally-user", arn);
+        iamService.createGroup("aad-tally-group", "/");
+        iamService.attachGroupPolicy("aad-tally-group", arn);
+        iamService.createRole("aad-tally-role", "/", "{}", null, 0, null);
+        iamService.attachRolePolicy("aad-tally-role", arn);
+
+        IamService.AccountAuthorizationDetails details = iamService.getAccountAuthorizationDetails();
+
+        assertEquals(3, details.attachmentCounts().get(arn));
+    }
+
+    @Test
+    void permissionsBoundaryUsageCountTalliesAcrossUsersAndRoles() {
+        IamPolicy boundary = iamService.createPolicy("aad-boundary", "/", null,
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}",
+                null);
+        iamService.createUser("aad-boundary-user", "/");
+        iamService.putUserPermissionsBoundary("aad-boundary-user", boundary.getArn());
+        iamService.createRole("aad-boundary-role", "/", "{}", null, 0, null);
+        iamService.putRolePermissionsBoundary("aad-boundary-role", boundary.getArn());
+
+        IamService.AccountAuthorizationDetails details = iamService.getAccountAuthorizationDetails();
+
+        assertEquals(2, details.permissionsBoundaryUsageCounts().get(boundary.getArn()));
+    }
+
+    @Test
+    void accountAuthorizationDetailsListsEveryUserGroupAndRole() {
+        iamService.createUser("aad-list-user", "/");
+        iamService.createGroup("aad-list-group", "/");
+        iamService.createRole("aad-list-role", "/", "{}", null, 0, null);
+
+        IamService.AccountAuthorizationDetails details = iamService.getAccountAuthorizationDetails();
+
+        assertTrue(details.users().stream().anyMatch(u -> u.getUserName().equals("aad-list-user")));
+        assertTrue(details.groups().stream().anyMatch(g -> g.getGroupName().equals("aad-list-group")));
+        assertTrue(details.roles().stream().anyMatch(r -> r.getRoleName().equals("aad-list-role")));
+    }
+
+    // =========================================================================
+    // Credential Report
+    // =========================================================================
+
+    @Test
+    void getCredentialReportBeforeAnyGenerateReturnsReportNotPresent() {
+        AwsException ex = assertThrows(AwsException.class, () -> iamService.getCredentialReport());
+        assertEquals("ReportNotPresent", ex.getErrorCode());
+    }
+
+    @Test
+    void generateCredentialReportReturnsStartedWhenNoneExists() {
+        IamService.CredentialReportGeneration generation = iamService.generateCredentialReport();
+
+        assertEquals("STARTED", generation.state());
+        assertEquals("No report exists. Starting a new report generation task", generation.description());
+    }
+
+    @Test
+    void generateCredentialReportReturnsCompleteWithinFourHoursOfAnExistingReport() {
+        iamService.generateCredentialReport();
+
+        IamService.CredentialReportGeneration second = iamService.generateCredentialReport();
+
+        assertEquals("COMPLETE", second.state());
+    }
+
+    @Test
+    void getCredentialReportAfterGenerateReturnsDecodableCsvWithTheHeaderAndRootRow() {
+        iamService.generateCredentialReport();
+
+        IamService.CredentialReportContent content = iamService.getCredentialReport();
+
+        assertEquals("text/csv", content.reportFormat());
+        String csv = new String(Base64.getDecoder().decode(content.base64Content()));
+        assertTrue(csv.startsWith("user,arn,user_creation_time,password_enabled,"),
+                "expected the documented column header, got: " + csv);
+        assertTrue(csv.contains("<root_account>,arn:aws:iam::"), "expected a root account row, got: " + csv);
+    }
+
+    @Test
+    void getCredentialReportIncludesEveryUserWithPasswordAndAccessKeyState() {
+        iamService.createUser("cred-report-user", "/");
+        iamService.createLoginProfile("cred-report-user", "Sup3r-Secret!", false);
+        iamService.createAccessKey("cred-report-user");
+        iamService.generateCredentialReport();
+
+        String csv = new String(Base64.getDecoder().decode(iamService.getCredentialReport().base64Content()));
+        String row = csv.lines().filter(line -> line.startsWith("cred-report-user,")).findFirst()
+                .orElseThrow(() -> new AssertionError("no row for cred-report-user in: " + csv));
+        String[] fields = row.split(",", -1);
+
+        assertEquals("TRUE", fields[3], "password_enabled");
+        assertEquals("TRUE", fields[8], "access_key_1_active");
+        assertEquals("FALSE", fields[7], "mfa_active, with no device enabled for this user");
+    }
+
+    /**
+     * The {@code mfa_active} column is backed by real device state rather than a constant, so a
+     * user holding an enabled device reports TRUE while the untouched user beside them stays FALSE.
+     */
+    @Test
+    void credentialReportMarksUsersHoldingAnMfaDeviceAsMfaActive() {
+        iamService.createUser("mfa-report-with", "/");
+        iamService.createUser("mfa-report-without", "/");
+        VirtualMfaDevice device = iamService.createVirtualMfaDevice("mfa-report-device", "/", Map.of());
+        String[] codes = consecutiveCodes(device.getBase32Seed());
+        iamService.enableMfaDevice("mfa-report-with", device.getSerialNumber(), codes[0], codes[1]);
+        iamService.generateCredentialReport();
+
+        String csv = new String(Base64.getDecoder().decode(iamService.getCredentialReport().base64Content()));
+        assertEquals("TRUE", mfaActiveColumn(csv, "mfa-report-with"));
+        assertEquals("FALSE", mfaActiveColumn(csv, "mfa-report-without"));
+    }
+
+    private static String mfaActiveColumn(String csv, String userName) {
+        return csv.lines().filter(line -> line.startsWith(userName + ","))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no row for " + userName + " in: " + csv))
+                .split(",", -1)[7];
+    }
+
+    /** The pair an authenticator would show now, which is what EnableMFADevice asks for. */
+    private static String[] consecutiveCodes(String base32Seed) {
+        long step = Totp.stepAt(Instant.now());
+        return new String[] {
+                Totp.codeAt(base32Seed, step - 1),
+                Totp.codeAt(base32Seed, step)
+        };
+    }
+
+    /**
+     * UpdateLoginProfile changes the password without touching LoginProfile's own createDate
+     * (its meaning stays "profile created"), so the credential report's password_last_changed
+     * column has to be backed by a separate field, updated whenever the password itself
+     * changes: otherwise a changed password would still report the original creation time.
+     */
+    @Test
+    void updateLoginProfilePasswordChangeMovesPasswordLastChanged() {
+        iamService.createUser("cred-report-changed-user", "/");
+        iamService.createLoginProfile("cred-report-changed-user", "Original-P4ss!", false);
+        Instant createdAt = iamService.getLoginProfile("cred-report-changed-user").getPasswordLastChanged();
+
+        iamService.updateLoginProfile("cred-report-changed-user", "Updated-P4ss!", null);
+        Instant changedAt = iamService.getLoginProfile("cred-report-changed-user").getPasswordLastChanged();
+
+        assertTrue(changedAt.isAfter(createdAt),
+                "expected password_last_changed to move: created=" + createdAt + " changed=" + changedAt);
+    }
+
+    /** Toggling only passwordResetRequired is not a password change, so the timestamp must not move. */
+    @Test
+    void updateLoginProfileWithoutAPasswordChangeLeavesPasswordLastChangedAlone() {
+        iamService.createUser("cred-report-unchanged-user", "/");
+        iamService.createLoginProfile("cred-report-unchanged-user", "Original-P4ss!", false);
+        Instant createdAt = iamService.getLoginProfile("cred-report-unchanged-user").getPasswordLastChanged();
+
+        iamService.updateLoginProfile("cred-report-unchanged-user", null, true);
+
+        assertEquals(createdAt, iamService.getLoginProfile("cred-report-unchanged-user").getPasswordLastChanged());
+    }
+
+    @Test
+    void getCredentialReportOnAnExpiredReportThrowsReportExpired() {
+        StorageBackend<String, CredentialReport> credentialReports = new InMemoryStorage<>();
+        credentialReports.put("credential-report/aws",
+                new CredentialReport("dGVzdA==", Instant.now().minus(Duration.ofHours(5))));
+        IamService withExpiredReport = new IamService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), credentialReports, new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), false, null);
+
+        AwsException ex = assertThrows(AwsException.class, withExpiredReport::getCredentialReport);
+        assertEquals("ReportExpired", ex.getErrorCode());
+    }
+
+    @Test
+    void generateCredentialReportOnAnExpiredReportStartsANewOne() {
+        StorageBackend<String, CredentialReport> credentialReports = new InMemoryStorage<>();
+        credentialReports.put("credential-report/aws",
+                new CredentialReport("dGVzdA==", Instant.now().minus(Duration.ofHours(5))));
+        IamService withExpiredReport = new IamService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), credentialReports, new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), false, null);
+
+        IamService.CredentialReportGeneration generation = withExpiredReport.generateCredentialReport();
+
+        assertEquals("STARTED", generation.state());
+        assertEquals("The previous report has expired. Starting a new report generation task",
+                generation.description());
+        assertDoesNotThrow(withExpiredReport::getCredentialReport);
     }
 }

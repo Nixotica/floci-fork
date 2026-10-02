@@ -192,6 +192,8 @@ class EcsIntegrationTest {
             .body("taskDefinition.taskDefinitionArn", containsString(TASK_DEF_FAMILY))
             .body("taskDefinition.containerDefinitions", hasSize(1))
             .body("taskDefinition.containerDefinitions[0].name", equalTo("app"))
+            .body("taskDefinition.requiresCompatibilities", hasItem("FARGATE"))
+            .body("taskDefinition.compatibilities", hasItem("FARGATE"))
         .extract()
             .path("taskDefinition.taskDefinitionArn");
 
@@ -210,6 +212,197 @@ class EcsIntegrationTest {
 
     @Test
     @Order(11)
+    void registerTaskDefinitionWithoutRequiresCompatibilitiesShouldDefaultToEc2() {
+        ecs("RegisterTaskDefinition")
+                .body("""
+                {
+                    "family": "ec2-fallback-family",
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "nginx:latest",
+                            "essential": true
+                        }
+                    ]
+                }
+                """)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(200)
+                .body("taskDefinition.family", equalTo("ec2-fallback-family"))
+                .body("taskDefinition.compatibilities", hasItem("EC2"))
+                // requiresCompatibilities shouldn't exist or should be empty
+                .body("taskDefinition.requiresCompatibilities", org.hamcrest.Matchers.nullValue());
+    }
+
+    @Test
+    @Order(12)
+    void registerTaskDefinitionWithFargateButBridgeModeShouldFail() {
+        ecs("RegisterTaskDefinition")
+                .body("""
+                {
+                    "family": "invalid-fargate-bridge",
+                    "requiresCompatibilities": ["FARGATE"],
+                    "networkMode": "bridge",
+                    "cpu": "256",
+                    "memory": "512",
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "nginx:latest",
+                            "essential": true
+                        }
+                    ]
+                }
+                """)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", containsString("ClientException"))
+                .body("message", containsString("Fargate only supports network mode 'awsvpc'."));
+    }
+
+    @Test
+    @Order(13)
+    void registerTaskDefinitionWithFargateButMissingCpuShouldFail() {
+        ecs("RegisterTaskDefinition")
+                .body("""
+                {
+                    "family": "invalid-fargate-cpu",
+                    "requiresCompatibilities": ["FARGATE"],
+                    "networkMode": "awsvpc",
+                    "memory": "512",
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "nginx:latest",
+                            "essential": true
+                        }
+                    ]
+                }
+                """)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", containsString("ClientException"))
+                .body("message", containsString("Fargate requires that 'cpu' be defined at the task level."));
+    }
+
+    @Test
+    @Order(14)
+    void registerTaskDefinitionWithFargateButMissingMemoryShouldFail() {
+        ecs("RegisterTaskDefinition")
+                .body("""
+                {
+                    "family": "invalid-fargate-memory",
+                    "requiresCompatibilities": ["FARGATE"],
+                    "networkMode": "awsvpc",
+                    "cpu": "256",
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "nginx:latest",
+                            "essential": true
+                        }
+                    ]
+                }
+                """)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", containsString("ClientException"))
+                .body("message", containsString("Fargate requires that 'memory' be defined at the task level."));
+    }
+
+    @Test
+    @Order(15)
+    void registerTaskDefinitionWithFargateButInvalidSizesShouldFail() {
+        ecs("RegisterTaskDefinition")
+                .body("""
+                {
+                    "family": "invalid-fargate-sizes",
+                    "requiresCompatibilities": ["FARGATE"],
+                    "networkMode": "awsvpc",
+                    "cpu": "256",
+                    "memory": "1000",
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "nginx:latest",
+                            "essential": true
+                        }
+                    ]
+                }
+                """)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", containsString("ClientException"))
+                .body("message", containsString("No Fargate configuration exists for given values."));
+    }
+
+    @Test
+    @Order(16)
+    void registerTaskDefinitionWithSecretsRoundTripsReferences() {
+        String secretArn = "arn:aws:secretsmanager:%s:%s:secret:db-password-AbCdEf"
+                .formatted(REGION, ACCOUNT);
+
+        String secretsTaskDefArn = ecs("RegisterTaskDefinition")
+            .body("""
+                {
+                    "family": "task-with-secrets",
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "nginx:latest",
+                            "essential": true,
+                            "secrets": [
+                                {"name": "DB_PASSWORD", "valueFrom": "%s"},
+                                {"name": "DB_TOKEN", "valueFrom": "%s:token::"},
+                                {"name": "CONFIG_VALUE", "valueFrom": "/app/config"}
+                            ]
+                        }
+                    ]
+                }
+                """.formatted(secretArn, secretArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.containerDefinitions[0].secrets", hasSize(3))
+            .body("taskDefinition.containerDefinitions[0].secrets[0].name", equalTo("DB_PASSWORD"))
+            .body("taskDefinition.containerDefinitions[0].secrets[0].valueFrom", equalTo(secretArn))
+            .body("taskDefinition.containerDefinitions[0].secrets[1].name", equalTo("DB_TOKEN"))
+            .body("taskDefinition.containerDefinitions[0].secrets[1].valueFrom", equalTo(secretArn + ":token::"))
+            .body("taskDefinition.containerDefinitions[0].secrets[2].name", equalTo("CONFIG_VALUE"))
+            .body("taskDefinition.containerDefinitions[0].secrets[2].valueFrom", equalTo("/app/config"))
+        .extract()
+            .path("taskDefinition.taskDefinitionArn");
+
+        ecs("DescribeTaskDefinition")
+            .body("""
+                {"taskDefinition": "%s"}
+                """.formatted(secretsTaskDefArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.containerDefinitions[0].secrets", hasSize(3))
+            .body("taskDefinition.containerDefinitions[0].secrets[0].name", equalTo("DB_PASSWORD"))
+            .body("taskDefinition.containerDefinitions[0].secrets[0].valueFrom", equalTo(secretArn))
+            .body("taskDefinition.containerDefinitions[0].secrets[1].name", equalTo("DB_TOKEN"))
+            .body("taskDefinition.containerDefinitions[0].secrets[1].valueFrom", equalTo(secretArn + ":token::"))
+            .body("taskDefinition.containerDefinitions[0].secrets[2].name", equalTo("CONFIG_VALUE"))
+            .body("taskDefinition.containerDefinitions[0].secrets[2].valueFrom", equalTo("/app/config"));
+    }
+
+    @Test
+    @Order(17)
     void describeTaskDefinition() {
         ecs("DescribeTaskDefinition")
             .body("""
@@ -225,10 +418,12 @@ class EcsIntegrationTest {
     }
 
     @Test
-    @Order(12)
+    @Order(18)
     void listTaskDefinitions() {
+        // Scoped by family: the unfiltered listing pages a hundred at a time, as it does on AWS,
+        // and the rest of the suite registers more families than fit on one page.
         ecs("ListTaskDefinitions")
-            .body("{}")
+            .body("{\"familyPrefix\":\"" + TASK_DEF_FAMILY + "\"}")
         .when()
             .post("/")
         .then()
@@ -237,10 +432,11 @@ class EcsIntegrationTest {
     }
 
     @Test
-    @Order(13)
+    @Order(19)
     void listTaskDefinitionFamilies() {
+        // Scoped for the same reason as listTaskDefinitions: this listing pages too.
         ecs("ListTaskDefinitionFamilies")
-            .body("{}")
+            .body("{\"familyPrefix\":\"" + TASK_DEF_FAMILY + "\"}")
         .when()
             .post("/")
         .then()
@@ -259,6 +455,7 @@ class EcsIntegrationTest {
                     "cluster": "%s",
                     "taskDefinition": "%s",
                     "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}},
                     "count": 1
                 }
                 """.formatted(CLUSTER_NAME, TASK_DEF_FAMILY))
@@ -348,6 +545,7 @@ class EcsIntegrationTest {
                     "cluster": "%s",
                     "taskDefinition": "empty-containers-task",
                     "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}},
                     "count": 1
                 }
                 """.formatted(CLUSTER_NAME))
@@ -370,6 +568,124 @@ class EcsIntegrationTest {
             .body("taskArns", empty());
     }
 
+    @Test
+    @Order(25)
+    void registerTaskDefinitionRoundTripsRuntimePlatformAndLogConfiguration() {
+        String platformTaskDefArn = ecs("RegisterTaskDefinition")
+            .body("""
+                {
+                    "family": "task-with-runtime-platform",
+                    "requiresCompatibilities": ["FARGATE"],
+                    "networkMode": "awsvpc",
+                    "cpu": "256",
+                    "memory": "512",
+                    "runtimePlatform": {"cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX"},
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "nginx:latest",
+                            "essential": true,
+                            "logConfiguration": {
+                                "logDriver": "awslogs",
+                                "options": {
+                                    "awslogs-group": "/ecs/task-with-runtime-platform",
+                                    "awslogs-region": "%s",
+                                    "awslogs-stream-prefix": "ecs"
+                                },
+                                "secretOptions": []
+                            }
+                        }
+                    ]
+                }
+                """.formatted(REGION))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.runtimePlatform.cpuArchitecture", equalTo("ARM64"))
+            .body("taskDefinition.runtimePlatform.operatingSystemFamily", equalTo("LINUX"))
+            .body("taskDefinition.containerDefinitions[0].logConfiguration.logDriver", equalTo("awslogs"))
+            .body("taskDefinition.containerDefinitions[0].logConfiguration.options.'awslogs-group'",
+                    equalTo("/ecs/task-with-runtime-platform"))
+            .body("taskDefinition.containerDefinitions[0].logConfiguration.options.'awslogs-region'", equalTo(REGION))
+            .body("taskDefinition.containerDefinitions[0].logConfiguration.options.'awslogs-stream-prefix'", equalTo("ecs"))
+        .extract()
+            .path("taskDefinition.taskDefinitionArn");
+
+        ecs("DescribeTaskDefinition")
+            .body("""
+                {"taskDefinition": "%s"}
+                """.formatted(platformTaskDefArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.runtimePlatform.cpuArchitecture", equalTo("ARM64"))
+            .body("taskDefinition.runtimePlatform.operatingSystemFamily", equalTo("LINUX"))
+            .body("taskDefinition.containerDefinitions[0].logConfiguration.logDriver", equalTo("awslogs"))
+            .body("taskDefinition.containerDefinitions[0].logConfiguration.options.'awslogs-group'",
+                    equalTo("/ecs/task-with-runtime-platform"))
+            .body("taskDefinition.containerDefinitions[0].logConfiguration.options.'awslogs-region'", equalTo(REGION))
+            .body("taskDefinition.containerDefinitions[0].logConfiguration.options.'awslogs-stream-prefix'", equalTo("ecs"));
+    }
+
+    @Test
+    @Order(26)
+    void describeTaskDefinitionWithoutRuntimePlatformOrLogConfigurationOmitsBothKeys() {
+        ecs("DescribeTaskDefinition")
+            .body("""
+                {"taskDefinition": "%s:1"}
+                """.formatted(TASK_DEF_FAMILY))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition", not(hasKey("runtimePlatform")))
+            .body("taskDefinition.containerDefinitions[0]", not(hasKey("logConfiguration")));
+    }
+
+    @Test
+    @Order(27)
+    void registerTaskDefinitionRoundTripsVolumesFrom() {
+        String volumesFromTaskDefArn = ecs("RegisterTaskDefinition")
+            .body("""
+                {
+                    "family": "task-with-volumes-from",
+                    "containerDefinitions": [
+                        {"name": "source", "image": "sidecar:latest"},
+                        {
+                            "name": "app",
+                            "image": "app:latest",
+                            "volumesFrom": [
+                                {"sourceContainer": "source", "readOnly": true}
+                            ]
+                        }
+                    ]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.containerDefinitions[1].volumesFrom", hasSize(1))
+            .body("taskDefinition.containerDefinitions[1].volumesFrom[0].sourceContainer", equalTo("source"))
+            .body("taskDefinition.containerDefinitions[1].volumesFrom[0].readOnly", equalTo(true))
+        .extract()
+            .path("taskDefinition.taskDefinitionArn");
+
+        ecs("DescribeTaskDefinition")
+            .body("""
+                {"taskDefinition": "%s"}
+                """.formatted(volumesFromTaskDefArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.containerDefinitions[1].volumesFrom", hasSize(1))
+            .body("taskDefinition.containerDefinitions[1].volumesFrom[0].sourceContainer", equalTo("source"))
+            .body("taskDefinition.containerDefinitions[1].volumesFrom[0].readOnly", equalTo(true));
+    }
+
     // ── Services ──────────────────────────────────────────────────────────────
 
     @Test
@@ -383,6 +699,7 @@ class EcsIntegrationTest {
                     "taskDefinition": "%s",
                     "desiredCount": 1,
                     "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}},
                     "tags": [
                         {"key": "Environment", "value": "dev"},
                         {"key": "Project", "value": "project1"}
@@ -476,7 +793,8 @@ class EcsIntegrationTest {
                     "serviceName": "%s",
                     "taskDefinition": "%s",
                     "desiredCount": 2,
-                    "launchType": "FARGATE"
+                    "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}}
                 }
                 """.formatted(CLUSTER_NAME, SERVICE_NAME, TASK_DEF_FAMILY))
                 .when()
@@ -497,7 +815,8 @@ class EcsIntegrationTest {
                     "serviceName": "%s",
                     "taskDefinition": "%s",
                     "desiredCount": 99,
-                    "launchType": "FARGATE"
+                    "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}}
                 }
                 """.formatted(CLUSTER_NAME, SERVICE_NAME, TASK_DEF_FAMILY))
                 .when()
@@ -506,6 +825,72 @@ class EcsIntegrationTest {
                 .statusCode(400)
                 .body("__type", containsString("InvalidParameterException"))
                 .body("message", containsString("Creation of service was not idempotent."));
+    }
+
+    // ── Negative desiredCount validation (issue #1382) ───────────────────────
+
+    @Test
+    @Order(36)
+    void createServiceRejectsNegativeDesiredCount() {
+        ecs("CreateService")
+                .body("""
+                {
+                    "cluster": "%s",
+                    "serviceName": "negative-count-svc",
+                    "taskDefinition": "%s",
+                    "desiredCount": -5,
+                    "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}}
+                }
+                """.formatted(CLUSTER_NAME, TASK_DEF_FAMILY))
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", containsString("InvalidParameterException"))
+                .body("message", containsString("desiredCount cannot be a negative number."));
+    }
+
+
+
+    @Test
+    @Order(38)
+    void updateServiceRejectsNegativeDesiredCount() {
+        ecs("UpdateService")
+                .body("""
+                {
+                    "cluster": "%s",
+                    "service": "%s",
+                    "desiredCount": -3
+                }
+                """.formatted(CLUSTER_NAME, SERVICE_NAME))
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", containsString("InvalidParameterException"))
+                .body("message", containsString("desiredCount cannot be a negative number."));
+    }
+
+    @Test
+    @Order(39)
+    void createServiceAcceptsZeroDesiredCount() {
+        ecs("CreateService")
+                .body("""
+                {
+                    "cluster": "%s",
+                    "serviceName": "zero-count-svc",
+                    "taskDefinition": "%s",
+                    "desiredCount": 0,
+                    "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}}
+                }
+                """.formatted(CLUSTER_NAME, TASK_DEF_FAMILY))
+                .when()
+                .post("/")
+                .then()
+                .statusCode(200)
+                .body("service.desiredCount", equalTo(0));
     }
 
     // ── Tags ─────────────────────────────────────────────────────────────────
@@ -629,7 +1014,32 @@ class EcsIntegrationTest {
 
     @Test
     @Order(53)
+    void deleteClusterRejectsAClusterThatStillHasServices() {
+        ecs("DeleteCluster")
+            .body("""
+                {"cluster": "%s"}
+                """.formatted(CLUSTER_NAME))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", containsString("ClusterContainsServicesException"));
+    }
+
+    @Test
+    @Order(54)
     void deleteCluster() {
+        // zero-count-svc outlives the service tests and keeps the cluster non-empty, which is
+        // exactly what AWS refuses to delete over.
+        ecs("DeleteService")
+            .body("""
+                {"cluster": "%s", "service": "zero-count-svc"}
+                """.formatted(CLUSTER_NAME))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
         ecs("DeleteCluster")
             .body("""
                 {"cluster": "%s"}
@@ -643,7 +1053,7 @@ class EcsIntegrationTest {
     }
 
     @Test
-    @Order(54)
+    @Order(55)
     void deleteClusterNotFound() {
         ecs("DeleteCluster")
             .body("""
@@ -699,7 +1109,8 @@ class EcsIntegrationTest {
                     "serviceName": "%s",
                     "taskDefinition": "review-td",
                     "desiredCount": 1,
-                    "launchType": "FARGATE"
+                    "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}}
                 }
                 """.formatted(REVIEW_CLUSTER, REVIEW_SERVICE))
         .when()
@@ -785,6 +1196,7 @@ class EcsIntegrationTest {
                     "taskDefinition": "review-td",
                     "desiredCount": 1,
                     "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}},
                     "loadBalancers": [
                         {
                             "targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-a/1234",
@@ -809,6 +1221,7 @@ class EcsIntegrationTest {
                     "taskDefinition": "review-td",
                     "desiredCount": 1,
                     "launchType": "FARGATE",
+                    "networkConfiguration": {"awsvpcConfiguration": {"subnets": ["subnet-default-us-east-1-a"]}},
                     "loadBalancers": [
                         {
                             "targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-DIFFERENT/9999",
@@ -852,5 +1265,84 @@ class EcsIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+    }
+
+    /**
+     * A container definition registered with {@code entryPoint} and {@code command} must echo
+     * both back on DescribeTaskDefinition. Without this, re-registering a task definition from
+     * describe output silently drops the overrides and the new revision falls back to the
+     * image's default entrypoint.
+     */
+    @Test
+    @Order(70)
+    void registerAndDescribeTaskDefinitionRoundTripsCommandAndEntryPoint() {
+        String arn = ecs("RegisterTaskDefinition")
+            .body("""
+                {
+                    "family": "entrypoint-roundtrip",
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "alpine:latest",
+                            "essential": true,
+                            "entryPoint": ["/bin/sh", "-c"],
+                            "command": ["fetch-ca && exec agent --serve"]
+                        },
+                        {
+                            "name": "sidecar",
+                            "image": "alpine:latest",
+                            "essential": false
+                        }
+                    ]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.containerDefinitions[0].entryPoint", contains("/bin/sh", "-c"))
+            .body("taskDefinition.containerDefinitions[0].command", contains("fetch-ca && exec agent --serve"))
+        .extract()
+            .path("taskDefinition.taskDefinitionArn");
+
+        ecs("DescribeTaskDefinition")
+            .body("""
+                {"taskDefinition": "%s"}
+                """.formatted(arn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.containerDefinitions[0].entryPoint", contains("/bin/sh", "-c"))
+            .body("taskDefinition.containerDefinitions[0].command", contains("fetch-ca && exec agent --serve"))
+            // A container that set neither keeps both keys absent, as real AWS does.
+            .body("taskDefinition.containerDefinitions[1]", not(hasKey("entryPoint")))
+            .body("taskDefinition.containerDefinitions[1]", not(hasKey("command")));
+    }
+
+    @Test
+    @Order(71)
+    void registerTaskDefinitionWithHealthCheckMissingCommandReturns400() {
+        ecs("RegisterTaskDefinition")
+                .body("""
+                {
+                    "family": "invalid-hc-missing-cmd",
+                    "containerDefinitions": [
+                        {
+                            "name": "app",
+                            "image": "nginx:latest",
+                            "healthCheck": {
+                                "interval": 30
+                            }
+                        }
+                    ]
+                }
+                """)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", containsString("ClientException"))
+                .body("message", containsString("HealthCheck command is required."));
     }
 }

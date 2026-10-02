@@ -3,6 +3,9 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsEndpoints;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -30,6 +33,9 @@ public class WebSocketProxyEventBuilder {
 
     @Inject
     ObjectMapper objectMapper;
+
+    @Inject
+    RegionResolver regionResolver;
 
     /**
      * Build a CONNECT event from the upgrade request.
@@ -282,11 +288,12 @@ public class WebSocketProxyEventBuilder {
     }
 
     private String buildDomainName(String apiId, String region) {
-        return apiId + ".execute-api." + region + ".amazonaws.com";
+        return AwsEndpoints.executeApiHost(apiId, region);
     }
 
     private String buildMethodArn(String region, String apiId, String stageName) {
-        return "arn:aws:execute-api:" + region + ":000000000000:" + apiId + "/" + stageName + "/$connect";
+        return AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
+                apiId + "/" + stageName + "/$connect").toString();
     }
 
     private String formatRequestTime(long epochMillis) {

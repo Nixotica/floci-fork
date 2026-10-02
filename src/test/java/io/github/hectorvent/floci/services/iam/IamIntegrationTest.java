@@ -25,9 +25,26 @@ class IamIntegrationTest {
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
             + "\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}";
 
+    private static void createRoleForAssume(String accessKeyId, String roleName) {
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("RoleName", roleName)
+            .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
     private static final String POLICY_DOCUMENT =
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
             + "\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}";
+
+    private static final String EXPLICIT_DENY_POLICY_DOCUMENT =
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\","
+            + "\"Action\":\"ec2:RunInstances\",\"Resource\":\"*\"}]}";
 
     private static String createdPolicyArn;
 
@@ -73,9 +90,10 @@ class IamIntegrationTest {
     @Test
     @Order(3)
     void stsAssumeRole() {
+        createRoleForAssume("test", "StsAssumeTestRole");
         given()
             .formParam("Action", "AssumeRole")
-            .formParam("RoleArn", "arn:aws:iam::000000000000:role/TestRole")
+            .formParam("RoleArn", "arn:aws:iam::000000000000:role/StsAssumeTestRole")
             .formParam("RoleSessionName", "test-session")
             .formParam("DurationSeconds", "3600")
             .header("Authorization",
@@ -90,12 +108,13 @@ class IamIntegrationTest {
             .body("AssumeRoleResponse.AssumeRoleResult.Credentials.SessionToken", notNullValue())
             .body("AssumeRoleResponse.AssumeRoleResult.Credentials.Expiration", notNullValue())
             .body("AssumeRoleResponse.AssumeRoleResult.AssumedRoleUser.Arn",
-                    containsString("assumed-role/TestRole/test-session"));
+                    containsString("assumed-role/StsAssumeTestRole/test-session"));
     }
 
     @Test
     @Order(4)
     void stsAssumeRoleHonoursTwelveDigitAccessKey() {
+        createRoleForAssume("123456789012", "TestRole");
         given()
             .formParam("Action", "AssumeRole")
             .formParam("RoleArn", "arn:aws:iam::123456789012:role/TestRole")
@@ -114,6 +133,7 @@ class IamIntegrationTest {
     @Test
     @Order(6)
     void stsAssumeRoleUsesAccountFromRoleArnForCrossAccount() {
+        createRoleForAssume("222222222222", "CrossAccountRole");
         given()
             .formParam("Action", "AssumeRole")
             .formParam("RoleArn", "arn:aws:iam::222222222222:role/CrossAccountRole")
@@ -154,7 +174,7 @@ class IamIntegrationTest {
     // The standard EKS managed policies the EKS console/SDK and the
     // terraform-aws-modules/eks module attach to cluster and node roles (#1092).
     @ParameterizedTest
-    @Order(6)
+    @Order(15)
     @ValueSource(strings = {
             "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy",
             "arn:aws:iam::aws:policy/AmazonEKSServicePolicy",
@@ -175,6 +195,390 @@ class IamIntegrationTest {
             .statusCode(200)
             .body("GetPolicyResponse.GetPolicyResult.Policy.PolicyName", equalTo(expectedName))
             .body("GetPolicyResponse.GetPolicyResult.Policy.Arn", equalTo(arn));
+    }
+
+    @Test
+    @Order(16)
+    void getSsmManagedInstanceCorePolicy() {
+        given()
+            .formParam("Action", "GetPolicy")
+            .formParam("PolicyArn", "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetPolicyResponse.GetPolicyResult.Policy.PolicyName",
+                    equalTo("AmazonSSMManagedInstanceCore"))
+            .body("GetPolicyResponse.GetPolicyResult.Policy.Arn",
+                    equalTo("arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"));
+    }
+
+    @Test
+    @Order(7)
+    void getCloudWatchAgentServerPolicy() {
+        given()
+            .formParam("Action", "GetPolicy")
+            .formParam("PolicyArn", "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetPolicyResponse.GetPolicyResult.Policy.PolicyName",
+                    equalTo("CloudWatchAgentServerPolicy"))
+            .body("GetPolicyResponse.GetPolicyResult.Policy.Arn",
+                    equalTo("arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"));
+    }
+
+    @Test
+    @Order(8)
+    void getEcrReadOnlyPolicy() {
+        given()
+            .formParam("Action", "GetPolicy")
+            .formParam("PolicyArn", "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetPolicyResponse.GetPolicyResult.Policy.PolicyName",
+                    equalTo("AmazonEC2ContainerRegistryReadOnly"))
+            .body("GetPolicyResponse.GetPolicyResult.Policy.Arn",
+                    equalTo("arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"));
+    }
+
+    @Test
+    @Order(17)
+    void getRdsEnhancedMonitoringPolicy() {
+        given()
+            .formParam("Action", "GetPolicy")
+            .formParam("PolicyArn",
+                    "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetPolicyResponse.GetPolicyResult.Policy.PolicyName",
+                    equalTo("AmazonRDSEnhancedMonitoringRole"))
+            .body("GetPolicyResponse.GetPolicyResult.Policy.Arn",
+                    equalTo("arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"));
+    }
+
+    @Test
+    @Order(18)
+    void getApiGatewayPushToCloudWatchLogsPolicy() {
+        given()
+            .formParam("Action", "GetPolicy")
+            .formParam("PolicyArn",
+                    "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetPolicyResponse.GetPolicyResult.Policy.PolicyName",
+                    equalTo("AmazonAPIGatewayPushToCloudWatchLogs"))
+            .body("GetPolicyResponse.GetPolicyResult.Policy.Arn",
+                    equalTo("arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"));
+    }
+
+    @Test
+    @Order(9)
+    void stsGetCallerIdentityFallsBackForUnseededFlociAccessKey() {
+        given()
+            .formParam("Action", "GetCallerIdentity")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=floci/20260227/us-east-1/sts/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("GetCallerIdentityResponse.GetCallerIdentityResult.Account", equalTo("000000000000"))
+            .body("GetCallerIdentityResponse.GetCallerIdentityResult.Arn",
+                    equalTo("arn:aws:iam::000000000000:root"));
+    }
+
+    @Test
+    @Order(34)
+    void simulatePrincipalPolicyEvaluatesIdentityPolicies() {
+        given()
+            .formParam("Action", "CreateUser")
+            .formParam("UserName", "simulate-user")
+            .formParam("Path", "/")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String policyArn = given()
+            .formParam("Action", "CreatePolicy")
+            .formParam("PolicyName", "SimulatePolicy")
+            .formParam("Path", "/")
+            .formParam("PolicyDocument", POLICY_DOCUMENT)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract()
+            .path("CreatePolicyResponse.CreatePolicyResult.Policy.Arn");
+
+        String denyPolicyArn = given()
+            .formParam("Action", "CreatePolicy")
+            .formParam("PolicyName", "SimulateExplicitDenyPolicy")
+            .formParam("Path", "/")
+            .formParam("PolicyDocument", EXPLICIT_DENY_POLICY_DOCUMENT)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract()
+            .path("CreatePolicyResponse.CreatePolicyResult.Policy.Arn");
+
+        given()
+            .formParam("Action", "AttachUserPolicy")
+            .formParam("UserName", "simulate-user")
+            .formParam("PolicyArn", policyArn)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "AttachUserPolicy")
+            .formParam("UserName", "simulate-user")
+            .formParam("PolicyArn", denyPolicyArn)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "SimulatePrincipalPolicy")
+            .formParam("PolicySourceArn", "arn:aws:iam::000000000000:user/simulate-user")
+            .formParam("ActionNames.member.1", "s3:GetObject")
+            .formParam("ActionNames.member.2", "ec2:RunInstances")
+            .formParam("ActionNames.member.3", "ssm:GetParameter")
+            .formParam("ResourceArns.member.1", "*")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult.EvaluationResults.member.find { it.EvalActionName == 's3:GetObject' }.EvalDecision",
+                    equalTo("allowed"))
+            .body("SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult.EvaluationResults.member.find { it.EvalActionName == 'ec2:RunInstances' }.EvalDecision",
+                    equalTo("explicitDeny"))
+            .body("SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult.EvaluationResults.member.find { it.EvalActionName == 'ssm:GetParameter' }.EvalDecision",
+                    equalTo("implicitDeny"));
+    }
+
+    @Test
+    @Order(36)
+    void simulateCustomPolicyEvaluatesProvidedDocuments() {
+        given()
+            .formParam("Action", "SimulateCustomPolicy")
+            .formParam("PolicyInputList.member.1", POLICY_DOCUMENT)
+            .formParam("PolicyInputList.member.2", EXPLICIT_DENY_POLICY_DOCUMENT)
+            .formParam("ActionNames.member.1", "s3:GetObject")
+            .formParam("ActionNames.member.2", "ec2:RunInstances")
+            .formParam("ActionNames.member.3", "ssm:GetParameter")
+            .formParam("ResourceArns.member.1", "*")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("SimulateCustomPolicyResponse.SimulateCustomPolicyResult.EvaluationResults.member.find { it.EvalActionName == 's3:GetObject' }.EvalDecision",
+                    equalTo("allowed"))
+            .body("SimulateCustomPolicyResponse.SimulateCustomPolicyResult.EvaluationResults.member.find { it.EvalActionName == 'ec2:RunInstances' }.EvalDecision",
+                    equalTo("explicitDeny"))
+            .body("SimulateCustomPolicyResponse.SimulateCustomPolicyResult.EvaluationResults.member.find { it.EvalActionName == 'ssm:GetParameter' }.EvalDecision",
+                    equalTo("implicitDeny"));
+    }
+
+    @Test
+    @Order(37)
+    void simulateCustomPolicyAppliesPermissionsBoundary() {
+        given()
+            .formParam("Action", "SimulateCustomPolicy")
+            .formParam("PolicyInputList.member.1", POLICY_DOCUMENT)
+            .formParam("PermissionsBoundaryPolicyInputList.member.1", EXPLICIT_DENY_POLICY_DOCUMENT)
+            .formParam("ActionNames.member.1", "s3:GetObject")
+            .formParam("ResourceArns.member.1", "*")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            // The identity policy allows s3:GetObject, but the boundary policy (denying only
+            // ec2:RunInstances) has no explicit allow for it, so the boundary intersection denies.
+            .body("SimulateCustomPolicyResponse.SimulateCustomPolicyResult.EvaluationResults.member.find { it.EvalActionName == 's3:GetObject' }.EvalDecision",
+                    equalTo("implicitDeny"));
+    }
+
+    @Test
+    @Order(38)
+    void simulateCustomPolicyWithoutPolicyInputListReturnsValidationError() {
+        given()
+            .formParam("Action", "SimulateCustomPolicy")
+            .formParam("ActionNames.member.1", "s3:GetObject")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("ErrorResponse.Error.Code", equalTo("ValidationError"));
+    }
+
+    @Test
+    @Order(39)
+    void getContextKeysForCustomPolicyReturnsKeysFromEveryDocumentIncludingRepeats() {
+        String conditionPolicyA = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Action\":\"s3:GetObject\",\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:PrincipalArn\":\"arn:aws:iam::111111111111:user/a\"}}}]}";
+        String conditionPolicyB = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Action\":\"s3:PutObject\",\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:PrincipalArn\":\"arn:aws:iam::111111111111:user/a\","
+                + "\"s3:VersionId\":\"abc\"}}}]}";
+
+        given()
+            .formParam("Action", "GetContextKeysForCustomPolicy")
+            .formParam("PolicyInputList.member.1", conditionPolicyA)
+            .formParam("PolicyInputList.member.2", conditionPolicyB)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            // Not sorted and not de-duplicated, matching AWS's own documented example response
+            // for this method's sibling, which repeats a key referenced by more than one policy.
+            .body("GetContextKeysForCustomPolicyResponse.GetContextKeysForCustomPolicyResult.ContextKeyNames.member",
+                    contains("aws:PrincipalArn", "aws:PrincipalArn", "s3:VersionId"));
+    }
+
+    // AWS's own primary documented example for GetContextKeysForCustomPolicy: a ${...} policy
+    // variable inside a Resource ARN is reported as a referenced context key, alongside the
+    // key from a Condition operator in the same statement.
+    @Test
+    @Order(43)
+    void getContextKeysForCustomPolicyIncludesPolicyVariablesFromResourcePatterns() {
+        String policyWithResourceVariable = "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\","
+                + "\"Action\":\"dynamodb:*\","
+                + "\"Resource\":\"arn:aws:dynamodb:us-east-2:123456789012:table/${aws:username}\","
+                + "\"Condition\":{\"DateGreaterThan\":{\"aws:CurrentTime\":\"2015-08-16T12:00:00Z\"}}}}";
+
+        given()
+            .formParam("Action", "GetContextKeysForCustomPolicy")
+            .formParam("PolicyInputList.member.1", policyWithResourceVariable)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetContextKeysForCustomPolicyResponse.GetContextKeysForCustomPolicyResult.ContextKeyNames.member",
+                    contains("aws:CurrentTime", "aws:username"));
+    }
+
+    @Test
+    @Order(41)
+    void getContextKeysForPrincipalPolicyMergesAttachedAndExtraPolicies() {
+        String extraConditionPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Action\":\"dynamodb:GetItem\",\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"dynamodb:LeadingKeys\":\"USER_alice\"}}}]}";
+
+        given()
+            .formParam("Action", "CreateUser")
+            .formParam("UserName", "context-keys-user")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "PutUserPolicy")
+            .formParam("UserName", "context-keys-user")
+            .formParam("PolicyName", "inline-with-condition")
+            .formParam("PolicyDocument", "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                    + "\"Action\":\"s3:GetObject\",\"Resource\":\"*\","
+                    + "\"Condition\":{\"StringEquals\":{\"aws:PrincipalArn\":\"arn:aws:iam::111111111111:user/a\"}}}]}")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // No extra PolicyInputList: only the attached policy's key comes back.
+        given()
+            .formParam("Action", "GetContextKeysForPrincipalPolicy")
+            .formParam("PolicySourceArn", "arn:aws:iam::000000000000:user/context-keys-user")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            // A single-element XML list decodes as a bare string rather than a list.
+            .body("GetContextKeysForPrincipalPolicyResponse.GetContextKeysForPrincipalPolicyResult.ContextKeyNames.member",
+                    equalTo("aws:PrincipalArn"));
+
+        // With an extra PolicyInputList document, both keys come back, merged.
+        given()
+            .formParam("Action", "GetContextKeysForPrincipalPolicy")
+            .formParam("PolicySourceArn", "arn:aws:iam::000000000000:user/context-keys-user")
+            .formParam("PolicyInputList.member.1", extraConditionPolicy)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetContextKeysForPrincipalPolicyResponse.GetContextKeysForPrincipalPolicyResult.ContextKeyNames.member",
+                    contains("aws:PrincipalArn", "dynamodb:LeadingKeys"));
+    }
+
+    @Test
+    @Order(42)
+    void getContextKeysForPrincipalPolicyOfUnknownUserReturnsNoSuchEntity() {
+        given()
+            .formParam("Action", "GetContextKeysForPrincipalPolicy")
+            .formParam("PolicySourceArn", "arn:aws:iam::000000000000:user/no-such-context-keys-user")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404)
+            .body("ErrorResponse.Error.Code", equalTo("NoSuchEntity"));
     }
 
     @Test
@@ -207,6 +611,119 @@ class IamIntegrationTest {
     // =========================================================================
     // Users
     // =========================================================================
+
+    @Test
+    @Order(50)
+    void listMfaDevicesRejectsAnUnknownUser() {
+        given()
+            .formParam("Action", "ListMFADevices")
+            .formParam("UserName", "no-such-mfa-user")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404)
+            .contentType("application/xml")
+            .body("ErrorResponse.Error.Code", equalTo("NoSuchEntity"));
+    }
+
+    @Test
+    @Order(51)
+    void getAccessKeyLastUsedReturnsNeverUsedShape() {
+        given()
+            .formParam("Action", "GetAccessKeyLastUsed")
+            .formParam("AccessKeyId", "AKIAEXAMPLE")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("GetAccessKeyLastUsedResponse.GetAccessKeyLastUsedResult"
+                    + ".AccessKeyLastUsed.ServiceName", equalTo("N/A"));
+    }
+
+    @Test
+    @Order(52)
+    void getLoginProfileReturnsNoSuchEntity() {
+        given()
+            .formParam("Action", "GetLoginProfile")
+            .formParam("UserName", "any-user")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404)
+            .contentType("application/xml")
+            .body("ErrorResponse.Error.Code", equalTo("NoSuchEntity"));
+    }
+
+    @Test
+    @Order(53)
+    void listSamlProvidersReturnsWireCompatibleResult() {
+        given()
+            .formParam("Action", "ListSAMLProviders")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("ListSAMLProvidersResponse.ListSAMLProvidersResult.SAMLProviderList", notNullValue());
+    }
+
+    @Test
+    @Order(54)
+    void getSamlProviderDoesNotCrossAccountBoundaries() {
+        String providerName = "cross-account-saml-" + System.nanoTime();
+        String metadata = "<md:EntityDescriptor xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\" entityID=\"https://idp.example.test/"
+                + providerName + "\"><md:IDPSSODescriptor><md:KeyDescriptor use=\"signing\"><ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:X509Data><ds:X509Certificate>Y2VydA==</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor></md:IDPSSODescriptor></md:EntityDescriptor>";
+        String ownerAuth = "AWS4-HMAC-SHA256 Credential=111111111111/20260227/us-east-1/iam/aws4_request";
+        String otherAccountAuth = "AWS4-HMAC-SHA256 Credential=222222222222/20260227/us-east-1/iam/aws4_request";
+        given().formParam("Action", "CreateSAMLProvider").formParam("Name", providerName)
+                .formParam("SAMLMetadataDocument", metadata).header("Authorization", ownerAuth)
+                .when().post("/").then().statusCode(200);
+
+        given().formParam("Action", "GetSAMLProvider")
+                .formParam("SAMLProviderArn", "arn:aws:iam::111111111111:saml-provider/" + providerName)
+                .header("Authorization", otherAccountAuth)
+                .when().post("/").then().statusCode(404).body("ErrorResponse.Error.Code", equalTo("NoSuchEntity"));
+    }
+
+    @Test
+    @Order(55)
+    void listOpenIdConnectProvidersReturnsEmptyList() {
+        given()
+            .formParam("Action", "ListOpenIDConnectProviders")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("ListOpenIDConnectProvidersResponse.ListOpenIDConnectProvidersResult"
+                    + ".OpenIDConnectProviderList", isEmptyOrNullString());
+    }
+
+    @Test
+    @Order(55)
+    void listServerCertificatesReturnsEmptyPaginatedList() {
+        given()
+            .formParam("Action", "ListServerCertificates")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("ListServerCertificatesResponse.ListServerCertificatesResult.IsTruncated", equalTo("false"));
+    }
 
     @Test
     @Order(10)
@@ -269,7 +786,7 @@ class IamIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("ListUsersResponse.ListUsersResult.Users.member.UserName",
+            .body("ListUsersResponse.ListUsersResult.Users.member.find { it.UserName == 'test-user' }.UserName",
                     equalTo("test-user"));
     }
 
@@ -352,7 +869,7 @@ class IamIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("ListRolesResponse.ListRolesResult.Roles.member.RoleName",
+            .body("ListRolesResponse.ListRolesResult.Roles.member.find { it.RoleName == 'TestRole' }.RoleName",
                     equalTo("TestRole"));
     }
 
@@ -414,6 +931,7 @@ class IamIntegrationTest {
             .body("CreatePolicyResponse.CreatePolicyResult.Policy.PolicyName", equalTo("TestPolicy"))
             .body("CreatePolicyResponse.CreatePolicyResult.Policy.PolicyId", startsWith("ANPA"))
             .body("CreatePolicyResponse.CreatePolicyResult.Policy.DefaultVersionId", equalTo("v1"))
+            .body("CreatePolicyResponse.CreatePolicyResult.Policy.Description", equalTo("Test managed policy"))
         .extract()
             .path("CreatePolicyResponse.CreatePolicyResult.Policy.Arn");
     }
@@ -430,7 +948,8 @@ class IamIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("GetPolicyResponse.GetPolicyResult.Policy.PolicyName", equalTo("TestPolicy"));
+            .body("GetPolicyResponse.GetPolicyResult.Policy.PolicyName", equalTo("TestPolicy"))
+            .body("GetPolicyResponse.GetPolicyResult.Policy.Description", equalTo("Test managed policy"));
     }
 
     @Test
@@ -491,6 +1010,106 @@ class IamIntegrationTest {
     // =========================================================================
     // Access Keys
     // =========================================================================
+
+    private static void createUser(String userName) {
+        given()
+            .formParam("Action", "CreateUser")
+            .formParam("UserName", userName)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    private static String createAccessKeyFor(String userName) {
+        return given()
+            .formParam("Action", "CreateAccessKey")
+            .formParam("UserName", userName)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+        .extract()
+            .path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+    }
+
+    @Test
+    @Order(56)
+    void listAccessKeysWithoutUserNameResolvesCaller() {
+        // UserName is optional per the IAM model: it defaults to the owner of the access
+        // key that signed the request (issue #1753: this path used to leak a JSON 500).
+        createUser("caller-list-user");
+        String keyId = createAccessKeyFor("caller-list-user");
+
+        given()
+            .formParam("Action", "ListAccessKeys")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=" + keyId + "/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType(containsString("xml"))
+            .body("ListAccessKeysResponse.ListAccessKeysResult.AccessKeyMetadata.member.UserName",
+                    equalTo("caller-list-user"));
+    }
+
+    @Test
+    @Order(57)
+    void listAccessKeysWithoutUserNameUnknownKeyReturnsNoSuchEntityXml() {
+        // The conventional 'test' key owns no IAM user: moto parity is the documented
+        // NoSuchEntity XML error, never a JSON body on the Query wire.
+        given()
+            .formParam("Action", "ListAccessKeys")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404)
+            .contentType(containsString("xml"))
+            .body("ErrorResponse.Error.Code", equalTo("NoSuchEntity"))
+            .body("ErrorResponse.Error.Message", containsString("test"));
+    }
+
+    @Test
+    @Order(58)
+    void getUserWithoutUserNameResolvesCaller() {
+        createUser("caller-get-user");
+        String keyId = createAccessKeyFor("caller-get-user");
+
+        given()
+            .formParam("Action", "GetUser")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=" + keyId + "/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("GetUserResponse.GetUserResult.User.UserName", equalTo("caller-get-user"));
+    }
+
+    @Test
+    @Order(59)
+    void deleteAccessKeyWithoutUserNameResolvesOwner() {
+        createUser("caller-del-user");
+        String keyId = createAccessKeyFor("caller-del-user");
+
+        given()
+            .formParam("Action", "DeleteAccessKey")
+            .formParam("AccessKeyId", keyId)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=" + keyId + "/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("DeleteAccessKeyResponse"));
+    }
 
     @Test
     @Order(40)
@@ -662,4 +1281,113 @@ class IamIntegrationTest {
             .statusCode(400)
             .body("ErrorResponse.Error.Code", equalTo("UnsupportedOperation"));
     }
+
+    @Test
+    @Order(73)
+    void getUserWithoutUserNameOnAnUnsignedRequestDoesNotLeakNull() {
+        // No Authorization header means no access key to resolve the caller from. The action
+        // still routes to IAM by name, so the error must read as a sentence rather than
+        // interpolating a null key id onto the wire.
+        given()
+            .formParam("Action", "GetUser")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404)
+            .contentType(containsString("xml"))
+            .body("ErrorResponse.Error.Code", equalTo("NoSuchEntity"))
+            .body("ErrorResponse.Error.Message", not(containsString("null")));
+    }
+
+    @Test
+    @Order(74)
+    void listPoliciesOmitsDescription() {
+        // AWS's own Policy model documents this explicitly: Description "is included in the
+        // response to the GetPolicy operation. It is not included in the response to the
+        // ListPolicies operation." Unlike GetPolicy/CreatePolicy (which do include it), no
+        // member returned by ListPolicies should ever carry a Description element — checking
+        // the raw response for the tag at all, rather than a specific policy's value, is what
+        // actually pins the shared-helper regression this guards against: folding the element
+        // back into policyXml() unconditionally would reintroduce it for every member, not just
+        // the one this test happens to create.
+        given()
+            .formParam("Action", "CreatePolicy")
+            .formParam("PolicyName", "ListPoliciesOmitCheckPolicy")
+            .formParam("Path", "/")
+            .formParam("PolicyDocument", POLICY_DOCUMENT)
+            .formParam("Description", "Should not appear in ListPolicies")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Asserting only the negative would pass vacuously if ListPolicies ever returned no
+        // members at all (a pagination bug, a scope-filter regression); the positive assertion
+        // proves the created policy is actually present before the absence check means anything.
+        // Matching the element itself, not the bare word "Description", also avoids colliding
+        // with a future policy name/path containing that substring.
+        given()
+            .formParam("Action", "ListPolicies")
+            .formParam("Scope", "Local")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("ListPoliciesOmitCheckPolicy"))
+            .body(not(containsString("<Description>")));
+    }
+
+    @Test
+    void simulatePrincipalPolicyReadsEveryContextKeyValue() {
+        // A ForAnyValue: condition is satisfied only by the SECOND supplied context value,
+        // so a handler that reads only ContextKeyValues.member.1 returns implicitDeny.
+        given()
+            .formParam("Action", "CreateUser")
+            .formParam("UserName", "multi-context-user")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260904/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "PutUserPolicy")
+            .formParam("UserName", "multi-context-user")
+            .formParam("PolicyName", "AllowAliceLeadingKeys")
+            .formParam("PolicyDocument", """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+                   "Condition":{"ForAnyValue:StringEquals":{"dynamodb:LeadingKeys":["USER_alice"]}}}
+                ]}""")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260904/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "SimulatePrincipalPolicy")
+            .formParam("PolicySourceArn", "arn:aws:iam::000000000000:user/multi-context-user")
+            .formParam("ActionNames.member.1", "dynamodb:GetItem")
+            .formParam("ResourceArns.member.1", "*")
+            .formParam("ContextEntries.member.1.ContextKeyName", "dynamodb:LeadingKeys")
+            .formParam("ContextEntries.member.1.ContextKeyValues.member.1", "USER_bob")
+            .formParam("ContextEntries.member.1.ContextKeyValues.member.2", "USER_alice")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260904/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult.EvaluationResults"
+                            + ".member.find { it.EvalActionName == 'dynamodb:GetItem' }.EvalDecision",
+                    equalTo("allowed"));
+    }
 }
+

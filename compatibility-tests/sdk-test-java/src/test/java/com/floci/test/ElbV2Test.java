@@ -70,6 +70,7 @@ import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetDescri
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetGroup;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetGroupAttribute;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetHealthDescription;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetHealthReasonEnum;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetHealthStateEnum;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetTypeEnum;
 
@@ -84,6 +85,7 @@ class ElbV2Test {
     private static ElasticLoadBalancingV2Client elb;
 
     private static String lbArn;
+    private static String lbDnsName;
     private static String tgArn;
     private static String listenerArn;
     private static String ruleArn;
@@ -141,11 +143,24 @@ class ElbV2Test {
         LoadBalancer lb = resp.loadBalancers().get(0);
         assertThat(lb.loadBalancerName()).isEqualTo(LB_NAME);
         assertThat(lb.loadBalancerArn()).contains("elasticloadbalancing");
-        assertThat(lb.dnsName()).isNotBlank();
+        assertThat(lb.dnsName()).endsWith(expectedElbDnsSuffix());
         assertThat(lb.type()).isEqualTo(LoadBalancerTypeEnum.APPLICATION);
         assertThat(lb.scheme()).isEqualTo(LoadBalancerSchemeEnum.INTERNET_FACING);
         assertThat(lb.state().code()).isEqualTo(LoadBalancerStateEnum.PROVISIONING);
         lbArn = lb.loadBalancerArn();
+        lbDnsName = lb.dnsName();
+    }
+
+    private static String expectedElbDnsSuffix() {
+        String hostname = System.getenv("FLOCI_HOSTNAME");
+        if (hostname == null || hostname.isBlank()) {
+            hostname = TestFixtures.endpoint().getHost();
+        }
+        if (hostname == null || hostname.isBlank()
+                || "localhost".equals(hostname) || "127.0.0.1".equals(hostname)) {
+            hostname = "localhost.floci.io";
+        }
+        return ".elb." + hostname;
     }
 
     @Test
@@ -159,6 +174,7 @@ class ElbV2Test {
         LoadBalancer lb = resp.loadBalancers().get(0);
         assertThat(lb.loadBalancerArn()).isEqualTo(lbArn);
         assertThat(lb.loadBalancerName()).isEqualTo(LB_NAME);
+        assertThat(lb.dnsName()).isEqualTo(lbDnsName);
         assertThat(lb.state().code()).isEqualTo(LoadBalancerStateEnum.ACTIVE);
     }
 
@@ -171,6 +187,7 @@ class ElbV2Test {
 
         assertThat(resp.loadBalancers()).hasSize(1);
         assertThat(resp.loadBalancers().get(0).loadBalancerArn()).isEqualTo(lbArn);
+        assertThat(resp.loadBalancers().get(0).dnsName()).isEqualTo(lbDnsName);
     }
 
     @Test
@@ -296,7 +313,29 @@ class ElbV2Test {
         assertThat(resp.targetHealthDescriptions()).hasSize(2);
         for (TargetHealthDescription thd : resp.targetHealthDescriptions()) {
             assertThat(thd.targetHealth().state()).isEqualTo(TargetHealthStateEnum.INITIAL);
+            assertThat(thd.targetHealth().reason()).isEqualTo(TargetHealthReasonEnum.ELB_REGISTRATION_IN_PROGRESS);
+            assertThat(thd.targetHealth().description()).isEqualTo("Target registration is in progress");
         }
+    }
+
+    @Test
+    @Order(16)
+    @DisplayName("DescribeTargetHealth - reports unused for explicit unregistered target")
+    void describeTargetHealthForUnregisteredTarget() {
+        DescribeTargetHealthResponse resp = elb.describeTargetHealth(
+                DescribeTargetHealthRequest.builder()
+                        .targetGroupArn(tgArn)
+                        .targets(TargetDescription.builder()
+                                .id("i-1234567890abcdef0")
+                                .port(8080)
+                                .build())
+                        .build());
+
+        assertThat(resp.targetHealthDescriptions()).hasSize(1);
+        TargetHealthDescription health = resp.targetHealthDescriptions().get(0);
+        assertThat(health.targetHealth().state()).isEqualTo(TargetHealthStateEnum.UNUSED);
+        assertThat(health.targetHealth().reason()).isEqualTo(TargetHealthReasonEnum.TARGET_NOT_REGISTERED);
+        assertThat(health.targetHealth().description()).isEqualTo("Target is not registered to the target group");
     }
 
     // ─── Listeners ───────────────────────────────────────────────────────────
@@ -462,6 +501,91 @@ class ElbV2Test {
                 .isInstanceOf(OperationNotPermittedException.class);
     }
 
+    @Test
+    @Order(36)
+    @DisplayName("SetRulePriorities - priority held on another listener is not a conflict")
+    void setRulePrioritiesIgnoresOtherListeners() {
+        String otherLbArn = elb.createLoadBalancer(CreateLoadBalancerRequest.builder()
+                .name(TestFixtures.uniqueName("sdk-lb2"))
+                .type(LoadBalancerTypeEnum.APPLICATION)
+                .scheme(LoadBalancerSchemeEnum.INTERNAL)
+                .ipAddressType(IpAddressType.IPV4)
+                .build()).loadBalancers().get(0).loadBalancerArn();
+        String otherListenerArn = null;
+        String otherRuleArn = null;
+        try {
+            otherListenerArn = elb.createListener(CreateListenerRequest.builder()
+                    .loadBalancerArn(otherLbArn)
+                    .protocol(ProtocolEnum.HTTP)
+                    .port(81)
+                    .defaultActions(Action.builder()
+                            .type(ActionTypeEnum.FORWARD)
+                            .targetGroupArn(tgArn)
+                            .build())
+                    .build()).listeners().get(0).listenerArn();
+            otherRuleArn = elb.createRule(CreateRuleRequest.builder()
+                    .listenerArn(otherListenerArn)
+                    .priority(100)
+                    .conditions(RuleCondition.builder()
+                            .field("path-pattern")
+                            .values("/signup/*")
+                            .build())
+                    .actions(Action.builder()
+                            .type(ActionTypeEnum.FORWARD)
+                            .targetGroupArn(tgArn)
+                            .build())
+                    .build()).rules().get(0).ruleArn();
+
+            elb.setRulePriorities(SetRulePrioritiesRequest.builder()
+                    .rulePriorities(RulePriorityPair.builder()
+                            .ruleArn(ruleArn)
+                            .priority(100)
+                            .build())
+                    .build());
+
+            DescribeRulesResponse resp = elb.describeRules(
+                    DescribeRulesRequest.builder().ruleArns(ruleArn, otherRuleArn).build());
+            assertThat(resp.rules()).extracting(Rule::priority).containsOnly("100");
+        } finally {
+            if (otherRuleArn != null) {
+                elb.deleteRule(DeleteRuleRequest.builder().ruleArn(otherRuleArn).build());
+            }
+            if (otherListenerArn != null) {
+                elb.deleteListener(DeleteListenerRequest.builder().listenerArn(otherListenerArn).build());
+            }
+            elb.deleteLoadBalancer(DeleteLoadBalancerRequest.builder().loadBalancerArn(otherLbArn).build());
+        }
+    }
+
+    @Test
+    @Order(37)
+    @DisplayName("SetRulePriorities - priority held on the same listener throws PriorityInUseException")
+    void setRulePrioritiesSameListenerConflict() {
+        String conflictingRuleArn = elb.createRule(CreateRuleRequest.builder()
+                .listenerArn(listenerArn)
+                .priority(30)
+                .conditions(RuleCondition.builder()
+                        .field("path-pattern")
+                        .values("/conflict/*")
+                        .build())
+                .actions(Action.builder()
+                        .type(ActionTypeEnum.FORWARD)
+                        .targetGroupArn(tgArn)
+                        .build())
+                .build()).rules().get(0).ruleArn();
+        try {
+            assertThatThrownBy(() -> elb.setRulePriorities(SetRulePrioritiesRequest.builder()
+                    .rulePriorities(RulePriorityPair.builder()
+                            .ruleArn(ruleArn)
+                            .priority(30)
+                            .build())
+                    .build()))
+                    .isInstanceOf(PriorityInUseException.class);
+        } finally {
+            elb.deleteRule(DeleteRuleRequest.builder().ruleArn(conflictingRuleArn).build());
+        }
+    }
+
     // ─── Tags ────────────────────────────────────────────────────────────────
 
     @Test
@@ -507,6 +631,7 @@ class ElbV2Test {
         boolean hasDefault = resp.sslPolicies().stream()
                 .anyMatch(p -> p.name().startsWith("ELBSecurityPolicy-"));
         assertThat(hasDefault).isTrue();
+        assertThat(resp.nextMarker()).isNull();
     }
 
     @Test

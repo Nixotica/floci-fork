@@ -122,10 +122,185 @@ class S3ObjectLockIntegrationTest {
             .body(containsString("<Days>30</Days>"));
     }
 
+    // --- PutObjectRetention RetainUntilDate parsing ---
+
+    private static final String RETENTION_KEY = "retained-object.txt";
+
+    @Test
+    @Order(10)
+    void putObjectForRetention() {
+        given()
+            .body("hello")
+        .when()
+            .put("/" + LOCK_BUCKET + "/" + RETENTION_KEY)
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(11)
+    void putObjectRetentionWithValidIsoDateReturns200() {
+        String body = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Mode>COMPLIANCE</Mode>
+                  <RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate>
+                </Retention>
+                """;
+        given()
+            .body(body)
+        .when()
+            .put("/" + LOCK_BUCKET + "/" + RETENTION_KEY + "?retention")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(12)
+    void putObjectRetentionWithEpochSecondsReturns400MalformedXml() {
+        String body = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Mode>GOVERNANCE</Mode>
+                  <RetainUntilDate>1577836800</RetainUntilDate>
+                </Retention>
+                """;
+        given()
+            .body(body)
+        .when()
+            .put("/" + LOCK_BUCKET + "/" + RETENTION_KEY + "?retention")
+        .then()
+            .statusCode(400)
+            .body(containsString("MalformedXML"))
+            .body(not(containsString("Internal Server Error")));
+    }
+
+    @Test
+    @Order(13)
+    void putObjectRetentionWithGarbageDateReturns400MalformedXml() {
+        String body = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Mode>GOVERNANCE</Mode>
+                  <RetainUntilDate>notadate</RetainUntilDate>
+                </Retention>
+                """;
+        given()
+            .body(body)
+        .when()
+            .put("/" + LOCK_BUCKET + "/" + RETENTION_KEY + "?retention")
+        .then()
+            .statusCode(400)
+            .body(containsString("MalformedXML"))
+            .body(not(containsString("Internal Server Error")));
+    }
+
     // --- non-existent bucket ---
 
     @Test
-    @Order(9)
+    @Order(14)
+    void putGovernanceObjectForRetentionUpgrade() {
+        given()
+            .header("x-amz-object-lock-mode", "GOVERNANCE")
+            .header("x-amz-object-lock-retain-until-date", "2030-01-01T00:00:00Z")
+            .body("governance object")
+        .when()
+            .put("/" + LOCK_BUCKET + "/governance-object.txt")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(15)
+    void governanceRetentionCanBeUpgradedToCompliance() {
+        String body = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Mode>COMPLIANCE</Mode>
+                  <RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate>
+                </Retention>
+                """;
+        given()
+            .body(body)
+        .when()
+            .put("/" + LOCK_BUCKET + "/governance-object.txt?retention")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/" + LOCK_BUCKET + "/governance-object.txt?retention")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Mode>COMPLIANCE</Mode>"));
+    }
+
+    @Test
+    @Order(16)
+    void complianceRetentionCannotBeDowngradedToGovernance() {
+        String body = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Mode>GOVERNANCE</Mode>
+                  <RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate>
+                </Retention>
+                """;
+        given()
+            .body(body)
+        .when()
+            .put("/" + LOCK_BUCKET + "/" + RETENTION_KEY + "?retention")
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
+
+        given()
+        .when()
+            .get("/" + LOCK_BUCKET + "/" + RETENTION_KEY + "?retention")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Mode>COMPLIANCE</Mode>"));
+    }
+
+    @Test
+    @Order(17)
+    void putObjectWithExpiredComplianceRetention() {
+        given()
+            .header("x-amz-object-lock-mode", "COMPLIANCE")
+            .header("x-amz-object-lock-retain-until-date", "2020-01-01T00:00:00Z")
+            .body("expired compliance object")
+        .when()
+            .put("/" + LOCK_BUCKET + "/expired-compliance-object.txt")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(18)
+    void expiredComplianceRetentionCanChangeMode() {
+        String body = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Mode>GOVERNANCE</Mode>
+                  <RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate>
+                </Retention>
+                """;
+        given()
+            .body(body)
+        .when()
+            .put("/" + LOCK_BUCKET + "/expired-compliance-object.txt?retention")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/" + LOCK_BUCKET + "/expired-compliance-object.txt?retention")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Mode>GOVERNANCE</Mode>"));
+    }
+
+    @Test
+    @Order(19)
     void nonExistentBucketReturnsNoSuchBucket() {
         given()
         .when()
@@ -133,5 +308,86 @@ class S3ObjectLockIntegrationTest {
         .then()
             .statusCode(404)
             .body(containsString("NoSuchBucket"));
+    }
+
+    // --- locks protect versions, not keys ---
+
+    @Test
+    @Order(20)
+    void simpleDeleteOfLegalHoldObjectCreatesDeleteMarker() {
+        String versionId = given()
+            .header("x-amz-object-lock-legal-hold", "ON")
+            .body("held")
+        .when()
+            .put("/" + LOCK_BUCKET + "/held-object.txt")
+        .then()
+            .statusCode(200)
+            .extract().header("x-amz-version-id");
+
+        given()
+        .when()
+            .delete("/" + LOCK_BUCKET + "/held-object.txt")
+        .then()
+            .statusCode(204)
+            .header("x-amz-delete-marker", "true");
+
+        given()
+        .when()
+            .get("/" + LOCK_BUCKET + "/held-object.txt?legal-hold&versionId=" + versionId)
+        .then()
+            .statusCode(200)
+            .body(containsString("<Status>ON</Status>"));
+
+        given()
+            .header("x-amz-bypass-governance-retention", "true")
+        .when()
+            .delete("/" + LOCK_BUCKET + "/held-object.txt?versionId=" + versionId)
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
+    }
+
+    @Test
+    @Order(21)
+    void putAndCopyOverGovernanceObjectCreateNewVersions() {
+        String versionId = given()
+            .header("x-amz-object-lock-mode", "GOVERNANCE")
+            .header("x-amz-object-lock-retain-until-date", "2099-01-01T00:00:00Z")
+            .body("v1")
+        .when()
+            .put("/" + LOCK_BUCKET + "/governed-object.txt")
+        .then()
+            .statusCode(200)
+            .extract().header("x-amz-version-id");
+
+        given()
+            .body("v2")
+        .when()
+            .put("/" + LOCK_BUCKET + "/governed-object.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-version-id", not(equalTo(versionId)));
+
+        given()
+            .header("x-amz-copy-source", "/" + LOCK_BUCKET + "/governed-object.txt?versionId=" + versionId)
+        .when()
+            .put("/" + LOCK_BUCKET + "/governed-object.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-version-id", not(equalTo(versionId)));
+
+        given()
+        .when()
+            .get("/" + LOCK_BUCKET + "/governed-object.txt?retention&versionId=" + versionId)
+        .then()
+            .statusCode(200)
+            .body(containsString("<Mode>GOVERNANCE</Mode>"));
+
+        given()
+        .when()
+            .delete("/" + LOCK_BUCKET + "/governed-object.txt?versionId=" + versionId)
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
     }
 }

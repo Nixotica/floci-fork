@@ -5,7 +5,9 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -13,16 +15,20 @@ public class Instance {
 
     private String instanceId;
     private String imageId;
-    private InstanceState state;
+    private volatile InstanceState state;
     private String stateTransitionReason;
     private String instanceType;
     private Placement placement;
     private String subnetId;
     private String vpcId;
     private String privateIpAddress;
+    private String logicalPrivateIpAddress;
     private String publicIpAddress;
     private String privateDnsName;
     private String publicDnsName;
+    // Whether this instance should be assigned a public IP — true when its subnet
+    // has MapPublicIpOnLaunch (#1984). Instances in private subnets get none.
+    private boolean associatePublicIp = false;
     private String keyName;
     private List<GroupIdentifier> securityGroups = new ArrayList<>();
     private List<InstanceNetworkInterface> networkInterfaces = new ArrayList<>();
@@ -39,6 +45,9 @@ public class Instance {
     private boolean ebsOptimized = false;
     private boolean enaSupport = true;
     private String iamInstanceProfileArn;
+    private Instant iamInstanceProfileAssociationTime;
+    private String stateReasonCode;
+    private String stateReasonMessage;
     private String region;
     private List<Tag> tags = new ArrayList<>();
 
@@ -50,12 +59,38 @@ public class Instance {
     private boolean disableApiStop = false;
     private boolean disableApiTermination = false;
 
+    // Null for an instance persisted before metadata options were stored; reads fall back to
+    // AWS's launch defaults through effectiveMetadataOptions().
+    private LaunchTemplateData.MetadataOptions metadataOptions;
+
+    // The credit option this instance acquired, at launch from the request or from its burstable
+    // family's default, or at a resize onto a burstable type. Stored rather than derived from the
+    // current instance type on read, because AWS keeps reporting the unlimited option of an
+    // instance that was configured as a T2, T3 or T3a and then resized onto another family. Null
+    // for an instance that never acquired one. CreditSpecification is not a member of the Instance
+    // shape DescribeInstances returns, so this reaches the wire only through
+    // DescribeInstanceCreditSpecifications.
+    private String creditSpecificationCpuCredits;
+
     // Docker backing fields (not serialised to AWS wire format)
     private String dockerContainerId;
     private String containerBridgeIp;
+    /**
+     * The container's default-bridge address, kept alongside {@code containerBridgeIp} when the
+     * instance is also attached to its VPC's Docker network. IMDS identifies a caller by the
+     * source address of its request, and that is whichever interface carries the container's
+     * default route, the bridge, while the address Floci reports is the VPC one. Both are
+     * registered so metadata answers either way.
+     */
+    private String imdsSourceIp;
     private String userData;
+    private String encodedUserData;
     private int sshHostPort;
     private long terminatedAt;
+
+    // Security-group ingress ports published on the host via socat sidecars:
+    // container app port -> allocated host port. Not part of the AWS wire format.
+    private Map<Integer, Integer> publishedPorts = new LinkedHashMap<>();
 
     public Instance() {}
 
@@ -85,6 +120,10 @@ public class Instance {
 
     public String getPrivateIpAddress() { return privateIpAddress; }
     public void setPrivateIpAddress(String privateIpAddress) { this.privateIpAddress = privateIpAddress; }
+    public String getLogicalPrivateIpAddress() { return logicalPrivateIpAddress; }
+    public void setLogicalPrivateIpAddress(String logicalPrivateIpAddress) {
+        this.logicalPrivateIpAddress = logicalPrivateIpAddress;
+    }
 
     public String getPublicIpAddress() { return publicIpAddress; }
     public void setPublicIpAddress(String publicIpAddress) { this.publicIpAddress = publicIpAddress; }
@@ -94,6 +133,8 @@ public class Instance {
 
     public String getPublicDnsName() { return publicDnsName; }
     public void setPublicDnsName(String publicDnsName) { this.publicDnsName = publicDnsName; }
+    public boolean isAssociatePublicIp() { return associatePublicIp; }
+    public void setAssociatePublicIp(boolean associatePublicIp) { this.associatePublicIp = associatePublicIp; }
 
     public String getKeyName() { return keyName; }
     public void setKeyName(String keyName) { this.keyName = keyName; }
@@ -142,6 +183,14 @@ public class Instance {
 
     public String getIamInstanceProfileArn() { return iamInstanceProfileArn; }
     public void setIamInstanceProfileArn(String iamInstanceProfileArn) { this.iamInstanceProfileArn = iamInstanceProfileArn; }
+    public Instant getIamInstanceProfileAssociationTime() { return iamInstanceProfileAssociationTime; }
+    public void setIamInstanceProfileAssociationTime(Instant iamInstanceProfileAssociationTime) { this.iamInstanceProfileAssociationTime = iamInstanceProfileAssociationTime; }
+
+    public String getStateReasonCode() { return stateReasonCode; }
+    public void setStateReasonCode(String stateReasonCode) { this.stateReasonCode = stateReasonCode; }
+
+    public String getStateReasonMessage() { return stateReasonMessage; }
+    public void setStateReasonMessage(String stateReasonMessage) { this.stateReasonMessage = stateReasonMessage; }
 
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
@@ -152,6 +201,8 @@ public class Instance {
     public String getDockerContainerId() { return dockerContainerId; }
     public void setDockerContainerId(String dockerContainerId) { this.dockerContainerId = dockerContainerId; }
 
+    public String getEncodedUserData() { return encodedUserData; }
+    public void setEncodedUserData(String encodedUserData) { this.encodedUserData = encodedUserData; }
     public String getUserData() { return userData; }
     public void setUserData(String userData) { this.userData = userData; }
 
@@ -164,6 +215,17 @@ public class Instance {
     public String getContainerBridgeIp() { return containerBridgeIp; }
     public void setContainerBridgeIp(String containerBridgeIp) { this.containerBridgeIp = containerBridgeIp; }
 
+    public String getImdsSourceIp() { return imdsSourceIp; }
+    public void setImdsSourceIp(String imdsSourceIp) { this.imdsSourceIp = imdsSourceIp; }
+
+    public Map<Integer, Integer> getPublishedPorts() {
+        if (publishedPorts == null) {
+            publishedPorts = new LinkedHashMap<>();
+        }
+        return publishedPorts;
+    }
+    public void setPublishedPorts(Map<Integer, Integer> publishedPorts) { this.publishedPorts = publishedPorts; }
+
     public String getRootVolumeId() { return rootVolumeId; }
     public void setRootVolumeId(String rootVolumeId) { this.rootVolumeId = rootVolumeId; }
 
@@ -172,4 +234,15 @@ public class Instance {
 
     public boolean isDisableApiTermination() { return disableApiTermination; }
     public void setDisableApiTermination(boolean disableApiTermination) { this.disableApiTermination = disableApiTermination; }
+
+    public LaunchTemplateData.MetadataOptions getMetadataOptions() { return metadataOptions; }
+    public void setMetadataOptions(LaunchTemplateData.MetadataOptions metadataOptions) { this.metadataOptions = metadataOptions; }
+
+    public String getCreditSpecificationCpuCredits() { return creditSpecificationCpuCredits; }
+    public void setCreditSpecificationCpuCredits(String creditSpecificationCpuCredits) { this.creditSpecificationCpuCredits = creditSpecificationCpuCredits; }
+
+    /** The stored metadata options, or AWS's launch defaults for a record that has none. */
+    public LaunchTemplateData.MetadataOptions effectiveMetadataOptions() {
+        return metadataOptions != null ? metadataOptions : LaunchTemplateData.MetadataOptions.launchDefaults();
+    }
 }

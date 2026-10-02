@@ -42,6 +42,59 @@ class GlobalCorsFilterIntegrationTest {
     }
 
     @Test
+    void preflightS3ObjectReturnsCorsHeaders() {
+        given()
+            .header("Origin", "http://localhost:3000")
+            .header("Access-Control-Request-Method", "PUT")
+        .when()
+            .options("/my-bucket/some-key")
+        .then()
+            .statusCode(204)
+            .header("Access-Control-Allow-Origin", equalTo("http://localhost:3000"));
+    }
+
+    @Test
+    void preflightS3ObjectVirtualHostReturnsCorsHeaders() {
+        given()
+            .header("Host", "my-bucket.s3.localhost.floci.io:4566")
+            .header("Origin", "http://localhost:3000")
+            .header("Access-Control-Request-Method", "PUT")
+        .when()
+            .options("/some-key")
+        .then()
+            .statusCode(204)
+            .header("Access-Control-Allow-Origin", equalTo("http://localhost:3000"));
+    }
+
+
+
+    @Test
+    void preflightRequestingPrivateNetworkAccessIsGranted() {
+        given()
+            .header("Origin", "http://localhost:3000")
+            .header("Access-Control-Request-Method", "POST")
+            .header("Access-Control-Request-Private-Network", "true")
+        .when()
+            .options("/")
+        .then()
+            .statusCode(204)
+            .header("Access-Control-Allow-Origin", equalTo("http://localhost:3000"))
+            .header("Access-Control-Allow-Private-Network", equalTo("true"));
+    }
+
+    @Test
+    void preflightWithoutPrivateNetworkRequestOmitsAllowHeader() {
+        given()
+            .header("Origin", "http://localhost:3000")
+            .header("Access-Control-Request-Method", "POST")
+        .when()
+            .options("/")
+        .then()
+            .statusCode(204)
+            .header("Access-Control-Allow-Private-Network", nullValue());
+    }
+
+    @Test
     void actualRequestFromExtraAllowedOriginGetsCorsHeaders() {
         given()
             .header("Origin", "https://ui.example.test")
@@ -71,13 +124,26 @@ class GlobalCorsFilterIntegrationTest {
             .header("Access-Control-Allow-Origin", nullValue());
     }
 
+    @Test
+    void preflightFromUnlistedOriginGetsNoGlobalCorsHeaders() {
+        given()
+            .header("Origin", "https://not-allowed.example.test")
+            .header("Access-Control-Request-Method", "PUT")
+        .when()
+            .options("/my-bucket/some-key")
+        .then()
+            .statusCode(403)
+            .header("Access-Control-Allow-Origin", nullValue());
+    }
+
     public static final class CorsProfile implements QuarkusTestProfile {
         @Override
         public Map<String, String> getConfigOverrides() {
             return Map.of(
                     "floci.security.extra-cors-allowed-origins", "http://localhost:3000,https://ui.example.test",
                     "floci.security.extra-cors-allowed-headers", "x-added-header",
-                    "floci.security.extra-cors-expose-headers", "x-visible-header");
+                    "floci.security.extra-cors-expose-headers", "x-visible-header",
+                    "floci.security.cors-allow-private-network", "true");
         }
     }
 }

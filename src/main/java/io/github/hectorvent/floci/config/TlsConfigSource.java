@@ -1,9 +1,12 @@
 package io.github.hectorvent.floci.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
-import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.asn1.x509.Extension;
 import org.eclipse.microprofile.config.spi.ConfigSource;
 import org.jboss.logging.Logger;
 
@@ -12,13 +15,13 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.security.Security;
 
 /**
  * A MicroProfile {@link ConfigSource} that dynamically provides Quarkus TLS/SSL
@@ -31,9 +34,13 @@ import java.security.Security;
  * would be too late.
  *
  * <p>
- * When TLS is enabled with self-signed mode, the certificate is generated
- * using the ACM {@link CertificateGenerator} and persisted under
- * {@code {persistent-path}/tls/} for reuse across restarts.
+ * When TLS is enabled without a user certificate, the server certificate is a leaf issued by
+ * {@link FlociCertificateAuthority} and persisted under {@code {persistent-path}/tls/}. Clients
+ * trust the CA ({@code floci-root-ca.crt}, or {@code GET /_floci/ca.pem}), never the leaf.
+ *
+ * <p>
+ * It also writes {@link ContainerCaBundle}, the trust bundle every container Floci launches
+ * receives, next to the certificates.
  *
  * <p>
  * Both HTTP and HTTPS are served simultaneously (LocalStack parity).
@@ -42,18 +49,61 @@ public class TlsConfigSource implements ConfigSource {
 
     private static final Logger LOG = Logger.getLogger(TlsConfigSource.class);
 
-    private static final String SELF_SIGNED_CERT_NAME = "floci-selfsigned.crt";
-    private static final String SELF_SIGNED_KEY_NAME = "floci-selfsigned.key";
-    private static final String SELF_SIGNED_METADATA_NAME = "floci-selfsigned.metadata.json";
+    static final String NAME = "FlociTlsConfigSource";
+
+    /**
+     * Internal ports Quarkus binds when TLS is enabled. {@link TlsProxyServer} listens on the
+     * public Floci port and routes to these by protocol, so the two classes must agree; they are
+     * declared here, next to the properties that set them, and referenced from the proxy.
+     */
+    static final int HTTP_INTERNAL_PORT = 4510;
+    static final int HTTPS_INTERNAL_PORT = 4511;
+
+    private static final String SERVER_CERT_NAME = "floci-server.crt";
+    private static final String SERVER_KEY_NAME = "floci-server.key";
+    private static final String SERVER_METADATA_NAME = "floci-server.metadata.json";
     private static final String TLS_DIR = "tls";
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
+    // host.docker.internal: how Lambda containers reach Floci when it runs on the host (not in a container).
+    // A wildcard SAN covers one label, so every two-label service form needs its own entry.
+    // Package-private so the tests assert against this list instead of copying it.
+    static final List<String> DEFAULT_SAN_HOSTNAMES = defaultSanHostnames();
+
+    private static List<String> defaultSanHostnames() {
+        List<String> sans = new ArrayList<>(List.of(
+                "localhost", "127.0.0.1", "0.0.0.0", "*.localhost",
+                "localhost.floci.io", "*.localhost.floci.io",
+                "*.execute-api.localhost.floci.io",
+                "*.execute-api.localhost.localstack.cloud",
+                "*.cloudfront.localhost.floci.io", "*.cloudfront.localhost",
+                "host.docker.internal"));
+        for (String region : AwsRegions.KNOWN_IDS.stream().sorted().toList()) {
+            sans.add("*.dkr.ecr." + region + ".localhost.floci.io");
+        }
+        return List.copyOf(sans);
+    }
+
+    private static volatile Path resolvedTlsDir;
+
     private final Map<String, String> properties = new HashMap<>();
 
+    /**
+     * The TLS directory the most recent bootstrap used, or null when that bootstrap ran with TLS
+     * off. With a user-provided certificate it holds the container CA bundle and, once
+     * {@code GET /_floci/ca.pem} is called, the local CA; in self-signed mode the CA and the leaf
+     * as well. Reset on every construction so a later boot in the same JVM never sees a stale
+     * value.
+     */
+    static Path resolvedTlsDir() {
+        return resolvedTlsDir;
+    }
+
     public TlsConfigSource() {
+        resolvedTlsDir = null;
         String enabled = resolveProperty("floci.tls.enabled", "false");
         if (!"true".equalsIgnoreCase(enabled)) {
-            LOG.debug("TLS disabled — TlsConfigSource inactive");
+            LOG.debug("TLS disabled, TlsConfigSource inactive");
             return;
         }
 
@@ -61,36 +111,35 @@ public class TlsConfigSource implements ConfigSource {
         String keyPath = resolveProperty("floci.tls.key-path", "");
         String selfSigned = resolveProperty("floci.tls.self-signed", "true");
         String persistentPath = resolveProperty("floci.storage.persistent-path", "./data");
+        Path tlsDir = Path.of(persistentPath, TLS_DIR);
+        resolvedTlsDir = tlsDir;
 
+        Path trustAnchor;
         if (!certPath.isBlank() && !keyPath.isBlank()) {
             validateFileExists(certPath, "TLS certificate");
             validateFileExists(keyPath, "TLS private key");
             LOG.infov("TLS: using user-provided certificate: {0}", certPath);
+            trustAnchor = Path.of(certPath);
         } else if ("true".equalsIgnoreCase(selfSigned)) {
-            Path tlsDir = Path.of(persistentPath, TLS_DIR);
-            Path certFile = tlsDir.resolve(SELF_SIGNED_CERT_NAME);
-            Path keyFile = tlsDir.resolve(SELF_SIGNED_KEY_NAME);
+            Path certFile = tlsDir.resolve(SERVER_CERT_NAME);
+            Path keyFile = tlsDir.resolve(SERVER_KEY_NAME);
+            FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(tlsDir);
+            trustAnchor = ca.certificatePath();
 
-            // Check if certificate files exist and configuration hasn't changed
             if (Files.exists(certFile) && Files.exists(keyFile)) {
-                // Extract current hostname configuration
-                List<String> customHostnames = extractCustomHostnames();
-                List<String> currentHostnames = new ArrayList<>();
-                currentHostnames.addAll(List.of("localhost", "127.0.0.1", "0.0.0.0", "*.localhost",
-                        "localhost.floci.io", "*.localhost.floci.io"));
-                currentHostnames.addAll(customHostnames);
-                
-                // Check if hostname configuration has changed
-                if (hostnameConfigChanged(tlsDir, currentHostnames)) {
-                    // Configuration changed or metadata missing - regenerate certificate
-                    generateSelfSignedCert(tlsDir, certFile, keyFile);
+                List<String> currentHostnames = configuredSanHostnames();
+
+                // Regenerate when the hostname config changed, when the existing leaf was not
+                // issued by the current CA (a pre-CA self-signed cert, or the CA was regenerated),
+                // or when it is outside its validity window (the leaf lives 365 days, dev data
+                // directories longer).
+                if (hostnameConfigChanged(tlsDir, currentHostnames) || !isValidLocalLeaf(ca, certFile)) {
+                    generateServerCert(tlsDir, certFile, keyFile, ca);
                 } else {
-                    // Configuration unchanged - reuse existing certificate
-                    LOG.infov("TLS: reusing existing self-signed certificate: {0}", certFile);
+                    LOG.infov("TLS: reusing existing server certificate: {0}", certFile);
                 }
             } else {
-                // Certificate files don't exist - generate new certificate
-                generateSelfSignedCert(tlsDir, certFile, keyFile);
+                generateServerCert(tlsDir, certFile, keyFile, ca);
             }
 
             certPath = certFile.toAbsolutePath().toString();
@@ -101,17 +150,21 @@ public class TlsConfigSource implements ConfigSource {
                             + "Set FLOCI_TLS_CERT_PATH + FLOCI_TLS_KEY_PATH, or enable FLOCI_TLS_SELF_SIGNED.");
         }
 
-        properties.put("quarkus.http.ssl.certificate.files", certPath);
-        properties.put("quarkus.http.ssl.certificate.key-files", keyPath);
+        writeContainerCaBundle(tlsDir, trustAnchor);
+
+        // The default entry of the Quarkus TLS registry. The HTTP server reads it when no
+        // quarkus.http.tls-configuration-name is set, and the registry can reload it at runtime.
+        properties.put("quarkus.tls.key-store.pem.0.cert", certPath);
+        properties.put("quarkus.tls.key-store.pem.0.key", keyPath);
         // When TLS is enabled, Quarkus HTTP and HTTPS run on internal ports.
         // A TlsProxyServer (NetServer) listens on the public Floci port (4566)
         // and does protocol detection to route HTTP and HTTPS to the correct backend.
         properties.put("quarkus.http.insecure-requests", "enabled");
         properties.put("quarkus.http.host", "127.0.0.1");
-        properties.put("quarkus.http.port", "4510");
-        properties.put("quarkus.http.ssl-port", "4511");
+        properties.put("quarkus.http.port", String.valueOf(HTTP_INTERNAL_PORT));
+        properties.put("quarkus.http.ssl-port", String.valueOf(HTTPS_INTERNAL_PORT));
 
-        LOG.infov("TLS: HTTPS enabled — proxy will listen on port {0} (HTTP+HTTPS), cert={1}",
+        LOG.infov("TLS: HTTPS enabled, proxy will listen on port {0} (HTTP+HTTPS), cert={1}",
                 resolveProperty("floci.port", "4566"), certPath);
     }
 
@@ -133,7 +186,7 @@ public class TlsConfigSource implements ConfigSource {
 
     @Override
     public String getName() {
-        return "FlociTlsConfigSource";
+        return NAME;
     }
 
     /**
@@ -156,37 +209,212 @@ public class TlsConfigSource implements ConfigSource {
         return defaultValue;
     }
 
-    private void generateSelfSignedCert(Path tlsDir, Path certFile, Path keyFile) {
+    /**
+     * Whether {@code floci.dns.spoof-aws-endpoints} is set where this source can read it (system
+     * property or environment variable). It cannot see application.yml, so a flag set only there
+     * leaves the certificate without the AWS SANs.
+     */
+    public static boolean spoofAwsEndpointsVisibleToTls() {
+        return "true".equalsIgnoreCase(resolveProperty("floci.dns.spoof-aws-endpoints", "false"));
+    }
+
+    /** Whether {@code floci.tls.enabled} is set where this source can read it. */
+    public static boolean tlsEnabledVisibleToTls() {
+        return "true".equalsIgnoreCase(resolveProperty("floci.tls.enabled", "false"));
+    }
+
+    /**
+     * The full SAN list the server certificate must cover for the current configuration:
+     * defaults, custom hostnames, and the AWS endpoint wildcards when
+     * {@code floci.dns.spoof-aws-endpoints} is enabled. Used both for generation and for the
+     * change detection that triggers regeneration, so flipping the spoof flag regenerates the
+     * certificate.
+     */
+    private List<String> configuredSanHostnames() {
+        List<String> sans = new ArrayList<>(DEFAULT_SAN_HOSTNAMES);
+        sans.addAll(extractCustomHostnames());
+        sans.addAll(awsSpoofSans());
+        return sans;
+    }
+
+    /**
+     * The suffixes floci.dns.spoof-aws-endpoints intercepts, shared by the embedded DNS server and
+     * the certificate SANs: every partition's DNS and dual-stack suffix. Each covers the suffix
+     * itself and its subdomains at any depth, so explicit SDK endpoints like
+     * {@code sts.us-east-1.<suffix>} resolve to Floci instead of real AWS.
+     */
+    public static Set<String> awsEndpointSuffixes() {
+        Set<String> result = new LinkedHashSet<>();
+        for (AwsPartition partition : AwsPartitions.all()) {
+            result.add(partition.dnsSuffix());
+            result.add(partition.dualStackDnsSuffix());
+        }
+        return result;
+    }
+
+    /** Service infixes that AWS virtual-hosts with an extra resource-id label before the region. */
+    private static final List<String> MULTI_LABEL_REGIONAL_SERVICE_INFIXES = List.of(
+            "execute-api", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
+            "s3-fips", "s3-fips.dualstack");
+
+    /**
+     * S3 endpoint prefixes that join the region with a hyphen instead of a dot: the legacy
+     * {@code s3-<region>} form and its website counterpart {@code s3-website-<region>}, per
+     * {@code S3VirtualHostFilter#isS3QualifierTail}, the authoritative list of endpoint forms
+     * Floci itself recognizes as S3.
+     */
+    private static final List<String> HYPHEN_JOINED_REGIONAL_S3_PREFIXES = List.of("s3", "s3-website");
+
+    /** Regionless S3 transfer-acceleration endpoints, with and without dualstack. */
+    private static final List<String> REGIONLESS_S3_INFIXES = List.of("s3-accelerate", "s3-accelerate.dualstack");
+
+    /**
+     * SANs covering AWS endpoint hostnames spoofed by the embedded DNS server.
+     * Wildcards match a single label, so {@code *.amazonaws.com} covers global
+     * endpoints ({@code sts.amazonaws.com}) but not regional ones
+     * ({@code sts.us-east-1.amazonaws.com}), which need their own
+     * {@code *.<region>.amazonaws.com} entry. A client can hit an explicit endpoint outside
+     * {@code floci.default-region} (a cross-region call, a Lambda whose own AWS_REGION differs
+     * from the emulator default, or a published region this emulator doesn't advertise via
+     * DescribeRegions); DNS spoofing routes it to Floci regardless of region, so every
+     * {@link AwsRegions#KNOWN_IDS published region id} gets a SAN, not just the configured default.
+     *
+     * <p>A single wildcard label also cannot cover multi-label endpoints, where a resource id
+     * contributes an extra label before the service name:
+     * {@code <api-id>.execute-api.<region>.amazonaws.com},
+     * {@code <account>.dkr.ecr.<region>.amazonaws.com},
+     * {@code <account>.s3-control.<region>.amazonaws.com}, and
+     * {@code <bucket>.s3.dualstack.<region>.amazonaws.com}. Each needs its own
+     * {@code *.<infix>.<region>.amazonaws.com} SAN.
+     *
+     * <p>S3 publishes several more forms: some join the region with a hyphen
+     * ({@code <bucket>.s3-<region>.amazonaws.com}, {@code <bucket>.s3-website-<region>.amazonaws.com}),
+     * and two are regionless transfer-acceleration endpoints
+     * ({@code <bucket>.s3-accelerate.amazonaws.com},
+     * {@code <bucket>.s3-accelerate.dualstack.amazonaws.com}). The set follows
+     * {@code S3VirtualHostFilter#isS3QualifierTail}, which documents every S3 endpoint form Floci
+     * itself routes; keep the two in sync so the SAN list does not drift from what gets spoofed.
+     *
+     * <p>The suffix is never fixed: global names use every partition's DNS suffix from
+     * {@link AwsPartitions#all()}, and each region's names use {@link AwsRegions#dnsSuffixFor}, so
+     * {@code cn-north-1} is named under the China suffix and never under the commercial one. Lambda
+     * function URLs ({@code <url-id>.lambda-url.<region>.on.aws}) live outside the partition suffix
+     * and are not intercepted, so they get no SAN.
+     */
+    private List<String> awsSpoofSans() {
+        if (!spoofAwsEndpointsVisibleToTls()) {
+            return List.of();
+        }
+        List<String> sans = new ArrayList<>();
+        for (String suffix : awsEndpointSuffixes()) {
+            sans.add("*." + suffix);
+            sans.add("*.s3." + suffix);
+            for (String infix : REGIONLESS_S3_INFIXES) {
+                sans.add("*." + infix + "." + suffix);
+            }
+        }
+        for (String region : AwsRegions.KNOWN_IDS.stream().sorted().toList()) {
+            String suffix = AwsRegions.dnsSuffixFor(region);
+            // A wildcard matches exactly one label (RFC 6125 6.4.3), so the two broad
+            // wildcards miss virtual-hosted addressing, where the bucket adds a label:
+            // my-bucket.s3.<suffix> and my-bucket.s3.<region>.<suffix>. The DNS
+            // spoof does route those, so without these the handshake fails on a hostname
+            // mismatch rather than the request reaching Floci.
+            sans.add("*." + region + "." + suffix);
+            sans.add("*.s3." + region + "." + suffix);
+            sans.add("*." + region + "." + AwsPartitions.forRegionOrCommercial(region).dualStackDnsSuffix());
+            for (String infix : MULTI_LABEL_REGIONAL_SERVICE_INFIXES) {
+                sans.add("*." + infix + "." + region + "." + suffix);
+            }
+            for (String prefix : HYPHEN_JOINED_REGIONAL_S3_PREFIXES) {
+                sans.add("*." + prefix + "-" + region + "." + suffix);
+            }
+        }
+        return sans;
+    }
+
+    private void generateServerCert(Path tlsDir, Path certFile, Path keyFile, FlociCertificateAuthority ca) {
         try {
             Files.createDirectories(tlsDir);
-
-            // BouncyCastle may not be registered yet — ConfigSource runs before CDI
-            if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
-                Security.addProvider(new BouncyCastleProvider());
+            List<String> configured = configuredSanHostnames();
+            List<String> learned = readLearnedHostnames(tlsDir, certFile);
+            List<String> allSans = new ArrayList<>(configured);
+            for (String name : learned) {
+                if (!allSans.contains(name)) {
+                    allSans.add(name);
+                }
             }
 
-            // Extract custom hostnames and combine with defaults
-            List<String> customHostnames = extractCustomHostnames();
-            List<String> allSans = new ArrayList<>();
-            allSans.addAll(List.of("localhost", "127.0.0.1", "0.0.0.0", "*.localhost",
-                    "localhost.floci.io", "*.localhost.floci.io"));
-            allSans.addAll(customHostnames);
-
-            CertificateGenerator gen = new CertificateGenerator();
-            CertificateGenerator.GeneratedCertificate generated = gen.generateCertificate(
-                    "localhost",
-                    allSans,
-                    KeyAlgorithm.RSA_2048);
+            CertificateGenerator.GeneratedCertificate generated = ca.issueServerCertificate("localhost", allSans,
+                    KeyAlgorithm.RSA_2048, null);
 
             Files.writeString(certFile, generated.certificatePem());
-            Files.writeString(keyFile, generated.privateKeyPem());
+            FlociCertificateAuthority.writePrivateKey(keyFile, generated.privateKeyPem());
 
-            LOG.infov("TLS: generated self-signed certificate: {0}", certFile);
-
-            // Persist metadata for change detection on restart
-            persistMetadata(tlsDir, allSans);
+            LOG.infov("TLS: generated server certificate {0} issued by {1}", certFile,
+                    ca.certificate().getSubjectX500Principal().getName());
+            persistMetadata(tlsDir, configured, learned);
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to write self-signed TLS certificate", e);
+            throw new IllegalStateException("Failed to write TLS server certificate", e);
+        }
+    }
+
+    /**
+     * Hostnames {@link TlsCertificateManager} added at runtime. A boot that regenerates the
+     * certificate (changed configuration, expired or foreign leaf) must keep serving them. The
+     * served certificate is the source of truth: a SAN it carries beyond the metadata's configured
+     * list was learned by a reissue whose metadata write did not complete, and is kept too.
+     */
+    private List<String> readLearnedHostnames(Path tlsDir, Path certFile) {
+        Path metadataFile = tlsDir.resolve(SERVER_METADATA_NAME);
+        if (!Files.exists(metadataFile)) {
+            return List.of();
+        }
+        try {
+            CertificateMetadata metadata = OBJECT_MAPPER.readValue(Files.readString(metadataFile), CertificateMetadata.class);
+            Set<String> learned = new LinkedHashSet<>(metadata.getLearnedHostnames());
+            if (metadata.getHostnames() != null && Files.exists(certFile)) {
+                Set<String> configured = new LinkedHashSet<>(metadata.getHostnames());
+                for (String san : servedSans(certFile)) {
+                    if (!configured.contains(san)) {
+                        learned.add(san);
+                    }
+                }
+            }
+            return new ArrayList<>(learned);
+        } catch (IOException e) {
+            LOG.warnv("TLS: could not read learned hostnames from {0} ({1}); the new certificate starts without them",
+                    metadataFile, e.getMessage());
+            return List.of();
+        }
+    }
+
+    private static List<String> servedSans(Path certFile) {
+        List<String> sans = new ArrayList<>();
+        try {
+            X509Certificate cert = new CertificateGenerator().parseCertificate(Files.readString(certFile));
+            if (cert.getSubjectAlternativeNames() != null) {
+                for (List<?> entry : cert.getSubjectAlternativeNames()) {
+                    sans.add(String.valueOf(entry.get(1)));
+                }
+            }
+        } catch (Exception e) {
+            LOG.debugv("TLS: could not read the SAN list of {0} ({1}); learned names come from the metadata only",
+                    certFile, e.getMessage());
+        }
+        return sans;
+    }
+
+    /**
+     * Containers Floci launches get this bundle copied in (Docker) or mounted (Kubernetes). A
+     * failure here must not stop Floci: log it, and containers simply will not trust Floci HTTPS
+     * until a boot manages to write it.
+     */
+    private static void writeContainerCaBundle(Path tlsDir, Path trustAnchor) {
+        try {
+            ContainerCaBundle.write(tlsDir, trustAnchor);
+        } catch (Exception e) {
+            LOG.warnv(e, "TLS: could not write the container CA bundle under {0}: {1}", tlsDir, e.getMessage());
         }
     }
 
@@ -198,7 +426,33 @@ public class TlsConfigSource implements ConfigSource {
     }
 
     /**
-     * Extracts custom hostnames from FLOCI_HOSTNAME and FLOCI_BASE_URL configuration.
+     * Returns {@code true} if the certificate at {@code certFile} was issued by the current local
+     * CA and is inside its validity window. A pre-CA self-signed leaf, a leaf from a regenerated
+     * CA, an expired leaf or an unreadable file all return {@code false} and are replaced.
+     */
+    private boolean isValidLocalLeaf(FlociCertificateAuthority ca, Path certFile) {
+        try {
+            X509Certificate cert = new CertificateGenerator().parseCertificate(Files.readString(certFile));
+            if (!ca.isIssuedByUs(cert)) {
+                LOG.infov("TLS: existing server certificate was not issued by the local CA; regenerating");
+                return false;
+            }
+            if (cert.getExtensionValue(Extension.subjectKeyIdentifier.getId()) == null
+                    || cert.getExtensionValue(Extension.authorityKeyIdentifier.getId()) == null) {
+                LOG.info("TLS: existing server certificate lacks key identifiers; regenerating");
+                return false;
+            }
+            cert.checkValidity();
+            return true;
+        } catch (Exception e) {
+            LOG.warnv("TLS: existing server certificate unusable ({0}); regenerating", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Extracts custom hostnames from FLOCI_HOSTNAME, FLOCI_BASE_URL and
+     * FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS configuration.
      * Filters out default values like "localhost" and "127.0.0.1".
      * Returns a deduplicated list of custom hostnames.
      *
@@ -227,6 +481,26 @@ public class TlsConfigSource implements ConfigSource {
             LOG.warnv("TLS: failed to parse base URL for hostname extraction: {0}", baseUrl);
         }
 
+        // Extract from FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS: devices verify that name on 8883 and 443
+        String iotEndpoint = resolveProperty("floci.services.iot.endpoint-address", "").strip();
+        if (!iotEndpoint.isEmpty()) {
+            try {
+                // Anything beyond host[:port] is a typo: java.net.URI would read "https" as the host of a URL.
+                URI uri = new URI("//" + iotEndpoint);
+                String host = uri.getHost();
+                if (host == null || uri.getUserInfo() != null || !iotEndpoint.equals(uri.getRawAuthority())) {
+                    LOG.warnv("TLS: floci.services.iot.endpoint-address is not a host or host:port, not added to the certificate: {0}",
+                            iotEndpoint);
+                } else if (!isDefaultHostname(host)) {
+                    hostnames.add(host);
+                    LOG.debugv("TLS: extracted hostname from floci.services.iot.endpoint-address: {0}", host);
+                }
+            } catch (URISyntaxException e) {
+                LOG.warnv("TLS: failed to parse floci.services.iot.endpoint-address for hostname extraction: {0}",
+                        iotEndpoint);
+            }
+        }
+
         List<String> result = new ArrayList<>(hostnames);
         if (!result.isEmpty()) {
             LOG.infov("TLS: detected custom hostnames: {0}", result);
@@ -248,17 +522,20 @@ public class TlsConfigSource implements ConfigSource {
 
     /**
      * Persists certificate metadata to enable change detection on restart.
-     * Writes metadata to {tls-dir}/floci-selfsigned.metadata.json.
+     * Writes metadata to {tls-dir}/floci-server.metadata.json.
      * 
      * @param tlsDir The TLS directory where metadata should be written
-     * @param hostnames List of hostnames included in the certificate SANs
+     * @param hostnames List of configured hostnames included in the certificate SANs
+     * @param learnedHostnames Hostnames added at runtime, also in the SANs but kept apart so a
+     *                         configuration change is still detected by comparing {@code hostnames}
      */
-    private void persistMetadata(Path tlsDir, List<String> hostnames) {
-        Path metadataFile = tlsDir.resolve(SELF_SIGNED_METADATA_NAME);
+    private void persistMetadata(Path tlsDir, List<String> hostnames, List<String> learnedHostnames) {
+        Path metadataFile = tlsDir.resolve(SERVER_METADATA_NAME);
         try {
             String version = resolveFlociVersion();
             CertificateMetadata metadata = CertificateMetadata.create(hostnames, version);
-            
+            metadata.setLearnedHostnames(learnedHostnames);
+
             String json = OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(metadata);
             
             Files.writeString(metadataFile, json);
@@ -291,7 +568,7 @@ public class TlsConfigSource implements ConfigSource {
      * @return true if configuration changed or metadata missing, false if same
      */
     private boolean hostnameConfigChanged(Path tlsDir, List<String> currentHostnames) {
-        Path metadataFile = tlsDir.resolve(SELF_SIGNED_METADATA_NAME);
+        Path metadataFile = tlsDir.resolve(SERVER_METADATA_NAME);
         
         // If metadata doesn't exist, trigger regeneration
         if (!Files.exists(metadataFile)) {

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.eventbridge;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.eventbridge.model.Rule;
 import io.github.hectorvent.floci.services.eventbridge.model.RuleState;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
@@ -12,6 +13,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -20,25 +22,42 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 @ApplicationScoped
-public class RuleScheduler {
+public class RuleScheduler implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(RuleScheduler.class);
 
     private final Vertx vertx;
     private final ObjectMapper objectMapper;
     private final String defaultAccountId;
-    private final EventBridgeInvoker invoker;
+    private final String defaultRegion;
+    private final TargetDispatcher dispatcher;
+    private final Clock clock;
     private final ConcurrentHashMap<String, ScheduleContext> scheduleContexts = new ConcurrentHashMap<>();
 
     @Inject
     public RuleScheduler(Vertx vertx,
                           EmulatorConfig config,
                           ObjectMapper objectMapper,
-                          EventBridgeInvoker invoker) {
+                          TargetDispatcher dispatcher) {
+        this(vertx, config, objectMapper, dispatcher, Clock.systemUTC());
+    }
+
+    /**
+     * Test seam: lets cron next-fire computation be exercised deterministically instead
+     * of depending on wall-clock time. Production code always goes through the
+     * public/{@code @Inject} constructor, which pins the system clock.
+     */
+    RuleScheduler(Vertx vertx,
+                  EmulatorConfig config,
+                  ObjectMapper objectMapper,
+                  TargetDispatcher dispatcher,
+                  Clock clock) {
         this.vertx = vertx;
         this.objectMapper = objectMapper;
         this.defaultAccountId = config.defaultAccountId();
-        this.invoker = invoker;
+        this.defaultRegion = config.defaultRegion();
+        this.dispatcher = dispatcher;
+        this.clock = clock;
     }
 
     @PreDestroy
@@ -46,6 +65,11 @@ public class RuleScheduler {
         scheduleContexts.values().forEach(ctx -> vertx.cancelTimer(ctx.timerId));
         scheduleContexts.clear();
         LOG.info("RuleScheduler shut down, all timers cancelled");
+    }
+
+    public void clear() {
+        scheduleContexts.values().forEach(ctx -> vertx.cancelTimer(ctx.timerId));
+        scheduleContexts.clear();
     }
 
     public void startScheduler(String ruleArn, String scheduleExpr, 
@@ -63,7 +87,7 @@ public class RuleScheduler {
             if (ScheduleExpressionParser.isRateExpression(scheduleExpr)) {
                 startRateScheduler(ruleArn, scheduleExpr, dataSupplier);
             } else if (ScheduleExpressionParser.isCronExpression(scheduleExpr)) {
-                scheduleCronFire(ruleArn, scheduleExpr, dataSupplier);
+                scheduleCronFire(ruleArn, scheduleExpr, dataSupplier, null);
             } else {
                 LOG.warnv("Unknown schedule expression format for rule {0}: {1}", ruleArn, scheduleExpr);
             }
@@ -82,22 +106,39 @@ public class RuleScheduler {
         LOG.debugv("Started rate scheduler for rule {0} with interval {1}ms", ruleArn, intervalMs);
     }
 
+    /**
+     * Arms the next cron fire. {@code previous} is the context of the fire that is re-arming,
+     * or {@code null} when the rule is starting.
+     */
     private void scheduleCronFire(String ruleArn, String scheduleExpr,
-                                  Supplier<ScheduleData> dataSupplier) {
+                                  Supplier<ScheduleData> dataSupplier, ScheduleContext previous) {
         long delayMs;
         try {
-            delayMs = ScheduleExpressionParser.millisUntilNextFire(scheduleExpr, ZonedDateTime.now());
+            delayMs = ScheduleExpressionParser.millisUntilNextFire(scheduleExpr, ZonedDateTime.now(clock));
         } catch (Exception e) {
             LOG.warnv("Failed to compute next fire time for rule {0}: {1}", ruleArn, e.getMessage());
+            if (previous != null) {
+                scheduleContexts.remove(ruleArn, previous);
+            }
             return;
         }
 
         long timerId = vertx.setTimer(delayMs, id -> {
             tick(dataSupplier);
-            scheduleContexts.remove(ruleArn);
-            scheduleCronFire(ruleArn, scheduleExpr, dataSupplier);
+            ScheduleContext current = scheduleContexts.get(ruleArn);
+            if (current != null && current.timerId() == id) {
+                scheduleCronFire(ruleArn, scheduleExpr, dataSupplier, current);
+            }
         });
-        scheduleContexts.put(ruleArn, new ScheduleContext(timerId, scheduleExpr));
+        ScheduleContext next = new ScheduleContext(timerId, scheduleExpr);
+        if (previous == null) {
+            scheduleContexts.put(ruleArn, next);
+        } else if (!scheduleContexts.replace(ruleArn, previous, next)) {
+            // DeleteRule, DisableRule or a restart replaced this fire's context while it was
+            // delivering. Swapping in one step means a stop is either seen here or cancels next.
+            vertx.cancelTimer(timerId);
+            return;
+        }
         LOG.debugv("Scheduled cron fire for rule {0} in {1}ms", ruleArn, delayMs);
     }
 
@@ -128,18 +169,18 @@ public class RuleScheduler {
             return;
         }
 
-        String region = data.rule.getRegion() != null ? data.rule.getRegion() : "us-east-1";
+        String region = data.rule.getRegion() != null ? data.rule.getRegion() : defaultRegion;
         String eventJson = buildScheduledEvent(data.rule, region);
         LOG.debugv("Rule {0} firing scheduled event", data.rule.getName());
 
         for (Target target : data.targets) {
-            try {
-                invoker.invokeTarget(target, eventJson, region);
-            } catch (Exception e) {
-                LOG.warnv("Failed to invoke target {0} for rule {1}: {2}",
-                        target.getId(), data.rule.getName(), e.getMessage());
-            }
+            dispatcher.dispatch(data.rule.getArn(), target, eventJson, region, () -> currentTargets(dataSupplier));
         }
+    }
+
+    private static List<Target> currentTargets(Supplier<ScheduleData> dataSupplier) {
+        ScheduleData current = dataSupplier.get();
+        return current == null || current.rule() == null ? List.of() : current.targets();
     }
 
     private String buildScheduledEvent(Rule rule, String region) {

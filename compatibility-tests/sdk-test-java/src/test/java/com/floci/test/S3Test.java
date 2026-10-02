@@ -257,10 +257,10 @@ class S3Test {
     void deleteBucketTagging() {
         s3.deleteBucketTagging(DeleteBucketTaggingRequest.builder().bucket(BUCKET).build());
 
-        GetBucketTaggingResponse response = s3.getBucketTagging(
-                GetBucketTaggingRequest.builder().bucket(BUCKET).build());
-
-        assertThat(response.tagSet()).isEmpty();
+        assertThatThrownBy(() -> s3.getBucketTagging(
+                GetBucketTaggingRequest.builder().bucket(BUCKET).build()))
+                .isInstanceOfSatisfying(S3Exception.class,
+                        e -> assertThat(e.awsErrorDetails().errorCode()).isEqualTo("NoSuchTagSet"));
     }
 
     @Test
@@ -499,6 +499,36 @@ class S3Test {
         // without first being rejected by the >10-tag rule.
         String huge = "k=" + "v".repeat(8 * 1024 + 1);
         assertInlineTaggingHeaderRejected(huge, 400, "InvalidArgument");
+    }
+
+    @Test
+    @Order(33)
+    void getObjectRangeRoundTripsThroughSdk() {
+        String bucket = TestFixtures.uniqueName("range-sdk-bucket");
+        String key = "range.txt";
+        s3.createBucket(CreateBucketRequest.builder().bucket(bucket).build());
+        try {
+            s3.putObject(PutObjectRequest.builder()
+                            .bucket(bucket).key(key).build(),
+                    RequestBody.fromString(CONTENT));
+
+            var response = s3.getObjectAsBytes(GetObjectRequest.builder()
+                    .bucket(bucket)
+                    .key(key)
+                    .range("bytes=6-13")
+                    .build());
+
+            assertThat(response.asUtf8String()).isEqualTo("from AWS");
+            assertThat(response.response().contentLength()).isEqualTo(8);
+            assertThat(response.response().contentRange()).isEqualTo("bytes 6-13/" + CONTENT.length());
+        } finally {
+            try {
+                s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
+            } catch (Exception ignored) {}
+            try {
+                s3.deleteBucket(DeleteBucketRequest.builder().bucket(bucket).build());
+            } catch (Exception ignored) {}
+        }
     }
 
     private void assertInlineTaggingHeaderRejected(String rawTaggingHeader, int expectedStatus, String expectedErrorCode) {

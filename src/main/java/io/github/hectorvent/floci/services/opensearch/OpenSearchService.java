@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.opensearch;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -24,14 +26,19 @@ import org.jboss.logging.Logger;
 
 import java.security.SecureRandom;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 
 @ApplicationScoped
-public class OpenSearchService {
+public class OpenSearchService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(OpenSearchService.class);
 
@@ -71,7 +78,7 @@ public class OpenSearchService {
     @PreDestroy
     public void shutdown() {
         poller.shutdownNow();
-        if (!config.services().opensearch().mock()) {
+        if (!config.services().opensearch().mock() && !config.services().opensearch().keepRunningOnShutdown()) {
             for (Domain domain : allDomains()) {
                 domainManager.stopDomain(domain);
             }
@@ -96,12 +103,12 @@ public class OpenSearchService {
 
     public Domain createDomain(String domainName, String engineVersion, ClusterConfig clusterConfig,
                                 EbsOptions ebsOptions, Map<String, String> tags, String region) {
-        return createDomain(domainName, engineVersion, clusterConfig, ebsOptions, tags,
+        return createDomain(domainName, engineVersion, clusterConfig, ebsOptions, tags, null,
                 DomainOptions.EMPTY, region);
     }
 
     public Domain createDomain(String domainName, String engineVersion, ClusterConfig clusterConfig,
-                                EbsOptions ebsOptions, Map<String, String> tags,
+                                EbsOptions ebsOptions, Map<String, String> tags, String accessPolicies,
                                 DomainOptions options, String region) {
         validateDomainName(domainName);
         OpenSearchVersions.validate(engineVersion);
@@ -119,11 +126,16 @@ public class OpenSearchService {
         domain.setAccountId(accountId);
         domain.setArn(AwsArnUtils.Arn.of("es", region, accountId, "domain/" + domainName).toString());
         domain.setEngineVersion(engineVersion != null ? engineVersion : DEFAULT_ENGINE_VERSION);
+        domain.setAccessPolicies(accessPolicies);
         domain.setProcessing(false);
         domain.setDeleted(false);
         domain.setEndpoint("");
         domain.setCreatedAt(Instant.now());
         domain.setVolumeId(String.format("%06x", new SecureRandom().nextInt(0xFFFFFF)));
+        // Stamp the volume name now, with the current prefix, so it is persisted rather than
+        // recomputed later. Only records predating this field fall back to the legacy name.
+        domain.setDockerVolumeName(ContainerStorageHelper.resourceName(
+                config, "opensearch", domain.getVolumeId(), domain.getDomainName()));
 
         if (clusterConfig != null) {
             domain.setClusterConfig(clusterConfig);
@@ -138,14 +150,36 @@ public class OpenSearchService {
 
         if (config.services().opensearch().mock()) {
             domain.setProcessing(false);
+            domain.setEndpoint(synthesizedEndpoint(domainName, region));
         } else {
             domain.setProcessing(true);
-            domainManager.startDomain(domain);
+            if (!domainManager.tryStartDomain(domain)) {
+                domain.setProcessing(false);
+                domain.setEndpoint(synthesizedEndpoint(domainName, region));
+            }
         }
 
         domainStore.put(domainName, domain);
         LOG.infov("Created OpenSearch domain: {0}", domainName);
         return domain;
+    }
+
+    /**
+     * The endpoint reported for a domain with no container behind it. Two cases reach this: the
+     * service is mocked, and no Docker daemon is reachable, which is the only condition under which
+     * {@link OpenSearchDomainManager#tryStartDomain} returns false rather than rethrowing.
+     *
+     * <p>It reports an AWS-shaped endpoint in place of a blank one,
+     * {@code search-<domain>-<suffix>.<region>.es.<dnsSuffix>}, taking the DNS suffix from the
+     * region's partition rather than assuming the commercial one, with the name suffix derived from the
+     * domain name so it survives a restart. A domain reporting {@code Processing false} alongside
+     * {@code Endpoint ""} describes a state AWS never returns, and a client that reads the endpoint
+     * to address the domain gets an empty string to connect to.
+     */
+    private static String synthesizedEndpoint(String domainName, String region) {
+        String suffix = Integer.toHexString(domainName.hashCode() & 0x7fffffff);
+        return "search-" + domainName + "-" + suffix + "." + region + ".es."
+                + AwsRegions.dnsSuffixFor(region);
     }
 
     public Domain describeDomain(String domainName) {
@@ -171,21 +205,23 @@ public class OpenSearchService {
     }
 
     public Domain updateDomainConfig(String domainName, String engineVersion,
-                                      ClusterConfig clusterConfig, EbsOptions ebsOptions,
-                                      String region) {
-        return updateDomainConfig(domainName, engineVersion, clusterConfig, ebsOptions,
-                DomainOptions.EMPTY, region);
+                                      ClusterConfig clusterConfig, EbsOptions ebsOptions) {
+        return updateDomainConfig(domainName, engineVersion, clusterConfig, ebsOptions, null,
+                DomainOptions.EMPTY);
     }
 
     public Domain updateDomainConfig(String domainName, String engineVersion,
                                       ClusterConfig clusterConfig, EbsOptions ebsOptions,
-                                      DomainOptions options, String region) {
+                                      String accessPolicies, DomainOptions options) {
         Domain domain = describeDomain(domainName);
         OpenSearchVersions.validate(engineVersion);
         validateOptions(options);
 
         if (engineVersion != null && !engineVersion.isBlank()) {
             domain.setEngineVersion(engineVersion);
+        }
+        if (accessPolicies != null) {
+            domain.setAccessPolicies(accessPolicies);
         }
         if (clusterConfig != null) {
             ClusterConfig existing = domain.getClusterConfig();
@@ -337,7 +373,11 @@ public class OpenSearchService {
     }
 
     private void startReadinessPoller() {
-        poller.scheduleWithFixedDelay(() -> {
+        poller.scheduleWithFixedDelay(this::pollReadiness, 3, 3, TimeUnit.SECONDS);
+    }
+
+    void pollReadiness() {
+        try {
             for (Domain domain : allDomains()) {
                 if (domain.isProcessing() && domainManager.isReady(domain)) {
                     domain.setProcessing(false);
@@ -346,7 +386,9 @@ public class OpenSearchService {
                             domain.getDomainName(), domain.getEndpoint());
                 }
             }
-        }, 3, 3, TimeUnit.SECONDS);
+        } catch (RuntimeException e) {
+            LOG.warn("OpenSearch readiness poll failed; will retry", e);
+        }
     }
 
     private List<Domain> allDomains() {
@@ -362,5 +404,27 @@ public class OpenSearchService {
         } else {
             domainStore.put(domain.getDomainName(), domain);
         }
+    }
+
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (Domain domain : listDomainNames(null)) {
+            if (domain.getArn() == null) {
+                continue;
+            }
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(domain.getArn());
+            resources.add(new ExplorerResource(
+                    domain.getArn(), "es:domain", "es",
+                    parsed.region(), parsed.accountId(),
+                    domain.getCreatedAt() != null ? domain.getCreatedAt() : Instant.now(),
+                    domain.getTags() != null ? domain.getTags() : Map.of()));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("es:domain", "es", true));
     }
 }

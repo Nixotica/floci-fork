@@ -1,14 +1,14 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -16,8 +16,10 @@ import jakarta.ws.rs.core.Response;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * SQS JSON protocol handler (application/x-amz-json-1.0).
@@ -83,7 +85,7 @@ public class SqsJsonHandler {
     }
 
     private void writeSystemAttributesJson(ObjectNode msgNode, Message msg,
-                                           java.util.Set<String> requested, String senderId) {
+                                           Set<String> requested, String senderId) {
         if (requested.isEmpty()) {
             return;
         }
@@ -136,7 +138,6 @@ public class SqsJsonHandler {
         Map<String, String> attributes = jsonNodeToMap(request.path("Attributes"));
         Map<String, String> tags = jsonNodeToMap(request.path("tags"));
         Queue queue = sqsService.createQueue(queueName, attributes, tags, region);
-
         ObjectNode response = objectMapper.createObjectNode();
         response.put("QueueUrl", queue.getQueueUrl());
         return Response.ok(response).build();
@@ -151,11 +152,10 @@ public class SqsJsonHandler {
     private Response handleListQueues(JsonNode request, String region) {
         String prefix = request.path("QueueNamePrefix").asText(null);
         List<Queue> queues = sqsService.listQueues(prefix, region);
-
         ObjectNode response = objectMapper.createObjectNode();
-        ArrayNode urls = response.putArray("QueueUrls");
+        ArrayNode queueUrls = response.putArray("QueueUrls");
         for (Queue q : queues) {
-            urls.add(q.getQueueUrl());
+            queueUrls.add(q.getQueueUrl());
         }
         return Response.ok(response).build();
     }
@@ -163,7 +163,6 @@ public class SqsJsonHandler {
     private Response handleGetQueueUrl(JsonNode request, String region) {
         String queueName = request.path("QueueName").asText(null);
         String queueUrl = sqsService.getQueueUrl(queueName, region);
-
         ObjectNode response = objectMapper.createObjectNode();
         response.put("QueueUrl", queueUrl);
         return Response.ok(response).build();
@@ -174,8 +173,8 @@ public class SqsJsonHandler {
         List<String> attributeNames = new ArrayList<>();
         JsonNode namesNode = request.path("AttributeNames");
         if (namesNode.isArray()) {
-            for (JsonNode n : namesNode) {
-                attributeNames.add(n.asText());
+            for (JsonNode name : namesNode) {
+                attributeNames.add(name.asText());
             }
         }
         if (attributeNames.isEmpty()) {
@@ -186,7 +185,7 @@ public class SqsJsonHandler {
 
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode attrsNode = response.putObject("Attributes");
-        for (var entry : attributes.entrySet()) {
+        for (Map.Entry<String, String> entry : attributes.entrySet()) {
             attrsNode.put(entry.getKey(), entry.getValue());
         }
         return Response.ok(response).build();
@@ -195,7 +194,8 @@ public class SqsJsonHandler {
     private Response handleSendMessage(JsonNode request, String region) {
         String queueUrl = request.path("QueueUrl").asText(null);
         String messageBody = request.path("MessageBody").asText(null);
-        int delaySeconds = request.path("DelaySeconds").asInt(0);
+        JsonNode delayNode = request.path("DelaySeconds");
+        Integer delaySeconds = parseOptionalInteger(delayNode, "DelaySeconds");
         String messageGroupId = request.path("MessageGroupId").asText(null);
         String messageDeduplicationId = request.path("MessageDeduplicationId").asText(null);
 
@@ -238,15 +238,28 @@ public class SqsJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Integer getOptionalIntField(JsonNode request, String field) {
+        JsonNode node = request.path(field);
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isIntegralNumber() || !node.canConvertToInt()) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value " + node.asText() + " for parameter " + field + " is invalid. Reason: Must be an integer.", 400);
+        }
+        return node.asInt();
+    }
+
     private Response handleReceiveMessage(JsonNode request, String region) {
         String queueUrl = request.path("QueueUrl").asText(null);
         int maxMessages = request.path("MaxNumberOfMessages").asInt(1);
         int visibilityTimeout = request.path("VisibilityTimeout").asInt(-1);
-        int waitTimeSeconds = request.path("WaitTimeSeconds").asInt(0);
+        Integer waitTimeSeconds = getOptionalIntField(request, "WaitTimeSeconds");
 
-        java.util.Set<String> requestedAttrs = new java.util.LinkedHashSet<>();
+        Set<String> requestedAttrs = new LinkedHashSet<>();
         requestedAttrs.addAll(jsonNodeToList(request.path("AttributeNames")));
         requestedAttrs.addAll(jsonNodeToList(request.path("MessageSystemAttributeNames")));
+        Set<String> requestedMessageAttrs = new LinkedHashSet<>(jsonNodeToList(request.path("MessageAttributeNames")));
 
         List<Message> messages = sqsService.receiveMessage(queueUrl, maxMessages,
                 visibilityTimeout, waitTimeSeconds, region);
@@ -261,20 +274,23 @@ public class SqsJsonHandler {
         }
         ArrayNode messagesArray = response.putArray("Messages");
         for (Message msg : messages) {
+            Map<String, MessageAttributeValue> selectedMessageAttrs = SqsMessageAttributeSelector.select(
+                    msg.getMessageAttributes(), requestedMessageAttrs);
             ObjectNode msgNode = objectMapper.createObjectNode();
             msgNode.put("MessageId", msg.getMessageId());
             msgNode.put("ReceiptHandle", msg.getReceiptHandle());
             msgNode.put("MD5OfBody", msg.getMd5OfBody());
-            if (msg.getMd5OfMessageAttributes() != null) {
-                msgNode.put("MD5OfMessageAttributes", msg.getMd5OfMessageAttributes());
+            String messageAttrsMd5 = Message.computeMessageAttributesMd5(selectedMessageAttrs);
+            if (messageAttrsMd5 != null) {
+                msgNode.put("MD5OfMessageAttributes", messageAttrsMd5);
             }
             msgNode.put("Body", msg.getBody());
 
             writeSystemAttributesJson(msgNode, msg, requestedAttrs, senderId);
 
-            if (msg.getMessageAttributes() != null && !msg.getMessageAttributes().isEmpty()) {
-                ObjectNode msgAttrs = msgNode.putObject("MessageAttributes");
-                for (var entry : msg.getMessageAttributes().entrySet()) {
+            if (!selectedMessageAttrs.isEmpty()) {
+                ObjectNode msgAttrs = objectMapper.createObjectNode();
+                for (Map.Entry<String, MessageAttributeValue> entry : selectedMessageAttrs.entrySet()) {
                     ObjectNode valNode = msgAttrs.putObject(entry.getKey());
                     valNode.put("DataType", entry.getValue().getDataType());
                     if (entry.getValue().getBinaryValue() != null) {
@@ -283,6 +299,7 @@ public class SqsJsonHandler {
                         valNode.put("StringValue", entry.getValue().getStringValue());
                     }
                 }
+                msgNode.set("MessageAttributes", msgAttrs);
             }
 
             messagesArray.add(msgNode);
@@ -317,7 +334,7 @@ public class SqsJsonHandler {
                 String id = entry.path("Id").asText();
                 String receiptHandle = entry.path("ReceiptHandle").asText(null);
                 try {
-                    sqsService.deleteMessage(queueUrl, receiptHandle, region);
+                    sqsService.deleteMessageInBatch(queueUrl, receiptHandle, region);
                     ObjectNode success = objectMapper.createObjectNode();
                     success.put("Id", id);
                     successful.add(success);
@@ -347,7 +364,7 @@ public class SqsJsonHandler {
         ArrayNode successful = objectMapper.createArrayNode();
         ArrayNode failed = objectMapper.createArrayNode();
 
-        record ParsedEntry(String id, String body, int delay, String groupId, String dedupId,
+        record ParsedEntry(String id, String body, Integer delay, String groupId, String dedupId,
                            Map<String, MessageAttributeValue> attributes, String awsTraceHeader) {}
 
         List<ParsedEntry> parsedEntries = new ArrayList<>();
@@ -356,7 +373,8 @@ public class SqsJsonHandler {
             for (JsonNode entry : entries) {
                 String id = entry.path("Id").asText();
                 String messageBody = entry.path("MessageBody").asText(null);
-                int delaySeconds = entry.path("DelaySeconds").asInt(0);
+                JsonNode entryDelayNode = entry.path("DelaySeconds");
+                Integer delaySeconds = parseOptionalInteger(entryDelayNode, "DelaySeconds");
                 String messageGroupId = entry.path("MessageGroupId").asText(null);
                 String messageDeduplicationId = entry.path("MessageDeduplicationId").asText(null);
 
@@ -508,7 +526,7 @@ public class SqsJsonHandler {
 
         ArrayNode successful = objectMapper.createArrayNode();
         ArrayNode failed = objectMapper.createArrayNode();
-        for (var result : results) {
+        for (SqsService.BatchResultEntry result : results) {
             if (result.success()) {
                 ObjectNode success = objectMapper.createObjectNode();
                 success.put("Id", result.id());
@@ -557,7 +575,7 @@ public class SqsJsonHandler {
 
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode tagsNode = response.putObject("Tags");
-        for (var entry : tags.entrySet()) {
+        for (Map.Entry<String, String> entry : tags.entrySet()) {
             tagsNode.put(entry.getKey(), entry.getValue());
         }
         return Response.ok(response).build();
@@ -582,5 +600,16 @@ public class SqsJsonHandler {
             });
         }
         return map;
+    }
+
+    private Integer parseOptionalInteger(JsonNode node, String paramName) {
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isIntegralNumber()) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value for parameter " + paramName + " is invalid. Reason: Must be an integer.", 400);
+        }
+        return node.asInt();
     }
 }

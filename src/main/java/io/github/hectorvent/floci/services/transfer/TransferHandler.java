@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.transfer;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -63,6 +64,7 @@ public class TransferHandler {
     // ── Server handlers ───────────────────────────────────────────────────────
 
     private Response createServer(JsonNode req, String region) {
+        String domain = textOrNull(req, "Domain");
         List<String> protocols = jsonStringList(req.path("Protocols"));
         String endpointType = textOrNull(req, "EndpointType");
         Map<String, Object> endpointDetails = jsonObjectMap(req.path("EndpointDetails"));
@@ -72,7 +74,7 @@ public class TransferHandler {
         String securityPolicyName = textOrNull(req, "SecurityPolicyName");
         Map<String, String> tags = parseTags(req.path("Tags"));
 
-        Server server = service.createServer(region, protocols, endpointType, endpointDetails,
+        Server server = service.createServer(region, domain, protocols, endpointType, endpointDetails,
                 identityProviderType, identityProviderDetails, loggingRole, securityPolicyName, tags);
 
         ObjectNode resp = objectMapper.createObjectNode();
@@ -124,7 +126,7 @@ public class TransferHandler {
         List<String> protocols = jsonStringList(req.path("Protocols"));
         String endpointType = textOrNull(req, "EndpointType");
         Map<String, Object> endpointDetails = jsonObjectMap(req.path("EndpointDetails"));
-        String identityProviderDetails = textOrNull(req, "IdentityProviderDetails");
+        Map<String, String> identityProviderDetails = jsonStringMap(req.path("IdentityProviderDetails"));
         String loggingRole = textOrNull(req, "LoggingRole");
         String securityPolicyName = textOrNull(req, "SecurityPolicyName");
 
@@ -277,6 +279,7 @@ public class TransferHandler {
         node.put("ServerId", s.getServerId());
         node.put("Arn", s.getArn());
         node.put("State", s.getState());
+        node.put("Domain", s.getDomain());
         node.put("EndpointType", s.getEndpointType());
         node.put("IdentityProviderType", s.getIdentityProviderType());
         node.put("SecurityPolicyName", s.getSecurityPolicyName());
@@ -288,6 +291,14 @@ public class TransferHandler {
         if (s.getProtocols() != null) {
             ArrayNode protocols = node.putArray("Protocols");
             s.getProtocols().forEach(protocols::add);
+        }
+        if (s.getEndpointDetails() != null) {
+            ObjectNode endpointDetails = objectMapper.valueToTree(s.getEndpointDetails());
+            endpointDetails.remove("SecurityGroupIds");
+            node.set("EndpointDetails", endpointDetails);
+        }
+        if (s.getIdentityProviderDetails() != null) {
+            node.set("IdentityProviderDetails", objectMapper.valueToTree(s.getIdentityProviderDetails()));
         }
         if (s.getTags() != null && !s.getTags().isEmpty()) {
             ArrayNode tags = node.putArray("Tags");
@@ -304,6 +315,7 @@ public class TransferHandler {
     private ObjectNode buildServerListEntry(Server s) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("Arn", s.getArn());
+        node.put("Domain", s.getDomain());
         node.put("EndpointType", s.getEndpointType());
         node.put("IdentityProviderType", s.getIdentityProviderType());
         node.put("ServerId", s.getServerId());
@@ -382,8 +394,11 @@ public class TransferHandler {
     }
 
     private Map<String, String> jsonStringMap(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return null;
+        }
         Map<String, String> map = new HashMap<>();
-        if (node != null && node.isObject()) {
+        if (node.isObject()) {
             node.fields().forEachRemaining(e -> map.put(e.getKey(), e.getValue().asText()));
         }
         return map;
@@ -393,9 +408,10 @@ public class TransferHandler {
         if (node == null || node.isMissingNode() || node.isNull()) {
             return null;
         }
-        Map<String, Object> map = new HashMap<>();
-        node.fields().forEachRemaining(e -> map.put(e.getKey(), e.getValue().asText()));
-        return map.isEmpty() ? null : map;
+        if (!node.isObject()) {
+            return new HashMap<>();
+        }
+        return objectMapper.convertValue(node, new TypeReference<Map<String, Object>>() {});
     }
 
     private Map<String, String> parseTags(JsonNode node) {

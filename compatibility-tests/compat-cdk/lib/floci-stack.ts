@@ -4,6 +4,9 @@ import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import * as path from 'path';
 import { Construct } from 'constructs';
 
@@ -71,10 +74,45 @@ export class FlociTestStack extends cdk.Stack {
       memorySize: 256,
     });
 
+    // VPC + internal ALB — regression for issue #1297: CloudFormation must create the
+    // EC2 VPC/subnets for real (in EC2), otherwise the ALB that references the
+    // CDK-generated subnets fails with "The subnet ID '...' does not exist".
+    const vpc = new ec2.Vpc(this, 'TestVpc', {
+      vpcName: 'floci-cdk-vpc',
+      maxAzs: 2,
+      natGateways: 0,
+      subnetConfiguration: [
+        { name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
+        { name: 'isolated', subnetType: ec2.SubnetType.PRIVATE_ISOLATED, cidrMask: 24 },
+      ],
+    });
+
+    const alb = new elbv2.ApplicationLoadBalancer(this, 'TestAlb', {
+      loadBalancerName: 'floci-cdk-alb',
+      vpc,
+      internetFacing: false,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+    });
+
+    // Cloud Map namespace + service: regression for https://github.com/floci-io/floci/issues/4596.
+    const namespace = new servicediscovery.PrivateDnsNamespace(this, 'TestNamespace', {
+      name: 'floci-cdk.internal',
+      vpc,
+    });
+    const service = namespace.createService('TestService', {
+      name: 'floci-cdk-svc',
+      dnsRecordType: servicediscovery.DnsRecordType.A,
+      dnsTtl: cdk.Duration.seconds(30),
+    });
+
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
     new cdk.CfnOutput(this, 'QueueUrl', { value: queue.queueUrl });
     new cdk.CfnOutput(this, 'TableName', { value: table.tableName });
     new cdk.CfnOutput(this, 'IndexTableName', { value: indexTable.tableName });
     new cdk.CfnOutput(this, 'GeneratedSecretName', { value: generatedSecret.name || 'floci-cdk-generated-secret' });
+    new cdk.CfnOutput(this, 'VpcId', { value: vpc.vpcId });
+    new cdk.CfnOutput(this, 'AlbArn', { value: alb.loadBalancerArn });
+    new cdk.CfnOutput(this, 'NamespaceId', { value: namespace.namespaceId });
+    new cdk.CfnOutput(this, 'ServiceId', { value: service.serviceId });
   }
 }

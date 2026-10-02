@@ -18,10 +18,14 @@ public class MultipartUpload {
     private String storageClass;
     private String contentDisposition;
     private String serverSideEncryption;
+    private String sseKmsKeyId;
     private String sseCustomerAlgorithm;
     private String sseCustomerKeyMd5;
     private String acl;
+    private ChecksumAlgorithm checksumAlgorithm;
+    private ChecksumType checksumType;
     private Map<String, String> metadata;
+    private Map<String, String> tagging;
     private Instant initiated;
     private final Map<Integer, Part> parts = new ConcurrentHashMap<>();
 
@@ -61,6 +65,9 @@ public class MultipartUpload {
     public String getServerSideEncryption() { return serverSideEncryption; }
     public void setServerSideEncryption(String serverSideEncryption) { this.serverSideEncryption = serverSideEncryption; }
 
+    public String getSseKmsKeyId() { return sseKmsKeyId; }
+    public void setSseKmsKeyId(String sseKmsKeyId) { this.sseKmsKeyId = sseKmsKeyId; }
+
     public String getSseCustomerAlgorithm() { return sseCustomerAlgorithm; }
     public void setSseCustomerAlgorithm(String sseCustomerAlgorithm) { this.sseCustomerAlgorithm = sseCustomerAlgorithm; }
 
@@ -70,8 +77,17 @@ public class MultipartUpload {
     public String getAcl() { return acl; }
     public void setAcl(String acl) { this.acl = acl; }
 
+    public ChecksumAlgorithm getChecksumAlgorithm() { return checksumAlgorithm; }
+    public void setChecksumAlgorithm(ChecksumAlgorithm checksumAlgorithm) { this.checksumAlgorithm = checksumAlgorithm; }
+
+    public ChecksumType getChecksumType() { return checksumType; }
+    public void setChecksumType(ChecksumType checksumType) { this.checksumType = checksumType; }
+
     public Map<String, String> getMetadata() { return metadata; }
     public void setMetadata(Map<String, String> metadata) { this.metadata = metadata; }
+
+    public Map<String, String> getTagging() { return tagging; }
+    public void setTagging(Map<String, String> tagging) { this.tagging = tagging; }
 
     public Instant getInitiated() { return initiated; }
     public void setInitiated(Instant initiated) { this.initiated = initiated; }

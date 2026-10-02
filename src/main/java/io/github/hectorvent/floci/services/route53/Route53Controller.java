@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.route53.model.HealthCheckConfig;
 import io.github.hectorvent.floci.services.route53.model.HostedZone;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecordSet;
+import io.github.hectorvent.floci.services.route53.model.VpcAssociation;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.DefaultValue;
@@ -22,17 +23,15 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Response;
 
-import javax.xml.stream.XMLInputFactory;
 import javax.xml.stream.XMLStreamConstants;
 import javax.xml.stream.XMLStreamReader;
-import java.io.StringReader;
 import java.net.URI;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Path("/2013-04-01")
 public class Route53Controller {
@@ -40,14 +39,7 @@ public class Route53Controller {
     private static final String NS = AwsNamespaces.ROUTE53;
     private static final String XML = "application/xml";
 
-    private static final XMLInputFactory XML_FACTORY;
-
-    static {
-        XML_FACTORY = XMLInputFactory.newInstance();
-        XML_FACTORY.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, true);
-        XML_FACTORY.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
-        XML_FACTORY.setProperty(XMLInputFactory.SUPPORT_DTD, false);
-    }
+    private static final Set<String> CHANGE_ACTIONS = Set.of("CREATE", "DELETE", "UPSERT");
 
     @Inject
     Route53Service service;
@@ -61,25 +53,29 @@ public class Route53Controller {
             String name = XmlParser.extractFirst(body, "Name", null);
             String callerRef = XmlParser.extractFirst(body, "CallerReference", null);
             String comment = XmlParser.extractFirst(body, "Comment", null);
-            boolean privateZone = "true".equalsIgnoreCase(
-                    XmlParser.extractFirst(body, "PrivateZone", "false"));
+            VpcAssociation vpcAssociation = parseVpcAssociation(body);
+            if (vpcAssociation != null) {
+                requireModelledVpcRegion(vpcAssociation.getVpcRegion());
+            }
 
             if (name == null || callerRef == null) {
                 throw new AwsException("InvalidInput", "Name and CallerReference are required.", 400);
             }
 
-            CreateZoneResult result = service.createHostedZone(name, callerRef, comment, privateZone);
-            String xml = new XmlBuilder()
+            CreateZoneResult result = service.createHostedZone(name, callerRef, comment, vpcAssociation);
+            XmlBuilder xml = new XmlBuilder()
                     .start("CreateHostedZoneResponse", NS)
                     .raw(xmlHostedZone(result.zone()))
                     .raw(xmlChangeInfo(result.change()))
-                    .raw(xmlDelegationSet())
-                    .end("CreateHostedZoneResponse")
-                    .build();
+                    .raw(xmlDelegationSet());
+            if (!result.zone().getVpcAssociations().isEmpty()) {
+                xml.raw(xmlVpcAssociation(result.zone().getVpcAssociations().getFirst()));
+            }
+            xml.end("CreateHostedZoneResponse");
 
             return Response.created(URI.create("/2013-04-01/hostedzone/" + result.zone().getId()))
                     .type(XML)
-                    .entity(xml)
+                    .entity(xml.build())
                     .build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
@@ -95,7 +91,30 @@ public class Route53Controller {
                     .start("GetHostedZoneResponse", NS)
                     .raw(xmlHostedZone(zone))
                     .raw(xmlDelegationSet())
+                    .raw(xmlVpcAssociations(zone.getVpcAssociations()))
                     .end("GetHostedZoneResponse")
+                    .build();
+            return Response.ok(xml, XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    @POST
+    @Path("/hostedzone/{Id}")
+    public Response updateHostedZoneComment(@PathParam("Id") String id, String body) {
+        try {
+            if (body != null && !body.isBlank()
+                    && !"UpdateHostedZoneCommentRequest".equals(XmlParser.rootElementName(body))) {
+                throw new AwsException("InvalidInput",
+                        "The request body must be an UpdateHostedZoneCommentRequest document.", 400);
+            }
+            String comment = XmlParser.extractFirst(body, "Comment", null);
+            HostedZone zone = service.updateHostedZoneComment(id, comment);
+            String xml = new XmlBuilder()
+                    .start("UpdateHostedZoneCommentResponse", NS)
+                    .raw(xmlHostedZone(zone))
+                    .end("UpdateHostedZoneCommentResponse")
                     .build();
             return Response.ok(xml, XML).build();
         } catch (AwsException e) {
@@ -171,6 +190,180 @@ public class Route53Controller {
                 xml.elem("DNSName", dnsName);
             }
             xml.end("ListHostedZonesByNameResponse");
+
+            return Response.ok(xml.build(), XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    // ── VPC Associations ──────────────────────────────────────────────────────
+
+    @POST
+    @Path("/hostedzone/{Id}/associatevpc")
+    public Response associateVpcWithHostedZone(@PathParam("Id") String id, String body) {
+        try {
+            VpcAssociation vpc = requireVpcAssociation(body);
+            String comment = XmlParser.extractFirst(body, "Comment", null);
+            ChangeInfo change = service.associateVpcWithHostedZone(id, vpc, comment);
+            String xml = new XmlBuilder()
+                    .start("AssociateVPCWithHostedZoneResponse", NS)
+                    .raw(xmlChangeInfo(change))
+                    .end("AssociateVPCWithHostedZoneResponse")
+                    .build();
+            return Response.ok(xml, XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    @POST
+    @Path("/hostedzone/{Id}/disassociatevpc")
+    public Response disassociateVpcFromHostedZone(@PathParam("Id") String id, String body) {
+        try {
+            VpcAssociation vpc = requireVpcAssociationWithoutRegionCheck(body);
+            String comment = XmlParser.extractFirst(body, "Comment", null);
+            ChangeInfo change = service.disassociateVpcFromHostedZone(id, vpc, comment);
+            String xml = new XmlBuilder()
+                    .start("DisassociateVPCFromHostedZoneResponse", NS)
+                    .raw(xmlChangeInfo(change))
+                    .end("DisassociateVPCFromHostedZoneResponse")
+                    .build();
+            return Response.ok(xml, XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    /** Creates the authorization required before a different account associates its VPC. */
+    @POST
+    @Path("/hostedzone/{Id}/authorizevpcassociation")
+    public Response createVpcAssociationAuthorization(@PathParam("Id") String id, String body) {
+        try {
+            VpcAssociation vpc = requireVpcAssociation(body);
+            service.createVpcAssociationAuthorization(id, vpc);
+            String xml = new XmlBuilder()
+                    .start("CreateVPCAssociationAuthorizationResponse", NS)
+                    .elem("HostedZoneId", id)
+                    .raw(xmlVpcAssociation(vpc))
+                    .end("CreateVPCAssociationAuthorizationResponse")
+                    .build();
+            return Response.ok(xml, XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    /** Counterpart to {@link #createVpcAssociationAuthorization}; AWS returns an empty body. */
+    @POST
+    @Path("/hostedzone/{Id}/deauthorizevpcassociation")
+    public Response deleteVpcAssociationAuthorization(@PathParam("Id") String id, String body) {
+        try {
+            VpcAssociation vpc = requireVpcAssociation(body);
+            service.deleteVpcAssociationAuthorization(id, vpc);
+            return Response.ok().build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    @GET
+    @Path("/hostedzone/{Id}/authorizevpcassociation")
+    public Response listVpcAssociationAuthorizations(@PathParam("Id") String id,
+                                                     @QueryParam("maxresults") @DefaultValue("50") int maxResults,
+                                                     @QueryParam("nexttoken") String nextToken) {
+        try {
+            if (maxResults <= 0) {
+                throw new AwsException("InvalidInput", "MaxResults must be a positive integer.", 400);
+            }
+            List<VpcAssociation> authorizations = service.listVpcAssociationAuthorizations(id);
+            int start = 0;
+            if (nextToken != null && !nextToken.isEmpty()) {
+                start = -1;
+                for (int i = 0; i < authorizations.size(); i++) {
+                    if (authorizationToken(authorizations.get(i)).equals(nextToken)) {
+                        start = i + 1;
+                        break;
+                    }
+                }
+                if (start < 0) {
+                    throw new AwsException("InvalidPaginationToken",
+                            "Invalid value for NextToken: " + nextToken, 400);
+                }
+            }
+            int end = Math.min(authorizations.size(), start + maxResults);
+            List<VpcAssociation> page = authorizations.subList(start, end);
+
+            XmlBuilder xml = new XmlBuilder()
+                    .start("ListVPCAssociationAuthorizationsResponse", NS)
+                    .elem("HostedZoneId", id)
+                    .start("VPCs");
+            for (VpcAssociation vpc : page) {
+                xml.raw(xmlVpcAssociation(vpc));
+            }
+            xml.end("VPCs");
+            if (end < authorizations.size() && !page.isEmpty()) {
+                xml.elem("NextToken", authorizationToken(page.get(page.size() - 1)));
+            }
+            xml.end("ListVPCAssociationAuthorizationsResponse");
+            return Response.ok(xml.build(), XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    @GET
+    @Path("/hostedzonesbyvpc")
+    public Response listHostedZonesByVpc(@QueryParam("vpcid") String vpcId,
+                                         @QueryParam("vpcregion") String vpcRegion,
+                                         @QueryParam("maxitems") @DefaultValue("100") int maxItems,
+                                         @QueryParam("nexttoken") String nextToken) {
+        try {
+            if (vpcId == null || vpcId.isEmpty()) {
+                throw new AwsException("InvalidInput", "VPCId is required.", 400);
+            }
+            if (vpcRegion == null || vpcRegion.isEmpty()) {
+                throw new AwsException("InvalidInput", "VPCRegion is required.", 400);
+            }
+            // Deliberately not enum-gated: an association persisted under a region since
+            // retired from VPC_REGIONS (or from before this check existed) must remain listable.
+
+            if (maxItems <= 0) {
+                throw new AwsException("InvalidInput", "MaxItems must be a positive integer.", 400);
+            }
+
+            List<HostedZone> zones = service.listHostedZonesByVpc(vpcId, vpcRegion);
+            if (nextToken != null && !nextToken.isEmpty()) {
+                int idx = -1;
+                for (int i = 0; i < zones.size(); i++) {
+                    if (zones.get(i).getId().equals(nextToken)) {
+                        idx = i + 1;
+                        break;
+                    }
+                }
+                if (idx < 0) {
+                    throw new AwsException("InvalidPaginationToken",
+                            "Invalid value for NextToken: " + nextToken, 400);
+                }
+                zones = zones.subList(idx, zones.size());
+            }
+            boolean truncated = zones.size() > maxItems;
+            if (truncated) {
+                zones = zones.subList(0, maxItems);
+            }
+
+            XmlBuilder xml = new XmlBuilder()
+                    .start("ListHostedZonesByVPCResponse", NS)
+                    .start("HostedZoneSummaries");
+            for (HostedZone zone : zones) {
+                xml.raw(xmlHostedZoneSummary(zone));
+            }
+            xml.end("HostedZoneSummaries")
+               .elem("MaxItems", String.valueOf(maxItems));
+            if (truncated) {
+                xml.elem("NextToken", zones.get(zones.size() - 1).getId());
+            }
+            xml.end("ListHostedZonesByVPCResponse");
 
             return Response.ok(xml.build(), XML).build();
         } catch (AwsException e) {
@@ -441,7 +634,7 @@ public class Route53Controller {
                     .start("HealthCheckObservations")
                     .start("HealthCheckObservation")
                     .elem("IPAddress", "1.2.3.4")
-                    .elem("Region", "us-east-1")
+                    .elem("Region", "us-east-1") // partition-literal: health-check observation fixture
                     .start("StatusReport")
                     .elem("Status", "Success: HTTP Status Code 200, OK")
                     .elem("CheckedTime", now)
@@ -542,6 +735,42 @@ public class Route53Controller {
         return xml.build();
     }
 
+    private String xmlVpcAssociation(VpcAssociation association) {
+        return new XmlBuilder()
+                .start("VPC")
+                .elem("VPCRegion", association.getVpcRegion())
+                .elem("VPCId", association.getVpcId())
+                .end("VPC")
+                .build();
+    }
+
+    private String xmlVpcAssociations(List<VpcAssociation> associations) {
+        if (associations == null || associations.isEmpty()) {
+            return "";
+        }
+        XmlBuilder xml = new XmlBuilder().start("VPCs");
+        for (VpcAssociation association : associations) {
+            xml.raw(xmlVpcAssociation(association));
+        }
+        return xml.end("VPCs").build();
+    }
+
+    private static String authorizationToken(VpcAssociation association) {
+        return association.getVpcId() + ":" + association.getVpcRegion();
+    }
+
+    private String xmlHostedZoneSummary(HostedZone zone) {
+        return new XmlBuilder()
+                .start("HostedZoneSummary")
+                .elem("HostedZoneId", zone.getId())
+                .elem("Name", zone.getName())
+                .start("Owner")
+                .elem("OwningAccount", service.ownerAccountId(zone))
+                .end("Owner")
+                .end("HostedZoneSummary")
+                .build();
+    }
+
     private String xmlResourceRecordSet(ResourceRecordSet rrs) {
         XmlBuilder xml = new XmlBuilder()
                 .start("ResourceRecordSet")
@@ -612,16 +841,98 @@ public class Route53Controller {
 
     // ── Request parsers ───────────────────────────────────────────────────────
 
+    private VpcAssociation parseVpcAssociation(String body) {
+        List<Map<String, String>> vpcs = XmlParser.extractGroups(body, "VPC");
+        if (vpcs.isEmpty()) {
+            return null;
+        }
+        Map<String, String> vpc = vpcs.get(0);
+        String vpcId = vpc.get("VPCId");
+        String vpcRegion = vpc.get("VPCRegion");
+        // AWS requires VPCId and VPCRegion together whenever VPC is present; a
+        // half-populated element must not mark the zone private.
+        if (vpcId == null || vpcId.isEmpty() || vpcRegion == null || vpcRegion.isEmpty()) {
+            throw new AwsException(
+                    "InvalidInput", "VPCId and VPCRegion are both required when VPC is specified.", 400);
+        }
+        return new VpcAssociation(vpcId, vpcRegion);
+    }
+
+    /**
+     * Parses the VPC element for the association operations, where AWS marks VPC as a
+     * required member — unlike CreateHostedZone, where its absence just means a public zone.
+     */
+    private VpcAssociation requireVpcAssociation(String body) {
+        VpcAssociation vpc = requireVpcAssociationWithoutRegionCheck(body);
+        requireModelledVpcRegion(vpc.getVpcRegion());
+        return vpc;
+    }
+
+    /**
+     * Same as {@link #requireVpcAssociation}, but skips the enum check: used by disassociate,
+     * where the target may be a legacy-persisted association whose region has since left
+     * VPC_REGIONS (or predates the enum check entirely). Rejecting the lookup here would strand
+     * that association — impossible to remove without deleting the whole hosted zone.
+     */
+    private VpcAssociation requireVpcAssociationWithoutRegionCheck(String body) {
+        VpcAssociation vpc = parseVpcAssociation(body);
+        if (vpc == null) {
+            throw new AwsException("InvalidInput", "VPC is required.", 400);
+        }
+        return vpc;
+    }
+
+    /**
+     * Rejects a VPCRegion outside the modelled enum. Without this the association is stored
+     * under a region that can never be matched again, so the associate reports success while
+     * the later disassociate and ListHostedZonesByVPC silently miss it.
+     */
+    private static void requireModelledVpcRegion(String vpcRegion) {
+        if (!Route53VpcRegions.VPC_REGIONS.contains(vpcRegion)) {
+            throw new AwsException("InvalidInput",
+                    "Invalid value '" + vpcRegion + "' at 'VPCRegion' failed to satisfy constraint: "
+                            + "Member must satisfy enum value set.", 400);
+        }
+    }
+
+    private static void requireExactlyOneRecordShape(String action, ResourceRecordSet rrs, boolean hasRecords) {
+        boolean hasAlias = rrs.getAliasTarget() != null;
+        boolean hasTtl = rrs.getTtl() != null;
+        String found;
+        if (hasAlias && (hasTtl || hasRecords)) {
+            found = "more than one";
+        } else if (!hasAlias && !(hasTtl && hasRecords)) {
+            found = "none";
+        } else {
+            return;
+        }
+        throw new AwsException("InvalidInput",
+                "Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and ResourceRecords], "
+                        + "or TrafficPolicyInstanceId], but found " + found + " in Change with [Action=" + action
+                        + ", Name=" + rrs.getName() + ", Type=" + rrs.getType()
+                        + ", SetIdentifier=" + rrs.getSetIdentifier() + "]", 400);
+    }
+
     /**
      * Parses the ChangeBatch XML using StAX to correctly handle multiple Change elements,
      * each containing a ResourceRecordSet with its own set of ResourceRecord/Value children.
      */
     private List<Map<String, Object>> parseChangeBatch(String body) {
         List<Map<String, Object>> result = new ArrayList<>();
-        if (body == null || body.isEmpty()) return result;
+        if (body != null && !body.isEmpty()) {
+            parseChangeBatchInto(body, result);
+        }
+        if (result.isEmpty()) {
+            throw new AwsException("InvalidInput",
+                    "Invalid XML ; cvc-complex-type.2.4.b: The content of element 'Changes' is not complete. "
+                            + "One of '{\"" + NS + "\":Change}' is expected.", 400);
+        }
+        return result;
+    }
 
+    private void parseChangeBatchInto(String body, List<Map<String, Object>> result) {
         try {
-            XMLStreamReader r = XML_FACTORY.createXMLStreamReader(new StringReader(body));
+            XMLStreamReader r = XmlParser.newStreamReader(body);
             String currentAction = null;
             ResourceRecordSet currentRrs = null;
             List<ResourceRecord> currentRecords = null;
@@ -649,7 +960,14 @@ public class Route53Controller {
                             }
                         }
                         case "Action" -> {
-                            if (inChange && !inRrs) currentAction = r.getElementText();
+                            if (inChange && !inRrs) {
+                                currentAction = r.getElementText();
+                                if (!CHANGE_ACTIONS.contains(currentAction)) {
+                                    throw new AwsException("InvalidInput",
+                                            "Invalid value '" + currentAction + "' at 'Action' failed to satisfy "
+                                                    + "constraint: Member must satisfy enum value set.", 400);
+                                }
+                            }
                         }
                         case "ResourceRecordSet" -> {
                             if (inChange) {
@@ -679,8 +997,14 @@ public class Route53Controller {
                         }
                         case "TTL" -> {
                             if (inRrs && currentRrs != null) {
-                                try { currentRrs.setTtl(Long.parseLong(r.getElementText())); }
-                                catch (NumberFormatException ignored) {}
+                                String ttl = r.getElementText();
+                                try {
+                                    currentRrs.setTtl(Long.parseLong(ttl));
+                                } catch (NumberFormatException e) {
+                                    throw new AwsException("InvalidInput",
+                                            "Invalid value '" + ttl + "' at 'TTL' failed to satisfy constraint: "
+                                                    + "Member must be a valid long.", 400);
+                                }
                             }
                         }
                         case "Value" -> {
@@ -693,8 +1017,14 @@ public class Route53Controller {
                         }
                         case "Weight" -> {
                             if (inRrs && currentRrs != null) {
-                                try { currentRrs.setWeight(Long.parseLong(r.getElementText())); }
-                                catch (NumberFormatException ignored) {}
+                                String weight = r.getElementText();
+                                try {
+                                    currentRrs.setWeight(Long.parseLong(weight));
+                                } catch (NumberFormatException e) {
+                                    throw new AwsException("InvalidInput",
+                                            "Invalid value '" + weight + "' at 'Weight' failed to satisfy "
+                                                    + "constraint: Member must be a valid long.", 400);
+                                }
                             }
                         }
                         case "Region" -> {
@@ -732,13 +1062,26 @@ public class Route53Controller {
                             currentAlias = null;
                         }
                         case "ResourceRecordSet" -> {
-                            if (inRrs && currentRrs != null && currentRecords != null) {
-                                if (!currentRecords.isEmpty()) currentRrs.setRecords(currentRecords);
+                            if (inRrs && currentRrs != null) {
+                                if (currentRrs.getName() == null || currentRrs.getType() == null) {
+                                    throw new AwsException("InvalidInput",
+                                            "ResourceRecordSet is missing a required Name or Type element.", 400);
+                                }
+                                boolean hasRecords = currentRecords != null && !currentRecords.isEmpty();
+                                if (hasRecords) {
+                                    currentRrs.setRecords(currentRecords);
+                                }
+                                requireExactlyOneRecordShape(currentAction, currentRrs, hasRecords);
                             }
                             inRrs = false;
                         }
                         case "Change" -> {
-                            if (inChange && currentAction != null && currentRrs != null) {
+                            if (inChange) {
+                                if (currentAction == null || currentRrs == null) {
+                                    throw new AwsException("InvalidInput",
+                                            "Change is missing a required Action or ResourceRecordSet element.",
+                                            400);
+                                }
                                 Map<String, Object> change = new HashMap<>();
                                 change.put("action", currentAction);
                                 change.put("rrs", currentRrs);
@@ -753,8 +1096,11 @@ public class Route53Controller {
                 }
             }
             r.close();
-        } catch (Exception ignored) {}
-        return result;
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new AwsException("InvalidInput", "The XML you provided was not well-formed.", 400);
+        }
     }
 
     private HealthCheckConfig parseHealthCheckConfig(String body) {
@@ -786,7 +1132,7 @@ public class Route53Controller {
         List<String> keys = new ArrayList<>();
         if (body == null || body.isEmpty()) return keys;
         try {
-            XMLStreamReader r = XML_FACTORY.createXMLStreamReader(new StringReader(body));
+            XMLStreamReader r = XmlParser.newStreamReader(body);
             boolean inRemove = false;
             while (r.hasNext()) {
                 int event = r.next();

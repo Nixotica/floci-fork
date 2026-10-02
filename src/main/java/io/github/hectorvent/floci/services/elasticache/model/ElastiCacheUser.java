@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.elasticache.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -13,19 +14,22 @@ public class ElastiCacheUser {
     private AuthMode authMode;
     private List<String> passwords;
     private String accessString;
+    // "redis" or "valkey"; the initializer keeps users persisted before this field existed on redis.
+    private String engine = "redis";
     private String status;
     private Instant createdAt;
 
     public ElastiCacheUser() {}
 
     public ElastiCacheUser(String userId, String userName, AuthMode authMode,
-                           List<String> passwords, String accessString,
+                           List<String> passwords, String accessString, String engine,
                            String status, Instant createdAt) {
         this.userId = userId;
         this.userName = userName;
         this.authMode = authMode;
         this.passwords = passwords;
         this.accessString = accessString;
+        this.engine = engine;
         this.status = status;
         this.createdAt = createdAt;
     }
@@ -45,9 +49,32 @@ public class ElastiCacheUser {
     public String getAccessString() { return accessString; }
     public void setAccessString(String accessString) { this.accessString = accessString; }
 
+    public String getEngine() { return engine; }
+    public void setEngine(String engine) { this.engine = engine; }
+
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
 
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+
+    @JsonIgnore
+    public boolean isEnabled() {
+        return isAccessStringOn(accessString);
+    }
+
+    public static boolean isAccessStringOn(String accessString) {
+        if (accessString == null || accessString.isBlank()) {
+            return false;
+        }
+        boolean on = false;
+        for (String token : accessString.trim().split("\\s+")) {
+            if ("on".equalsIgnoreCase(token)) {
+                on = true;
+            } else if ("off".equalsIgnoreCase(token)) {
+                on = false;
+            }
+        }
+        return on;
+    }
 }

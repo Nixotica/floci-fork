@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.vertx.core.Vertx;
@@ -10,6 +12,7 @@ import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.util.Arrays;
 import java.util.List;
@@ -17,12 +20,13 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 @ApplicationScoped
-public class ElbV2HealthChecker {
+public class ElbV2HealthChecker implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(ElbV2HealthChecker.class);
 
     private final Vertx vertx;
     private final EmulatorConfig config;
+    private final Ec2Service ec2Service;
 
     // tgArn → (targetKey → TargetState)
     private final Map<String, Map<String, TargetState>> states = new ConcurrentHashMap<>();
@@ -30,9 +34,10 @@ public class ElbV2HealthChecker {
     private final Map<String, Long> timers = new ConcurrentHashMap<>();
 
     @Inject
-    public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config) {
+    public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
         this.vertx = vertx;
         this.config = config;
+        this.ec2Service = ec2Service;
     }
 
     public static int effectivePort(TargetDescription target, TargetGroup tg) {
@@ -68,6 +73,12 @@ public class ElbV2HealthChecker {
         states.remove(tgArn);
     }
 
+    public void clear() {
+        timers.values().forEach(vertx::cancelTimer);
+        timers.clear();
+        states.clear();
+    }
+
     public void addTargets(String tgArn, List<TargetDescription> targets, TargetGroup tg) {
         if (config.services().elbv2().mock()) {
             return;
@@ -77,6 +88,9 @@ public class ElbV2HealthChecker {
             int port = effectivePort(t, tg);
             String key = stateKey(t.getId(), port);
             tgStates.putIfAbsent(key, new TargetState());
+        }
+        if (Boolean.TRUE.equals(tg.getHealthCheckEnabled())) {
+            vertx.setTimer(1, ignored -> probeAll(tgArn, tg));
         }
     }
 
@@ -92,15 +106,19 @@ public class ElbV2HealthChecker {
     }
 
     public String getState(String tgArn, String targetId, int port) {
+        return getHealth(tgArn, targetId, port).state();
+    }
+
+    public TargetHealthStatus getHealth(String tgArn, String targetId, int port) {
         Map<String, TargetState> tgStates = states.get(tgArn);
         if (tgStates == null) {
-            return "initial";
+            return TargetHealthStatus.registrationInProgress();
         }
         TargetState s = tgStates.get(stateKey(targetId, port));
         if (s == null) {
-            return "initial";
+            return TargetHealthStatus.registrationInProgress();
         }
-        return s.status;
+        return new TargetHealthStatus(s.status, s.reason, s.description);
     }
 
     public boolean isHealthy(String tgArn, TargetDescription target, int port) {
@@ -120,21 +138,23 @@ public class ElbV2HealthChecker {
             if (parts.length != 2) {
                 continue;
             }
-            String host = parts[0];
+            String targetId = parts[0];
             int port;
             try {
                 port = Integer.parseInt(parts[1]);
             } catch (NumberFormatException e) {
                 continue;
             }
+            String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, targetId);
             String path = tg.getHealthCheckPath() != null ? tg.getHealthCheckPath() : "/";
             String matcher = tg.getMatcher() != null ? tg.getMatcher() : "200";
             int timeout = tg.getHealthCheckTimeoutSeconds() != null ? tg.getHealthCheckTimeoutSeconds() : 5;
             int healthyThreshold = tg.getHealthyThresholdCount() != null ? tg.getHealthyThresholdCount() : 5;
             int unhealthyThreshold = tg.getUnhealthyThresholdCount() != null ? tg.getUnhealthyThresholdCount() : 2;
+            int probePort = healthCheckPort(tg, port);
 
             vertx.executeBlocking(() -> {
-                return probe(host, port, path, timeout);
+                return probe(host, probePort, path, timeout);
             }).onSuccess(statusCode -> {
                 boolean success = matchesStatusCode(statusCode, matcher);
                 if (success) {
@@ -142,12 +162,19 @@ public class ElbV2HealthChecker {
                     state.consecutiveSuccesses++;
                     if (state.consecutiveSuccesses >= healthyThreshold) {
                         state.status = "healthy";
+                        state.reason = null;
+                        state.description = null;
+                    } else if ("initial".equals(state.status)) {
+                        state.reason = "Elb.InitialHealthChecking";
+                        state.description = "Initial health checks in progress";
                     }
                 } else {
                     state.consecutiveSuccesses = 0;
                     state.consecutiveFailures++;
                     if (state.consecutiveFailures >= unhealthyThreshold) {
                         state.status = "unhealthy";
+                        state.reason = "Target.ResponseCodeMismatch";
+                        state.description = "Health checks failed with these codes: [" + statusCode + "]";
                     }
                 }
             }).onFailure(err -> {
@@ -155,6 +182,13 @@ public class ElbV2HealthChecker {
                 state.consecutiveFailures++;
                 if (state.consecutiveFailures >= unhealthyThreshold) {
                     state.status = "unhealthy";
+                    if (isTimeout(err)) {
+                        state.reason = "Target.Timeout";
+                        state.description = "Request timed out";
+                    } else {
+                        state.reason = "Target.FailedHealthChecks";
+                        state.description = "Health checks failed";
+                    }
                 }
                 LOG.debugv("Health check failed for {0}:{1} - {2}", host, port, err.getMessage());
             });
@@ -162,7 +196,7 @@ public class ElbV2HealthChecker {
     }
 
     private int probe(String host, int port, String path, int timeoutSeconds) throws IOException {
-        URL url = new URL("http", host, port, path);
+        URL url = new URL("http", ElbV2TargetResolver.resolveCheckedAddress(host), port, path);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setConnectTimeout(timeoutSeconds * 1000);
         conn.setReadTimeout(timeoutSeconds * 1000);
@@ -173,6 +207,37 @@ public class ElbV2HealthChecker {
             return conn.getResponseCode();
         } finally {
             conn.disconnect();
+        }
+    }
+
+    /**
+     * AWS probes {@code HealthCheckPort} when it is a number and the target's own port when it is
+     * {@code traffic-port} or unset. Health state stays keyed by the traffic port either way.
+     * A stored value that is not a valid port, which the API accepted before it validated the
+     * field, keeps probing the traffic port as before.
+     */
+    static int healthCheckPort(TargetGroup tg, int trafficPort) {
+        String configured = tg.getHealthCheckPort();
+        if (configured == null || configured.isBlank() || "traffic-port".equals(configured)) {
+            return trafficPort;
+        }
+        Integer port = parsePort(configured);
+        if (port == null) {
+            LOG.debugv("Target group {0} has invalid HealthCheckPort {1}; probing traffic port {2}",
+                    tg.getTargetGroupArn(), configured, trafficPort);
+            return trafficPort;
+        }
+        return port;
+    }
+
+    /** Returns the port number {@code value} names, or null when it is not a port from 1 to 65535. */
+    static Integer parsePort(String value) {
+        try {
+            int port = Integer.parseInt(value.trim());
+            return port >= 1 && port <= 65535 ? port : null;
+        } catch (NumberFormatException ignored) {
+            // Not a number: the caller treats it the same as an out-of-range port.
+            return null;
         }
     }
 
@@ -193,12 +258,34 @@ public class ElbV2HealthChecker {
                 .anyMatch(codeStr::equals);
     }
 
+    private static boolean isTimeout(Throwable err) {
+        Throwable current = err;
+        while (current != null) {
+            if (current instanceof SocketTimeoutException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
     private static String stateKey(String targetId, int port) {
         return targetId + ":" + port;
     }
 
+    public record TargetHealthStatus(String state, String reason, String description) {
+        private static TargetHealthStatus registrationInProgress() {
+            return new TargetHealthStatus(
+                    "initial",
+                    "Elb.RegistrationInProgress",
+                    "Target registration is in progress");
+        }
+    }
+
     private static class TargetState {
         volatile String status = "initial";
+        volatile String reason = "Elb.RegistrationInProgress";
+        volatile String description = "Target registration is in progress";
         volatile int consecutiveSuccesses = 0;
         volatile int consecutiveFailures = 0;
     }

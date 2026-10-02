@@ -32,11 +32,12 @@ import static org.assertj.core.api.Assertions.*;
  *   #229 — InitiateAuth rejects auth when no password hash is set
  *   #233 — ListUsers respects Filter parameter
  *   #235 — AdminSetUserPassword(Permanent=false) changes the password
+ *   #1505 — CreateUserPoolClient must not return empty {} for unset optional blocks
  *
  * Note: Issue #234 (GetTokensFromRefreshToken) is tested in sdk-test-node/tests/cognito-features.test.ts
  * because GetTokensFromRefreshTokenCommand is not present in Java SDK 2.31.8.
  */
-@DisplayName("Cognito IDP — bug fixes #218 #220 #228 #229 #233 #235")
+@DisplayName("Cognito IDP — bug fixes #218 #220 #228 #229 #233 #235 #1505")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class CognitoFeaturesTest {
 
@@ -48,6 +49,7 @@ class CognitoFeaturesTest {
     private static CognitoIdentityProviderClient cognito;
 
     private static String poolId;
+    private static String userPoolClientId;
     private static String poolArn;
     private static String clientId;
     private static final String USERNAME = "compat-user-" + UUID.randomUUID() + "@example.com";
@@ -63,6 +65,12 @@ class CognitoFeaturesTest {
     static void cleanup() {
         if (cognito == null) return;
         try {
+            if (userPoolClientId != null) {
+                cognito.deleteUserPoolClient(b -> b
+                        .userPoolId(poolId)
+                        .clientId(userPoolClientId)
+                );
+            }
             if (poolId != null) {
                 cognito.deleteUserPool(b -> b.userPoolId(poolId));
             }
@@ -114,6 +122,7 @@ class CognitoFeaturesTest {
                 .clientName("compat-test-client")
                 .explicitAuthFlows(
                         ExplicitAuthFlowsType.ALLOW_USER_PASSWORD_AUTH,
+                        ExplicitAuthFlowsType.ALLOW_ADMIN_USER_PASSWORD_AUTH,
                         ExplicitAuthFlowsType.ALLOW_REFRESH_TOKEN_AUTH));
         clientId = resp.userPoolClient().clientId();
         assertThat(clientId).isNotBlank();
@@ -142,6 +151,30 @@ class CognitoFeaturesTest {
                 .findFirst()
                 .orElse(null);
         assertThat(userSub).isNotBlank();
+    }
+
+    @Test
+    @Order(6)
+    void createUserPoolClientDoesNotReturnEmptyOptionalBlocks() {
+        CreateUserPoolClientResponse resp = cognito.createUserPoolClient(b -> b
+                .userPoolId(poolId)
+                .clientName("user-pool-client"));
+        UserPoolClientType client = resp.userPoolClient();
+        userPoolClientId = client.clientId();
+
+        assertThat(client.analyticsConfiguration())
+                .as("analyticsConfiguration must be null when not set")
+                .isNull();
+        assertThat(client.tokenValidityUnits())
+                .as("tokenValidityUnits must be null when not set")
+                .isNull();
+        assertThat(client.refreshTokenRotation())
+                .as("refreshTokenRotation must be null when not set")
+                .isNull();
+        assertThat(client.explicitAuthFlows())
+                .as("ExplicitAuthFlows must be empty when not set, matching AWS; the default"
+                        + " (refresh, SRP and custom auth) is enforced at auth time, not stored")
+                .isEmpty();
     }
 
     // ── Issue #229 — InitiateAuth rejects when no password hash is set ────────
@@ -287,6 +320,27 @@ class CognitoFeaturesTest {
         assertThat(verifyRs256Signature(accessToken, jwk))
                 .as("AccessToken RS256 signature must verify against published JWKS public key")
                 .isTrue();
+    }
+
+    // ── Issue #4760: GetUserAuthFactors ──────────────────────────────────────
+
+    @Test
+    @Order(34)
+    void getUserAuthFactorsListsPasswordAndVerifiedEmail() {
+        InitiateAuthResponse resp = cognito.initiateAuth(b -> b
+                .clientId(clientId)
+                .authFlow(AuthFlowType.USER_PASSWORD_AUTH)
+                .authParameters(Map.of("USERNAME", USERNAME, "PASSWORD", PASSWORD)));
+        String accessToken = resp.authenticationResult().accessToken();
+
+        GetUserAuthFactorsResponse factors = cognito.getUserAuthFactors(b -> b.accessToken(accessToken));
+
+        assertThat(factors.username())
+                .isEqualTo(cognito.getUser(b -> b.accessToken(accessToken)).username());
+        assertThat(factors.configuredUserAuthFactors())
+                .containsExactly(AuthFactorType.PASSWORD, AuthFactorType.EMAIL_OTP);
+        assertThat(factors.preferredMfaSetting()).isNull();
+        assertThat(factors.hasUserMFASettingList()).isFalse();
     }
 
     // ── Issue #220 — AdminGetUser accepts sub UUID and email as Username ───────
@@ -438,6 +492,27 @@ class CognitoFeaturesTest {
         assertThat(challengeResp.authenticationResult().refreshToken()).isNotBlank();
 
         cognito.adminDeleteUser(b -> b.userPoolId(poolId).username(tempUser));
+    }
+
+    @Test
+    @Order(61)
+    void deletionProtectionRefusesDeleteUntilDeactivated() {
+        String protectedPoolId = cognito.createUserPool(b -> b
+                .poolName("compat-protected-pool")
+                .deletionProtection(DeletionProtectionType.ACTIVE))
+                .userPool().id();
+        try {
+            assertThatThrownBy(() -> cognito.deleteUserPool(b -> b.userPoolId(protectedPoolId)))
+                    .isInstanceOf(InvalidParameterException.class)
+                    .hasMessageContaining("deletion protection is activated");
+            assertThat(cognito.describeUserPool(b -> b.userPoolId(protectedPoolId)).userPool().deletionProtection())
+                    .isEqualTo(DeletionProtectionType.ACTIVE);
+        } finally {
+            cognito.updateUserPool(b -> b.userPoolId(protectedPoolId).deletionProtection(DeletionProtectionType.INACTIVE));
+            cognito.deleteUserPool(b -> b.userPoolId(protectedPoolId));
+        }
+        assertThatThrownBy(() -> cognito.describeUserPool(b -> b.userPoolId(protectedPoolId)))
+                .isInstanceOf(ResourceNotFoundException.class);
     }
 
     // ── Issue #234 note ───────────────────────────────────────────────────────

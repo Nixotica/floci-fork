@@ -4,12 +4,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -28,6 +31,7 @@ class DynamoDbProjectionIntegrationTest {
 
     private static final String CT = "application/x-amz-json-1.0";
     private static final String TABLE = "ProjectionBugTable";
+    private static int testPort;
 
     @BeforeAll
     static void configureRestAssured() {
@@ -37,6 +41,7 @@ class DynamoDbProjectionIntegrationTest {
     @Test
     @Order(1)
     void createTable() {
+        testPort = RestAssured.port;
         given()
             .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
             .contentType(CT)
@@ -167,10 +172,143 @@ class DynamoDbProjectionIntegrationTest {
             .body("Items[0].data.M.sources", nullValue());
     }
 
+    @Test
+    @Order(6)
+    void putItemWithBracketedMapKey() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+            .contentType(CT)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "Item": {
+                        "pk": {"S": "item2"},
+                        "data": {"M": {
+                            "settings": {"M": {
+                                "[alpha]": {"L": [{"S": "one"}]},
+                                "[beta]": {"L": [{"S": "three"}]}
+                            }}
+                        }}
+                    }
+                }
+                """.formatted(TABLE))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    /**
+     * An alias that resolves to a bracketed map key such as "[alpha]" is a literal
+     * attribute name, not a list index. Before the fix this failed with a 500 because
+     * the bracket was parsed as an index.
+     */
+    @Test
+    @Order(7)
+    void getItemWithAliasResolvingToBracketedKeyProjectsThatKey() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(CT)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "Key": {"pk": {"S": "item2"}},
+                    "ExpressionAttributeNames": {"#data": "data", "#key": "[alpha]"},
+                    "ProjectionExpression": "#data.settings.#key"
+                }
+                """.formatted(TABLE))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Item.data.M.settings.M.'[alpha]'.L[0].S", equalTo("one"))
+            .body("Item.data.M.settings.M.'[beta]'", nullValue());
+    }
+
+    @Test
+    @Order(8)
+    void queryWithAliasResolvingToBracketedKeyProjectsThatKey() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.Query")
+            .contentType(CT)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "KeyConditionExpression": "pk = :pk",
+                    "ExpressionAttributeValues": {":pk": {"S": "item2"}},
+                    "ExpressionAttributeNames": {"#data": "data", "#key": "[alpha]"},
+                    "ProjectionExpression": "#data.settings.#key"
+                }
+                """.formatted(TABLE))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Count", equalTo(1))
+            .body("Items[0].data.M.settings.M.'[alpha]'.L[0].S", equalTo("one"))
+            .body("Items[0].data.M.settings.M.'[beta]'", nullValue());
+    }
+
+    @Test
+    @Order(9)
+    void getItemRejectsOverlappingPathsBeforeReadingTheItem() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(CT)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "Key": {"pk": {"S": "no-such-item"}},
+                    "ProjectionExpression": "a, a.b"
+                }
+                """.formatted(TABLE))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Invalid ProjectionExpression: Two document paths overlap with each other; "
+                    + "must remove or rewrite one of these paths; path one: [a], path two: [a, b]"));
+    }
+
+    @Test
+    @Order(11)
+    void otherReadsRejectOverlappingPathsWhenNothingMatches() {
+        String missingKey = "{\"pk\": {\"S\": \"no-such-item\"}}";
+        Map<String, String> requests = Map.of(
+                "Query", """
+                    {"TableName": "%s", "KeyConditionExpression": "pk = :p",
+                     "ExpressionAttributeValues": {":p": {"S": "no-such-item"}}, "ProjectionExpression": "a, a.b"}
+                    """.formatted(TABLE),
+                "Scan", """
+                    {"TableName": "%s", "FilterExpression": "pk = :p",
+                     "ExpressionAttributeValues": {":p": {"S": "no-such-item"}}, "ProjectionExpression": "a, a.b"}
+                    """.formatted(TABLE),
+                "BatchGetItem", """
+                    {"RequestItems": {"%s": {"Keys": [%s], "ProjectionExpression": "a, a.b"}}}
+                    """.formatted(TABLE, missingKey),
+                "TransactGetItems", """
+                    {"TransactItems": [
+                        {"Get": {"TableName": "%1$s", "Key": {"pk": {"S": "other"}}}},
+                        {"Get": {"TableName": "%1$s", "Key": %2$s, "ProjectionExpression": "a, a.b"}}]}
+                    """.formatted(TABLE, missingKey));
+        requests.forEach((action, body) -> given()
+            .header("X-Amz-Target", "DynamoDB_20120810." + action)
+            .contentType(CT)
+            .body(body)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Invalid ProjectionExpression: Two document paths overlap with each other; "
+                    + "must remove or rewrite one of these paths; path one: [a], path two: [a, b]")));
+    }
+
     @AfterAll
     static void cleanup() {
-        try {
-            given()
+        given()
+                .port(testPort)
                 .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
                 .contentType(CT)
                 .body("""
@@ -180,7 +318,6 @@ class DynamoDbProjectionIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200);
-        } catch (Exception ignored) {}
     }
 
     /**

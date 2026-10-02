@@ -91,9 +91,84 @@ class SchedulerExpressionParserTest {
     }
 
     @Test
+    void cronSkipsNonexistentLocalTimeDuringSpringForward() {
+        // Los Angeles advances from 01:59 to 03:00 on 2026-03-08.
+        assertEquals(Instant.parse("2026-03-09T09:30:00Z"),
+                SchedulerExpressionParser.nextCronFire("cron(30 2 * * ? *)",
+                        Instant.parse("2026-03-08T09:00:00Z"), "America/Los_Angeles"));
+    }
+
+    @Test
+    void cronRunsOnlyOnceDuringFallBack() {
+        // 01:30 happens twice on 2026-11-01; AWS invokes only at its first occurrence.
+        String expression = "cron(30 1 * * ? *)";
+        Instant first = SchedulerExpressionParser.nextCronFire(expression,
+                Instant.parse("2026-11-01T07:00:00Z"), "America/Los_Angeles");
+        assertEquals(Instant.parse("2026-11-01T08:30:00Z"), first);
+        assertEquals(Instant.parse("2026-11-02T09:30:00Z"),
+                SchedulerExpressionParser.nextCronFire(expression, first, "America/Los_Angeles"));
+    }
+
+    @Test
     void nextCronFireRejectsWrongFieldCount() {
         Instant from = Instant.now();
         assertThrows(IllegalArgumentException.class,
                 () -> SchedulerExpressionParser.nextCronFire("cron(0 10 * * *)", from, null));
+    }
+
+    // Day-of-week numbering: AWS is 1-7 = SUN-SAT.
+
+    /** 2026-03-01 is a Sunday, so it doubles as the day the "from" instant lands on. */
+    private static final Instant SUNDAY_2026_03_01_02_00 =
+            ZonedDateTime.of(2026, 3, 1, 2, 0, 0, 0, ZoneOffset.UTC).toInstant();
+
+    private static Instant utc(int day, int hour, int minute) {
+        return ZonedDateTime.of(2026, 3, day, hour, minute, 0, 0, ZoneOffset.UTC).toInstant();
+    }
+
+    @Test
+    void dayOfWeekOneIsSunday() {
+        assertEquals(utc(1, 12, 0),
+                SchedulerExpressionParser.nextCronFire("cron(0 12 ? * 1 *)", SUNDAY_2026_03_01_02_00, "UTC"));
+    }
+
+    @Test
+    void dayOfWeekTwoIsMonday() {
+        assertEquals(utc(2, 12, 0),
+                SchedulerExpressionParser.nextCronFire("cron(0 12 ? * 2 *)", SUNDAY_2026_03_01_02_00, "UTC"));
+    }
+
+    @Test
+    void dayOfWeekSevenIsSaturdayAndIsAccepted() {
+        assertEquals(utc(7, 12, 0),
+                SchedulerExpressionParser.nextCronFire("cron(0 12 ? * 7 *)", SUNDAY_2026_03_01_02_00, "UTC"));
+    }
+
+    @Test
+    void dayOfWeekNamesAgreeWithTheirNumbers() {
+        assertEquals(
+                SchedulerExpressionParser.nextCronFire("cron(0 12 ? * 2 *)", SUNDAY_2026_03_01_02_00, "UTC"),
+                SchedulerExpressionParser.nextCronFire("cron(0 12 ? * MON *)", SUNDAY_2026_03_01_02_00, "UTC"));
+    }
+
+    @Test
+    void hashSelectsTheNthWeekdayOfTheMonth() {
+        // 2#1 is the first Monday of March 2026, which is the 2nd.
+        assertEquals(utc(2, 2, 30),
+                SchedulerExpressionParser.nextCronFire("cron(30 2 ? * 2#1 *)", SUNDAY_2026_03_01_02_00, "UTC"));
+    }
+
+    @Test
+    void lastWeekdayOfMonthUsesAwsNumbering() {
+        // AWS documents cron(15 10 ? * 6L 2022-2023) as the last Friday of the month.
+        // The last Friday of March 2026 is the 27th.
+        assertEquals(utc(27, 10, 15),
+                SchedulerExpressionParser.nextCronFire("cron(15 10 ? * 6L *)", SUNDAY_2026_03_01_02_00, "UTC"));
+    }
+
+    @Test
+    void dayOfWeekZeroIsRejected() {
+        assertThrows(IllegalArgumentException.class,
+                () -> SchedulerExpressionParser.nextCronFire("cron(0 12 ? * 0 *)", SUNDAY_2026_03_01_02_00, "UTC"));
     }
 }

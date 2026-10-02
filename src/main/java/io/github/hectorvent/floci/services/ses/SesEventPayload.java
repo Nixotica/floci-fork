@@ -9,7 +9,6 @@ import io.github.hectorvent.floci.services.ses.model.MessageTag;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 
@@ -32,22 +31,58 @@ final class SesEventPayload {
 
     private SesEventPayload() {}
 
-    static ObjectNode build(ObjectMapper mapper, String eventType, String messageId, String source,
-                            String sourceArn, String sendingAccountId, String subject,
+    static ObjectNode build(ObjectMapper mapper, SesRecipientEvent event, String messageId,
+                            String source, String sourceArn, String sendingAccountId, String subject,
                             List<String> toAddresses, List<String> ccAddresses,
                             List<String> bccAddresses, List<String> envelopeDestinations,
-                            List<String> suppressionBounceRecipients,
-                            List<String> suppressionComplaintRecipients,
                             String configurationSetName, List<MessageTag> emailTags,
                             List<MessageHeader> additionalHeaders, Instant timestamp) {
+        return buildRoot(mapper, "eventType", event, messageId, source, sourceArn,
+                sendingAccountId, subject, toAddresses, ccAddresses, bccAddresses,
+                envelopeDestinations, configurationSetName, emailTags, additionalHeaders, timestamp,
+                true, true);
+    }
+
+    /**
+     * Builds the legacy Amazon SNS notification JSON delivered to the per-identity feedback
+     * topics configured through {@code SetIdentityNotificationTopic}, matching the format at
+     * https://docs.aws.amazon.com/ses/latest/dg/notification-contents.html. It shares the
+     * {@code mail}/{@code bounce}/{@code complaint}/{@code delivery} blocks with the
+     * event-publishing payload from {@link #build} but differs in three spec-mandated ways:
+     * the top-level discriminator is named {@code notificationType} rather than {@code eventType};
+     * the {@code mail} object never carries a {@code tags} field; and the original headers
+     * ({@code headers}/{@code commonHeaders}/{@code headersTruncated}) appear only when the
+     * identity has headers-in-notifications enabled for the type ({@code includeHeaders}). Only
+     * the {@code BOUNCE}, {@code COMPLAINT}, and {@code DELIVERY} event types are ever published
+     * through this path.
+     */
+    static ObjectNode buildIdentityNotification(ObjectMapper mapper, SesRecipientEvent event,
+                            String messageId, String source, String sourceArn,
+                            String sendingAccountId, String subject,
+                            List<String> toAddresses, List<String> ccAddresses,
+                            List<String> bccAddresses, List<String> envelopeDestinations,
+                            List<MessageHeader> additionalHeaders, Instant timestamp,
+                            boolean includeHeaders) {
+        return buildRoot(mapper, "notificationType", event, messageId, source, sourceArn,
+                sendingAccountId, subject, toAddresses, ccAddresses, bccAddresses,
+                envelopeDestinations, null, null, additionalHeaders, timestamp, includeHeaders, false);
+    }
+
+    private static ObjectNode buildRoot(ObjectMapper mapper, String typeField, SesRecipientEvent event,
+                            String messageId, String source, String sourceArn,
+                            String sendingAccountId, String subject,
+                            List<String> toAddresses, List<String> ccAddresses,
+                            List<String> bccAddresses, List<String> envelopeDestinations,
+                            String configurationSetName, List<MessageTag> emailTags,
+                            List<MessageHeader> additionalHeaders, Instant timestamp,
+                            boolean includeHeaders, boolean includeTags) {
         ObjectNode root = mapper.createObjectNode();
-        root.put("eventType", eventTypeLabel(eventType));
+        root.put(typeField, eventTypeLabel(event.eventType()));
         root.set("mail", buildMail(mapper, messageId, source, sourceArn, sendingAccountId,
                 subject, toAddresses, ccAddresses, bccAddresses, envelopeDestinations,
-                configurationSetName, emailTags, additionalHeaders, timestamp));
-        root.set(blockName(eventType),
-                buildEventBlock(mapper, eventType, messageId, envelopeDestinations,
-                        suppressionBounceRecipients, suppressionComplaintRecipients, timestamp));
+                configurationSetName, emailTags, additionalHeaders, timestamp,
+                includeHeaders, includeTags));
+        root.set(blockName(event.eventType()), buildEventBlock(mapper, event, messageId, timestamp));
         return root;
     }
 
@@ -58,7 +93,8 @@ final class SesEventPayload {
                                         List<String> envelopeDestinations,
                                         String configurationSetName, List<MessageTag> emailTags,
                                         List<MessageHeader> additionalHeaders,
-                                        Instant timestamp) {
+                                        Instant timestamp, boolean includeHeaders,
+                                        boolean includeTags) {
         ObjectNode mail = mapper.createObjectNode();
         mail.put("timestamp", ISO_MILLIS.format(timestamp));
         if (source != null && !source.isBlank()) {
@@ -73,70 +109,74 @@ final class SesEventPayload {
         for (String d : envelopeDestinations) {
             dest.add(d);
         }
-        mail.put("headersTruncated", false);
-        ArrayNode headers = mail.putArray("headers");
-        if (source != null && !source.isBlank()) {
-            addHeader(headers, mapper, "From", source);
-        }
-        if (toAddresses != null && !toAddresses.isEmpty()) {
-            addHeader(headers, mapper, "To", String.join(", ", toAddresses));
-        }
-        if (ccAddresses != null && !ccAddresses.isEmpty()) {
-            addHeader(headers, mapper, "Cc", String.join(", ", ccAddresses));
-        }
-        if (subject != null && !subject.isEmpty()) {
-            addHeader(headers, mapper, "Subject", subject);
-        }
-        if (additionalHeaders != null) {
-            for (MessageHeader h : additionalHeaders) {
-                if (h == null || h.name() == null || h.name().isBlank()) {
-                    continue;
+        if (includeHeaders) {
+            mail.put("headersTruncated", false);
+            ArrayNode headers = mail.putArray("headers");
+            if (source != null && !source.isBlank()) {
+                addHeader(headers, mapper, "From", source);
+            }
+            if (toAddresses != null && !toAddresses.isEmpty()) {
+                addHeader(headers, mapper, "To", String.join(", ", toAddresses));
+            }
+            if (ccAddresses != null && !ccAddresses.isEmpty()) {
+                addHeader(headers, mapper, "Cc", String.join(", ", ccAddresses));
+            }
+            if (subject != null && !subject.isEmpty()) {
+                addHeader(headers, mapper, "Subject", subject);
+            }
+            if (additionalHeaders != null) {
+                for (MessageHeader h : additionalHeaders) {
+                    if (h == null || h.name() == null || h.name().isBlank()) {
+                        continue;
+                    }
+                    addHeader(headers, mapper, h.name(), h.value() == null ? "" : h.value());
                 }
-                addHeader(headers, mapper, h.name(), h.value() == null ? "" : h.value());
             }
-        }
-        ObjectNode common = mail.putObject("commonHeaders");
-        common.put("messageId", messageId);
-        common.put("date", RFC_5322_DATE.format(timestamp));
-        ArrayNode fromArr = common.putArray("from");
-        if (source != null && !source.isBlank()) {
-            fromArr.add(source);
-        }
-        ArrayNode toArr = common.putArray("to");
-        if (toAddresses != null) {
-            for (String a : toAddresses) {
-                toArr.add(a);
+            ObjectNode common = mail.putObject("commonHeaders");
+            common.put("messageId", messageId);
+            common.put("date", RFC_5322_DATE.format(timestamp));
+            ArrayNode fromArr = common.putArray("from");
+            if (source != null && !source.isBlank()) {
+                fromArr.add(source);
             }
-        }
-        if (ccAddresses != null && !ccAddresses.isEmpty()) {
-            ArrayNode ccArr = common.putArray("cc");
-            for (String a : ccAddresses) {
-                ccArr.add(a);
-            }
-        }
-        if (bccAddresses != null && !bccAddresses.isEmpty()) {
-            ArrayNode bccArr = common.putArray("bcc");
-            for (String a : bccAddresses) {
-                bccArr.add(a);
-            }
-        }
-        if (subject != null && !subject.isEmpty()) {
-            common.put("subject", subject);
-        }
-        ObjectNode tags = mail.putObject("tags");
-        if (configurationSetName != null) {
-            ArrayNode csTag = tags.putArray("ses:configuration-set");
-            csTag.add(configurationSetName);
-        }
-        if (emailTags != null) {
-            for (MessageTag t : emailTags) {
-                if (t == null || t.name() == null) {
-                    continue;
+            ArrayNode toArr = common.putArray("to");
+            if (toAddresses != null) {
+                for (String a : toAddresses) {
+                    toArr.add(a);
                 }
-                ArrayNode arr = tags.has(t.name())
-                        ? (ArrayNode) tags.get(t.name())
-                        : tags.putArray(t.name());
-                arr.add(t.value() == null ? "" : t.value());
+            }
+            if (ccAddresses != null && !ccAddresses.isEmpty()) {
+                ArrayNode ccArr = common.putArray("cc");
+                for (String a : ccAddresses) {
+                    ccArr.add(a);
+                }
+            }
+            if (bccAddresses != null && !bccAddresses.isEmpty()) {
+                ArrayNode bccArr = common.putArray("bcc");
+                for (String a : bccAddresses) {
+                    bccArr.add(a);
+                }
+            }
+            if (subject != null && !subject.isEmpty()) {
+                common.put("subject", subject);
+            }
+        }
+        if (includeTags) {
+            ObjectNode tags = mail.putObject("tags");
+            if (configurationSetName != null) {
+                ArrayNode csTag = tags.putArray("ses:configuration-set");
+                csTag.add(configurationSetName);
+            }
+            if (emailTags != null) {
+                for (MessageTag t : emailTags) {
+                    if (t == null || t.name() == null) {
+                        continue;
+                    }
+                    ArrayNode arr = tags.has(t.name())
+                            ? (ArrayNode) tags.get(t.name())
+                            : tags.putArray(t.name());
+                    arr.add(t.value() == null ? "" : t.value());
+                }
             }
         }
         return mail;
@@ -149,42 +189,61 @@ final class SesEventPayload {
         headers.add(h);
     }
 
-    private static ObjectNode buildEventBlock(ObjectMapper mapper, String eventType, String messageId,
-                                              List<String> destination,
-                                              List<String> suppressionBounceRecipients,
-                                              List<String> suppressionComplaintRecipients,
-                                              Instant timestamp) {
+    // Probed against real SES on 2026-09-21: an account-suppressed recipient bounces with this
+    // subtype and diagnostic, or is complained about with this subtype and no feedback type, while
+    // suppressionlist@simulator is an ordinary General bounce whose diagnostic names the suppression.
+    static final String ON_ACCOUNT_SUPPRESSION_LIST = "OnAccountSuppressionList";
+    static final String ACCOUNT_SUPPRESSION_DIAGNOSTIC = "Amazon SES did not send the message to this "
+            + "address because it is on the suppression list for your account. For more information "
+            + "about removing addresses from the suppression list, see the Amazon SES Developer Guide "
+            + "at https://docs.aws.amazon.com/ses/latest/dg/sending-email-suppression-list.html";
+
+    private static ObjectNode buildEventBlock(ObjectMapper mapper, SesRecipientEvent event,
+                                              String messageId, Instant timestamp) {
         ObjectNode body = mapper.createObjectNode();
-        switch (eventType) {
+        switch (event.eventType()) {
             case "DELIVERY" -> {
                 body.put("timestamp", ISO_MILLIS.format(timestamp));
                 body.put("processingTimeMillis", 0);
                 ArrayNode recipients = body.putArray("recipients");
-                for (String d : destination) {
-                    if (SimulatorAddresses.isSuccess(d)) {
-                        recipients.add(d.trim());
-                    }
+                for (String recipient : event.recipients()) {
+                    recipients.add(recipient);
                 }
                 body.put("smtpResponse", "250 ok");
                 body.put("reportingMTA", "floci");
             }
             case "BOUNCE" -> {
+                boolean suppressed = event.cause() == SesRecipientEvent.Cause.ACCOUNT_SUPPRESSION;
                 body.put("bounceType", "Permanent");
-                body.put("bounceSubType", "General");
-                emitDedupedRecipientObjects(body.putArray("bouncedRecipients"),
-                        destination, SimulatorAddresses::isBounce,
-                        suppressionBounceRecipients);
+                body.put("bounceSubType", suppressed ? ON_ACCOUNT_SUPPRESSION_LIST : "General");
+                ArrayNode bounced = body.putArray("bouncedRecipients");
+                for (String recipient : event.recipients()) {
+                    ObjectNode entry = bounced.addObject();
+                    entry.put("emailAddress", recipient);
+                    // The shape of a list-management opt-out bounce has not been probed, so it
+                    // carries only the address, as it did before the per-cause split.
+                    if (event.cause() != SesRecipientEvent.Cause.LIST_MANAGEMENT) {
+                        entry.put("action", "failed");
+                        entry.put("status", "5.1.1");
+                        entry.put("diagnosticCode", bounceDiagnosticCode(recipient, suppressed));
+                    }
+                }
                 body.put("timestamp", ISO_MILLIS.format(timestamp));
-                body.put("feedbackId", "feedback-" + messageId);
+                body.put("feedbackId", feedbackId(messageId, event));
             }
             case "COMPLAINT" -> {
-                emitDedupedRecipientObjects(body.putArray("complainedRecipients"),
-                        destination, SimulatorAddresses::isComplaint,
-                        suppressionComplaintRecipients);
+                if (event.cause() == SesRecipientEvent.Cause.ACCOUNT_SUPPRESSION) {
+                    body.put("complaintSubType", ON_ACCOUNT_SUPPRESSION_LIST);
+                }
+                ArrayNode complained = body.putArray("complainedRecipients");
+                for (String recipient : event.recipients()) {
+                    complained.addObject().put("emailAddress", recipient);
+                }
                 body.put("timestamp", ISO_MILLIS.format(timestamp));
-                body.put("feedbackId", "feedback-" + messageId);
+                body.put("arrivalDate", ISO_MILLIS.format(timestamp));
+                body.put("feedbackId", feedbackId(messageId, event));
             }
-            case "REJECT" -> body.put("reason", "Bad content");
+            case "REJECT" -> body.put("reason", SesRecipientEvents.CONTENT_REJECT_REASON);
             default -> {
                 // SEND and other not-yet-modelled event types: empty block.
             }
@@ -192,34 +251,26 @@ final class SesEventPayload {
         return body;
     }
 
-    /**
-     * Emit `{emailAddress: ...}` objects into {@code arr} for every recipient that either
-     * matches {@code simulatorPredicate} in {@code envelope} or is listed in
-     * {@code suppressionRecipients}. Addresses are trimmed and deduplicated by trimmed
-     * form so the same address never appears twice when both inputs claim it.
-     */
-    private static void emitDedupedRecipientObjects(ArrayNode arr,
-                                                    List<String> envelope,
-                                                    java.util.function.Predicate<String> simulatorPredicate,
-                                                    List<String> suppressionRecipients) {
-        LinkedHashSet<String> emitted = new LinkedHashSet<>();
-        if (envelope != null) {
-            for (String d : envelope) {
-                if (d != null && simulatorPredicate.test(d) && emitted.add(d.trim())) {
-                    arr.addObject().put("emailAddress", d.trim());
-                }
-            }
-        }
-        if (suppressionRecipients != null) {
-            for (String d : suppressionRecipients) {
-                if (d != null && emitted.add(d.trim())) {
-                    arr.addObject().put("emailAddress", d.trim());
-                }
-            }
-        }
+    // SES gives every bounce and complaint notification its own id, so the events split from one
+    // send (a simulator bounce and a suppression bounce) never share one; the id is derived rather
+    // than random so the configuration-set event and the identity notification of one outcome agree.
+    private static String feedbackId(String messageId, SesRecipientEvent event) {
+        return "feedback-" + messageId + "-" + event.eventType().toLowerCase(Locale.ROOT) + "-"
+                + event.cause().name().toLowerCase(Locale.ROOT);
     }
 
-    private static String eventTypeLabel(String eventType) {
+    static String bounceDiagnosticCode(String recipient, boolean suppressed) {
+        if (suppressed) {
+            return ACCOUNT_SUPPRESSION_DIAGNOSTIC;
+        }
+        if (SimulatorAddresses.isSuppressionList(recipient)) {
+            return "smtp; 550 5.1.1 As requested: user unknown (suppressed address: " + recipient + ")";
+        }
+        // The simulator documents bounce@ as an SMTP 550 5.1.1 "Unknown User" response.
+        return "smtp; 550 5.1.1 user unknown";
+    }
+
+    static String eventTypeLabel(String eventType) {
         return switch (eventType) {
             case "SEND" -> "Send";
             case "REJECT" -> "Reject";
@@ -232,6 +283,58 @@ final class SesEventPayload {
             case "DELIVERY_DELAY" -> "DeliveryDelay";
             case "SUBSCRIPTION" -> "Subscription";
             default -> eventType;
+        };
+    }
+
+    /**
+     * Returns the CloudWatch {@code MetricName} value AWS SES uses for an event.
+     * Mostly matches {@link #eventTypeLabel}, but at least one event type has a
+     * different spelling on CloudWatch than on the SNS payload's {@code eventType}
+     * field, and they must not be unified through {@code eventTypeLabel} or the SNS
+     * payload regresses to a non-AWS value:
+     *   - {@code RENDERING_FAILURE} → CW {@code "RenderingFailure"} (no space)
+     *     vs SNS {@code "Rendering Failure"} (with space) — verified against real
+     *     AWS via a CW event destination + a templated send with a missing
+     *     {@code TemplateData} key.
+     * {@code DELIVERY_DELAY} is not directly observed yet (sandbox cannot easily
+     * trigger SES backoff); kept as {@code "DeliveryDelay"} pending verification.
+     */
+    static String cloudWatchMetricName(String eventType) {
+        return switch (eventType) {
+            case "SEND" -> "Send";
+            case "REJECT" -> "Reject";
+            case "BOUNCE" -> "Bounce";
+            case "COMPLAINT" -> "Complaint";
+            case "DELIVERY" -> "Delivery";
+            case "OPEN" -> "Open";
+            case "CLICK" -> "Click";
+            case "RENDERING_FAILURE" -> "RenderingFailure";
+            case "DELIVERY_DELAY" -> "DeliveryDelay";
+            case "SUBSCRIPTION" -> "Subscription";
+            default -> eventType;
+        };
+    }
+
+    /**
+     * Returns the EventBridge {@code detail-type} value for a SES event. AWS uses a
+     * separate past-tense vocabulary on EventBridge (e.g. {@code Email Sent}) that
+     * differs from the SNS notification {@code eventType} value (e.g. {@code Send})
+     * — a rule pattern keyed on the EventBridge value will not match the SNS value.
+     * Reference: https://docs.aws.amazon.com/eventbridge/latest/ref/events-ref-ses.html
+     */
+    static String eventBridgeDetailType(String eventType) {
+        return switch (eventType) {
+            case "SEND" -> "Email Sent";
+            case "REJECT" -> "Email Rejected";
+            case "BOUNCE" -> "Email Bounced";
+            case "COMPLAINT" -> "Email Complaint Received";
+            case "DELIVERY" -> "Email Delivered";
+            case "OPEN" -> "Email Opened";
+            case "CLICK" -> "Email Clicked";
+            case "RENDERING_FAILURE" -> "Email Rendering Failed";
+            case "DELIVERY_DELAY" -> "Email Delivery Delayed";
+            case "SUBSCRIPTION" -> "Email Subscribed";
+            default -> "Email " + eventType;
         };
     }
 

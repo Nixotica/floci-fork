@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.bcmdataexports;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.S3DestinationValidation;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.bcmdataexports.model.DataQuery;
@@ -236,15 +238,7 @@ public class BcmDataExportsService {
      * behavior for callers that don't pass a 12-digit access key.
      */
     public String accountIdFromArn(String arn) {
-        if (arn == null) {
-            return regionResolver.getAccountId();
-        }
-        // arn:aws:bcm-data-exports:<region>:<account>:export/<name>
-        String[] parts = arn.split(":", 6);
-        if (parts.length >= 5 && !parts[4].isEmpty()) {
-            return parts[4];
-        }
-        return regionResolver.getAccountId();
+        return AwsArnUtils.accountOrDefault(arn, regionResolver.getAccountId());
     }
 
     public void completeExecution(String accountId, ExportExecution exec, boolean success, String reason) {
@@ -302,12 +296,12 @@ public class BcmDataExportsService {
         }
         DestinationConfiguration.S3Destination s3 = dest.getS3Destination();
         requireNonEmpty(s3.getS3Bucket(), "S3Destination.S3Bucket");
-        requireValidBucketName(s3.getS3Bucket(), "S3Destination.S3Bucket");
+        S3DestinationValidation.requireValidBucketName(s3.getS3Bucket(), "S3Destination.S3Bucket");
         requireNonEmpty(s3.getS3Region(), "S3Destination.S3Region");
         if (s3.getS3Prefix() == null) {
             s3.setS3Prefix("");
         } else if (!s3.getS3Prefix().isEmpty()) {
-            requireSafeKeySegment(s3.getS3Prefix(), "S3Destination.S3Prefix");
+            S3DestinationValidation.requireSafeKeySegment(s3.getS3Prefix(), "S3Destination.S3Prefix");
         }
         DestinationConfiguration.S3OutputConfigurations out = s3.getS3OutputConfigurations();
         if (out != null) {
@@ -360,40 +354,4 @@ public class BcmDataExportsService {
         }
     }
 
-    private static void requireValidBucketName(String bucket, String field) {
-        if (bucket.length() < 3 || bucket.length() > 63) {
-            throw new AwsException("ValidationException",
-                    field + " must be between 3 and 63 characters.", 400);
-        }
-        for (int i = 0; i < bucket.length(); i++) {
-            char c = bucket.charAt(i);
-            boolean valid = (c >= 'a' && c <= 'z')
-                    || (c >= '0' && c <= '9')
-                    || c == '-' || c == '.';
-            if (!valid) {
-                throw new AwsException("ValidationException",
-                        field + " contains invalid characters.", 400);
-            }
-        }
-        if (bucket.startsWith("-") || bucket.endsWith("-")
-                || bucket.startsWith(".") || bucket.endsWith(".")
-                || bucket.contains("..")) {
-            throw new AwsException("ValidationException",
-                    field + " is not a valid S3 bucket name.", 400);
-        }
-    }
-
-    private static void requireSafeKeySegment(String value, String field) {
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            boolean ok = (c >= 'A' && c <= 'Z')
-                    || (c >= 'a' && c <= 'z')
-                    || (c >= '0' && c <= '9')
-                    || c == '-' || c == '_' || c == '.' || c == '/';
-            if (!ok) {
-                throw new AwsException("ValidationException",
-                        field + " contains characters not permitted in an S3 key segment.", 400);
-            }
-        }
-    }
 }

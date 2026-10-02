@@ -1,11 +1,14 @@
 package io.github.hectorvent.floci.services.apigateway.model;
 
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 
 import java.util.HashMap;
 import java.util.Map;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
+@RegisterForReflection
 public class Stage {
 
     private String stageName;
@@ -13,6 +16,65 @@ public class Stage {
     private String description;
     private Map<String, String> variables = new HashMap<>();
     private Map<String, MethodSetting> methodSettings = new HashMap<>();
+    /** Stage-level cache switch; a method's own cachingEnabled only applies when this is on. */
+    private boolean cacheClusterEnabled;
+    private String cacheClusterSize;
+    private String cacheClusterStatus = "NOT_AVAILABLE";
+    private AccessLogSettings accessLogSettings;
+    private boolean tracingEnabled;
+    private Map<String, String> tags = new HashMap<>();
+
+    @RegisterForReflection
+    public record AccessLogSettings(String destinationArn, String format) {}
+
+    public AccessLogSettings getAccessLogSettings() {
+        return accessLogSettings;
+    }
+
+    public void setAccessLogSettings(AccessLogSettings accessLogSettings) {
+        this.accessLogSettings = accessLogSettings;
+    }
+
+    public boolean isTracingEnabled() {
+        return tracingEnabled;
+    }
+
+    public void setTracingEnabled(boolean tracingEnabled) {
+        this.tracingEnabled = tracingEnabled;
+    }
+
+    public Map<String, String> getTags() {
+        return tags;
+    }
+
+    public void setTags(Map<String, String> tags) {
+        this.tags = tags != null ? tags : new HashMap<>();
+    }
+
+    public boolean isCacheClusterEnabled() {
+        return cacheClusterEnabled;
+    }
+
+    public void setCacheClusterEnabled(boolean cacheClusterEnabled) {
+        this.cacheClusterEnabled = cacheClusterEnabled;
+        this.cacheClusterStatus = cacheClusterEnabled ? "AVAILABLE" : "NOT_AVAILABLE";
+    }
+
+    public String getCacheClusterSize() {
+        return cacheClusterSize;
+    }
+
+    public void setCacheClusterSize(String cacheClusterSize) {
+        this.cacheClusterSize = cacheClusterSize;
+    }
+
+    public String getCacheClusterStatus() {
+        return cacheClusterStatus;
+    }
+
+    public void setCacheClusterStatus(String cacheClusterStatus) {
+        this.cacheClusterStatus = cacheClusterStatus;
+    }
     private long createdDate;
     private long lastUpdatedDate;
 

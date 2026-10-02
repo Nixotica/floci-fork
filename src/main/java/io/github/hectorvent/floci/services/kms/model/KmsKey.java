@@ -14,9 +14,17 @@ public class KmsKey {
     private String arn;
     private String description;
     private boolean enabled = true;
-    private String keyState = "Enabled"; // Enabled, Disabled, PendingDeletion
-    private String keyUsage = "ENCRYPT_DECRYPT";
-    private String customerMasterKeySpec = "SYMMETRIC_DEFAULT";
+    private String keyState = "Enabled"; // Enabled, Disabled, PendingDeletion, PendingImport
+    private String origin = "AWS_KMS";
+    private String expirationModel;
+    private long validTo;
+    private KmsImportParameters importParameters;
+    private String keyMaterialId;
+    private KmsKeyUsage keyUsage = KmsKeyUsage.ENCRYPT_DECRYPT;
+    private KmsKeySpec keySpec = KmsKeySpec.SYMMETRIC_DEFAULT;
+    private boolean multiRegion;
+    private String multiRegionKeyType;
+    private String multiRegionPrimaryRegion;
     private long creationDate;
     private long deletionDate;
     private String policy;
@@ -25,6 +33,14 @@ public class KmsKey {
     private String privateKeyEncoded;
     private String publicKeyEncoded;
     private int onDemandRotationCount;
+    // Backing keys for the AES-GCM ciphertext envelope (symmetric CMKs only): backing key id
+    // -> Base64(32 random bytes). Rotation adds a new entry and switches currentBackingKeyId
+    // rather than replacing the map, so blobs encrypted under a prior backing key keep
+    // decrypting, matching AWS KMS's own behavior of retaining prior backing keys. Keys
+    // persisted before this field existed load with an empty map (Jackson leaves the default),
+    // and KmsService lazily generates material for them on first use.
+    private Map<String, String> backingKeys = new HashMap<>();
+    private String currentBackingKeyId;
 
     public KmsKey() {
         this.creationDate = Instant.now().getEpochSecond();
@@ -45,11 +61,39 @@ public class KmsKey {
     public String getKeyState() { return keyState; }
     public void setKeyState(String keyState) { this.keyState = keyState; }
 
-    public String getKeyUsage() { return keyUsage; }
-    public void setKeyUsage(String keyUsage) { this.keyUsage = keyUsage; }
+    public String getOrigin() { return origin; }
+    public void setOrigin(String origin) { this.origin = origin; }
 
-    public String getCustomerMasterKeySpec() { return customerMasterKeySpec; }
-    public void setCustomerMasterKeySpec(String spec) { this.customerMasterKeySpec = spec; }
+    public String getExpirationModel() { return expirationModel; }
+    public void setExpirationModel(String expirationModel) { this.expirationModel = expirationModel; }
+
+    public long getValidTo() { return validTo; }
+    public void setValidTo(long validTo) { this.validTo = validTo; }
+
+    public KmsImportParameters getImportParameters() { return importParameters; }
+    public void setImportParameters(KmsImportParameters importParameters) {
+        this.importParameters = importParameters;
+    }
+
+    public String getKeyMaterialId() { return keyMaterialId; }
+    public void setKeyMaterialId(String keyMaterialId) { this.keyMaterialId = keyMaterialId; }
+
+    public KmsKeyUsage getKeyUsage() { return keyUsage; }
+    public void setKeyUsage(KmsKeyUsage keyUsage) { this.keyUsage = keyUsage; }
+
+    public KmsKeySpec getKeySpec() { return keySpec; }
+    public void setKeySpec(KmsKeySpec spec) { this.keySpec = spec; }
+
+    public boolean isMultiRegion() { return multiRegion; }
+    public void setMultiRegion(boolean multiRegion) { this.multiRegion = multiRegion; }
+
+    public String getMultiRegionKeyType() { return multiRegionKeyType; }
+    public void setMultiRegionKeyType(String multiRegionKeyType) { this.multiRegionKeyType = multiRegionKeyType; }
+
+    public String getMultiRegionPrimaryRegion() { return multiRegionPrimaryRegion; }
+    public void setMultiRegionPrimaryRegion(String multiRegionPrimaryRegion) {
+        this.multiRegionPrimaryRegion = multiRegionPrimaryRegion;
+    }
 
     public long getCreationDate() { return creationDate; }
     public void setCreationDate(long creationDate) { this.creationDate = creationDate; }
@@ -74,4 +118,10 @@ public class KmsKey {
 
     public int getOnDemandRotationCount() { return onDemandRotationCount; }
     public void setOnDemandRotationCount(int onDemandRotationCount) { this.onDemandRotationCount = onDemandRotationCount; }
+
+    public Map<String, String> getBackingKeys() { return backingKeys; }
+    public void setBackingKeys(Map<String, String> backingKeys) { this.backingKeys = backingKeys; }
+
+    public String getCurrentBackingKeyId() { return currentBackingKeyId; }
+    public void setCurrentBackingKeyId(String currentBackingKeyId) { this.currentBackingKeyId = currentBackingKeyId; }
 }

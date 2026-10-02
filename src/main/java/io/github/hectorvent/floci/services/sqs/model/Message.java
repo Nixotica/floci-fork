@@ -4,8 +4,16 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -38,6 +46,10 @@ public class Message {
     // on ReceiveMessage when requested.
     private String awsTraceHeader;
 
+    // The retention period starts over when a message is moved to a FIFO DLQ or by a message
+    // move task. A standard DLQ keeps the original enqueue time.
+    private Instant retentionStartTimestamp;
+
     // Transient fields for visibility timeout tracking
     @JsonIgnore
     private String receiptHandle;
@@ -55,6 +67,28 @@ public class Message {
         this.sentTimestamp = Instant.now();
         this.receiveCount = 0;
         this.md5OfBody = computeMd5(body);
+    }
+
+    /** A copy for delivery to another queue by StartMessageMoveTask. The content carries over. AWS
+     *  gives it a new message id, and per-receive state (receive count, first-receive timestamp,
+     *  receipt handle, visibility) starts over. The source instance is untouched so a failed
+     *  delivery can put it back as it was. */
+    public Message copyForRedrive() {
+        Message copy = new Message();
+        copy.messageId = UUID.randomUUID().toString();
+        copy.body = body;
+        copy.messageAttributes = messageAttributes == null ? new HashMap<>() : new HashMap<>(messageAttributes);
+        copy.sentTimestamp = sentTimestamp;
+        copy.md5OfBody = md5OfBody;
+        copy.md5OfMessageAttributes = md5OfMessageAttributes;
+        copy.messageGroupId = messageGroupId;
+        copy.messageDeduplicationId = messageDeduplicationId;
+        copy.sequenceNumber = sequenceNumber;
+        copy.originalSourceQueueUrl = originalSourceQueueUrl;
+        copy.awsTraceHeader = awsTraceHeader;
+        copy.retentionStartTimestamp = Instant.now();
+        // receiveCount 0, firstReceiveTimestamp / receiptHandle / visibleAt null: a fresh life.
+        return copy;
     }
 
     public String getMessageId() { return messageId; }
@@ -102,31 +136,43 @@ public class Message {
     public String getAwsTraceHeader() { return awsTraceHeader; }
     public void setAwsTraceHeader(String awsTraceHeader) { this.awsTraceHeader = awsTraceHeader; }
 
+    public Instant getRetentionStartTimestamp() { return retentionStartTimestamp; }
+    public void setRetentionStartTimestamp(Instant retentionStartTimestamp) { this.retentionStartTimestamp = retentionStartTimestamp; }
+
+    @JsonIgnore
+    public boolean isExpired(Instant cutoff) {
+        Instant start = retentionStartTimestamp != null ? retentionStartTimestamp : sentTimestamp;
+        return start != null && !start.isAfter(cutoff);
+    }
+
     @JsonIgnore
     public boolean isVisible() {
         return visibleAt == null || !Instant.now().isBefore(visibleAt);
     }
 
     public void updateMd5OfMessageAttributes() {
+        this.md5OfMessageAttributes = computeMessageAttributesMd5(messageAttributes);
+    }
+
+    public static String computeMessageAttributesMd5(Map<String, MessageAttributeValue> messageAttributes) {
         if (messageAttributes == null || messageAttributes.isEmpty()) {
-            this.md5OfMessageAttributes = null;
-            return;
+            return null;
         }
         try {
-            var md = java.security.MessageDigest.getInstance("MD5");
-            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-            java.io.DataOutputStream dos = new java.io.DataOutputStream(bos);
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            DataOutputStream dos = new DataOutputStream(bos);
 
-            java.util.List<String> keys = new java.util.ArrayList<>(messageAttributes.keySet());
-            java.util.Collections.sort(keys);
+            List<String> keys = new ArrayList<>(messageAttributes.keySet());
+            Collections.sort(keys);
 
             for (String key : keys) {
                 MessageAttributeValue val = messageAttributes.get(key);
-                byte[] nameBytes = key.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                byte[] nameBytes = key.getBytes(StandardCharsets.UTF_8);
                 dos.writeInt(nameBytes.length);
                 dos.write(nameBytes);
 
-                byte[] typeBytes = val.getDataType().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                byte[] typeBytes = val.getDataType().getBytes(StandardCharsets.UTF_8);
                 dos.writeInt(typeBytes.length);
                 dos.write(typeBytes);
 
@@ -136,33 +182,35 @@ public class Message {
                     dos.write(val.getBinaryValue());
                 } else {
                     dos.write(1); // String or Number
-                    byte[] valBytes = val.getStringValue().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    byte[] valBytes = val.getStringValue().getBytes(StandardCharsets.UTF_8);
                     dos.writeInt(valBytes.length);
                     dos.write(valBytes);
                 }
             }
 
             byte[] digest = md.digest(bos.toByteArray());
-            var sb = new StringBuilder();
+            StringBuilder sb = new StringBuilder();
             for (byte b : digest) {
                 sb.append(String.format("%02x", b));
             }
-            this.md5OfMessageAttributes = sb.toString();
-        } catch (Exception e) {
-            this.md5OfMessageAttributes = null;
+            return sb.toString();
+        } catch (Exception ignored) {
+            // Attribute serialization failure falls back to null MD5
+            return null;
         }
     }
 
     private static String computeMd5(String input) {
         try {
-            var md = java.security.MessageDigest.getInstance("MD5");
-            byte[] digest = md.digest(input.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            var sb = new StringBuilder();
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
             for (byte b : digest) {
                 sb.append(String.format("%02x", b));
             }
             return sb.toString();
-        } catch (java.security.NoSuchAlgorithmException e) {
+        } catch (NoSuchAlgorithmException ignored) {
+            // MD5 is always available in the standard JDK runtime
             return "";
         }
     }

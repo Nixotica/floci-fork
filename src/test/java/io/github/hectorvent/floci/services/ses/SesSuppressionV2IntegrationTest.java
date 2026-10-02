@@ -6,6 +6,8 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import static io.github.hectorvent.floci.services.ses.SesV2TimestampMatchers.DECIMAL_NUMBERS;
+import static io.github.hectorvent.floci.services.ses.SesV2TimestampMatchers.epochSecondsWithMillis;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 
@@ -53,6 +55,7 @@ class SesSuppressionV2IntegrationTest {
     @Order(3)
     void getSuppressedDestination_returnsStoredEntry() {
         given()
+            .config(DECIMAL_NUMBERS)
             .header("Authorization", AUTH_HEADER)
         .when()
             .get("/v2/email/suppression/addresses/bounce-1@example.com")
@@ -60,7 +63,7 @@ class SesSuppressionV2IntegrationTest {
             .statusCode(200)
             .body("SuppressedDestination.EmailAddress", equalTo("bounce-1@example.com"))
             .body("SuppressedDestination.Reason", equalTo("BOUNCE"))
-            .body("SuppressedDestination.LastUpdateTime", notNullValue());
+            .body("SuppressedDestination.LastUpdateTime", epochSecondsWithMillis());
     }
 
     @Test
@@ -102,6 +105,7 @@ class SesSuppressionV2IntegrationTest {
     @Order(6)
     void listSuppressedDestinations_returnsAll() {
         given()
+            .config(DECIMAL_NUMBERS)
             .header("Authorization", AUTH_HEADER)
         .when()
             .get("/v2/email/suppression/addresses")
@@ -109,7 +113,8 @@ class SesSuppressionV2IntegrationTest {
             .statusCode(200)
             .body("SuppressedDestinationSummaries", hasSize(greaterThanOrEqualTo(2)))
             .body("SuppressedDestinationSummaries.EmailAddress",
-                  hasItems("bounce-1@example.com", "complaint-1@example.com"));
+                  hasItems("bounce-1@example.com", "complaint-1@example.com"))
+            .body("SuppressedDestinationSummaries.LastUpdateTime", everyItem(epochSecondsWithMillis()));
     }
 
     @Test
@@ -335,5 +340,175 @@ class SesSuppressionV2IntegrationTest {
             .statusCode(200)
             .body("SuppressedDestinationSummaries.EmailAddress",
                   hasItems("multi-bounce@example.com", "complaint-1@example.com"));
+    }
+
+    @Test
+    @Order(20)
+    void putSuppressedDestination_lowercasesDomainPreservesLocalPart() {
+        // Verified against real AWS SES V2 (2026-06-15): AWS canonicalizes only the
+        // domain to lower case; the local-part keeps its case. PUT MixedCase@Example.COM
+        // is stored and read back as MixedCase@example.com.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailAddress": "MixedCase@Example.COM", "Reason": "BOUNCE"}
+                """)
+        .when()
+            .put("/v2/email/suppression/addresses")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/suppression/addresses/MixedCase@Example.COM")
+        .then()
+            .statusCode(200)
+            .body("SuppressedDestination.EmailAddress", equalTo("MixedCase@example.com"))
+            .body("SuppressedDestination.Reason", equalTo("BOUNCE"));
+    }
+
+    @Test
+    @Order(21)
+    void getSuppressedDestination_domainCaseInsensitive_localCaseSensitive() {
+        // Self-contained: seed its own entry so the test is order-independent.
+        // A differing domain case still hits the entry; a differing local-part case
+        // does not (it is a different key).
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailAddress": "CaseProbe@Example.COM", "Reason": "BOUNCE"}
+                """)
+        .when()
+            .put("/v2/email/suppression/addresses")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/suppression/addresses/CaseProbe@EXAMPLE.com")
+        .then()
+            .statusCode(200)
+            .body("SuppressedDestination.EmailAddress", equalTo("CaseProbe@example.com"));
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/suppression/addresses/caseprobe@example.com")
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    @Order(22)
+    void deleteSuppressedDestination_domainCaseInsensitive() {
+        // PUT one domain case, DELETE a different domain case (same local-part), GET 404.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailAddress": "DeleteMe@Example.com", "Reason": "COMPLAINT"}
+                """)
+        .when()
+            .put("/v2/email/suppression/addresses")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .delete("/v2/email/suppression/addresses/DeleteMe@EXAMPLE.com")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/suppression/addresses/DeleteMe@example.com")
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    @Order(23)
+    void putSuppressedDestination_domainCaseCollision_lastPutWins() {
+        // Same local-part, domain differing only in case: one entry, latest Reason wins.
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailAddress": "UpdateTarget@example.com", "Reason": "BOUNCE"}
+                """)
+        .when()
+            .put("/v2/email/suppression/addresses")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailAddress": "UpdateTarget@EXAMPLE.com", "Reason": "COMPLAINT"}
+                """)
+        .when()
+            .put("/v2/email/suppression/addresses")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/suppression/addresses/UpdateTarget@example.com")
+        .then()
+            .statusCode(200)
+            .body("SuppressedDestination.EmailAddress", equalTo("UpdateTarget@example.com"))
+            .body("SuppressedDestination.Reason", equalTo("COMPLAINT"));
+    }
+
+    @Test
+    @Order(24)
+    void putSuppressedDestination_localPartCaseDifference_distinctEntries() {
+        // Local-part case differences are distinct entries (not merged), each keeping
+        // its own Reason. Verified against real AWS SES V2 (2026-06-15).
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailAddress": "LocalCase@distinct.example.com", "Reason": "BOUNCE"}
+                """)
+        .when()
+            .put("/v2/email/suppression/addresses")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailAddress": "localcase@distinct.example.com", "Reason": "COMPLAINT"}
+                """)
+        .when()
+            .put("/v2/email/suppression/addresses")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/suppression/addresses/LocalCase@distinct.example.com")
+        .then()
+            .statusCode(200)
+            .body("SuppressedDestination.Reason", equalTo("BOUNCE"));
+
+        given()
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .get("/v2/email/suppression/addresses/localcase@distinct.example.com")
+        .then()
+            .statusCode(200)
+            .body("SuppressedDestination.Reason", equalTo("COMPLAINT"));
     }
 }

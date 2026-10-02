@@ -1,8 +1,11 @@
 package io.github.hectorvent.floci.services.cloudfront.model;
 
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
 import java.util.List;
 import java.util.Map;
 
+@RegisterForReflection
 public class Origin {
 
     private String id;
@@ -13,6 +16,7 @@ public class Origin {
     private Map<String, Object> customOriginConfig;
     private int connectionAttempts = 3;
     private int connectionTimeout = 10;
+    private Integer responseCompletionTimeout;
     private List<Map<String, String>> customHeaders;
 
     public Origin() {}
@@ -40,6 +44,9 @@ public class Origin {
 
     public int getConnectionTimeout() { return connectionTimeout; }
     public void setConnectionTimeout(int connectionTimeout) { this.connectionTimeout = connectionTimeout; }
+
+    public Integer getResponseCompletionTimeout() { return responseCompletionTimeout; }
+    public void setResponseCompletionTimeout(Integer responseCompletionTimeout) { this.responseCompletionTimeout = responseCompletionTimeout; }
 
     public List<Map<String, String>> getCustomHeaders() { return customHeaders; }
     public void setCustomHeaders(List<Map<String, String>> customHeaders) { this.customHeaders = customHeaders; }

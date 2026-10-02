@@ -15,7 +15,7 @@ AWS Transfer Family managed file transfer server management. This implementation
 | `CreateServer` | Create a managed file transfer server |
 | `DescribeServer` | Get server metadata and configuration |
 | `UpdateServer` | Update protocols, endpoint type, logging role, security policy |
-| `DeleteServer` | Delete a server (must be in `OFFLINE` state) |
+| `DeleteServer` | Delete a server in any state, along with its users |
 | `ListServers` | Paginated list of servers |
 | `StartServer` | Transition server from `OFFLINE` to `ONLINE` |
 | `StopServer` | Transition server from `ONLINE` to `OFFLINE` |
@@ -111,5 +111,6 @@ aws transfer delete-server --server-id s-01234567890abcdef
 ## Notes
 
 - **Phase 1** covers the management-plane API only. Data-plane SFTP connectivity (actual file transfer) is not emulated.
+- CloudFormation provisions `AWS::Transfer::Server` through the management-plane service. `Ref` returns the server ARN; `Fn::GetAtt` exposes `Arn`, `ServerId`, and `State`. AS2 managed egress IP allocation is not modeled, so `As2ServiceManagedEgressIpAddresses` is not exposed. `AWS::Transfer::User` is not yet provisioned. Server properties not supported by the management-plane implementation fail explicitly. Changing `Domain` requires replacement, which is not yet supported. `IdentityProviderType` changes are also not supported by Floci, although AWS supports updating that property without replacement.
 - Server `EndpointType` defaults to `PUBLIC`. The `State` field transitions between `ONLINE` and `OFFLINE` via `StartServer` / `StopServer`.
 - SSH key bodies are stored and returned as-is; no cryptographic validation is performed.

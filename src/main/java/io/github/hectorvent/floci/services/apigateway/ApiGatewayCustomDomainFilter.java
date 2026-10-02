@@ -1,8 +1,11 @@
 package io.github.hectorvent.floci.services.apigateway;
 
+import io.github.hectorvent.floci.core.common.RequestHost;
 import io.github.hectorvent.floci.services.apigateway.model.BasePathMapping;
 import io.github.hectorvent.floci.services.apigateway.model.CustomDomain;
+import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import jakarta.annotation.Priority;
+import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ContainerRequestFilter;
@@ -27,21 +30,28 @@ import java.net.URI;
 @Provider
 @PreMatching
 @Priority(10) // Run after Lambda URL filter (5) but before general processing
+@ApplicationScoped
 public class ApiGatewayCustomDomainFilter implements ContainerRequestFilter {
 
     private static final Logger LOG = Logger.getLogger(ApiGatewayCustomDomainFilter.class);
     private static final String REGIONAL_SUFFIX = ".regional.local";
 
     private final ApiGatewayService apiGatewayService;
+    private final ApiGatewayV2Service apiGatewayV2Service;
+    private final ApiGatewayExecuteRouteContext routeContext;
 
     @Inject
-    public ApiGatewayCustomDomainFilter(ApiGatewayService apiGatewayService) {
+    public ApiGatewayCustomDomainFilter(ApiGatewayService apiGatewayService,
+                                        ApiGatewayV2Service apiGatewayV2Service,
+                                        ApiGatewayExecuteRouteContext routeContext) {
         this.apiGatewayService = apiGatewayService;
+        this.apiGatewayV2Service = apiGatewayV2Service;
+        this.routeContext = routeContext;
     }
 
     @Override
     public void filter(ContainerRequestContext requestContext) {
-        String host = requestContext.getHeaderString("Host");
+        String host = RequestHost.of(requestContext);
         if (host == null) {
             return;
         }
@@ -99,6 +109,17 @@ public class ApiGatewayCustomDomainFilter implements ContainerRequestFilter {
                 .build();
 
         LOG.debugv("Custom domain routing: {0}{1} -> {2}", host, path, newUri.getPath());
+        // AWS_IAM dispatch rebuilds the caller's canonical request, which covers the path they
+        // signed: the custom-domain path, not the /execute-api/... form this rewrite produces.
+        // Older persisted mappings have no type. Prefer REST if that API exists; otherwise
+        // retain v2 routing when a v2 API owns the id.
+        if ("REST".equals(mapping.getApiType())
+                || (mapping.getApiType() == null
+                        && (apiGatewayService.hasRestApi(restApiId)
+                                || apiGatewayV2Service.findApiOwner(restApiId).isEmpty()))) {
+            routeContext.routeToRestApi();
+        }
+        routeContext.recordSignedRequestPath(path);
         requestContext.setRequestUri(newUri);
     }
 

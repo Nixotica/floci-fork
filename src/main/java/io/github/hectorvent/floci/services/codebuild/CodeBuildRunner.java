@@ -5,6 +5,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
@@ -13,6 +14,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.codebuild.BuildspecParser.ParsedArtifacts;
 import io.github.hectorvent.floci.services.codebuild.BuildspecParser.ParsedBuildspec;
 import io.github.hectorvent.floci.services.codebuild.model.Build;
@@ -54,9 +56,10 @@ import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 
 @ApplicationScoped
-public class CodeBuildRunner {
+public class CodeBuildRunner implements ContainerTeardown {
 
     private static final Logger LOG = Logger.getLogger(CodeBuildRunner.class);
+    private static final int FAILURE_OUTPUT_CHARS = 512;
 
     private final DockerClient dockerClient;
     private final ContainerBuilder containerBuilder;
@@ -95,18 +98,38 @@ public class CodeBuildRunner {
         this.regionResolver = regionResolver;
     }
 
-    public void startBuild(String region, Build build, Project project, String buildspecOverride) {
-        AtomicBoolean stopFlag = new AtomicBoolean(false);
-        stopFlags.put(build.getId(), stopFlag);
-        Thread.ofVirtual().start(() -> runBuild(region, build, project, buildspecOverride, stopFlag));
+    /**
+     * Stops the containers of all in-flight builds on emulator shutdown; without this
+     * they outlive the process as orphans. Build state is transient, so there is no
+     * persisted status to update.
+     */
+    @Override
+    public void stopManagedContainers() {
+        for (Map.Entry<String, String> entry : new LinkedHashMap<>(runningContainers).entrySet()) {
+            if (runningContainers.remove(entry.getKey(), entry.getValue())) {
+                try {
+                    lifecycleManager.stopAndRemove(entry.getValue(), null);
+                } catch (Exception e) {
+                    LOG.warnv("Failed to stop CodeBuild container for build {0} on shutdown: {1}",
+                            entry.getKey(), e.getMessage());
+                }
+            }
+        }
     }
 
-    public void stopBuild(String buildId) {
-        AtomicBoolean flag = stopFlags.get(buildId);
+    public void startBuild(String region, Build build, Project project, String buildspecOverride) {
+        String executionId = build.getArn();
+        AtomicBoolean stopFlag = new AtomicBoolean(false);
+        stopFlags.put(executionId, stopFlag);
+        Thread.ofVirtual().start(() -> runBuild(region, build, project, buildspecOverride, stopFlag, executionId));
+    }
+
+    public void stopBuild(String executionId) {
+        AtomicBoolean flag = stopFlags.get(executionId);
         if (flag != null) {
             flag.set(true);
         }
-        String containerId = runningContainers.get(buildId);
+        String containerId = runningContainers.get(executionId);
         if (containerId != null) {
             try {
                 dockerClient.stopContainerCmd(containerId).withTimeout(5).exec();
@@ -117,7 +140,7 @@ public class CodeBuildRunner {
     }
 
     private void runBuild(String region, Build build, Project project,
-                          String buildspecOverride, AtomicBoolean stopFlag) {
+                          String buildspecOverride, AtomicBoolean stopFlag, String executionId) {
         String buildId = build.getId();
         Path workspace = null;
         String containerId = null;
@@ -190,32 +213,45 @@ public class CodeBuildRunner {
 
             List<String> envList = buildEnvList(region, build, project, buildspec, logStream);
 
-            // Create the working directory inside the container as part of startup,
-            // then keep the container alive. No bind mount needed — source and
-            // artifacts are transferred with docker cp.
+            // Keep the container alive so each phase can be run with docker exec.
+            // No bind mount needed — source and artifacts are transferred with docker cp.
             ContainerSpec spec = containerBuilder.newContainer(image)
-                    .withCmd(List.of("sh", "-c",
-                            "mkdir -p /codebuild/output/src/src && tail -f /dev/null"))
+                    .withCmd(List.of("sh", "-c", "tail -f /dev/null"))
                     .withEnv(envList)
                     .withDockerNetwork(config.services().codebuild().dockerNetwork())
                     .withEmbeddedDns()
                     .withHostDockerInternalOnLinux()
                     .withPrivileged(privileged)
                     .withLogRotation()
+                    .withLabels(ContainerStorageHelper.resourceIdentityLabels(
+                            "codebuild", buildId, regionResolver.getAccountId(), region))
                     .build();
 
             ContainerLifecycleManager.ContainerInfo info = lifecycleManager.createAndStart(spec);
             containerId = info.containerId();
-            runningContainers.put(buildId, containerId);
+            runningContainers.put(executionId, containerId);
 
             logHandle = logStreamer.attach(containerId, logGroup, logStream, region, "codebuild:" + buildId);
-
-            // Copy downloaded source files into the container (no-op for NO_SOURCE builds)
-            copySourceToContainer(containerId, workspace, "/codebuild/output/src/src");
 
             String containerSrcDir = "/codebuild/output/src/src";
             int timeoutMinutes = build.getTimeoutInMinutes() != null ? build.getTimeoutInMinutes() : 60;
             boolean buildFailed = false;
+
+            // createAndStart returns as soon as the container's entrypoint process is
+            // running, which can be before any startup command would finish. Create the
+            // working directory with an explicit, awaited exec (run from "/", which always
+            // exists) so the source copy, the phase execs that chdir into it, and the final
+            // artifact copy can never race against container startup.
+            PhaseResult workDirResult = runPhase(containerId, "/", envList,
+                    List.of("mkdir -p " + containerSrcDir), timeoutMinutes, stopFlag);
+            if (workDirResult.stopped()) { finishStopped(build); return; }
+            if (workDirResult.failed()) {
+                throw new IllegalStateException("Could not create build working directory "
+                        + containerSrcDir + ": " + workDirResult.errorMessage());
+            }
+
+            // Copy downloaded source files into the container (no-op for NO_SOURCE builds)
+            copySourceToContainer(containerId, workspace, containerSrcDir);
 
             // INSTALL
             if (stopFlag.get()) { finishStopped(build); return; }
@@ -337,13 +373,11 @@ public class CodeBuildRunner {
                 build.getPhases().add(completedPhase);
             }
         } finally {
-            stopFlags.remove(buildId);
-            if (containerId != null) {
-                runningContainers.remove(buildId);
-                if (logHandle != null) {
-                    try { logHandle.close(); } catch (Exception ignored) {}
-                }
-                lifecycleManager.stopAndRemove(containerId, null);
+            stopFlags.remove(executionId);
+            if (containerId != null && runningContainers.remove(executionId, containerId)) {
+                lifecycleManager.stopAndRemove(containerId, logHandle);
+            } else if (logHandle != null) {
+                try { logHandle.close(); } catch (Exception ignored) {}
             }
             if (workspace != null) {
                 deleteDirectory(workspace);
@@ -555,7 +589,7 @@ public class CodeBuildRunner {
         return tar;
     }
 
-    private PhaseResult runPhase(String containerId, String workDir, List<String> env,
+    PhaseResult runPhase(String containerId, String workDir, List<String> env,
                                  List<String> commands, int timeoutMinutes, AtomicBoolean stopFlag) {
         if (commands.isEmpty()) {
             return PhaseResult.ofSuccess();
@@ -578,13 +612,13 @@ public class CodeBuildRunner {
                     .getId();
 
             CountDownLatch latch = new CountDownLatch(1);
-            ByteArrayOutputStream outputCapture = new ByteArrayOutputStream();
+            OutputTail outputCapture = new OutputTail();
 
             dockerClient.execStartCmd(execId).exec(new ResultCallback.Adapter<Frame>() {
                 @Override
                 public void onNext(Frame frame) {
                     if (frame.getPayload() != null) {
-                        try { outputCapture.write(frame.getPayload()); } catch (IOException ignored) {}
+                        outputCapture.write(frame.getPayload());
                     }
                 }
                 @Override
@@ -603,11 +637,10 @@ public class CodeBuildRunner {
 
             Long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
             if (exitCode != null && exitCode != 0) {
-                String output = outputCapture.toString(StandardCharsets.UTF_8);
+                String output = outputCapture.asString().stripTrailing();
                 String msg = "Exit code " + exitCode;
                 if (!output.isBlank()) {
-                    int start = Math.max(0, output.length() - 512);
-                    msg += ": " + output.stripTrailing().substring(start);
+                    msg += ": " + output.substring(Math.max(0, output.length() - FAILURE_OUTPUT_CHARS));
                 }
                 return PhaseResult.ofFailure(msg);
             }
@@ -834,9 +867,63 @@ public class CodeBuildRunner {
         return "text/plain";
     }
 
+    /**
+     * The last bytes a phase printed. Only the tail reaches the failure message, so a phase that
+     * prints gigabytes of logs does not hold them all in the heap. Trailing whitespace is held
+     * apart until more output follows it, so a long run of blank lines cannot push the last
+     * error out of the tail before the message strips it. The tail keeps eight bytes for every
+     * character of the message, so it always decodes to more than {@link #FAILURE_OUTPUT_CHARS}
+     * characters and a character cut in half at its start never reaches the message.
+     */
+    private static final class OutputTail {
+        private final ByteTail content = new ByteTail(FAILURE_OUTPUT_CHARS * 8);
+        private final ByteTail trailingWhitespace = new ByteTail(FAILURE_OUTPUT_CHARS * 8);
+
+        synchronized void write(byte[] bytes) {
+            int contentEnd = bytes.length;
+            while (contentEnd > 0 && Character.isWhitespace(bytes[contentEnd - 1])) {
+                contentEnd--;
+            }
+            if (contentEnd > 0) {
+                content.append(trailingWhitespace.buffer, 0, trailingWhitespace.length);
+                trailingWhitespace.length = 0;
+                content.append(bytes, 0, contentEnd);
+            }
+            trailingWhitespace.append(bytes, contentEnd, bytes.length - contentEnd);
+        }
+
+        synchronized String asString() {
+            return new String(content.buffer, 0, content.length, StandardCharsets.UTF_8);
+        }
+    }
+
+    private static final class ByteTail {
+        private final byte[] buffer;
+        private int length;
+
+        ByteTail(int capacity) {
+            buffer = new byte[capacity];
+        }
+
+        void append(byte[] bytes, int offset, int count) {
+            if (count >= buffer.length) {
+                System.arraycopy(bytes, offset + count - buffer.length, buffer, 0, buffer.length);
+                length = buffer.length;
+                return;
+            }
+            int overflow = length + count - buffer.length;
+            if (overflow > 0) {
+                System.arraycopy(buffer, overflow, buffer, 0, length - overflow);
+                length -= overflow;
+            }
+            System.arraycopy(bytes, offset, buffer, length, count);
+            length += count;
+        }
+    }
+
     private enum PhaseStatus { SUCCEEDED, FAILED, STOPPED }
 
-    private record PhaseResult(PhaseStatus status, String errorMessage) {
+    record PhaseResult(PhaseStatus status, String errorMessage) {
         boolean succeeded() { return status == PhaseStatus.SUCCEEDED; }
         boolean failed() { return status == PhaseStatus.FAILED; }
         boolean stopped() { return status == PhaseStatus.STOPPED; }

@@ -5,28 +5,33 @@
 
 ## Supported Actions
 
+<!-- floci:actions:start -->
 | Action | Description |
-|---|---|
+| --- | --- |
 | `CreateQueue` | Create a standard or FIFO queue |
 | `DeleteQueue` | Delete a queue |
 | `ListQueues` | List all queues |
 | `GetQueueUrl` | Look up a queue URL by name |
 | `GetQueueAttributes` | Get queue configuration attributes |
-| `SetQueueAttributes` | Update queue configuration |
 | `SendMessage` | Send a message to a queue |
-| `SendMessageBatch` | Send up to 10 messages in one call |
 | `ReceiveMessage` | Poll for messages |
 | `DeleteMessage` | Acknowledge and delete a message |
 | `DeleteMessageBatch` | Delete multiple messages at once |
+| `SendMessageBatch` | Send up to 10 messages in one call |
 | `ChangeMessageVisibility` | Extend or reset a message's visibility timeout |
 | `ChangeMessageVisibilityBatch` | Change visibility for multiple messages |
-| `PurgeQueue` | Delete all messages in a queue |
+| `SetQueueAttributes` | Update queue configuration |
 | `TagQueue` | Add tags to a queue |
 | `UntagQueue` | Remove tags from a queue |
 | `ListQueueTags` | List tags on a queue |
+| `PurgeQueue` | Delete all messages in a queue |
 | `ListDeadLetterSourceQueues` | Find queues that use this queue as DLQ |
 | `StartMessageMoveTask` | Start a DLQ redrive task |
 | `ListMessageMoveTasks` | List DLQ redrive tasks |
+| `CancelMessageMoveTask` | - |
+| `AddPermission` | - |
+| `RemovePermission` | - |
+<!-- floci:actions:end -->
 
 ## Local Inspection Endpoint
 
@@ -75,14 +80,41 @@ curl "http://localhost:4566/_aws/sqs/messages?QueueUrl=$QUEUE_URL"
 curl -X DELETE "http://localhost:4566/_aws/sqs/messages?QueueUrl=$QUEUE_URL"
 ```
 
+## Long Polling
+
+`ReceiveMessage` waits up to `WaitTimeSeconds` (0 to 20) for a message to arrive and returns as soon as one is available. Values outside that range are rejected with `InvalidParameterValue`. When the request omits `WaitTimeSeconds`, the queue's `ReceiveMessageWaitTimeSeconds` attribute applies (default `0`, short polling), matching AWS.
+
+```bash
+# Enable long polling for every consumer of the queue
+aws sqs set-queue-attributes \
+  --queue-url $QUEUE_URL \
+  --attributes ReceiveMessageWaitTimeSeconds=20 \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+## Queue Attributes
+
+`GetQueueAttributes` with `--attribute-names All` returns the set AWS returns for a standard queue: `QueueArn`, `CreatedTimestamp`, `LastModifiedTimestamp`, `ApproximateNumberOfMessages`, `ApproximateNumberOfMessagesNotVisible`, `ApproximateNumberOfMessagesDelayed`, `VisibilityTimeout`, `MaximumMessageSize`, `MessageRetentionPeriod`, `DelaySeconds`, `ReceiveMessageWaitTimeSeconds` and `SqsManagedSseEnabled`. `Policy`, `RedrivePolicy` and `KmsMasterKeyId` appear only once set, and FIFO queues also report `FifoQueue` and `ContentBasedDeduplication`.
+
+`MaximumMessageSize` defaults to `1048576` bytes, the AWS default and maximum since August 2025, when AWS raised both from `262144`. `CreateQueue` and `SetQueueAttributes` reject values outside 1024 to 1048576 with `InvalidAttributeValue`; raising `FLOCI_SERVICES_SQS_MAX_MESSAGE_SIZE` above the AWS maximum raises that accepted ceiling with it. Lowering the variable below 1048576 only changes the default a new queue receives: the accepted ceiling stays at the AWS maximum, so a queue can still be set to `1048576` explicitly.
+
+`SqsManagedSseEnabled` is `true` for a queue with no `KmsMasterKeyId`, matching AWS, and `false` once a KMS key is set. It is derived on read rather than stored, so clearing `KmsMasterKeyId` returns the queue to `true`, unless you set `SqsManagedSseEnabled` yourself, in which case your value stands. AWS does not document the cleared-key case crisply, so that behaviour is Floci's choice rather than a copied one.
+
+## Message Retention
+
+A message older than the queue's `MessageRetentionPeriod` is no longer returned or counted, including a message in flight. A shorter period applies to messages already in the queue. A message moved to a FIFO dead-letter queue, or moved by `StartMessageMoveTask`, starts its retention period over. A message moved to a standard dead-letter queue keeps its original enqueue time. Expired messages are freed from memory and storage every 60 seconds.
+
+`CreateQueue` and `SetQueueAttributes` reject a `MessageRetentionPeriod` outside 60 to 1209600 seconds with `InvalidAttributeValue`.
+
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_SQS_ENABLED` | `true` | Enable or disable the service |
 | `FLOCI_SERVICES_SQS_DEFAULT_VISIBILITY_TIMEOUT` | `30` | Default message visibility timeout (seconds) |
-| `FLOCI_SERVICES_SQS_MAX_MESSAGE_SIZE` | `262144` | Maximum message size in bytes (256 KB) |
+| `FLOCI_SERVICES_SQS_MAX_MESSAGE_SIZE` | `1048576` | Maximum message size in bytes (1 MiB) |
 | `FLOCI_SERVICES_SQS_CLEAR_FIFO_DEDUPLICATION_CACHE_ON_PURGE` | `false` | When `true`, `PurgeQueue` also clears the FIFO deduplication cache for the queue and any SNS FIFO topics subscribed to it |
+| `FLOCI_SERVICES_SQS_RECEIPT_HANDLE_SECRET` | `local-emulator-secret` | HMAC secret that signs receipt handles, so a handle that was edited or built by hand is rejected |
 
 ## Examples
 
