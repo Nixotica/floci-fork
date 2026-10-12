@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CidrCanonicalizer;
@@ -285,7 +286,7 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             ObjectNode prior = inPlacePrior(r, resourceId, ctx);
             ObjectNode tags = prior.putObject("tags");
             currentTags.forEach(tags::put);
-            var applied = prior.putArray("appliedKeys");
+            ArrayNode applied = prior.putArray("appliedKeys");
             desired.keySet().forEach(applied::add);
             writeInPlacePrior(r, prior);
         }
@@ -402,7 +403,8 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         // only MapPublicIpOnLaunch is applied; changed, a new subnet replaces it.
         Subnet existing = ctx.isUpdate() ? findSubnet(ctx.priorPhysicalId(), ctx.region()) : null;
         boolean reuse = existing != null && Objects.equals(vpcId, existing.getVpcId())
-                && Objects.equals(cidr, existing.getCidrBlock())
+                // Both sides canonical: a subnet saved before canonicalization may still hold host bits.
+                && CidrCanonicalizer.sameBlock(cidr, existing.getCidrBlock())
                 && (az == null || az.equals(existing.getAvailabilityZone()));
         Subnet subnet = reuse ? existing : ec2Service.createSubnet(ctx.region(), vpcId, cidr, az);
         r.setPhysicalId(subnet.getSubnetId());

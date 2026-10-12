@@ -1,11 +1,11 @@
 package io.github.hectorvent.floci.services.appsync;
 
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsEndpoints;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.CloudFrontEdgeDomain;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -59,6 +59,7 @@ public class AppSyncService {
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final String baseUrl;
+    private final String cloudFrontDomainSuffix;
     private final LambdaAuthorizerCache lambdaAuthorizerCache;
 
     @Inject
@@ -88,6 +89,7 @@ public class AppSyncService {
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.baseUrl = trimTrailingSlash(config.effectiveBaseUrl());
+        this.cloudFrontDomainSuffix = config.services().cloudfront().domainSuffix();
         this.lambdaAuthorizerCache = lambdaAuthorizerCache;
     }
 
@@ -735,10 +737,8 @@ public class AppSyncService {
         dn.setDomainName(domainName);
         dn.setDescription((String) request.get("description"));
         dn.setCertificateArn((String) request.get("certificateArn"));
-        String shortId = generateShortId();
-        dn.setAppsyncDomainName(shortId + "." + AwsEndpoints.host("appsync-api", regionResolver.getDefaultRegion()));
-        dn.setHostedZoneId("Z" + generateShortId());
-        dn.setDomainNameArn(regionResolver.buildArn("appsync", regionResolver.getDefaultRegion(),
+        applyCloudFrontFront(dn, regionResolver.getRegion());
+        dn.setDomainNameArn(regionResolver.buildArn("appsync", regionResolver.getRegion(),
             "domainnames/" + domainName));
 
         Object tagsObj = request.get("tags");
@@ -750,6 +750,19 @@ public class AppSyncService {
 
         domainStore.put(domainName, dn);
         return dn;
+    }
+
+    /**
+     * AppSync fronts a custom domain with a CloudFront distribution: the CDK aliases
+     * {@code appsyncDomainName} into the CloudFront hosted zone of the partition
+     * ({@code aws-route53-targets/lib/appsync-target.ts}), so the name is a distribution name and
+     * the zone is CloudFront's, never a zone of its own, the same front an edge-optimized API
+     * Gateway domain gets.
+     */
+    private void applyCloudFrontFront(DomainName dn, String region) {
+        CloudFrontEdgeDomain edge = CloudFrontEdgeDomain.create(region, cloudFrontDomainSuffix);
+        dn.setAppsyncDomainName(edge.domainName());
+        dn.setHostedZoneId(edge.hostedZoneId());
     }
 
     public DomainName getDomainName(String domainName) {
@@ -814,7 +827,7 @@ public class AppSyncService {
 
     public ChannelNamespace createChannelNamespace(String apiId, Map<String, Object> request) {
         assertSchemaNotBusy(apiId);
-        getGraphqlApi(apiId);
+        GraphqlApi api = getGraphqlApi(apiId);
         String name = (String) request.get("name");
         if (name == null || name.isBlank()) {
             throw new AwsException("BadRequestException", "A channel namespace name is required", 400);
@@ -828,7 +841,7 @@ public class AppSyncService {
         ns.setName(name);
         ns.setApiId(apiId);
         ns.setDescription((String) request.get("description"));
-        ns.setChannelNamespaceArn(regionResolver.buildArn("appsync", regionResolver.getDefaultRegion(),
+        ns.setChannelNamespaceArn(regionResolver.buildArn("appsync", apiRegion(api),
             "apis/" + apiId + "/channelNamespaces/" + name));
         ns.setCodeHandlers((String) request.get("codeHandlers"));
         ns.setCreated(System.currentTimeMillis());
@@ -1153,6 +1166,14 @@ public class AppSyncService {
         return apiId + "::" + typeName + "::" + fieldName;
     }
 
+    /** The region of an API's ARN, where its child resources live; the request region if it has none. */
+    private String apiRegion(GraphqlApi api) {
+        if (api.getArn() != null && AwsArnUtils.isArn(api.getArn())) {
+            return AwsArnUtils.parse(api.getArn()).region();
+        }
+        return regionResolver.getRegion();
+    }
+
     private String buildApiArn(String apiId, String region) {
         return regionResolver.buildArn("appsync", region, "apis/" + apiId);
     }
@@ -1265,7 +1286,7 @@ public class AppSyncService {
     private Map<String, String> castStringMap(Object value) {
         if (value instanceof Map) {
             Map<String, String> result = new HashMap<>();
-            for (var entry : ((Map<Object, Object>) value).entrySet()) {
+            for (Map.Entry<Object, Object> entry : ((Map<Object, Object>) value).entrySet()) {
                 result.put(String.valueOf(entry.getKey()), String.valueOf(entry.getValue()));
             }
             return result;

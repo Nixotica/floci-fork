@@ -7,25 +7,26 @@ import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.model.Dashboard;
-import io.github.hectorvent.floci.services.cloudwatch.metricstreams.CloudWatchMetricStreamsService;
-import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStream;
-import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStreamFilter;
-import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStreamStatisticsConfiguration;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
+import io.github.hectorvent.floci.services.cloudwatch.metricstreams.CloudWatchMetricStreamsService;
+import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStream;
+import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStreamFilter;
+import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStreamStatisticsConfiguration;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+import org.jboss.logging.Logger;
+
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import org.jboss.logging.Logger;
 
 @ApplicationScoped
 public class CloudWatchMetricsQueryHandler {
@@ -89,9 +90,9 @@ public class CloudWatchMetricsQueryHandler {
         List<CloudWatchMetricsService.MetricIdentity> metrics =
                 metricsService.listMetrics(namespace, metricName, dimensions, region);
 
-        var xml = new XmlBuilder().start("Metrics");
-        for (var m : metrics) {
-            var member = xml.start("member")
+        XmlBuilder xml = new XmlBuilder().start("Metrics");
+        for (CloudWatchMetricsService.MetricIdentity m : metrics) {
+            XmlBuilder member = xml.start("member")
                     .elem("Namespace", m.namespace())
                     .elem("MetricName", m.metricName())
                     .start("Dimensions");
@@ -131,10 +132,10 @@ public class CloudWatchMetricsQueryHandler {
                         startTime, endTime, period, statistics, unit, region);
 
         DateTimeFormatter fmt = DateTimeFormatter.ISO_INSTANT;
-        var xml = new XmlBuilder()
+        XmlBuilder xml = new XmlBuilder()
                 .elem("Label", metricName)
                 .start("Datapoints");
-        for (var dp : datapoints) {
+        for (CloudWatchMetricsService.Datapoint dp : datapoints) {
             xml.start("member").elem("Timestamp", fmt.format(dp.timestamp()));
             if (statistics.contains("Average")) {
                 xml.elem("Average", String.valueOf(dp.average()));
@@ -167,8 +168,8 @@ public class CloudWatchMetricsQueryHandler {
                 metricsService.getMetricData(queries, startTime, endTime, region);
 
         DateTimeFormatter fmt = DateTimeFormatter.ISO_INSTANT;
-        var xml = new XmlBuilder().start("MetricDataResults");
-        for (var r : results) {
+        XmlBuilder xml = new XmlBuilder().start("MetricDataResults");
+        for (CloudWatchMetricsService.MetricDataResult r : results) {
             xml.start("member")
                     .elem("Id", r.id())
                     .elem("Label", r.label())
@@ -249,7 +250,7 @@ public class CloudWatchMetricsQueryHandler {
 
         List<MetricAlarm> alarms = metricsService.describeAlarms(alarmNames, prefix, region);
 
-        var xml = new XmlBuilder().start("MetricAlarms");
+        XmlBuilder xml = new XmlBuilder().start("MetricAlarms");
         for (MetricAlarm a : alarms) {
             toAlarmXml(xml, a);
         }
@@ -369,7 +370,7 @@ public class CloudWatchMetricsQueryHandler {
                 dashboardsService.listDashboards(params.getFirst("DashboardNamePrefix"), region);
 
         DateTimeFormatter fmt = DateTimeFormatter.ISO_INSTANT;
-        var xml = new XmlBuilder().start("DashboardEntries");
+        XmlBuilder xml = new XmlBuilder().start("DashboardEntries");
         for (Dashboard d : dashboards) {
             xml.start("member")
                     .elem("DashboardName", d.getDashboardName())
@@ -518,7 +519,7 @@ public class CloudWatchMetricsQueryHandler {
         xml.start("StatisticsConfigurations");
         for (MetricStreamStatisticsConfiguration configuration : configurations) {
             xml.start("member").start("IncludeMetrics");
-            for (var metric : configuration.getIncludeMetrics()) {
+            for (MetricStreamStatisticsConfiguration.IncludeMetric metric : configuration.getIncludeMetrics()) {
                 xml.start("member")
                         .elem("Namespace", metric.namespace())
                         .elem("MetricName", metric.metricName())

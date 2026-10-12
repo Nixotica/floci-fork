@@ -1,21 +1,13 @@
 package io.github.hectorvent.floci.services.ec2;
 
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.containsString;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.hamcrest.Matchers.not;
-import static org.hamcrest.Matchers.endsWith;
-import static org.hamcrest.Matchers.emptyOrNullString;
-import static org.hamcrest.Matchers.containsInAnyOrder;
-import static org.hamcrest.Matchers.hasItems;
-import static org.hamcrest.Matchers.hasItem;
-import static org.hamcrest.Matchers.everyItem;
-import static org.hamcrest.Matchers.greaterThan;
-import static org.hamcrest.Matchers.greaterThanOrEqualTo;
-import static org.hamcrest.Matchers.notNullValue;
-import static org.hamcrest.Matchers.nullValue;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.startsWith;
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.path.xml.XmlPath;
+import io.restassured.response.ExtractableResponse;
+import io.restassured.response.Response;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -24,15 +16,25 @@ import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
 import java.util.zip.GZIPOutputStream;
-import org.junit.jupiter.api.MethodOrderer;
-import org.junit.jupiter.api.Order;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestMethodOrder;
 
-import io.quarkus.test.junit.QuarkusTest;
 import static io.restassured.RestAssured.given;
-
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.emptyOrNullString;
+import static org.hamcrest.Matchers.endsWith;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.everyItem;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.matchesRegex;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * Integration tests for EC2 via the EC2 Query Protocol (form-encoded POST, XML response).
@@ -303,7 +305,7 @@ class Ec2IntegrationTest {
      * absent from the body rather than compared as a value.
      */
     private void assertSynthesizedOwnership(String ownerScope, String expectedId, String expectedAlias) {
-        var response = given()
+        ExtractableResponse<Response> response = given()
             .formParam("Action", "DescribeImages")
             .formParam("Owner.1", ownerScope)
             .formParam("Filter.1.Name", "name")
@@ -345,7 +347,7 @@ class Ec2IntegrationTest {
     void anOwnerAliasFilterAloneStillAgreesWithTheOwnerId() {
         // The mirror of the above. Filtering on the alias with no Owner.N left the id at the
         // Amazon default, so the image reported aws-marketplace beside Amazon's account.
-        var response = given()
+        ExtractableResponse<Response> response = given()
             .formParam("Action", "DescribeImages")
             .formParam("Filter.1.Name", "name")
             .formParam("Filter.1.Value.1", "unmatched-alias-filter-only-*")
@@ -2795,6 +2797,7 @@ class Ec2IntegrationTest {
             .formParam("VpcId", vpcId)
             .formParam("ServiceName", "com.amazonaws.us-east-1.s3")
             .formParam("VpcEndpointType", "Gateway")
+            .formParam("IpAddressType", "ipv4")
             .formParam("RouteTableId.1", routeTableId)
             .formParam("TagSpecification.1.ResourceType", "vpc-endpoint")
             .formParam("TagSpecification.1.Tag.1.Key", "Name")
@@ -2806,6 +2809,7 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .body("CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId", startsWith("vpce-"))
             .body("CreateVpcEndpointResponse.vpcEndpoint.vpcId", equalTo(vpcId))
+            .body("CreateVpcEndpointResponse.vpcEndpoint.ipAddressType", equalTo("ipv4"))
             .body("CreateVpcEndpointResponse.vpcEndpoint.routeTableIdSet.item",
                     equalTo(routeTableId))
             .extract().path("CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId");
@@ -2825,7 +2829,9 @@ class Ec2IntegrationTest {
             .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.vpcEndpointId",
                     equalTo(vpcEndpointId))
             .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.serviceName",
-                    equalTo("com.amazonaws.us-east-1.s3"));
+                    equalTo("com.amazonaws.us-east-1.s3"))
+            .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.ipAddressType",
+                    equalTo("ipv4"));
     }
 
     @Test
@@ -5011,6 +5017,82 @@ class Ec2IntegrationTest {
             .statusCode(400)
             .body("Response.Errors.Error.Code", equalTo("InvalidIpamId.NotFound"));
     }
+
+    @Test
+    @Order(322)
+    void describeIpamScopesReturnsTheDefaultScopesOverQuery() {
+        // aws_vpc_ipam_pool reads its scope through DescribeIpamScopes before CreateIpamPool
+        XmlPath created = given()
+            .formParam("Action", "CreateIpam")
+            .formParam("Description", "scope-ipam")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath();
+        String ipamId = created.getString("CreateIpamResponse.ipam.ipamId");
+        String ipamArn = created.getString("CreateIpamResponse.ipam.ipamArn");
+        String scopeId = given()
+            .formParam("Action", "DescribeIpams")
+            .formParam("IpamId.1", ipamId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("DescribeIpamsResponse.ipamSet.item.privateDefaultScopeId");
+
+        given()
+            .formParam("Action", "DescribeIpamScopes")
+            .formParam("IpamScopeId.1", scopeId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.size()", equalTo(1))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeId", equalTo(scopeId))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamArn", equalTo(ipamArn))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeType", equalTo("private"))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.isDefault", equalTo("true"))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeArn", endsWith("ipam-scope/" + scopeId));
+
+        // aws_vpc_ipam_pool's Read splits ipamScopeArn on "/" and reads ipamScopeType off the pool
+        String poolId = given()
+            .formParam("Action", "CreateIpamPool")
+            .formParam("IpamScopeId", scopeId)
+            .formParam("AddressFamily", "ipv4")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateIpamPoolResponse.ipamPool.ipamPoolId");
+        given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("IpamPoolId.1", poolId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamScopeArn", endsWith("ipam-scope/" + scopeId))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamScopeType", equalTo("private"))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamArn", equalTo(ipamArn))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamRegion", equalTo("us-east-1"));
+
+        given()
+            .formParam("Action", "DescribeIpamScopes")
+            .formParam("IpamScopeId.1", "ipam-scope-doesnotexist")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidIpamScopeId.NotFound"));
+    }
+
     @Test
     @Order(323)
     void associateIpamByoasnSuccess() {

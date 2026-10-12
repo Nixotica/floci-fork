@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.codeartifact;
 
+import java.util.Optional;
+
 /**
  * Common contract for a CodeArtifact sidecar backing one package format: get one repository ready
  * to serve that format, and release whatever backing storage it holds once the repository is
@@ -39,4 +41,39 @@ public interface RepositorySidecarManager {
      * format is a no-op, not an error.
      */
     void release(String repositoryContainerId);
+
+    /**
+     * Fetches the bytes of one named asset already published to this sidecar's own backing
+     * storage, for bridging {@code GetPackageVersionAsset} when there is no generic-format record
+     * to serve it from: Maven, npm, and pypi are metadata-free passthroughs straight to their
+     * sidecar, so nothing in {@code CodeArtifactService}'s own package-version store ever records
+     * what they hold. {@code domain}/{@code repository} exist only for a sidecar whose
+     * {@link #ensureReady} needs a public URL to self-start correctly the same way a real client's
+     * first request would; most implementations ignore them. {@code namespace} is {@code null}
+     * for a format or package that has none. Returns empty both when the asset genuinely isn't
+     * there and when the repository was never started for this format, since an unstarted sidecar
+     * has published nothing either way.
+     */
+    Optional<byte[]> fetchPackageVersionAsset(String repositoryContainerId, String domain, String repository,
+            String namespace, String packageName, String version, String assetName);
+
+    /**
+     * {@code true} when this sidecar holds at least one version of the named package. {@code namespace}
+     * follows the same convention as {@link #fetchPackageVersionAsset}: {@code null} for a format that
+     * has none. A repository that was never started for this format holds nothing, so it is {@code false}.
+     */
+    boolean packageExists(String repositoryContainerId, String domain, String repository, String namespace,
+            String packageName);
+
+    /**
+     * Deletes every version of the named package from this sidecar's own backing storage. Every
+     * sidecar Floci currently backs (Reposilite, Verdaccio, pypiserver) can do this; the default
+     * throws {@link UnsupportedOperationException} rather than silently leaving the package in place
+     * or claiming a success it cannot back up, for a future format whose sidecar genuinely cannot. An
+     * implementation that can delete overrides this.
+     */
+    default void deletePackage(String repositoryContainerId, String domain, String repository, String namespace,
+            String packageName) {
+        throw new UnsupportedOperationException(format() + " packages cannot be deleted through this sidecar");
+    }
 }

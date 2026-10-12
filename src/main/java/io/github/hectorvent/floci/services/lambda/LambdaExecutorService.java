@@ -8,8 +8,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.model.FunctionEventInvokeConfig;
-import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.PendingInvocation;
 import jakarta.annotation.PreDestroy;
@@ -146,6 +146,10 @@ public class LambdaExecutorService implements Resettable {
         return invoke(fn, payload, type, 0);
     }
 
+    public InvokeResult invoke(LambdaFunction fn, byte[] payload, InvocationType type, String requestId) {
+        return invoke(fn, payload, type, 0, null, null, requestId);
+    }
+
     /**
      * Invokes {@code fn}, carrying the number of invocations that the same originating event has
      * already caused. A direct invoke starts at zero; each destination delivery adds one, whether
@@ -162,8 +166,16 @@ public class LambdaExecutorService implements Resettable {
 
     InvokeResult invoke(LambdaFunction fn, byte[] payload, InvocationType type, int chainDepth,
                         String invokedQualifier) {
-        String requestId = UUID.randomUUID().toString();
+        return invoke(fn, payload, type, chainDepth, invokedQualifier, null);
+    }
 
+    InvokeResult invoke(LambdaFunction fn, byte[] payload, InvocationType type, int chainDepth,
+                        String invokedQualifier, String clientContext) {
+        return invoke(fn, payload, type, chainDepth, invokedQualifier, clientContext, UUID.randomUUID().toString());
+    }
+
+    private InvokeResult invoke(LambdaFunction fn, byte[] payload, InvocationType type, int chainDepth,
+                                String invokedQualifier, String clientContext, String requestId) {
         if (type == InvocationType.DryRun) {
             return new InvokeResult(204, null, new byte[0], null, requestId);
         }
@@ -215,7 +227,7 @@ public class LambdaExecutorService implements Resettable {
         }
 
         try {
-            return executeSync(fn, payload, requestId);
+            return executeSync(fn, payload, requestId, clientContext);
         } finally {
             permit.close();
         }
@@ -271,7 +283,7 @@ public class LambdaExecutorService implements Resettable {
         }
         InvokeResult result;
         try (permit) {
-            result = executeSync(event.fn(), event.payload(), event.requestId());
+            result = executeSync(event.fn(), event.payload(), event.requestId(), null);
         } catch (RuntimeException e) {
             LOG.warnv("Error in async Lambda execution for {0}: {1}", event.fn().getFunctionName(), e.getMessage());
             // Stops retrying, as upstream did: routes the previous attempt's result, or UnknownError when
@@ -312,7 +324,8 @@ public class LambdaExecutorService implements Resettable {
                 event.invokedQualifier());
     }
 
-    private InvokeResult executeSync(LambdaFunction fn, byte[] payload, String requestId) {
+    private InvokeResult executeSync(LambdaFunction fn, byte[] payload, String requestId,
+                                     String clientContext) {
         ContainerHandle handle;
         try {
             handle = warmPool.acquire(fn);
@@ -327,6 +340,7 @@ public class LambdaExecutorService implements Resettable {
             PendingInvocation invocation = new PendingInvocation(
                     requestId, payload, deadlineMs, fn.getFunctionArn(),
                     new CompletableFuture<>());
+            invocation.setClientContext(clientContext);
 
             handle.getRuntimeApiServer().enqueue(invocation);
 

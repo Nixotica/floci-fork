@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.EksPodIdentityCredentialsResponse;
 import io.github.hectorvent.floci.services.eks.model.PodIdentityAssociation;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
@@ -133,8 +134,27 @@ public class EksPodIdentityCredentialsController {
         String sessionToken = randomSecret(200);
         Instant expiration = Instant.now().plus(Duration.ofHours(1));
 
-        iamService.registerSession(accessKeyId, secretAccessKey, sessionToken, roleArn,
-                expiration, association.policy(), callerAccountId);
+        String sessionName = podIdentitySessionName(cluster.getName(), association.serviceAccount());
+        String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : roleArn;
+        // EKS Auth assumes the association's role through STS, so a role that is gone gets no
+        // credentials. The lookup is by name only, and enforcement loads a session's policies the
+        // same way, so a role recreated under another path is refused too: it is not the role the
+        // association names.
+        Optional<IamRole> role = iamService.findRole(roleAccountId, roleName)
+                .filter(found -> IamService.roleArnMatches(roleArn, found));
+        if (role.isEmpty()) {
+            return error(400, "AccessDeniedException: The role of the association cannot be assumed: "
+                    + roleArn + "\n");
+        }
+        String assumedRoleId = role.map(IamRole::getRoleId).filter(id -> !id.isBlank())
+                .map(id -> id + ":" + sessionName)
+                .orElse(null);
+
+        // Like STS AssumeRole, the session names the stored role, so it lives in the role's
+        // partition even when the association was made with the role's ARN in another partition.
+        String sessionRoleArn = role.map(IamRole::getArn).filter(AwsArnUtils::isArn).orElse(roleArn);
+        iamService.registerSession(accessKeyId, secretAccessKey, sessionToken, sessionRoleArn,
+                expiration, association.policy(), callerAccountId, sessionName, assumedRoleId);
 
         EksPodIdentityCredentialsResponse response = new EksPodIdentityCredentialsResponse(
                 accessKeyId,
@@ -168,5 +188,16 @@ public class EksPodIdentityCredentialsController {
             sb.append(CHARS.charAt(secureRandom.nextInt(CHARS.length())));
         }
         return sb.toString();
+    }
+
+    private String podIdentitySessionName(String clusterName, String serviceAccount) {
+        String randomSuffix = randomId(8);
+        String prefix = "eks-";
+        String base = prefix + (clusterName != null && !clusterName.isBlank() ? clusterName + "-" : "") + serviceAccount;
+        int maxBaseLen = 64 - 1 - randomSuffix.length();
+        if (base.length() > maxBaseLen) {
+            base = base.substring(0, maxBaseLen);
+        }
+        return base + "-" + randomSuffix;
     }
 }

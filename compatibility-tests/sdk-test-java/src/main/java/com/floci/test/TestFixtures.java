@@ -2,126 +2,112 @@ package com.floci.test;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.account.AccountClient;
-import software.amazon.awssdk.services.accessanalyzer.AccessAnalyzerClient;
-import software.amazon.awssdk.services.redshiftserverless.RedshiftServerlessClient;
-import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
-import software.amazon.awssdk.services.cloudhsmv2.CloudHsmV2Client;
-import software.amazon.awssdk.services.cloudfront.CloudFrontClient;
-import software.amazon.awssdk.services.cloudtrail.CloudTrailClient;
-import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
-import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient;
-import software.amazon.awssdk.services.codeartifact.CodeartifactClient;
-import software.amazon.awssdk.services.cognitoidentityprovider.CognitoIdentityProviderClient;
-import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.core.client.config.SdkAdvancedClientOption;
-import software.amazon.awssdk.services.eventbridge.EventBridgeClient;
-import software.amazon.awssdk.services.servicediscovery.ServiceDiscoveryClient;
-import software.amazon.awssdk.services.emr.EmrClient;
-import software.amazon.awssdk.services.emrserverless.EmrServerlessClient;
-import software.amazon.awssdk.services.wafv2.Wafv2Client;
-import software.amazon.awssdk.services.iam.IamClient;
-import software.amazon.awssdk.services.kinesis.KinesisAsyncClient;
-import software.amazon.awssdk.services.kinesis.KinesisClient;
-import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient;
-import software.amazon.awssdk.http.Protocol;
-import software.amazon.awssdk.services.kms.KmsClient;
-import software.amazon.awssdk.services.lambda.LambdaClient;
-import software.amazon.awssdk.services.opensearch.OpenSearchClient;
-import software.amazon.awssdk.services.oam.OamClient;
-import software.amazon.awssdk.services.neptune.NeptuneClient;
-import software.amazon.awssdk.services.rds.RdsClient;
-import software.amazon.awssdk.services.redshift.RedshiftClient;
-import software.amazon.awssdk.services.redshiftdata.RedshiftDataClient;
-import software.amazon.awssdk.services.guardduty.GuardDutyClient;
-import software.amazon.awssdk.services.fis.FisClient;
-import software.amazon.awssdk.services.organizations.OrganizationsClient;
-import software.amazon.awssdk.services.sso.SsoClient;
-import software.amazon.awssdk.services.ssoadmin.SsoAdminClient;
-import software.amazon.awssdk.services.ssooidc.SsoOidcClient;
-import software.amazon.awssdk.services.identitystore.IdentitystoreClient;
-import software.amazon.awssdk.services.budgets.BudgetsClient;
-import software.amazon.awssdk.services.bcmpricingcalculator.BcmPricingCalculatorClient;
-import software.amazon.awssdk.services.timestreaminfluxdb.TimestreamInfluxDbClient;
-import software.amazon.awssdk.services.macie2.Macie2Client;
-import software.amazon.awssdk.services.controlcatalog.ControlCatalogClient;
-import software.amazon.awssdk.services.marketplacecatalog.MarketplaceCatalogClient;
-import software.amazon.awssdk.services.marketplaceagreement.MarketplaceAgreementClient;
-import software.amazon.awssdk.services.marketplaceentitlement.MarketplaceEntitlementClient;
-import software.amazon.awssdk.services.verifiedpermissions.VerifiedPermissionsClient;
-import software.amazon.awssdk.services.marketplacedeployment.MarketplaceDeploymentClient;
-import software.amazon.awssdk.services.marketplacereporting.MarketplaceReportingClient;
-import software.amazon.awssdk.services.marketplacemetering.MarketplaceMeteringClient;
-import software.amazon.awssdk.services.marketplacediscovery.MarketplaceDiscoveryClient;
-import software.amazon.awssdk.services.inspector2.Inspector2Client;
-import software.amazon.awssdk.services.securityhub.SecurityHubClient;
-import software.amazon.awssdk.services.databasemigration.DatabaseMigrationClient;
-import software.amazon.awssdk.services.detective.DetectiveClient;
-import software.amazon.awssdk.services.globalaccelerator.GlobalAcceleratorClient;
-import software.amazon.awssdk.services.rum.RumClient;
-import software.amazon.awssdk.services.resourceexplorer2.ResourceExplorer2Client;
-import software.amazon.awssdk.services.ram.RamClient;
-import software.amazon.awssdk.services.s3.S3AsyncClient;
-import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.endpoints.Endpoint;
-import software.amazon.awssdk.services.s3control.S3ControlClient;
-import software.amazon.awssdk.services.s3control.endpoints.S3ControlEndpointProvider;
-import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
-import software.amazon.awssdk.services.ses.SesClient;
-import software.amazon.awssdk.services.sesv2.SesV2Client;
-import software.amazon.awssdk.services.sfn.SfnClient;
-import software.amazon.awssdk.services.signin.SigninClient;
-import software.amazon.awssdk.services.swf.SwfClient;
-import software.amazon.awssdk.services.sns.SnsClient;
-import software.amazon.awssdk.services.sqs.SqsClient;
-import software.amazon.awssdk.services.ssm.SsmClient;
-import software.amazon.awssdk.services.sts.StsClient;
-import software.amazon.awssdk.services.kafka.KafkaClient;
-import software.amazon.awssdk.services.mq.MqClient;
-import software.amazon.awssdk.services.kinesisanalyticsv2.KinesisAnalyticsV2Client;
+import software.amazon.awssdk.http.Protocol;
+import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.regions.RegionMetadata;
+import software.amazon.awssdk.services.accessanalyzer.AccessAnalyzerClient;
+import software.amazon.awssdk.services.account.AccountClient;
+import software.amazon.awssdk.services.acm.AcmClient;
+import software.amazon.awssdk.services.amp.AmpClient;
+import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
+import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
+import software.amazon.awssdk.services.appconfig.AppConfigClient;
+import software.amazon.awssdk.services.appconfigdata.AppConfigDataClient;
+import software.amazon.awssdk.services.appintegrations.AppIntegrationsClient;
+import software.amazon.awssdk.services.appsync.AppSyncClient;
 import software.amazon.awssdk.services.athena.AthenaClient;
 import software.amazon.awssdk.services.athena.model.GetQueryExecutionRequest;
 import software.amazon.awssdk.services.athena.model.QueryExecutionState;
 import software.amazon.awssdk.services.athena.model.QueryExecutionStatus;
-import software.amazon.awssdk.services.glue.GlueClient;
-import software.amazon.awssdk.services.firehose.FirehoseClient;
-import software.amazon.awssdk.services.resourcegroupstaggingapi.ResourceGroupsTaggingApiClient;
-import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
-import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
-import software.amazon.awssdk.services.elasticache.ElastiCacheClient;
-import software.amazon.awssdk.services.elasticbeanstalk.ElasticBeanstalkClient;
-import software.amazon.awssdk.services.acm.AcmClient;
-import software.amazon.awssdk.services.amp.AmpClient;
-import software.amazon.awssdk.services.efs.EfsClient;
-import software.amazon.awssdk.services.ec2.Ec2Client;
-import software.amazon.awssdk.services.ecr.EcrClient;
+import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
+import software.amazon.awssdk.services.backup.BackupClient;
+import software.amazon.awssdk.services.bcmpricingcalculator.BcmPricingCalculatorClient;
 import software.amazon.awssdk.services.bedrock.BedrockClient;
 import software.amazon.awssdk.services.bedrockagentcore.BedrockAgentCoreClient;
 import software.amazon.awssdk.services.bedrockagentcorecontrol.BedrockAgentCoreControlClient;
 import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeAsyncClient;
-import software.amazon.awssdk.services.pipes.PipesClient;
+import software.amazon.awssdk.services.budgets.BudgetsClient;
+import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
+import software.amazon.awssdk.services.cloudfront.CloudFrontClient;
+import software.amazon.awssdk.services.cloudhsmv2.CloudHsmV2Client;
+import software.amazon.awssdk.services.cloudtrail.CloudTrailClient;
+import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
+import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient;
+import software.amazon.awssdk.services.codeartifact.CodeartifactClient;
 import software.amazon.awssdk.services.codebuild.CodeBuildClient;
-import software.amazon.awssdk.services.sagemaker.SageMakerClient;
-import software.amazon.awssdk.services.sagemakerruntime.SageMakerRuntimeClient;
 import software.amazon.awssdk.services.codedeploy.CodeDeployClient;
 import software.amazon.awssdk.services.codepipeline.CodePipelineClient;
+import software.amazon.awssdk.services.cognitoidentityprovider.CognitoIdentityProviderClient;
+import software.amazon.awssdk.services.controlcatalog.ControlCatalogClient;
+import software.amazon.awssdk.services.databasemigration.DatabaseMigrationClient;
+import software.amazon.awssdk.services.datasync.DataSyncClient;
+import software.amazon.awssdk.services.detective.DetectiveClient;
+import software.amazon.awssdk.services.dlm.DlmClient;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsClient;
+import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ecr.EcrClient;
 import software.amazon.awssdk.services.ecs.EcsClient;
+import software.amazon.awssdk.services.efs.EfsClient;
 import software.amazon.awssdk.services.eks.EksClient;
+import software.amazon.awssdk.services.elasticache.ElastiCacheClient;
+import software.amazon.awssdk.services.elasticbeanstalk.ElasticBeanstalkClient;
+import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
+import software.amazon.awssdk.services.emr.EmrClient;
+import software.amazon.awssdk.services.emrserverless.EmrServerlessClient;
+import software.amazon.awssdk.services.eventbridge.EventBridgeClient;
+import software.amazon.awssdk.services.firehose.FirehoseClient;
+import software.amazon.awssdk.services.fis.FisClient;
+import software.amazon.awssdk.services.globalaccelerator.GlobalAcceleratorClient;
+import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.guardduty.GuardDutyClient;
+import software.amazon.awssdk.services.iam.IamClient;
+import software.amazon.awssdk.services.identitystore.IdentitystoreClient;
+import software.amazon.awssdk.services.inspector2.Inspector2Client;
 import software.amazon.awssdk.services.iot.IotClient;
 import software.amazon.awssdk.services.iotdataplane.IotDataPlaneClient;
 import software.amazon.awssdk.services.iotjobsdataplane.IotJobsDataPlaneClient;
-import software.amazon.awssdk.services.scheduler.SchedulerClient;
-import software.amazon.awssdk.services.appconfig.AppConfigClient;
-import software.amazon.awssdk.services.appconfigdata.AppConfigDataClient;
-import software.amazon.awssdk.services.appintegrations.AppIntegrationsClient;
-import software.amazon.awssdk.services.dlm.DlmClient;
-import software.amazon.awssdk.services.datasync.DataSyncClient;
-import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
-import software.amazon.awssdk.services.backup.BackupClient;
-import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
-import software.amazon.awssdk.services.appsync.AppSyncClient;
+import software.amazon.awssdk.services.kafka.KafkaClient;
+import software.amazon.awssdk.services.kinesis.KinesisAsyncClient;
+import software.amazon.awssdk.services.kinesis.KinesisClient;
+import software.amazon.awssdk.services.kinesisanalyticsv2.KinesisAnalyticsV2Client;
+import software.amazon.awssdk.services.kms.KmsClient;
+import software.amazon.awssdk.services.lambda.LambdaClient;
+import software.amazon.awssdk.services.lambda.model.CreateFunctionRequest;
+import software.amazon.awssdk.services.lambda.model.DeleteFunctionRequest;
+import software.amazon.awssdk.services.lambda.model.FunctionCode;
+import software.amazon.awssdk.services.lambda.model.InvocationType;
+import software.amazon.awssdk.services.lambda.model.InvokeRequest;
+import software.amazon.awssdk.services.lambda.model.InvokeResponse;
+import software.amazon.awssdk.services.lambda.model.Runtime;
 import software.amazon.awssdk.services.lightsail.LightsailClient;
+import software.amazon.awssdk.services.macie2.Macie2Client;
+import software.amazon.awssdk.services.marketplaceagreement.MarketplaceAgreementClient;
+import software.amazon.awssdk.services.marketplacecatalog.MarketplaceCatalogClient;
+import software.amazon.awssdk.services.marketplacedeployment.MarketplaceDeploymentClient;
+import software.amazon.awssdk.services.marketplacediscovery.MarketplaceDiscoveryClient;
+import software.amazon.awssdk.services.marketplaceentitlement.MarketplaceEntitlementClient;
+import software.amazon.awssdk.services.marketplacemetering.MarketplaceMeteringClient;
+import software.amazon.awssdk.services.marketplacereporting.MarketplaceReportingClient;
+import software.amazon.awssdk.services.mq.MqClient;
+import software.amazon.awssdk.services.neptune.NeptuneClient;
+import software.amazon.awssdk.services.oam.OamClient;
+import software.amazon.awssdk.services.opensearch.OpenSearchClient;
+import software.amazon.awssdk.services.organizations.OrganizationsClient;
+import software.amazon.awssdk.services.pipes.PipesClient;
+import software.amazon.awssdk.services.ram.RamClient;
+import software.amazon.awssdk.services.rds.RdsClient;
+import software.amazon.awssdk.services.redshift.RedshiftClient;
+import software.amazon.awssdk.services.redshiftdata.RedshiftDataClient;
+import software.amazon.awssdk.services.redshiftserverless.RedshiftServerlessClient;
+import software.amazon.awssdk.services.resourceexplorer2.ResourceExplorer2Client;
+import software.amazon.awssdk.services.resourceexplorer2.ResourceExplorer2ClientBuilder;
+import software.amazon.awssdk.services.resourcegroupstaggingapi.ResourceGroupsTaggingApiClient;
 import software.amazon.awssdk.services.route53.Route53Client;
 import software.amazon.awssdk.services.route53.model.Change;
 import software.amazon.awssdk.services.route53.model.ChangeAction;
@@ -132,39 +118,54 @@ import software.amazon.awssdk.services.route53.model.CreateHostedZoneResponse;
 import software.amazon.awssdk.services.route53.model.RRType;
 import software.amazon.awssdk.services.route53.model.ResourceRecord;
 import software.amazon.awssdk.services.route53.model.ResourceRecordSet;
-import software.amazon.awssdk.services.s3vectors.S3VectorsClient;
+import software.amazon.awssdk.services.rum.RumClient;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3control.S3ControlClient;
+import software.amazon.awssdk.services.s3control.endpoints.S3ControlEndpointProvider;
 import software.amazon.awssdk.services.s3tables.S3TablesClient;
-
-import software.amazon.awssdk.core.SdkBytes;
-import software.amazon.awssdk.services.lambda.model.CreateFunctionRequest;
-import software.amazon.awssdk.services.lambda.model.DeleteFunctionRequest;
-import software.amazon.awssdk.services.lambda.model.FunctionCode;
-import software.amazon.awssdk.services.lambda.model.InvokeRequest;
-import software.amazon.awssdk.services.lambda.model.InvokeResponse;
-import software.amazon.awssdk.services.lambda.model.InvocationType;
-import software.amazon.awssdk.services.lambda.model.Runtime;
+import software.amazon.awssdk.services.s3vectors.S3VectorsClient;
+import software.amazon.awssdk.services.sagemaker.SageMakerClient;
+import software.amazon.awssdk.services.sagemakerruntime.SageMakerRuntimeClient;
+import software.amazon.awssdk.services.scheduler.SchedulerClient;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
+import software.amazon.awssdk.services.securityhub.SecurityHubClient;
+import software.amazon.awssdk.services.servicediscovery.ServiceDiscoveryClient;
+import software.amazon.awssdk.services.ses.SesClient;
+import software.amazon.awssdk.services.sesv2.SesV2Client;
 import software.amazon.awssdk.services.sesv2.model.CreateEmailIdentityRequest;
 import software.amazon.awssdk.services.sesv2.model.CreateEmailIdentityResponse;
 import software.amazon.awssdk.services.sesv2.model.GetEmailIdentityRequest;
-
-import java.io.ByteArrayOutputStream;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.security.GeneralSecurityException;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
+import software.amazon.awssdk.services.sfn.SfnClient;
+import software.amazon.awssdk.services.signin.SigninClient;
+import software.amazon.awssdk.services.sns.SnsClient;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.sso.SsoClient;
+import software.amazon.awssdk.services.ssoadmin.SsoAdminClient;
+import software.amazon.awssdk.services.ssooidc.SsoOidcClient;
+import software.amazon.awssdk.services.sts.StsClient;
+import software.amazon.awssdk.services.swf.SwfClient;
+import software.amazon.awssdk.services.timestreaminfluxdb.TimestreamInfluxDbClient;
+import software.amazon.awssdk.services.transfer.TransferClient;
+import software.amazon.awssdk.services.verifiedpermissions.VerifiedPermissionsClient;
+import software.amazon.awssdk.services.wafv2.Wafv2Client;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
+import java.io.ByteArrayOutputStream;
+import java.net.URI;
+import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
-
-import software.amazon.awssdk.core.exception.SdkClientException;
 
 /**
  * Shared test utilities and AWS client factories.
@@ -203,6 +204,36 @@ public final class TestFixtures {
      */
     public static boolean isRealAws() {
         return "aws".equalsIgnoreCase(System.getenv("FLOCI_TARGET"));
+    }
+
+    /** The region every fixture client signs for, for tests that build or compare region-scoped values. */
+    public static Region region() {
+        return REGION;
+    }
+
+    /**
+     * The partition of {@link #region()} ({@code aws}, {@code aws-cn}, {@code aws-us-gov}, ...), from
+     * the SDK's own region metadata, so a test pins the partition its clients actually sign in. A region
+     * the SDK does not know is taken as commercial.
+     */
+    public static String partition() {
+        RegionMetadata metadata = REGION.metadata();
+        return metadata == null ? "aws" : metadata.partition().id();
+    }
+
+    /** A regional ARN in the fixture partition and region. */
+    public static String arn(String service, String accountId, String resource) {
+        return arn(service, REGION.id(), accountId, resource);
+    }
+
+    /** A regional ARN in the fixture partition and the given region of that partition. */
+    public static String arn(String service, String region, String accountId, String resource) {
+        return "arn:" + partition() + ":" + service + ":" + region + ":" + accountId + ":" + resource;
+    }
+
+    /** A regionless ARN (IAM, SSO, Organizations, ...) in the fixture partition. */
+    public static String globalArn(String service, String accountId, String resource) {
+        return "arn:" + partition() + ":" + service + "::" + accountId + ":" + resource;
     }
 
     /**
@@ -683,6 +714,14 @@ public final class TestFixtures {
                 .build();
     }
 
+    public static DynamoDbStreamsClient dynamoDbStreamsClient() {
+        return DynamoDbStreamsClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
     public static LambdaClient lambdaClient() {
         return LambdaClient.builder()
                 .endpointOverride(ENDPOINT)
@@ -700,6 +739,14 @@ public final class TestFixtures {
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accountId, "test")))
+                .build();
+    }
+
+    public static TransferClient transferClient() {
+        return TransferClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
                 .build();
     }
 
@@ -969,6 +1016,19 @@ public final class TestFixtures {
                 .build();
     }
 
+    /**
+     * An SES v2 client acting as {@code accountId}, which the emulator reads from a 12-digit access
+     * key: SES allows one contact list per account, so a test that needs its own list uses an
+     * account no other test touches.
+     */
+    public static SesV2Client sesV2Client(String accountId) {
+        return SesV2Client.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accountId, "test")))
+                .build();
+    }
+
     public static Route53Client route53Client() {
         return route53Client("test");
     }
@@ -990,6 +1050,10 @@ public final class TestFixtures {
         if (tokens == null || tokens.isEmpty()) {
             throw new IllegalStateException("CreateEmailIdentity did not return DKIM tokens for " + domain);
         }
+        String signingHostedZone = identity.dkimAttributes().signingHostedZone();
+        if (signingHostedZone == null || signingHostedZone.isBlank()) {
+            throw new IllegalStateException("CreateEmailIdentity did not return SigningHostedZone for " + domain);
+        }
 
         try (Route53Client route53 = route53Client()) {
             CreateHostedZoneResponse zone = route53.createHostedZone(CreateHostedZoneRequest.builder()
@@ -1005,7 +1069,7 @@ public final class TestFixtures {
                                     .type(RRType.CNAME)
                                     .ttl(300L)
                                     .resourceRecords(ResourceRecord.builder()
-                                            .value(token + ".dkim.amazonses.com")
+                                            .value(token + "." + signingHostedZone)
                                             .build())
                                     .build())
                             .build())
@@ -1404,7 +1468,7 @@ public final class TestFixtures {
      * to exercise a real create against a region that starts with no index.
      */
     public static ResourceExplorer2Client resourceExplorer2Client(Region region) {
-        var builder = ResourceExplorer2Client.builder().region(region);
+        ResourceExplorer2ClientBuilder builder = ResourceExplorer2Client.builder().region(region);
         if (!isRealAws()) {
             builder.endpointOverride(ENDPOINT).credentialsProvider(CREDENTIALS);
         }

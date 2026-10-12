@@ -3,19 +3,33 @@ package com.floci.test;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.services.redshiftdata.RedshiftDataClient;
+import software.amazon.awssdk.services.redshiftdata.model.DescribeStatementResponse;
+import software.amazon.awssdk.services.redshiftdata.model.ExecuteStatementResponse;
+import software.amazon.awssdk.services.redshiftdata.model.StatusString;
 import software.amazon.awssdk.services.redshiftserverless.RedshiftServerlessClient;
 import software.amazon.awssdk.services.redshiftserverless.model.ConflictException;
+import software.amazon.awssdk.services.redshiftserverless.model.GetCredentialsResponse;
 import software.amazon.awssdk.services.redshiftserverless.model.Namespace;
 import software.amazon.awssdk.services.redshiftserverless.model.NamespaceStatus;
 import software.amazon.awssdk.services.redshiftserverless.model.ResourceNotFoundException;
+import software.amazon.awssdk.services.redshiftserverless.model.Snapshot;
 import software.amazon.awssdk.services.redshiftserverless.model.Tag;
+import software.amazon.awssdk.services.redshiftserverless.model.UsageLimit;
+import software.amazon.awssdk.services.redshiftserverless.model.UsageLimitBreachAction;
+import software.amazon.awssdk.services.redshiftserverless.model.UsageLimitPeriod;
+import software.amazon.awssdk.services.redshiftserverless.model.UsageLimitUsageType;
+import software.amazon.awssdk.services.redshiftserverless.model.Workgroup;
+import software.amazon.awssdk.services.redshiftserverless.model.WorkgroupStatus;
+
+import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
-@DisplayName("Redshift Serverless namespace lifecycle")
+@DisplayName("Redshift Serverless namespace and workgroup lifecycle")
 class RedshiftServerlessTest {
 
     private static final Logger LOG = Logger.getLogger(RedshiftServerlessTest.class);
@@ -67,6 +81,198 @@ class RedshiftServerlessTest {
 
             assertThatThrownBy(() -> client.getNamespace(request -> request.namespaceName(namespaceName)))
                     .isInstanceOf(ResourceNotFoundException.class);
+        }
+    }
+
+    @Test
+    void workgroupLifecycleUsesAwsSdk() {
+        assumeFalse(TestFixtures.isRealAws(), "Creates a workgroup and asserts emulator-local defaults");
+
+        try (RedshiftServerlessClient client = TestFixtures.redshiftServerlessClient();
+             RedshiftDataClient dataClient = TestFixtures.redshiftDataClient()) {
+            String namespaceName = "floci-compat-wg-ns";
+            String workgroupName = "floci-compat-wg";
+            try {
+                client.createNamespace(request -> request
+                        .namespaceName(namespaceName)
+                        .adminUsername("admin")
+                        .adminUserPassword("Secret123!"));
+
+                Workgroup created = client.createWorkgroup(request -> request
+                        .workgroupName(workgroupName)
+                        .namespaceName(namespaceName)
+                        .baseCapacity(32)
+                        .tags(Tag.builder().key("env").value("dev").build())).workgroup();
+
+                assertThat(created.workgroupName()).isEqualTo(workgroupName);
+                assertThat(created.namespaceName()).isEqualTo(namespaceName);
+                assertThat(created.status()).isEqualTo(WorkgroupStatus.AVAILABLE);
+                assertThat(created.baseCapacity()).isEqualTo(32);
+                assertThat(created.port()).isEqualTo(5439);
+                assertThat(created.trackName()).isEqualTo("current");
+                assertThat(created.workgroupArn()).contains(":redshift-serverless:").contains(":workgroup/");
+                assertThat(created.creationDate()).isNotNull();
+                assertThat(created.endpoint().address()).isNotBlank();
+                assertThat(created.endpoint().port()).isPositive();
+
+                Workgroup fetched = client.getWorkgroup(request -> request.workgroupName(workgroupName)).workgroup();
+                assertThat(fetched.workgroupId()).isEqualTo(created.workgroupId());
+
+                assertThat(client.listWorkgroups(request -> {}).workgroups())
+                        .extracting(Workgroup::workgroupName)
+                        .contains(workgroupName);
+
+                Workgroup updated = client.updateWorkgroup(request -> request
+                        .workgroupName(workgroupName)
+                        .baseCapacity(64)).workgroup();
+                assertThat(updated.baseCapacity()).isEqualTo(64);
+
+                assertThatThrownBy(() -> client.createWorkgroup(request -> request
+                                .workgroupName(workgroupName)
+                                .namespaceName(namespaceName)))
+                        .isInstanceOf(ConflictException.class);
+                assertThatThrownBy(() -> client.deleteNamespace(request -> request.namespaceName(namespaceName)))
+                        .isInstanceOf(ConflictException.class);
+
+                GetCredentialsResponse credentials = client.getCredentials(request -> request
+                        .workgroupName(workgroupName)
+                        .dbName("dev"));
+                assertThat(credentials.dbUser()).isNotBlank();
+                assertThat(credentials.dbPassword()).isNotBlank();
+                assertThat(credentials.expiration()).isAfter(Instant.now());
+
+                ExecuteStatementResponse executed = dataClient.executeStatement(request -> request
+                        .workgroupName(workgroupName)
+                        .database("dev")
+                        .sql("select 1"));
+                assertThat(executed.workgroupName()).isEqualTo(workgroupName);
+                assertThat(executed.clusterIdentifier()).isNull();
+                DescribeStatementResponse described = dataClient.describeStatement(request -> request.id(executed.id()));
+                assertThat(described.status()).isEqualTo(StatusString.FINISHED);
+
+                String arn = created.workgroupArn();
+                client.tagResource(request -> request.resourceArn(arn)
+                        .tags(Tag.builder().key("team").value("data").build()));
+                assertThat(client.listTagsForResource(request -> request.resourceArn(arn)).tags())
+                        .extracting(Tag::key)
+                        .contains("env", "team");
+            } finally {
+                deleteWorkgroupBestEffort(client, workgroupName);
+                deleteBestEffort(client, namespaceName);
+            }
+
+            assertThatThrownBy(() -> client.getWorkgroup(request -> request.workgroupName(workgroupName)))
+                    .isInstanceOf(ResourceNotFoundException.class);
+        }
+    }
+
+    @Test
+    void snapshotLifecycleUsesAwsSdk() {
+        assumeFalse(TestFixtures.isRealAws(), "Creates snapshots instantly and asserts emulator-local behavior");
+
+        try (RedshiftServerlessClient client = TestFixtures.redshiftServerlessClient()) {
+            String namespaceName = "floci-compat-snap-ns";
+            String workgroupName = "floci-compat-snap-wg";
+            String snapshotName = "floci-compat-snap";
+            try {
+                client.createNamespace(request -> request.namespaceName(namespaceName).adminUsername("admin")
+                        .adminUserPassword("Secret123!"));
+                client.createWorkgroup(request -> request.workgroupName(workgroupName).namespaceName(namespaceName));
+
+                Snapshot created = client.createSnapshot(request -> request
+                        .snapshotName(snapshotName).namespaceName(namespaceName)).snapshot();
+                assertThat(created.snapshotName()).isEqualTo(snapshotName);
+                assertThat(created.status().toString()).isEqualTo("AVAILABLE");
+                assertThat(created.snapshotCreateTime()).isNotNull();
+
+                assertThat(client.getSnapshot(request -> request.snapshotArn(created.snapshotArn())).snapshot()
+                        .snapshotName()).isEqualTo(snapshotName);
+                assertThat(client.listSnapshots(request -> request.namespaceName(namespaceName)).snapshots())
+                        .extracting(Snapshot::snapshotName)
+                        .containsExactly(snapshotName);
+
+                assertThat(client.restoreFromSnapshot(request -> request
+                        .namespaceName(namespaceName).workgroupName(workgroupName).snapshotName(snapshotName))
+                        .snapshotName()).isEqualTo(snapshotName);
+
+                client.deleteSnapshot(request -> request.snapshotName(snapshotName));
+                assertThatThrownBy(() -> client.getSnapshot(request -> request.snapshotName(snapshotName)))
+                        .isInstanceOf(ResourceNotFoundException.class);
+            } finally {
+                deleteSnapshotBestEffort(client, snapshotName);
+                deleteWorkgroupBestEffort(client, workgroupName);
+                deleteBestEffort(client, namespaceName);
+            }
+        }
+    }
+
+    @Test
+    void usageLimitLifecycleUsesAwsSdk() {
+        assumeFalse(TestFixtures.isRealAws(), "Creates a workgroup and asserts emulator-local behavior");
+
+        try (RedshiftServerlessClient client = TestFixtures.redshiftServerlessClient()) {
+            String namespaceName = "floci-compat-limit-ns";
+            String workgroupName = "floci-compat-limit-wg";
+            try {
+                client.createNamespace(request -> request.namespaceName(namespaceName).adminUsername("admin")
+                        .adminUserPassword("Secret123!"));
+                String workgroupArn = client.createWorkgroup(request -> request
+                        .workgroupName(workgroupName).namespaceName(namespaceName)).workgroup().workgroupArn();
+
+                UsageLimit created = client.createUsageLimit(request -> request
+                        .resourceArn(workgroupArn)
+                        .usageType(UsageLimitUsageType.SERVERLESS_COMPUTE)
+                        .amount(60L)).usageLimit();
+                assertThat(created.amount()).isEqualTo(60L);
+                assertThat(created.period()).isEqualTo(UsageLimitPeriod.MONTHLY);
+                assertThat(created.breachAction()).isEqualTo(UsageLimitBreachAction.LOG);
+                assertThat(created.resourceArn()).isEqualTo(workgroupArn);
+                assertThat(created.usageLimitArn()).contains(":usagelimit/");
+
+                UsageLimit second = client.createUsageLimit(request -> request
+                        .resourceArn(workgroupArn)
+                        .usageType(UsageLimitUsageType.SERVERLESS_COMPUTE)
+                        .period(UsageLimitPeriod.DAILY)
+                        .amount(10L)).usageLimit();
+                assertThat(second.period()).isEqualTo(UsageLimitPeriod.DAILY);
+
+                UsageLimit updated = client.updateUsageLimit(request -> request
+                        .usageLimitId(created.usageLimitId())
+                        .amount(90L)
+                        .breachAction(UsageLimitBreachAction.DEACTIVATE)).usageLimit();
+                assertThat(updated.amount()).isEqualTo(90L);
+                assertThat(updated.breachAction()).isEqualTo(UsageLimitBreachAction.DEACTIVATE);
+
+                assertThat(client.getUsageLimit(request -> request.usageLimitId(created.usageLimitId()))
+                        .usageLimit().amount()).isEqualTo(90L);
+                assertThat(client.listUsageLimits(request -> request.resourceArn(workgroupArn)).usageLimits())
+                        .extracting(UsageLimit::usageLimitId)
+                        .containsExactlyInAnyOrder(created.usageLimitId(), second.usageLimitId());
+
+                client.deleteUsageLimit(request -> request.usageLimitId(second.usageLimitId()));
+                client.deleteUsageLimit(request -> request.usageLimitId(created.usageLimitId()));
+                assertThatThrownBy(() -> client.getUsageLimit(request -> request.usageLimitId(created.usageLimitId())))
+                        .isInstanceOf(ResourceNotFoundException.class);
+            } finally {
+                deleteWorkgroupBestEffort(client, workgroupName);
+                deleteBestEffort(client, namespaceName);
+            }
+        }
+    }
+
+    private static void deleteSnapshotBestEffort(RedshiftServerlessClient client, String snapshotName) {
+        try {
+            client.deleteSnapshot(request -> request.snapshotName(snapshotName));
+        } catch (Exception cleanupError) {
+            LOG.warnf(cleanupError, "Best-effort cleanup failed for snapshotName=%s", snapshotName);
+        }
+    }
+
+    private static void deleteWorkgroupBestEffort(RedshiftServerlessClient client, String workgroupName) {
+        try {
+            client.deleteWorkgroup(request -> request.workgroupName(workgroupName));
+        } catch (Exception cleanupError) {
+            LOG.warnf(cleanupError, "Best-effort cleanup failed for workgroupName=%s", workgroupName);
         }
     }
 

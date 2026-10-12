@@ -1,22 +1,16 @@
 package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.accessanalyzer.AccessAnalyzerController;
+import io.github.hectorvent.floci.services.account.AccountController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigController;
-import io.github.hectorvent.floci.services.backup.BackupController;
-import io.github.hectorvent.floci.services.resourceexplorer2.ResourceExplorer2Controller;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
+import io.github.hectorvent.floci.services.appsync.AppSyncController;
+import io.github.hectorvent.floci.services.aps.ApsController;
+import io.github.hectorvent.floci.services.backup.BackupController;
 import io.github.hectorvent.floci.services.batch.BatchController;
 import io.github.hectorvent.floci.services.bedrock.BedrockController;
-import io.github.hectorvent.floci.services.bedrockruntime.BedrockRuntimeController;
-import io.github.hectorvent.floci.services.cognito.CognitoOAuthController;
-import io.github.hectorvent.floci.services.cognito.CognitoWellKnownController;
-import io.github.hectorvent.floci.services.eks.EksController;
-import io.github.hectorvent.floci.services.fis.FisController;
-import io.github.hectorvent.floci.services.mwaa.MwaaController;
-import io.github.hectorvent.floci.services.iot.IotController;
-import io.github.hectorvent.floci.services.iot.IotDomainConfigurationController;
-import io.github.hectorvent.floci.services.iot.IotDataController;
 import io.github.hectorvent.floci.services.bedrockagentcore.BedrockAgentCoreController;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreControlController;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreGatewayController;
@@ -25,15 +19,50 @@ import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentC
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryController;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreResourcePolicyController;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreToolsController;
-import io.github.hectorvent.floci.services.pipes.PipesController;
-import io.github.hectorvent.floci.services.lambda.LambdaController;
-import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsController;
-import io.github.hectorvent.floci.services.lambdamicrovms.LambdaNetworkConnectorsController;
-import io.github.hectorvent.floci.services.opensearch.OpenSearchController;
-import io.github.hectorvent.floci.services.oam.OamController;
+import io.github.hectorvent.floci.services.bedrockruntime.BedrockRuntimeController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontServingController;
+import io.github.hectorvent.floci.services.codeartifact.CodeArtifactMavenController;
+import io.github.hectorvent.floci.services.codeartifact.CodeArtifactPypiController;
+import io.github.hectorvent.floci.services.cognito.CognitoOAuthController;
+import io.github.hectorvent.floci.services.cognito.CognitoWellKnownController;
+import io.github.hectorvent.floci.services.controlcatalog.ControlCatalogController;
+import io.github.hectorvent.floci.services.controltower.ControlTowerControlController;
+import io.github.hectorvent.floci.services.controltower.ControlTowerController;
+import io.github.hectorvent.floci.services.detective.DetectiveController;
+import io.github.hectorvent.floci.services.dlm.DlmController;
+import io.github.hectorvent.floci.services.efs.EfsController;
+import io.github.hectorvent.floci.services.eks.EksController;
+import io.github.hectorvent.floci.services.fis.FisController;
+import io.github.hectorvent.floci.services.guardduty.GuardDutyController;
+import io.github.hectorvent.floci.services.inspector2.Inspector2Controller;
+import io.github.hectorvent.floci.services.iot.IotAuthorizerController;
+import io.github.hectorvent.floci.services.iot.IotController;
+import io.github.hectorvent.floci.services.iot.IotDataController;
+import io.github.hectorvent.floci.services.iot.IotDomainConfigurationController;
+import io.github.hectorvent.floci.services.iot.IotFleetIndexingController;
+import io.github.hectorvent.floci.services.lambda.LambdaController;
+import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionController;
+import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsController;
+import io.github.hectorvent.floci.services.lambdamicrovms.LambdaNetworkConnectorsController;
+import io.github.hectorvent.floci.services.macie2.MacieController;
+import io.github.hectorvent.floci.services.marketplace.MarketplaceCatalogController;
+import io.github.hectorvent.floci.services.marketplace.MarketplaceDeploymentController;
+import io.github.hectorvent.floci.services.marketplace.MarketplaceDiscoveryController;
+import io.github.hectorvent.floci.services.marketplace.MarketplaceReportingController;
+import io.github.hectorvent.floci.services.mwaa.MwaaController;
+import io.github.hectorvent.floci.services.oam.OamController;
+import io.github.hectorvent.floci.services.opensearch.OpenSearchController;
+import io.github.hectorvent.floci.services.pipes.PipesController;
+import io.github.hectorvent.floci.services.rdsdata.RdsDataController;
+import io.github.hectorvent.floci.services.resourceexplorer2.ResourceExplorer2Controller;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
+import io.github.hectorvent.floci.services.rum.RumController;
+import io.github.hectorvent.floci.services.s3.S3Controller;
+import io.github.hectorvent.floci.services.s3tables.S3TablesController;
+import io.github.hectorvent.floci.services.s3vectors.S3VectorsController;
+import io.github.hectorvent.floci.services.sagemaker.SageMakerRuntimeController;
+import io.github.hectorvent.floci.services.securityhub.SecurityHubController;
 import io.github.hectorvent.floci.services.ses.SesAccountController;
 import io.github.hectorvent.floci.services.ses.SesConfigurationSetController;
 import io.github.hectorvent.floci.services.ses.SesContactController;
@@ -49,37 +78,13 @@ import io.github.hectorvent.floci.services.ses.SesSuppressionController;
 import io.github.hectorvent.floci.services.ses.SesTagController;
 import io.github.hectorvent.floci.services.ses.SesTemplateController;
 import io.github.hectorvent.floci.services.ses.SesTenantController;
-import io.github.hectorvent.floci.services.appsync.AppSyncController;
-import io.github.hectorvent.floci.services.rdsdata.RdsDataController;
-import io.github.hectorvent.floci.services.guardduty.GuardDutyController;
-import io.github.hectorvent.floci.services.macie2.MacieController;
-import io.github.hectorvent.floci.services.account.AccountController;
-import io.github.hectorvent.floci.services.accessanalyzer.AccessAnalyzerController;
-import io.github.hectorvent.floci.services.inspector2.Inspector2Controller;
-import io.github.hectorvent.floci.services.securityhub.SecurityHubController;
 import io.github.hectorvent.floci.services.ssooidc.SsoOidcController;
 import io.github.hectorvent.floci.services.ssoportal.SsoPortalController;
-import io.github.hectorvent.floci.services.detective.DetectiveController;
-import io.github.hectorvent.floci.services.dlm.DlmController;
-import io.github.hectorvent.floci.services.aps.ApsController;
-import io.github.hectorvent.floci.services.controlcatalog.ControlCatalogController;
-import io.github.hectorvent.floci.services.controltower.ControlTowerControlController;
-import io.github.hectorvent.floci.services.controltower.ControlTowerController;
-import io.github.hectorvent.floci.services.rum.RumController;
-import io.github.hectorvent.floci.services.s3vectors.S3VectorsController;
-import io.github.hectorvent.floci.services.s3tables.S3TablesController;
-import io.github.hectorvent.floci.services.efs.EfsController;
-import io.github.hectorvent.floci.services.marketplace.MarketplaceCatalogController;
-import io.github.hectorvent.floci.services.marketplace.MarketplaceDeploymentController;
-import io.github.hectorvent.floci.services.marketplace.MarketplaceDiscoveryController;
-import io.github.hectorvent.floci.services.marketplace.MarketplaceReportingController;
-import io.github.hectorvent.floci.services.sagemaker.SageMakerRuntimeController;
-import io.github.hectorvent.floci.services.s3.S3Controller;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import java.util.EnumSet;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -138,6 +143,7 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("lambda"), Set.of(),
                         Set.of(LambdaController.class,
+                                DurableExecutionController.class,
                                 LambdaMicrovmsController.class,
                                 LambdaNetworkConnectorsController.class)),
                 descriptor("apigateway", "apigateway", config.services().apigateway().enabled(), true,
@@ -257,7 +263,9 @@ public class ResolvedServiceCatalog {
                 descriptor("apigatewayv2", "apigatewayv2", config.services().apigatewayv2().enabled(), true,
                         "apigatewayv2", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
-                        Set.of("AmazonApiGatewayV2."), Set.of("apigatewayv2"), Set.of(), Set.of()),
+                        // No credential scope: every SDK signs API Gateway v2 as apigateway, which the
+                        // apigateway descriptor declares; REST /v2/apis routes by its resource class.
+                        Set.of("AmazonApiGatewayV2."), Set.of(), Set.of(), Set.of()),
                 descriptor("kinesis", "kinesis", config.services().kinesis().enabled(), true,
                         "kinesis", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON, ServiceProtocol.CBOR),
@@ -308,7 +316,8 @@ public class ResolvedServiceCatalog {
                 descriptor("email", "ses", config.services().ses().enabled(), true,
                         "ses", config.storage().mode(), 5000L, AwsNamespaces.SES, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON, ServiceProtocol.QUERY),
-                        Set.of(), Set.of("email", "ses", "sesv2"), Set.of(),
+                        // SES v2 signs as ses in every SDK, so sesv2 is not a credential scope.
+                        Set.of(), Set.of("email", "ses"), Set.of(),
                         Set.of(SesAccountController.class, SesConfigurationSetController.class,
                                 SesContactController.class, SesCvetController.class,
                                 SesDedicatedIpController.class, SesExportJobController.class,
@@ -641,7 +650,8 @@ public class ResolvedServiceCatalog {
                         // DescribeJobExecution, StartNextPendingJobExecution, UpdateJobExecution)
                         // signs under its own name while IotController serves its /things/*/jobs routes
                         Set.of(), Set.of("iot", "execute-api", "iot-jobs-data"), Set.of(),
-                        Set.of(IotController.class, IotDomainConfigurationController.class)),
+                        Set.of(IotController.class, IotDomainConfigurationController.class,
+                                IotAuthorizerController.class, IotFleetIndexingController.class)),
                 descriptor("iotdata", "iotdata", config.services().iotdata().enabled(), true,
                         "iot", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
@@ -743,7 +753,9 @@ public class ResolvedServiceCatalog {
                         "codeartifact", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("codeartifact"), Set.of(),
-                        Set.of(io.github.hectorvent.floci.services.codeartifact.CodeArtifactController.class)),
+                        Set.of(io.github.hectorvent.floci.services.codeartifact.CodeArtifactController.class,
+                                CodeArtifactMavenController.class,
+                                CodeArtifactPypiController.class)),
                 descriptor("verifiedpermissions", "verifiedpermissions", config.services().verifiedpermissions().enabled(), true,
                         "verifiedpermissions", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),

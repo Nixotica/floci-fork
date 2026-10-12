@@ -8,10 +8,10 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import io.github.hectorvent.floci.services.rds.proxy.PasswordValidator;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbApiStreamReader;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbStreamReader.CheckpointLifetime;
+import io.github.hectorvent.floci.services.rds.proxy.PasswordValidator;
 import io.github.hectorvent.floci.services.redshift.container.RedshiftContainerHandle;
 import io.github.hectorvent.floci.services.redshift.container.RedshiftContainerManager;
 import io.github.hectorvent.floci.services.redshift.model.Cluster;
@@ -1845,5 +1845,29 @@ class RedshiftServiceTest {
 
         assertEquals(PasswordValidator.AuthResult.PASSTHROUGH,
                 validator.validate("someone-else", "whatever"));
+    }
+
+    @Test
+    void reservedProxyPortsAreSharedBetweenAllCallersAndReusableOnceReleased() {
+        int first = service.reserveProxyPort();
+        int second = service.reserveProxyPort();
+
+        assertEquals(7100, first);
+        assertEquals(7101, second);
+        assertFalse(service.reserveProxyPort(first), "a port already handed out cannot be reserved again");
+        assertTrue(service.reserveProxyPort(7150), "a specific free port, such as a persisted one, can be reserved");
+        assertEquals(7102, service.reserveProxyPort(), "reserving a specific port does not disturb the sequence");
+
+        service.releaseProxyPort(first);
+        assertTrue(service.reserveProxyPort(first));
+        assertFalse(service.reserveProxyPort(0), "port 0 is never a real port");
+    }
+
+    @Test
+    void advertisedEndpointUsesTheConfiguredHostAndTheGivenPort() {
+        Endpoint endpoint = service.advertisedEndpoint(7123);
+
+        assertEquals("localhost", endpoint.getAddress());
+        assertEquals(7123, endpoint.getPort());
     }
 }

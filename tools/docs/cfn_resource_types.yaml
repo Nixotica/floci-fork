@@ -24,10 +24,13 @@ order:
   - AWS::ECS
   - AWS::EKS
   - AWS::RDS
+  - AWS::ElastiCache
   - AWS::Redshift
+  - AWS::RedshiftServerless
   - AWS::EC2
   - AWS::ElasticLoadBalancingV2
   - AWS::AutoScaling
+  - AWS::ApplicationAutoScaling
   - AWS::Route53
   - AWS::ServiceDiscovery
   - AWS::ApiGateway
@@ -83,14 +86,19 @@ type_order:
   AWS::EKS: [Cluster, Nodegroup]
   AWS::RDS:
     [DBInstance, DBCluster, DBSubnetGroup, DBParameterGroup, DBClusterParameterGroup]
+  AWS::ElastiCache:
+    [CacheCluster, SubnetGroup]
   AWS::Redshift:
     [Cluster, ClusterParameterGroup, ClusterSubnetGroup, ClusterSecurityGroup]
+  AWS::RedshiftServerless:
+    [Namespace, Workgroup]
   AWS::EC2:
     [VPC, Subnet, SecurityGroup, SecurityGroupIngress, SecurityGroupEgress, InternetGateway,
      RouteTable, SubnetRouteTableAssociation, Route, NatGateway, EIP, Instance, LaunchTemplate,
      VPCGatewayAttachment, VPCEndpoint, NetworkAcl, NetworkAclEntry, SubnetNetworkAclAssociation,
      FlowLog]
   AWS::ElasticLoadBalancingV2: [LoadBalancer, TargetGroup, Listener, ListenerRule]
+  AWS::ApplicationAutoScaling: [ScalableTarget, ScalingPolicy]
   AWS::AutoScaling: [LaunchConfiguration, AutoScalingGroup, LifecycleHook]
   AWS::Route53: [HostedZone, RecordSet]
   AWS::ApiGateway: [RestApi, Resource, Authorizer, Method, Deployment, Stage, Account, DomainName, BasePathMapping, GatewayResponse]
@@ -107,6 +115,7 @@ service_labels:
   AWS::ApiGateway: API Gateway (v1)
   AWS::ApiGatewayV2: API Gateway v2
   AWS::AppSync: AppSync
+  AWS::ApplicationAutoScaling: Application Auto Scaling
   AWS::AutoScaling: Auto Scaling
   AWS::Batch: Batch
   AWS::Backup: Backup
@@ -134,10 +143,12 @@ service_labels:
   AWS::KinesisFirehose: Kinesis Data Firehose
   AWS::Lambda: Lambda
   AWS::Logs: CloudWatch Logs
+  AWS::ElastiCache: ElastiCache
   AWS::Organizations: Organizations
   AWS::Pipes: Pipes
   AWS::RDS: RDS
   AWS::Redshift: Redshift
+  AWS::RedshiftServerless: Redshift Serverless
   AWS::Route53: Route 53
   AWS::S3: S3
   AWS::SNS: SNS
@@ -159,21 +170,31 @@ notes:
   AWS::Lambda::EventSourceMapping: 'SQS, Kinesis, DynamoDB Streams; `ParallelizationFactor` and `TumblingWindowInSeconds` are ignored'
   AWS::Lambda::Alias: also what SAM's `AutoPublishAlias` expands into
   AWS::EC2::SecurityGroup: inline `SecurityGroupIngress`/`SecurityGroupEgress` supported
+  AWS::ApplicationAutoScaling::ScalableTarget: '`ScheduledActions` are accepted and not run; Floci has no scheduled scaling'
   AWS::RDS::DBInstance: starts a real container
   AWS::RDS::DBCluster: starts a real container
+  AWS::ElastiCache::CacheCluster: 'starts a real container; modifying an existing cluster in place is not supported'
   AWS::Redshift::ClusterSecurityGroup: accepted; no EC2-Classic security group model
   AWS::Redshift::Cluster: single-node container; Port and non-dev DBName ignored; ManageMasterPassword unsupported
+  AWS::RedshiftServerless::Namespace: 'ManageAdminPassword is accepted and not applied; GetAtt uses the dotted Namespace.* form'
+  AWS::RedshiftServerless::Workgroup: 'starts a real container; one workgroup per namespace; capacity, VPC and price-performance settings are stored only; snapshot restore properties are ignored; GetAtt uses the dotted Workgroup.* form'
   AWS::CDK::Metadata: accepted; no-op
   AWS::Transfer::Server: 'management plane only; Ref returns the server ARN; Arn, ServerId and State attributes supported; AS2 managed egress IPs are not modeled; Domain replacement and IdentityProviderType changes are not supported'
+  AWS::Transfer::User: 'management plane only; Ref returns the user ARN; Arn attribute supported; Policy and PosixProfile are not supported; a ServerId or UserName change replaces the user'
   AWS::IAM::User: 'template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete'
   AWS::IoT::DomainConfiguration: '`ServerCertificates` resolves to a JSON string'
   AWS::IoT::Policy: 'deleted after detaching it from its principals; on AWS the delete fails with `DeleteConflictException` while the policy is attached'
   Custom::DynamoDBReplica: applied natively against DynamoDB, not via a provider Lambda
   AWS::Cognito::UserPool: '`ProviderURL` is the local issuer of the tokens Floci mints, `<base-url>/<pool id>`'
+  AWS::Events::Archive: '`KmsKeyIdentifier` is ignored'
+  AWS::CloudFront::Function: '`KeyValueStoreAssociations` is ignored'
 
 # Trailing prose appended to a row after its type list, for behaviour that belongs to the service
 # rather than to one type.
 row_notes:
+  AWS::AppSync: >-
+    `Ref` on `GraphQLApi` and `ApiKey` returns the id where AWS returns the ARN. See
+    [AppSync](appsync.md#cloudformation) for `Ref` and `Fn::GetAtt` compared with AWS.
   AWS::Lambda: >-
     Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module
     AWS injects for that code path, so Solutions-style custom-resource handlers work.

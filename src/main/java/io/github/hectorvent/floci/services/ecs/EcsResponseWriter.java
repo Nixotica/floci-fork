@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.services.ecs;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.services.ecs.model.Attribute;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.CapacityProvider;
@@ -39,9 +42,6 @@ import io.github.hectorvent.floci.services.ecs.model.TaskOverride;
 import io.github.hectorvent.floci.services.ecs.model.TaskSet;
 import io.github.hectorvent.floci.services.ecs.model.Volume;
 import io.github.hectorvent.floci.services.ecs.model.VolumeFrom;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -970,6 +970,22 @@ public class EcsResponseWriter {
                     .forEach(arn -> sources.add(serviceRevisionSummaryNode(arn, d.getServiceArn())));
         }
         n.set("sourceServiceRevisions", sources);
+        if (d.getRollbackTargetServiceRevisionArn() != null) {
+            ObjectNode rollback = n.putObject("rollback");
+            rollback.put("serviceRevisionArn", d.getRollbackTargetServiceRevisionArn());
+            rollback.put("reason", d.getRollbackReason());
+            putInstant(rollback, "startedAt", d.getRollbackStartedAt());
+        }
+        if (d.getAlarmNames() != null) {
+            ObjectNode alarms = n.putObject("alarms");
+            ArrayNode alarmNames = alarms.putArray("alarmNames");
+            d.getAlarmNames().forEach(alarmNames::add);
+            ArrayNode triggered = alarms.putArray("triggeredAlarmNames");
+            if (d.getTriggeredAlarmNames() != null) {
+                d.getTriggeredAlarmNames().forEach(triggered::add);
+            }
+            alarms.put("status", d.getAlarmStatus());
+        }
         return n;
     }
 

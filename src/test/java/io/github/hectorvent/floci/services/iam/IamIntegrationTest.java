@@ -7,7 +7,11 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -415,6 +419,51 @@ class IamIntegrationTest {
             .body("SimulateCustomPolicyResponse.SimulateCustomPolicyResult.EvaluationResults.member.find { it.EvalActionName == 'ec2:RunInstances' }.EvalDecision",
                     equalTo("explicitDeny"))
             .body("SimulateCustomPolicyResponse.SimulateCustomPolicyResult.EvaluationResults.member.find { it.EvalActionName == 'ssm:GetParameter' }.EvalDecision",
+                    equalTo("implicitDeny"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "ForAllValues:StringLike, allowed",
+            "ForAllValues:StringNotLike, allowed",
+            "ForAnyValue:StringLike, implicitDeny",
+            "ForAnyValue:StringNotLike, implicitDeny"
+    })
+    void simulateCustomPolicyUsesSetOperatorSemanticsForMissingKeys(String operator, String decision) {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+                   "Condition":{"%s":{"dynamodb:LeadingKeys":["USER_alice*"]}}}
+                ]}""".formatted(operator);
+        given()
+            .formParam("Action", "SimulateCustomPolicy")
+            .formParam("PolicyInputList.member.1", policy)
+            .formParam("ActionNames.member.1", "dynamodb:GetItem")
+            .formParam("ResourceArns.member.1", "*")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then().statusCode(200)
+            .body("SimulateCustomPolicyResponse.SimulateCustomPolicyResult.EvaluationResults.member.EvalDecision",
+                    equalTo(decision));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ForAllValues:StringTypoIfExists", "ForAnyValue:StringTypoIfExists",
+            "StringTypoIfExists", "ForAllValues:Null", "ForAnyValue:Null", "NullIfExists",
+            "ForAllValues:NullIfExists", "ForAnyValue:NullIfExists"})
+    void simulateCustomPolicyRejectsUnsupportedMissingKeyShortcuts(String operator) {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+                   "Condition":{"%s":{"dynamodb:LeadingKeys":["true"]}}}
+                ]}""".formatted(operator);
+        given()
+            .formParam("Action", "SimulateCustomPolicy")
+            .formParam("PolicyInputList.member.1", policy)
+            .formParam("ActionNames.member.1", "dynamodb:GetItem")
+            .formParam("ResourceArns.member.1", "*")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then().statusCode(200)
+            .body("SimulateCustomPolicyResponse.SimulateCustomPolicyResult.EvaluationResults.member.EvalDecision",
                     equalTo("implicitDeny"));
     }
 
@@ -1389,5 +1438,284 @@ class IamIntegrationTest {
                             + ".member.find { it.EvalActionName == 'dynamodb:GetItem' }.EvalDecision",
                     equalTo("allowed"));
     }
-}
 
+    // =========================================================================
+    // PermissionsBoundary round-trip (CreateRole/CreateUser accept it; Get* return it; List* don't)
+    // =========================================================================
+
+    private static final String IAM_AUTH =
+            "AWS4-HMAC-SHA256 Credential=test/20261001/us-east-1/iam/aws4_request";
+
+    private static String createBoundaryPolicy(String name) {
+        return given()
+            .formParam("Action", "CreatePolicy")
+            .formParam("PolicyName", name)
+            .formParam("PolicyDocument", POLICY_DOCUMENT)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .extract().path("CreatePolicyResponse.CreatePolicyResult.Policy.Arn");
+    }
+
+    @Test
+    @Order(80)
+    void createRoleWithPermissionsBoundaryIsReturnedByGetRole() {
+        String boundary = createBoundaryPolicy("pb-create-role-boundary");
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("RoleName", "pb-create-role")
+            .formParam("Path", "/pb-list/")
+            .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+            .formParam("PermissionsBoundary", boundary)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .body("CreateRoleResponse.CreateRoleResult.Role.PermissionsBoundary.PermissionsBoundaryArn",
+                    equalTo(boundary));
+
+        given()
+            .formParam("Action", "GetRole")
+            .formParam("RoleName", "pb-create-role")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .body("GetRoleResponse.GetRoleResult.Role.PermissionsBoundary.PermissionsBoundaryArn",
+                    equalTo(boundary))
+            .body("GetRoleResponse.GetRoleResult.Role.PermissionsBoundary.PermissionsBoundaryType",
+                    equalTo("Policy"));
+    }
+
+    @Test
+    @Order(81)
+    void putRolePermissionsBoundaryIsReturnedByGetRole() {
+        String boundary = createBoundaryPolicy("pb-put-role-boundary");
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("RoleName", "pb-put-role")
+            .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .formParam("Action", "PutRolePermissionsBoundary")
+            .formParam("RoleName", "pb-put-role")
+            .formParam("PermissionsBoundary", boundary)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .formParam("Action", "GetRole")
+            .formParam("RoleName", "pb-put-role")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .body("GetRoleResponse.GetRoleResult.Role.PermissionsBoundary.PermissionsBoundaryArn",
+                    equalTo(boundary));
+    }
+
+    @Test
+    @Order(82)
+    void createUserWithPermissionsBoundaryIsReturnedByGetUser() {
+        String boundary = createBoundaryPolicy("pb-create-user-boundary");
+        given()
+            .formParam("Action", "CreateUser")
+            .formParam("UserName", "pb-create-user")
+            .formParam("Path", "/pb-list/")
+            .formParam("PermissionsBoundary", boundary)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .body("CreateUserResponse.CreateUserResult.User.PermissionsBoundary.PermissionsBoundaryArn",
+                    equalTo(boundary));
+
+        given()
+            .formParam("Action", "GetUser")
+            .formParam("UserName", "pb-create-user")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .body("GetUserResponse.GetUserResult.User.PermissionsBoundary.PermissionsBoundaryArn",
+                    equalTo(boundary));
+    }
+
+    @Test
+    @Order(83)
+    void putUserPermissionsBoundaryIsReturnedByGetUser() {
+        String boundary = createBoundaryPolicy("pb-put-user-boundary");
+        given()
+            .formParam("Action", "CreateUser")
+            .formParam("UserName", "pb-put-user")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .formParam("Action", "PutUserPermissionsBoundary")
+            .formParam("UserName", "pb-put-user")
+            .formParam("PermissionsBoundary", boundary)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .formParam("Action", "GetUser")
+            .formParam("UserName", "pb-put-user")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .body("GetUserResponse.GetUserResult.User.PermissionsBoundary.PermissionsBoundaryArn",
+                    equalTo(boundary));
+    }
+
+    @Test
+    @Order(84)
+    void listRolesAndListUsersOmitPermissionsBoundary() {
+        // Orders 80 and 82 created a bounded role and user under /pb-list/. ListRoles and
+        // ListUsers document that they do not return PermissionsBoundary.
+        given()
+            .formParam("Action", "ListRoles")
+            .formParam("PathPrefix", "/pb-list/")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .body("ListRolesResponse.ListRolesResult.Roles.member.RoleName", equalTo("pb-create-role"))
+            .body(not(containsString("PermissionsBoundary")));
+
+        given()
+            .formParam("Action", "ListUsers")
+            .formParam("PathPrefix", "/pb-list/")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200)
+            .body("ListUsersResponse.ListUsersResult.Users.member.UserName", equalTo("pb-create-user"))
+            .body(not(containsString("PermissionsBoundary")));
+    }
+
+    @Test
+    @Order(85)
+    void createRoleWithUnknownPermissionsBoundaryCreatesNothing() {
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("RoleName", "pb-bad-role")
+            .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+            .formParam("PermissionsBoundary", "arn:aws:iam::000000000000:policy/pb-does-not-exist")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(404)
+            .body(containsString("NoSuchEntity"));
+
+        given()
+            .formParam("Action", "GetRole")
+            .formParam("RoleName", "pb-bad-role")
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(404);
+    }
+
+    @Test
+    @Order(86)
+    void createRoleRejectsANameOutsideTheRoleNamePattern() {
+        String pattern = "Member must satisfy regular expression pattern: [\\w+=,.@-]+";
+        Map<String, String> constraints = Map.of(
+                "aws:ec2-instance", pattern,
+                "bad/name", pattern,
+                "x".repeat(65), "Member must have length less than or equal to 64");
+        for (Map.Entry<String, String> entry : constraints.entrySet()) {
+            String name = entry.getKey();
+            given()
+                .formParam("Action", "CreateRole")
+                .formParam("RoleName", name)
+                .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+                .header("Authorization", IAM_AUTH)
+            .when().post("/").then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
+                .body("ErrorResponse.Error.Message", equalTo("1 validation error detected: Value '" + name
+                        + "' at 'roleName' failed to satisfy constraint: " + entry.getValue()));
+
+            given()
+                .formParam("Action", "GetRole")
+                .formParam("RoleName", name)
+                .header("Authorization", IAM_AUTH)
+            .when().post("/").then()
+                .statusCode(400);
+
+            given()
+                .formParam("Action", "ListRoles")
+                .header("Authorization", IAM_AUTH)
+            .when().post("/").then()
+                .statusCode(200)
+                .body("ListRolesResponse.ListRolesResult.Roles.member.RoleName.flatten()",
+                        not(hasItem(name)));
+        }
+
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(400)
+            .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
+            .body("ErrorResponse.Error.Message", equalTo("1 validation error detected: Value null"
+                    + " at 'roleName' failed to satisfy constraint: Member must not be null"));
+
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("RoleName", "")
+            .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(400)
+            .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
+            .body("ErrorResponse.Error.Message", equalTo("1 validation error detected: Value ''"
+                    + " at 'roleName' failed to satisfy constraint: Member must have length greater than or equal to 1"));
+
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("RoleName", "Ok_+=,.@-" + "x".repeat(55))
+            .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+            .header("Authorization", IAM_AUTH)
+        .when().post("/").then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(87)
+    void roleActionsRejectANameOutsideTheRoleNamePattern() {
+        String name = "aws:ec2-instance";
+        String message = "1 validation error detected: Value '" + name + "' at 'roleName' failed to satisfy"
+                + " constraint: Member must satisfy regular expression pattern: [\\w+=,.@-]+";
+        Map<String, Map<String, String>> actions = new LinkedHashMap<>();
+        actions.put("GetRole", Map.of());
+        actions.put("DeleteRole", Map.of());
+        actions.put("UpdateRole", Map.of());
+        actions.put("UpdateAssumeRolePolicy", Map.of("PolicyDocument", TRUST_POLICY));
+        actions.put("TagRole", Map.of("Tags.member.1.Key", "k", "Tags.member.1.Value", "v"));
+        actions.put("UntagRole", Map.of("TagKeys.member.1", "k"));
+        actions.put("ListRoleTags", Map.of());
+        actions.put("AttachRolePolicy", Map.of("PolicyArn", "arn:aws:iam::aws:policy/ReadOnlyAccess"));
+        actions.put("DetachRolePolicy", Map.of("PolicyArn", "arn:aws:iam::aws:policy/ReadOnlyAccess"));
+        actions.put("ListAttachedRolePolicies", Map.of());
+        actions.put("PutRolePolicy", Map.of("PolicyName", "p", "PolicyDocument", TRUST_POLICY));
+        actions.put("GetRolePolicy", Map.of("PolicyName", "p"));
+        actions.put("DeleteRolePolicy", Map.of("PolicyName", "p"));
+        actions.put("ListRolePolicies", Map.of());
+        actions.put("ListInstanceProfilesForRole", Map.of());
+        actions.put("PutRolePermissionsBoundary",
+                Map.of("PermissionsBoundary", "arn:aws:iam::aws:policy/ReadOnlyAccess"));
+        actions.put("DeleteRolePermissionsBoundary", Map.of());
+        actions.put("AddRoleToInstanceProfile", Map.of("InstanceProfileName", "ip"));
+        actions.put("RemoveRoleFromInstanceProfile", Map.of("InstanceProfileName", "ip"));
+        actions.put("DeleteServiceLinkedRole", Map.of());
+
+        for (Map.Entry<String, Map<String, String>> action : actions.entrySet()) {
+            given()
+                .formParam("Action", action.getKey())
+                .formParam("RoleName", name)
+                .formParams(action.getValue())
+                .header("Authorization", IAM_AUTH)
+            .when().post("/").then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
+                .body("ErrorResponse.Error.Message", equalTo(message));
+        }
+    }
+}

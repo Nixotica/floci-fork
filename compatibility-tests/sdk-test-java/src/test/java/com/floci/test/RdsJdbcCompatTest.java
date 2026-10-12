@@ -3,10 +3,10 @@ package com.floci.test;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
-import org.junit.jupiter.api.MethodOrderer;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -38,7 +38,7 @@ class RdsJdbcCompatTest {
 
     private static final StaticCredentialsProvider CREDENTIALS =
             StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
-    private static final Region REGION = Region.US_EAST_1;
+    private static final Region REGION = TestFixtures.region();
     private static final String USERNAME = "admin";
     private static final String PASSWORD = "secret123";
     private static final String DATABASE = "app";

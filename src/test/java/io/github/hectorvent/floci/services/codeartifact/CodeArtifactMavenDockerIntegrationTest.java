@@ -25,6 +25,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -88,6 +89,13 @@ class CodeArtifactMavenDockerIntegrationTest {
         given().header("Authorization", "Bearer " + bearerToken)
                 .head("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + GAV)
                 .then().statusCode(200);
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike")
+                .then().statusCode(200).body("package.name", equalTo("spike"))
+                .body("package.namespace", equalTo("com.example"))
+                .body("package.originConfiguration.restrictions.publish", equalTo("ALLOW"));
     }
 
     /**
@@ -146,6 +154,11 @@ class CodeArtifactMavenDockerIntegrationTest {
         given().header("Authorization", "Bearer " + bearerToken)
                 .get("/codeartifact/maven/" + DOMAIN + "/no-such-repo/does/not/exist.jar")
                 .then().statusCode(404);
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=does-not-exist")
+                .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
     }
 
     @Test
@@ -356,6 +369,73 @@ class CodeArtifactMavenDockerIntegrationTest {
         // entry, specifically, is what disappeared from the real shared instance's own settings
         // list, not just that Floci stopped tracking the CodeArtifact-side metadata.
         assertEquals(repositoryCountBeforeDelete - 1, reposiliteSettingsRepositoryCount());
+    }
+
+    /**
+     * The real-world gap this closes: {@code GetPackageVersionAsset} used to 404 for every
+     * Maven-deployed artifact since Floci's generic-format package-version store never had a
+     * record for it (Maven publishing goes straight to Reposilite, bypassing it entirely). Proves
+     * the JSON API now bridges to the same artifact {@link #deployThenFetchRoundTripsTheExactBytes}
+     * already confirmed is really there, through the real sidecar, not a mock.
+     */
+    @Test
+    @Order(12)
+    void getPackageVersionAssetBridgesToTheRealReposiliteSidecar() {
+        byte[] fetched = given().header("Authorization", AUTH)
+                .get("/v1/package/version/asset?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=1.0.0&asset=spike-1.0.0.jar")
+                .then().statusCode(200)
+                .header("X-AssetName", equalTo("spike-1.0.0.jar"))
+                .header("X-PackageVersion", equalTo("1.0.0"))
+                .extract().asByteArray();
+        assertEquals("real-jar-bytes", new String(fetched, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    @Order(12)
+    void getPackageVersionAssetRequiresANamespaceForMaven() {
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/asset?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&package=spike&version=1.0.0&asset=spike-1.0.0.jar")
+                .then().statusCode(400);
+    }
+
+    @Test
+    @Order(12)
+    void getPackageVersionAssetReturns404ForAMavenAssetThatWasNeverDeployed() {
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/asset?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=1.0.0&asset=does-not-exist.jar")
+                .then().statusCode(404);
+    }
+
+    /**
+     * A throwaway groupId/artifactId, not {@link #GAV}: deleting it exercises Reposilite's real
+     * directory delete (confirmed live before this was built: a single {@code DELETE} on the
+     * group/artifact path removes everything beneath it), and must not disturb the artifact every
+     * other test in this class shares.
+     */
+    @Test
+    @Order(13)
+    void deletePackageRemovesTheWholeReposiliteArtifactDirectory() {
+        byte[] content = "delete-me-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/deleteme/1.0.0/deleteme-1.0.0.jar")
+                .then().statusCode(200);
+
+        given().header("Authorization", AUTH)
+                .delete("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=deleteme")
+                .then().statusCode(200).body("deletedPackage.package", equalTo("deleteme"));
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/deleteme/1.0.0/deleteme-1.0.0.jar")
+                .then().statusCode(404);
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=deleteme")
+                .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
     }
 
     /**

@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -14,11 +16,12 @@ import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.RouteTableAssociation;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
-import org.mockito.ArgumentCaptor;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -29,8 +32,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
-import io.github.hectorvent.floci.core.common.AwsException;
-import java.util.Map;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -296,6 +297,38 @@ class Ec2NetworkCfnProvisionerTest {
     }
 
     @Test
+    void anUnchangedSubnetWhoseTemplateCidrHasHostBitsIsKept() {
+        Subnet current = subnet();
+        current.setCidrBlock("10.0.1.0/24");
+        when(ec2.describeSubnets(REGION, List.of(SUBNET_ID), Map.of())).thenReturn(List.of(current));
+        StackResource r = prior("AWS::EC2::Subnet", "Subnet", SUBNET_ID, Map.of("SubnetId", SUBNET_ID));
+        ObjectNode props = mapper.createObjectNode().put("VpcId", VPC_ID).put("CidrBlock", "10.0.1.9/24");
+
+        provisioner.provision(r, props, ctx(SUBNET_ID));
+
+        verify(ec2, never()).createSubnet(any(), any(), any(), any());
+        assertEquals(SUBNET_ID, r.getPhysicalId());
+        assertFalse(provisioner.hasReplacementUpdate(r));
+    }
+
+    @Test
+    void aSubnetSavedWithHostBitsBeforeCanonicalizationIsKept() {
+        // State persisted by an older build can still hold the template's spelling, host bits and all.
+        Subnet current = subnet();
+        current.setCidrBlock("10.0.1.9/24");
+        when(ec2.describeSubnets(REGION, List.of(SUBNET_ID), Map.of())).thenReturn(List.of(current));
+        StackResource r = prior("AWS::EC2::Subnet", "Subnet", SUBNET_ID, Map.of("SubnetId", SUBNET_ID));
+        ObjectNode props = mapper.createObjectNode().put("VpcId", VPC_ID).put("CidrBlock", "10.0.1.9/24")
+                .put("MapPublicIpOnLaunch", true);
+
+        provisioner.provision(r, props, ctx(SUBNET_ID));
+
+        verify(ec2, never()).createSubnet(any(), any(), any(), any());
+        assertEquals(SUBNET_ID, r.getPhysicalId());
+        assertFalse(provisioner.hasReplacementUpdate(r));
+    }
+
+    @Test
     void aSubnetWithAChangedCidrIsReplacedAndThePriorOneIsOwedToCleanup() {
         Subnet current = subnet();
         current.setCidrBlock("10.0.1.0/24");
@@ -478,7 +511,7 @@ class Ec2NetworkCfnProvisionerTest {
     }
 
     private static ObjectNode withTags(ObjectNode props, String... keyValues) {
-        var tags = props.putArray("Tags");
+        ArrayNode tags = props.putArray("Tags");
         for (int i = 0; i + 1 < keyValues.length; i += 2) {
             tags.addObject().put("Key", keyValues[i]).put("Value", keyValues[i + 1]);
         }
@@ -714,7 +747,7 @@ class Ec2NetworkCfnProvisionerTest {
         when(ec2.allocateAddress(REGION)).thenReturn(addr);
         doThrow(new AwsException("TagLimitExceeded", "too many tags", 400)).when(ec2).createTags(any(), any(), any());
 
-        for (var attempt : List.of(
+        for (Map.Entry<String, ObjectNode> attempt : List.of(
                 Map.entry("AWS::EC2::Subnet", withTags(mapper.createObjectNode().put("VpcId", VPC_ID).put("CidrBlock", "10.0.1.0/24"), "k", "v")),
                 Map.entry("AWS::EC2::RouteTable", withTags(mapper.createObjectNode().put("VpcId", VPC_ID), "k", "v")),
                 Map.entry("AWS::EC2::InternetGateway", withTags(mapper.createObjectNode(), "k", "v")),

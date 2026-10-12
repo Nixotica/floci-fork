@@ -145,12 +145,19 @@ public class CloudFormationQueryHandler {
         String stackName = params.getFirst("StackName");
         String templateBody = params.getFirst("TemplateBody");
         String templateUrl = params.getFirst("TemplateURL");
+        boolean usePreviousTemplate = Boolean.parseBoolean(params.getFirst("UsePreviousTemplate"));
+        cfnService.validateTemplateSource(templateBody, templateUrl, usePreviousTemplate);
         Map<String, String> parameters =
                 extractParameters(params, cfnService.currentParameters(stackName, region));
         List<String> capabilities = extractList(params, "Capabilities.member.");
+        Map<String, String> tags = extractTags(params);
 
-        ChangeSet cs = cfnService.createChangeSet(stackName, "update-" + UUID.randomUUID().toString().substring(0, 8),
-                "UPDATE", templateBody, templateUrl, parameters, capabilities, Map.of(), region);
+        String changeSetName = "update-" + UUID.randomUUID().toString().substring(0, 8);
+        ChangeSet cs = usePreviousTemplate
+                ? cfnService.createChangeSetFromPreviousTemplate(stackName, changeSetName,
+                        parameters, capabilities, tags, region)
+                : cfnService.createChangeSet(stackName, changeSetName,
+                        "UPDATE", templateBody, templateUrl, parameters, capabilities, tags, region);
         awaitExecution(cfnService.executeChangeSet(stackName, cs.getChangeSetName(), region));
 
         Stack stack = cfnService.describeStacks(stackName, region).get(0);
@@ -211,6 +218,12 @@ public class CloudFormationQueryHandler {
         String changeSetType = params.getFirst("ChangeSetType");
         String templateBody = params.getFirst("TemplateBody");
         String templateUrl = params.getFirst("TemplateURL");
+        boolean usePreviousTemplate = Boolean.parseBoolean(params.getFirst("UsePreviousTemplate"));
+        if (usePreviousTemplate && "CREATE".equalsIgnoreCase(changeSetType)) {
+            throw new AwsException("ValidationError",
+                    "UsePreviousTemplate cannot be specified for a CREATE change set", 400);
+        }
+        cfnService.validateTemplateSource(templateBody, templateUrl, usePreviousTemplate);
         Map<String, String> parameters =
                 extractParameters(params, cfnService.currentParameters(stackName, region));
         List<String> capabilities = extractList(params, "Capabilities.member.");
@@ -218,8 +231,11 @@ public class CloudFormationQueryHandler {
 
         // The CreateChangeSet operation, unlike the change sets CreateStack/UpdateStack build
         // internally, may attach a CREATE change set to a stack still in REVIEW_IN_PROGRESS.
-        ChangeSet cs = cfnService.createChangeSetForRequest(stackName, changeSetName, changeSetType,
-                templateBody, templateUrl, parameters, capabilities, tags, region);
+        ChangeSet cs = usePreviousTemplate
+                ? cfnService.createChangeSetFromPreviousTemplate(stackName, changeSetName,
+                        parameters, capabilities, tags, region)
+                : cfnService.createChangeSetForRequest(stackName, changeSetName, changeSetType,
+                        templateBody, templateUrl, parameters, capabilities, tags, region);
 
         String xml = new XmlBuilder()
                 .start("CreateChangeSetResponse", CF_NS)
@@ -450,7 +466,7 @@ public class CloudFormationQueryHandler {
         String templateStage = params.getFirst("TemplateStage");
         try {
             String template = cfnService.getTemplate(stackName, templateStage, region);
-            var xml = new XmlBuilder()
+            XmlBuilder xml = new XmlBuilder()
                     .start("GetTemplateResponse", CF_NS)
                     .start("GetTemplateResult")
                     .elem("TemplateBody", template);
@@ -479,7 +495,7 @@ public class CloudFormationQueryHandler {
         try {
             TemplateSummary summary = cfnService.getTemplateSummary(stackName, templateBody, templateUrl, region);
 
-            var xml = new XmlBuilder()
+            XmlBuilder xml = new XmlBuilder()
                     .start("GetTemplateSummaryResponse", CF_NS)
                     .start("GetTemplateSummaryResult");
 
@@ -574,12 +590,12 @@ public class CloudFormationQueryHandler {
     // ── ListExports ─────────────────────────────────────────────────────────
 
     private Response listExports(MultivaluedMap<String, String> params, String region) {
-        var exportEntries = cfnService.listExports(region);
+        Map<String, CloudFormationService.ExportEntry> exportEntries = cfnService.listExports(region);
         XmlBuilder xml = new XmlBuilder()
                 .start("ListExportsResponse", CF_NS)
                 .start("ListExportsResult")
                 .start("Exports");
-        for (var entry : exportEntries.values()) {
+        for (CloudFormationService.ExportEntry entry : exportEntries.values()) {
             xml.start("member")
                .elem("ExportingStackId", entry.exportingStackId())
                .elem("Name", entry.name())
@@ -708,7 +724,9 @@ public class CloudFormationQueryHandler {
             result.put(key, value != null ? value : "");
             i++;
         }
-        return result;
+        boolean supplied = params.keySet().stream().anyMatch(name ->
+                "Tags".equals(name) || "Tags.member".equals(name) || name.startsWith("Tags.member."));
+        return supplied ? result : null;
     }
 
     private List<String> extractList(MultivaluedMap<String, String> params, String prefix) {

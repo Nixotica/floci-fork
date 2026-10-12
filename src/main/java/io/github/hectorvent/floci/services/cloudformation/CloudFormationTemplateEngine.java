@@ -2,6 +2,9 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.MissingNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
@@ -98,6 +101,11 @@ public class CloudFormationTemplateEngine {
         this.objectMapper = objectMapper;
         this.importValueResolver = importValueResolver;
         this.dynamicReferenceResolver = dynamicReferenceResolver;
+    }
+
+    /** The id of the stack this engine resolves for, as {@code AWS::StackId} returns it. */
+    public String stackId() {
+        return stackId;
     }
 
     /**
@@ -200,28 +208,80 @@ public class CloudFormationTemplateEngine {
             if (node.has("Fn::Split") || node.has("Fn::GetAZs") || node.has("Fn::Cidr")) {
                 return objectMapper.valueToTree(resolveList(node));
             }
-            if (node.has("Ref") || node.has("Fn::Sub") || node.has("Fn::Join") ||
-                    node.has("Fn::Select") || node.has("Fn::Base64") ||
-                    node.has("Fn::GetAtt") || node.has("Fn::ImportValue") || node.has("Fn::FindInMap")) {
+            if (isIntrinsic(node)) {
                 return TextNode.valueOf(resolve(node));
             }
-            // Plain object — resolve each field
-            var resolved = objectMapper.createObjectNode();
+            // Plain object: resolve each field.
+            ObjectNode resolved = objectMapper.createObjectNode();
             Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
             while (fields.hasNext()) {
-                var entry = fields.next();
+                Map.Entry<String, JsonNode> entry = fields.next();
                 resolved.set(entry.getKey(), resolveNode(entry.getValue()));
             }
             return resolved;
         }
         if (node.isArray()) {
-            var arr = objectMapper.createArrayNode();
+            ArrayNode arr = objectMapper.createArrayNode();
             for (JsonNode item : node) {
                 arr.add(resolveNode(item));
             }
             return arr;
         }
         return node;
+    }
+
+    /** Resolves optional structured properties, omitting only selected AWS::NoValue expressions. */
+    public JsonNode resolveNodeOmittingNoValue(JsonNode node) {
+        return resolveNode(omitNoValue(node));
+    }
+
+    private JsonNode omitNoValue(JsonNode node) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return node;
+        }
+        if (node.isObject()) {
+            if (node.size() == 1 && "AWS::NoValue".equals(node.path("Ref").asText())) {
+                return MissingNode.getInstance();
+            }
+            if (node.size() == 1 && node.has("Fn::If")) {
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                if (branch != null) {
+                    return omitNoValue(branch);
+                }
+            }
+            if (isIntrinsic(node)) {
+                return node;
+            }
+            ObjectNode resolved = objectMapper.createObjectNode();
+            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> field = fields.next();
+                JsonNode value = omitNoValue(field.getValue());
+                if (!value.isMissingNode()) {
+                    resolved.set(field.getKey(), value);
+                }
+            }
+            return resolved;
+        }
+        if (node.isArray()) {
+            ArrayNode resolved = objectMapper.createArrayNode();
+            for (JsonNode item : node) {
+                JsonNode value = omitNoValue(item);
+                if (!value.isMissingNode()) {
+                    resolved.add(value);
+                }
+            }
+            return resolved;
+        }
+        return node;
+    }
+
+    private static boolean isIntrinsic(JsonNode node) {
+        return node.has("Ref") || node.has("Fn::Sub") || node.has("Fn::Join")
+                || node.has("Fn::Select") || node.has("Fn::Base64") || node.has("Fn::GetAtt")
+                || node.has("Fn::ImportValue") || node.has("Fn::FindInMap")
+                || node.has("Fn::Split") || node.has("Fn::GetAZs") || node.has("Fn::Cidr")
+                || node.has("Fn::If");
     }
 
     /**
@@ -595,7 +655,8 @@ public class CloudFormationTemplateEngine {
 
     private String resolveGetAttParts(String logicalId, String attrName) {
         Map<String, String> attrs = resourceAttributes.get(logicalId);
-        if (attrs != null && attrs.containsKey(attrName)) {
+        // Provisioners keep private state under __Floci keys; AWS resolves no such attribute.
+        if (attrs != null && attrs.containsKey(attrName) && !attrName.startsWith("__Floci")) {
             return attrs.get(attrName);
         }
         LOG.warnv("Unresolved GetAtt: {0}.{1}", logicalId, attrName);

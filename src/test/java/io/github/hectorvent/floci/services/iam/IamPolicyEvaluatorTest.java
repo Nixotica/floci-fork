@@ -1,11 +1,14 @@
 package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsServiceNamespaces;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourceAccountRelationship;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.List;
@@ -52,6 +55,48 @@ class IamPolicyEvaluatorTest {
             assertFalse(IamPolicyEvaluator.globMatches(pattern, value));
             assertTrue(IamPolicyEvaluator.caseSensitiveGlobMatches("*a?*b", "zzacccb"));
         });
+    }
+
+    @Test
+    void supportedConditionOperatorsIncludeQuantifiersAndIfExists() {
+        assertTrue(IamPolicyEvaluator.isSupportedConditionOperator("IpAddress"));
+        assertTrue(IamPolicyEvaluator.isSupportedConditionOperator("ForAnyValue:StringLikeIfExists"));
+        assertTrue(IamPolicyEvaluator.isSupportedConditionOperator("Null"));
+        assertFalse(IamPolicyEvaluator.isSupportedConditionOperator("NullIfExists"));
+        assertFalse(IamPolicyEvaluator.isSupportedConditionOperator("IpAddres"));
+        assertFalse(IamPolicyEvaluator.isSupportedConditionOperator("forallvalues:StringEquals"));
+    }
+
+    @Test
+    void numericAndBooleanScalarConditionValuesAreCompared() {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket",
+                  "Resource":"*","Condition":{"NumericLessThanEquals":{"s3:max-keys":10},
+                  "StringEquals":{"aws:MultiFactorAuthPresent":true}}}]}""";
+        Map<String, List<String>> within = Map.of("s3:max-keys", List.of("10"),
+                "aws:MultiFactorAuthPresent", List.of("true"));
+        Map<String, List<String>> over = Map.of("s3:max-keys", List.of("11"),
+                "aws:MultiFactorAuthPresent", List.of("true"));
+
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(policy), "s3:ListBucket", "*", within));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy), "s3:ListBucket", "*", over));
+    }
+
+    @Test
+    void nullConditionReadsUnquotedBooleanValues() {
+        String requireAbsent = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket",
+                  "Resource":"*","Condition":{"Null":{"aws:TokenIssueTime":true}}}]}""";
+        String requirePresent = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket",
+                  "Resource":"*","Condition":{"Null":{"aws:TokenIssueTime":false}}}]}""";
+        Map<String, List<String>> absent = Map.of();
+        Map<String, List<String>> present = Map.of("aws:TokenIssueTime", List.of("2030-01-01T00:00:00Z"));
+
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(requireAbsent), "s3:ListBucket", "*", absent));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(requireAbsent), "s3:ListBucket", "*", present));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(requirePresent), "s3:ListBucket", "*", absent));
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(requirePresent), "s3:ListBucket", "*", present));
     }
 
     @Test
@@ -353,11 +398,81 @@ class IamPolicyEvaluatorTest {
     }
 
     @Test
-    void setOperatorWithoutIfExistsFailsClosedWhenTheKeyIsAbsent() {
-        // The key is absent from the context entirely — not an empty set. A request that
-        // cannot be proven in scope is treated as out of scope.
-        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(
+    void forAllValuesMatchesWhenTheKeyIsAbsent() {
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(
                 List.of(LEADING_KEYS_FOR_ALL), "dynamodb:GetItem", "*", Map.of()));
+        assertEquals(Decision.ALLOW, evaluator.evaluate(CallerContext.of(List.of(LEADING_KEYS_FOR_ALL)),
+                List.of(), "dynamodb:GetItem", "*", Map.of()));
+    }
+
+    @Test
+    void forAllValuesExplicitDenyMatchesWhenTheKeyIsAbsent() {
+        String deny = LEADING_KEYS_FOR_ALL.replace("\"Effect\":\"Allow\"", "\"Effect\":\"Deny\"");
+        assertEquals(Decision.DENY, evaluator.evaluate(CallerContext.of(List.of(ALLOW_ALL, deny)),
+                List.of(), "dynamodb:GetItem", "*", Map.of()));
+        assertEquals(IamPolicyEvaluator.SimulationDecision.EXPLICIT_DENY, evaluator.simulatePrincipalPolicy(
+                CallerContext.of(List.of(ALLOW_ALL, deny)), "dynamodb:GetItem", "*", Map.of()));
+    }
+
+    @Test
+    void forAllValuesMissingKeyStillRequiresOtherConditionKeysToMatch() {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+                   "Condition":{"ForAllValues:StringLike":{
+                     "dynamodb:LeadingKeys":["USER_alice*"],"aws:TagKeys":["environment"]}}}
+                ]}""";
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy), "dynamodb:GetItem", "*",
+                Map.of("aws:TagKeys", List.of("unapproved"))));
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(policy), "dynamodb:GetItem", "*",
+                Map.of("aws:TagKeys", List.of("environment"))));
+    }
+
+    @Test
+    void unknownForAllValuesOperatorsDoNotMatchMissingKeys() {
+        for (String operator : List.of("ForAllValues:StringTypo", "ForAllValues:ForAnyValue:StringLike")) {
+            String allow = """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+                       "Condition":{"%s":{"dynamodb:LeadingKeys":["USER_alice*"]}}}
+                    ]}""".formatted(operator);
+            String deny = allow.replace("\"Effect\":\"Allow\"", "\"Effect\":\"Deny\"");
+            assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(
+                    List.of(allow), "dynamodb:GetItem", "*", Map.of()));
+            assertEquals(Decision.DENY, evaluator.evaluate(CallerContext.of(List.of(allow)),
+                    List.of(), "dynamodb:GetItem", "*", Map.of()));
+            assertEquals(IamPolicyEvaluator.SimulationDecision.ALLOWED, evaluator.simulatePrincipalPolicy(
+                    CallerContext.of(List.of(ALLOW_ALL, deny)), "dynamodb:GetItem", "*", Map.of()));
+            assertEquals(Decision.ALLOW, evaluator.evaluate(CallerContext.of(List.of(ALLOW_ALL, deny)),
+                    List.of(), "dynamodb:GetItem", "*", Map.of()));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ForAllValues:StringTypoIfExists", "ForAnyValue:StringTypoIfExists",
+            "StringTypoIfExists", "ForAllValues:Null", "ForAnyValue:Null", "NullIfExists",
+            "ForAllValues:NullIfExists", "ForAnyValue:NullIfExists"})
+    void unsupportedOperatorsCannotBypassConditionChecks(String operator) {
+        String allow = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+                   "Condition":{"%s":{"dynamodb:LeadingKeys":["true"]}}}
+                ]}""".formatted(operator);
+        String deny = allow.replace("\"Effect\":\"Allow\"", "\"Effect\":\"Deny\"");
+        List<Map<String, List<String>>> contexts = List.of(Map.of(),
+                Map.of("dynamodb:LeadingKeys", List.of()),
+                Map.of("dynamodb:LeadingKeys", List.of("USER_alice")));
+        for (Map<String, List<String>> context : contexts) {
+            assertFalse(IamPolicyEvaluator.isSupportedConditionOperator(operator));
+            assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(
+                    List.of(allow), "dynamodb:GetItem", "*", context));
+            assertEquals(Decision.DENY, evaluator.evaluate(CallerContext.of(List.of(allow)),
+                    List.of(), "dynamodb:GetItem", "*", context));
+            assertEquals(IamPolicyEvaluator.SimulationDecision.ALLOWED, evaluator.simulatePrincipalPolicy(
+                    CallerContext.of(List.of(ALLOW_ALL, deny)), "dynamodb:GetItem", "*", context));
+            assertEquals(Decision.ALLOW, evaluator.evaluate(CallerContext.of(List.of(ALLOW_ALL, deny)),
+                    List.of(), "dynamodb:GetItem", "*", context));
+        }
     }
 
     @Test
@@ -383,7 +498,7 @@ class IamPolicyEvaluatorTest {
             {"Version":"2012-10-17","Statement":[
               {"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
                "Condition":{
-                 "ForAllValues:StringLikeIfExists":{"dynamodb:LeadingKeys":["USER_alice*"]},
+                 "ForAllValues:StringLike":{"dynamodb:LeadingKeys":["USER_alice*"]},
                  "Null":{"dynamodb:LeadingKeys":"false"}}}
             ]}""";
 
@@ -686,7 +801,8 @@ class IamPolicyEvaluatorTest {
         String serviceWildcard = resourcePolicy("Allow", "\"Principal\":{\"Service\":\"*\"}");
         assertEquals(ResourcePolicyDecision.NEUTRAL, resourceDecision(serviceWildcard, alice));
         assertEquals(ResourcePolicyDecision.NEUTRAL, resourceDecision(serviceWildcard, sns));
-        // Federated and CanonicalUser name callers of their own kinds, never an IAM identity.
+        // Federated names callers of its own kind, never an IAM identity; CanonicalUser names one
+        // account by its canonical ID, never every account.
         assertEquals(ResourcePolicyDecision.NEUTRAL,
                 resourceDecision(resourcePolicy("Allow", "\"Principal\":{\"Federated\":\"*\"}"), alice));
         assertEquals(ResourcePolicyDecision.NEUTRAL,
@@ -736,6 +852,52 @@ class IamPolicyEvaluatorTest {
         assertEquals(Decision.DENY, evaluator.evaluateServicePrincipal(
                 List.of(allowSns, resourcePolicy("Deny", "\"Principal\":{\"AWS\":\"*\"}")),
                 sns, "sqs:SendMessage", "*", null));
+    }
+
+    @Test
+    void aCanonicalUserNamesTheIamIdentitiesOfItsAccount() {
+        // S3 bucket policies can name an account by its canonical user ID (IAM User Guide, "AWS
+        // account principals"); Floci's canonical ID for an account is the account id.
+        String canonical = resourcePolicy("Allow", "\"Principal\":{\"CanonicalUser\":\"123456789012\"}");
+        assertEquals(ResourcePolicyDecision.ALLOW,
+                resourceDecision(canonical, RequestPrincipal.iam("arn:aws:iam::123456789012:user/alice")));
+        assertEquals(ResourcePolicyDecision.ALLOW, resourceDecision(canonical, RequestPrincipal.roleSession(
+                "arn:aws:sts::123456789012:assumed-role/App/s", "arn:aws:iam::123456789012:role/team/App")));
+        assertEquals(ResourcePolicyDecision.NEUTRAL,
+                resourceDecision(canonical, RequestPrincipal.iam("arn:aws:iam::210987654321:user/alice")));
+        assertEquals(ResourcePolicyDecision.NEUTRAL,
+                resourceDecision(canonical, RequestPrincipal.service("sns.amazonaws.com")));
+        assertEquals(ResourcePolicyDecision.NEUTRAL, resourceDecision(canonical, RequestPrincipal.anonymous()));
+    }
+
+    @Test
+    void onlyAGrantNamingTheUserExactlyIsDirect() {
+        // A grant names a user directly by its exact ARN, or by "*" with aws:PrincipalArn pinned to
+        // it. One that reaches the user through a pattern is not direct, and a Deny still wins.
+        RequestPrincipal alice = RequestPrincipal.iam("arn:aws:iam::123456789012:user/alice");
+        Map<String, List<String>> ctx = Map.of("aws:PrincipalArn", List.of(alice.arn()));
+        String exact = resourcePolicy("Allow", "\"Principal\":{\"AWS\":\"arn:aws:iam::123456789012:user/alice\"}");
+        String pinned = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*",
+              "Condition":{"ArnEquals":{"aws:PrincipalArn":"arn:aws:iam::123456789012:user/alice"}}}]}""";
+        String pattern = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"*","Resource":"*",
+              "Condition":{"ArnLike":{"aws:PrincipalArn":"arn:aws:iam::123456789012:user/*"}}}]}""";
+        String pinnedDeny = """
+            {"Version":"2012-10-17","Statement":[
+              {"Effect":"Allow","Principal":"*","Action":"*","Resource":"*",
+               "Condition":{"StringEquals":{"aws:PrincipalArn":"arn:aws:iam::123456789012:user/alice"}}},
+              {"Effect":"Deny","Principal":"*","Action":"*","Resource":"*",
+               "Condition":{"ArnEquals":{"aws:PrincipalArn":"arn:aws:iam::123456789012:user/alice"}}}]}""";
+
+        assertEquals(ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER,
+                evaluator.evaluateResourcePolicyFor(List.of(exact), alice, "s3:GetObject", "*", ctx));
+        assertEquals(ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER,
+                evaluator.evaluateResourcePolicyFor(List.of(pinned), alice, "s3:GetObject", "*", ctx));
+        assertEquals(ResourcePolicyDecision.ALLOW,
+                evaluator.evaluateResourcePolicyFor(List.of(pattern), alice, "s3:GetObject", "*", ctx));
+        assertEquals(ResourcePolicyDecision.EXPLICIT_DENY,
+                evaluator.evaluateResourcePolicyFor(List.of(pinnedDeny), alice, "s3:GetObject", "*", ctx));
     }
 
     private static String resourcePolicy(String effect, String principal) {
@@ -998,5 +1160,187 @@ class IamPolicyEvaluatorTest {
         List<String> keys = evaluator.contextKeysReferencedIn(List.of(MALFORMED, validWithKey));
 
         assertEquals(List.of("aws:PrincipalArn"), keys);
+    }
+
+    @Test
+    void anAbsentScpChainLeavesEveryServiceReachable() {
+        // The management account's case: the reference says it "is not limited by SCPs", so its
+        // report lists every service.
+        assertEquals(AwsServiceNamespaces.all().size(),
+                evaluator.servicesAllowedByScpLevels(null).size());
+    }
+
+    @Test
+    void aLevelAllowingEverythingLeavesEveryServiceReachable() {
+        assertEquals(AwsServiceNamespaces.all().size(),
+                evaluator.servicesAllowedByScpLevels(List.of(List.of(ALLOW_ALL))).size());
+    }
+
+    @Test
+    void theLevelsAreIntersectedAndTheAttachedPoliciesWithinOneAreNot() {
+        // FullAWSAccess at the root, S3 only at the OU: the OU's ceiling wins.
+        assertEquals(List.of("s3"),
+                evaluator.servicesAllowedByScpLevels(
+                        List.of(List.of(ALLOW_ALL), List.of(ALLOW_S3_ONLY))));
+        // Two policies attached at one level are a union, so both services survive a root that
+        // allows everything.
+        assertEquals(List.of("dynamodb", "s3"),
+                evaluator.servicesAllowedByScpLevels(List.of(List.of(ALLOW_ALL),
+                        List.of(ALLOW_S3_ONLY, allowOnly("dynamodb")))));
+    }
+
+    @Test
+    void levelsThatCannotOverlapLeaveNothingReachable() {
+        assertEquals(List.of(), evaluator.servicesAllowedByScpLevels(
+                List.of(List.of(ALLOW_S3_ONLY), List.of(allowOnly("dynamodb")))));
+    }
+
+    @Test
+    void aDenyDropsAServiceOnlyWhenItClosesTheWholeNamespace() {
+        // DENY_S3 denies s3:*, so S3 goes.
+        assertFalse(evaluator.servicesAllowedByScpLevels(List.of(List.of(DENY_S3))).contains("s3"));
+        // One action is not the service: a principal can still reach S3 through everything else.
+        String denyOneAction =
+                "{\"Version\":\"2012-10-17\",\"Statement\":["
+                        + "{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"Action\":\"s3:DeleteBucket\","
+                        + "\"Resource\":\"*\"}]}";
+        assertTrue(evaluator.servicesAllowedByScpLevels(List.of(List.of(denyOneAction)))
+                .contains("s3"));
+    }
+
+    @Test
+    void aConditionalDenyLeavesEveryServiceReachable() {
+        // The region guardrail most organizations carry. It bites only outside one region, so
+        // every service is still reachable inside it, and treating it as a total deny would report
+        // an organization that reaches nothing at all.
+        String denyOutsideOneRegion =
+                "{\"Version\":\"2012-10-17\",\"Statement\":["
+                        + "{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"Action\":\"*\",\"Resource\":\"*\","
+                        + "\"Condition\":{\"StringNotEquals\":"
+                        + "{\"aws:RequestedRegion\":\"us-east-1\"}}}]}";
+
+        assertEquals(AwsServiceNamespaces.all().size(),
+                evaluator.servicesAllowedByScpLevels(List.of(List.of(denyOutsideOneRegion)))
+                        .size());
+    }
+
+    @Test
+    void aDenyScopedToOneResourceLeavesTheServiceReachable() {
+        // Denying s3:* on one bucket does not put S3 out of reach: every other bucket is still
+        // there, which is the same reading that keeps a service denied one action on the list.
+        String denyOneBucket =
+                "{\"Version\":\"2012-10-17\",\"Statement\":["
+                        + "{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"Action\":\"s3:*\","
+                        + "\"Resource\":\"arn:aws:s3:::locked-bucket/*\"}]}";
+
+        assertTrue(evaluator.servicesAllowedByScpLevels(List.of(List.of(denyOneBucket)))
+                .contains("s3"));
+    }
+
+    @Test
+    void aNotActionDenyIsTheAllowListIdiomItIsWrittenAs() {
+        // The common SCP shape: allow everything, then deny everything that is not S3.
+        String denyAllButS3 =
+                "{\"Version\":\"2012-10-17\",\"Statement\":["
+                        + "{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"NotAction\":\"s3:*\","
+                        + "\"Resource\":\"*\"}]}";
+
+        assertEquals(List.of("s3"),
+                evaluator.servicesAllowedByScpLevels(List.of(List.of(denyAllButS3))));
+    }
+
+    @Test
+    void levelsAllowingDisjointSingleActionsLeaveNothingReachable() {
+        // Both levels allow an S3 action, so a namespace-at-a-time reading intersects S3 with S3
+        // and keeps it, although no one action clears both ceilings.
+        assertFalse(evaluator.servicesAllowedByScpLevels(
+                        List.of(List.of(allowOnlyAction("s3:GetObject")),
+                                List.of(allowOnlyAction("s3:PutObject"))))
+                .contains("s3"));
+        // The same two levels where the actions do overlap keep it.
+        assertTrue(evaluator.servicesAllowedByScpLevels(
+                        List.of(List.of(allowOnlyAction("s3:Get*")),
+                                List.of(allowOnlyAction("s3:GetObject"))))
+                .contains("s3"));
+    }
+
+    @Test
+    void aDenyOnTheOnlyAllowedActionDropsTheService() {
+        // The deny closes nothing like the whole namespace, but it closes everything the level
+        // allowed, which leaves no S3 action to reach.
+        String allowAndDenyOneAction =
+                "{\"Version\":\"2012-10-17\",\"Statement\":["
+                        + "{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\","
+                        + "\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"Action\":\"s3:GetObject\","
+                        + "\"Resource\":\"*\"}]}";
+
+        assertFalse(evaluator.servicesAllowedByScpLevels(List.of(List.of(allowAndDenyOneAction)))
+                .contains("s3"));
+    }
+
+    @Test
+    void aDenyOnAWiderPatternThanTheAllowDropsTheService() {
+        String allowOneDenyThePrefix =
+                "{\"Version\":\"2012-10-17\",\"Statement\":["
+                        + "{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\","
+                        + "\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"Action\":\"s3:Get*\","
+                        + "\"Resource\":\"*\"}]}";
+
+        assertFalse(evaluator.servicesAllowedByScpLevels(List.of(List.of(allowOneDenyThePrefix)))
+                .contains("s3"));
+        // Narrower the other way round: the deny takes GetObject and the allow keeps the rest of
+        // the prefix, so the service stays.
+        String allowThePrefixDenyOne =
+                "{\"Version\":\"2012-10-17\",\"Statement\":["
+                        + "{\"Effect\":\"Allow\",\"Action\":\"s3:Get*\","
+                        + "\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"Action\":\"s3:GetObject\","
+                        + "\"Resource\":\"*\"}]}";
+
+        assertTrue(evaluator.servicesAllowedByScpLevels(List.of(List.of(allowThePrefixDenyOne)))
+                .contains("s3"));
+    }
+
+    @Test
+    void aWildcardThatIsNotATrailingOneKeepsTheServiceOnTheList() {
+        // The documented limit of the probes: s3:*Object and s3:Get* do overlap, at s3:GetObject,
+        // but no stand-in action shows it. The service stays on the list rather than coming off
+        // it, which is the side the namespace reading was already on.
+        assertTrue(evaluator.servicesAllowedByScpLevels(
+                        List.of(List.of(allowOnlyAction("s3:Get*")),
+                                List.of(allowOnlyAction("s3:*Object"))))
+                .contains("s3"));
+    }
+
+    @Test
+    void anUnreadableGuardrailLeavesNothingReachable() {
+        // The same judgement scpAllows makes: the ceiling cannot tell what the document said, and
+        // reporting every service would be the permissive answer.
+        assertEquals(List.of(),
+                evaluator.servicesAllowedByScpLevels(List.of(List.of(ALLOW_ALL, MALFORMED))));
+    }
+
+    @Test
+    void aLevelWithNoPolicyConstrainsNothing() {
+        // AWS keeps FullAWSAccess attached to every target, so a bare level is not a level that
+        // denies: it is one that has nothing to say.
+        assertEquals(List.of("s3"), evaluator.servicesAllowedByScpLevels(
+                List.of(List.of(), List.of(ALLOW_S3_ONLY))));
+    }
+
+    private static String allowOnlyAction(String action) {
+        return "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Action\":\"" + action + "\",\"Resource\":\"*\"}]}";
+    }
+
+    private static String allowOnly(String namespace) {
+        return "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Action\":\"" + namespace + ":*\",\"Resource\":\"*\"}]}";
     }
 }

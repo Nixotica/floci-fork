@@ -1,6 +1,11 @@
 package io.github.hectorvent.floci.services.mwaa;
 
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Mount;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
@@ -11,12 +16,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.E
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
-import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.mwaa.model.Environment;
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
-import com.github.dockerjava.api.exception.NotFoundException;
-import com.github.dockerjava.api.model.Mount;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -323,6 +323,25 @@ class MwaaEnvironmentManagerTest {
                 MwaaEnvironmentManager.dbContainerName(namespacedConfig, environment));
         assertEquals("floci-aws-ns1-mwaa-000000000000.us-east-1.my-env-airflow",
                 MwaaEnvironmentManager.airflowContainerName(namespacedConfig, environment));
+    }
+
+    @Test
+    void anEnvironmentWithoutAnArnIsNamedInTheConfiguredDefaultRegion() {
+        EmulatorConfig.DockerConfig dockerConfig = Mockito.mock(EmulatorConfig.DockerConfig.class);
+        when(dockerConfig.resourceNamespace()).thenReturn(Optional.empty());
+        EmulatorConfig chinaConfig = Mockito.mock(EmulatorConfig.class);
+        when(chinaConfig.docker()).thenReturn(dockerConfig);
+        when(chinaConfig.defaultRegion()).thenReturn("cn-north-1");
+
+        Environment environment = new Environment();
+        environment.setName("my-env");
+        environment.setAccountId("000000000000");
+
+        assertEquals("floci-aws-mwaa-000000000000.cn-north-1.my-env-db",
+                MwaaEnvironmentManager.dbContainerName(chinaConfig, environment));
+        assertEquals("cn-north-1", MwaaEnvironmentManager.environmentRegion(environment, "cn-north-1"));
+        environment.setArn("arn:aws:airflow:eu-west-1:000000000000:environment/my-env");
+        assertEquals("eu-west-1", MwaaEnvironmentManager.environmentRegion(environment, "cn-north-1"));
     }
 
     @Test

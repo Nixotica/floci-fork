@@ -63,6 +63,10 @@
     "StageName",
     "ApiId"
   ],
+  "AWS::ApiGatewayV2::VpcLink": [
+    "SecurityGroupIds",
+    "SubnetIds"
+  ],
   "AWS::AppSync::ApiKey": [
     "ApiId"
   ],
@@ -147,8 +151,13 @@
   ],
   "AWS::CloudFront::CachePolicy": [],
   "AWS::CloudFront::Distribution": [],
+  "AWS::CloudFront::Function": [
+    "Name"
+  ],
+  "AWS::CloudFront::KeyGroup": [],
   "AWS::CloudFront::OriginAccessControl": [],
   "AWS::CloudFront::OriginRequestPolicy": [],
+  "AWS::CloudFront::PublicKey": [],
   "AWS::CloudFront::ResponseHeadersPolicy": [],
   "AWS::CloudTrail::Trail": [
     "TrailName"
@@ -450,6 +459,10 @@
   ],
   "AWS::IAM::User": [
     "UserName"
+  ],
+  "AWS::IoT::Authorizer": [
+    "SigningDisabled",
+    "AuthorizerName"
   ],
   "AWS::IoT::DomainConfiguration": [
     "DomainConfigurationName",

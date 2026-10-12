@@ -12,30 +12,30 @@ import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import io.github.hectorvent.floci.services.ssoadmin.model.Assignment;
-import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentOperation;
-import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentDeletionOperation;
+import io.github.hectorvent.floci.services.identitystore.IdentityStoreService;
+import io.github.hectorvent.floci.services.organizations.OrganizationsService;
+import io.github.hectorvent.floci.services.ssoadmin.model.AccessControlAttribute;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAccessScope;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAssignment;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAuthenticationMethod;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationGrant;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationPortalOptions;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationSignInOptions;
-import io.github.hectorvent.floci.services.ssoadmin.model.AccessControlAttribute;
+import io.github.hectorvent.floci.services.ssoadmin.model.Assignment;
+import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentDeletionOperation;
+import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentOperation;
 import io.github.hectorvent.floci.services.ssoadmin.model.CustomerManagedPolicyReference;
 import io.github.hectorvent.floci.services.ssoadmin.model.InstanceAccessControlAttributeConfiguration;
 import io.github.hectorvent.floci.services.ssoadmin.model.InstanceUpdateState;
 import io.github.hectorvent.floci.services.ssoadmin.model.OidcJwtIssuerConfiguration;
 import io.github.hectorvent.floci.services.ssoadmin.model.PermissionSet;
-import io.github.hectorvent.floci.services.ssoadmin.model.PermissionsBoundary;
 import io.github.hectorvent.floci.services.ssoadmin.model.PermissionSetProvisioning;
 import io.github.hectorvent.floci.services.ssoadmin.model.PermissionSetProvisioningOperation;
+import io.github.hectorvent.floci.services.ssoadmin.model.PermissionsBoundary;
 import io.github.hectorvent.floci.services.ssoadmin.model.RegionMetadata;
 import io.github.hectorvent.floci.services.ssoadmin.model.SsoApplication;
 import io.github.hectorvent.floci.services.ssoadmin.model.SsoInstance;
 import io.github.hectorvent.floci.services.ssoadmin.model.TrustedTokenIssuer;
-import io.github.hectorvent.floci.services.identitystore.IdentityStoreService;
-import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -352,7 +352,7 @@ public class SsoAdminService implements Resettable {
         }
         String tokenKey = clientToken == null ? null : instanceArn + "::" + clientToken;
         if (tokenKey != null) {
-            var priorArn = trustedTokenIssuerClientTokens.get(tokenKey);
+            Optional<String> priorArn = trustedTokenIssuerClientTokens.get(tokenKey);
             if (priorArn.isPresent()) {
                 TrustedTokenIssuer prior = trustedTokenIssuers.get(priorArn.get()).orElse(null);
                 if (prior != null && trustedTokenIssuerMatches(prior, name, issuerType, oidcConfiguration, tags)) {
@@ -647,7 +647,7 @@ public class SsoAdminService implements Resettable {
             }
         }
         String tokenKey = callerAccountId + "::" + clientToken;
-        var priorArn = instanceClientTokens.get(tokenKey);
+        Optional<String> priorArn = instanceClientTokens.get(tokenKey);
         if (priorArn.isPresent()) {
             SsoInstance prior = findInstanceByArn(priorArn.get());
             if (prior != null && java.util.Objects.equals(prior.name(), name)
@@ -1389,7 +1389,7 @@ public class SsoAdminService implements Resettable {
 
         String tokenKey = clientToken == null ? null : callerAccountId + "::" + region + "::" + clientToken;
         if (tokenKey != null) {
-            var existingArn = applicationClientTokens.get(tokenKey);
+            Optional<String> existingArn = applicationClientTokens.get(tokenKey);
             if (existingArn.isPresent()) {
                 SsoApplication existing = applications.get(existingArn.get()).orElse(null);
                 if (existing != null && applicationMatches(existing, providerArn, description, name, portalOptions, status, tags)) {

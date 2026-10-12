@@ -25,12 +25,16 @@
 When `floci.services.scheduler.invocation-enabled` is `true` (the default), a
 background dispatcher fires schedule targets on time. Supported expressions:
 
-- `at(YYYY-MM-DDTHH:mm:ss)` — one-time fire; honors `ScheduleExpressionTimezone`
+- `at(YYYY-MM-DDTHH:mm:ss)`: one-time fire; honors `ScheduleExpressionTimezone`
   (default UTC) and `ActionAfterCompletion=DELETE`.
-- `rate(N unit)` — repeating fire (`minutes`, `hours`, `days`, `weeks`).
-- `cron(minute hour day-of-month month day-of-week year)` — AWS 6-field cron;
+- `rate(N unit)`: repeating fire (`minutes`, `hours`, `days`).
+- `cron(minute hour day-of-month month day-of-week year)`: AWS 6-field cron;
   honors `ScheduleExpressionTimezone`. Day-of-week is `1-7` or `SUN-SAT`, so
   `2` is Monday and `cron(30 2 ? * 2#1 *)` is the first Monday of the month.
+
+`CreateSchedule` and `UpdateSchedule` validate expression syntax and require
+`Target.RoleArn` to be an IAM role ARN. Invalid values return HTTP 400 with
+`ValidationException`, including when a Step Functions task calls Scheduler.
 
 `State=DISABLED` schedules and schedules outside their `StartDate`/`EndDate`
 window are skipped. The dispatcher ticks every
@@ -48,12 +52,34 @@ an asynchronous execution with that payload as its input. Scheduler delivery
 succeeds when `StartExecution` is accepted; a later workflow failure does not
 trigger Scheduler retries.
 
+When `Input` is present, Floci replaces the Scheduler context attributes in it
+on every invocation, for templated and universal (`aws-sdk`) targets alike:
+`<aws.scheduler.schedule-arn>` with the schedule ARN,
+`<aws.scheduler.scheduled-time>` with the occurrence's scheduled time in UTC
+to the second (for example `2026-04-21T09:17:54Z`), `<aws.scheduler.execution-id>`
+with a 16-character hex id, and `<aws.scheduler.attempt-number>` with the
+1-based attempt number. Each attempted invocation, retries included, gets its
+own execution id and increments the attempt number; a dead-letter message
+reports the last attempt's id as `EXECUTION_ID`. The dead-letter body carries
+the last attempt's request, with matching context attributes.
+
 `CreateSchedule` and `UpdateSchedule` reject a non-JSON `Input` for Lambda,
 Step Functions, and EventBridge targets with a `ValidationException`, as AWS
 does. A blank `Input`, or one with text after the JSON value such as
 `{} garbage`, is rejected the same way. SQS and SNS targets accept any text,
 and the `Input` of a universal (`aws-sdk`) target is only checked when the
 schedule is invoked.
+
+Universal targets (`arn:aws:scheduler:::aws-sdk:<service>:<action>`) deliver `sns:publish`,
+`sqs:sendMessage`, `redshiftdata:executeStatement` and `redshiftdata:batchExecuteStatement`; any
+other action fails when the schedule fires. The Redshift Data targets take the Data API request
+as `Input` (PascalCase) and run the SQL against a provisioned cluster (`ClusterIdentifier`) or a
+Serverless workgroup (`WorkgroupName`). The SQL runs on its own thread, so a slow statement does not
+delay other schedules. Delivery succeeds once the Data API accepts the request;
+a SQL error is recorded on the statement and does not trigger Scheduler retries, while a request
+the Data API rejects (an unknown cluster, a malformed request) is retried like any failed
+delivery. When `redshift` or `redshift-data` is disabled the target fails with
+`ServiceNotAvailableException`.
 
 ### Retries and dead-letter queues
 

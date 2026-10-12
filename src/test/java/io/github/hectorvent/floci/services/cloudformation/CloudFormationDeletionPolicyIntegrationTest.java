@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -18,8 +19,8 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Verifies the resource-level {@code DeletionPolicy} attribute (issue #1555): {@code Retain} keeps a
@@ -1355,7 +1356,7 @@ class CloudFormationDeletionPolicyIntegrationTest {
     }
 
     private static String createStack(String stackName, String template, String auth) {
-        var req = given().contentType("application/x-www-form-urlencoded");
+        RequestSpecification req = given().contentType("application/x-www-form-urlencoded");
         if (auth != null) {
             req.header("Authorization", auth);
         }
@@ -1389,7 +1390,7 @@ class CloudFormationDeletionPolicyIntegrationTest {
     }
 
     private static void updateStack(String stackName, String template, String auth) {
-        var req = given().contentType("application/x-www-form-urlencoded");
+        RequestSpecification req = given().contentType("application/x-www-form-urlencoded");
         if (auth != null) {
             req.header("Authorization", auth);
         }
@@ -1437,7 +1438,7 @@ class CloudFormationDeletionPolicyIntegrationTest {
     }
 
     private static Response cfnQuery(String action, String stackId, String auth) {
-        var req = given().contentType("application/x-www-form-urlencoded");
+        RequestSpecification req = given().contentType("application/x-www-form-urlencoded");
         if (auth != null) {
             req.header("Authorization", auth);
         }

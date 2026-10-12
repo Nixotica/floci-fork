@@ -10,7 +10,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
-import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.CloudFrontEdgeDomain;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
@@ -46,6 +46,7 @@ import io.swagger.v3.core.util.Json;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.PathItem;
+import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.parser.core.models.SwaggerParseResult;
@@ -299,6 +300,7 @@ public class ApiGatewayService implements ResourceProvider {
             throw new AwsException("BadRequestException",
                     "Endpoint configuration types must contain exactly one value.", 400);
         }
+        requireEndpointTypeAvailable(endpointConfiguration.getTypes().getFirst().name(), region);
 
         api.setEndpointConfiguration(endpointConfigurationOf(endpointConfiguration.getTypes().getFirst(),
                 endpointConfiguration.getVpcEndpointIds()));
@@ -541,7 +543,7 @@ public class ApiGatewayService implements ResourceProvider {
         resourceStore.put(resourceKey(region, apiId, resourceId), resource);
     }
 
-    public MethodResponse putMethodResponse(String region, String apiId, String resourceId,
+    public synchronized MethodResponse putMethodResponse(String region, String apiId, String resourceId,
                                             String httpMethod, String statusCode,
                                             Map<String, Object> request) {
         MethodConfig method = getMethod(region, apiId, resourceId, httpMethod);
@@ -564,7 +566,41 @@ public class ApiGatewayService implements ResourceProvider {
         return mr;
     }
 
-    public void deleteMethodResponse(String region, String apiId, String resourceId,
+    public synchronized MethodResponse updateMethodResponse(String region, String apiId, String resourceId,
+                                               String httpMethod, String statusCode,
+                                               List<Map<String, String>> patchOperations) {
+        MethodResponse response = getMethodResponse(region, apiId, resourceId, httpMethod, statusCode);
+        Map<String, Boolean> parameters = new HashMap<>(
+                response.responseParameters() != null ? response.responseParameters() : Map.of());
+        if (patchOperations != null) {
+            for (Map<String, String> patch : patchOperations) {
+                String path = patch.get("path");
+                if (path == null || !path.startsWith("/responseParameters/method.response.header.")
+                        || path.length() == "/responseParameters/method.response.header.".length()) {
+                    throw new AwsException("BadRequestException", "Invalid patch operation", 400);
+                }
+                String name = unescapeJsonPointer(path.substring("/responseParameters/".length()));
+                String op = patch.get("op");
+                if ("remove".equals(op)) {
+                    parameters.remove(name);
+                } else if ("add".equals(op) || "replace".equals(op)) {
+                    String value = patch.get("value");
+                    if (!"true".equals(value) && !"false".equals(value)) {
+                        throw new AwsException("BadRequestException", "Invalid patch operation", 400);
+                    }
+                    parameters.put(name, Boolean.parseBoolean(value));
+                } else {
+                    throw new AwsException("BadRequestException", "Invalid patch operation", 400);
+                }
+            }
+        }
+        MethodResponse updated = new MethodResponse(statusCode, parameters);
+        getMethod(region, apiId, resourceId, httpMethod).getMethodResponses().put(statusCode, updated);
+        resourceStore.put(resourceKey(region, apiId, resourceId), getResource(region, apiId, resourceId));
+        return updated;
+    }
+
+    public synchronized void deleteMethodResponse(String region, String apiId, String resourceId,
                                      String httpMethod, String statusCode) {
         MethodConfig method = getMethod(region, apiId, resourceId, httpMethod);
         if (method.getMethodResponses().remove(statusCode) == null) {
@@ -590,20 +626,17 @@ public class ApiGatewayService implements ResourceProvider {
 
         integration.setContentHandling((String) request.get("contentHandling"));
         integration.setCredentials((String) request.get("credentials"));
-        integration.setCacheNamespace((String) request.get("cacheNamespace"));
+        integration.setCacheNamespace(request.get("cacheNamespace") != null
+                ? (String) request.get("cacheNamespace") : resourceId);
+        integration.setResponseTransferMode(transferMode(request.get("responseTransferMode")));
+        validateTransferMode(integration.getResponseTransferMode(), integration.getType());
         if (request.get("connectionType") != null) {
             integration.setConnectionType((String) request.get("connectionType"));
         }
         integration.setConnectionId((String) request.get("connectionId"));
 
         if (request.get("timeoutInMillis") instanceof Number timeout) {
-            // AWS accepts 50ms upward; the 29s ceiling applies only to edge-optimized APIs, and
-            // Regional/private APIs (Floci's default) may exceed it, so only the floor is enforced.
-            if (timeout.intValue() < 50) {
-                throw new AwsException("BadRequestException",
-                        "Invalid timeout value: " + timeout.intValue(), 400);
-            }
-            integration.setTimeoutInMillis(timeout.intValue());
+            integration.setTimeoutInMillis(parseIntegrationTimeout(timeout));
         }
 
         if (request.get("cacheKeyParameters") instanceof List<?> cacheKeys) {
@@ -993,6 +1026,8 @@ public class ApiGatewayService implements ResourceProvider {
         authorizer.setAuthorizerUri((String) request.get("authorizerUri"));
         authorizer.setIdentitySource((String) request.get("identitySource"));
         authorizer.setAuthorizerResultTtlInSeconds(String.valueOf(request.getOrDefault("authorizerResultTtlInSeconds", "300")));
+        validateRequestAuthorizerIdentitySource(authorizer.getType(), authorizer.getIdentitySource(),
+                authorizer.getAuthorizerResultTtlInSeconds());
         // COGNITO_USER_POOLS authorizers carry the pool ARNs; keep them so get-authorizer reflects them.
         if (request.get("providerARNs") instanceof List<?> arns) {
             List<String> providerArns = new ArrayList<>();
@@ -1068,12 +1103,29 @@ public class ApiGatewayService implements ResourceProvider {
             }
         }
         }
+        validateRequestAuthorizerIdentitySource(authorizer.getType(), newIdentitySource, newTtl);
         authorizer.setName(newName);
         authorizer.setAuthorizerUri(newAuthorizerUri);
         authorizer.setIdentitySource(newIdentitySource);
         authorizer.setAuthorizerResultTtlInSeconds(newTtl);
         authorizerStore.put(authorizerKey(region, apiId, authorizerId), authorizer);
         return authorizer;
+    }
+
+    private static void validateRequestAuthorizerIdentitySource(String type, String identitySource, String ttl) {
+        if (!"REQUEST".equals(type)) {
+            return;
+        }
+        int ttlSeconds;
+        try {
+            ttlSeconds = Integer.parseInt(ttl);
+        } catch (NumberFormatException exception) {
+            throw new AwsException("BadRequestException", "authorizerResultTtlInSeconds must be an integer", 400);
+        }
+        if (ttlSeconds > 0 && (identitySource == null || identitySource.isBlank())) {
+            throw new AwsException("BadRequestException",
+                    "Identity source is required for a REQUEST authorizer when caching is enabled", 400);
+        }
     }
 
     // ──────────────────────────── API Keys ────────────────────────────
@@ -2032,11 +2084,9 @@ public class ApiGatewayService implements ResourceProvider {
             domain.setDistributionDomainName(null);
             domain.setDistributionHostedZoneId(null);
         } else if (domain.getDistributionDomainName() == null) {
-            domain.setDistributionDomainName(
-                    "d" + UUID.randomUUID().toString().replace("-", "").substring(0, 13) + "."
-                            + config.services().cloudfront().domainSuffix());
-            domain.setDistributionHostedZoneId(AwsRegionFacts.cloudFrontHostedZoneId(
-                    AwsPartitions.forRegionOrCommercial(region).id()).orElse(null));
+            CloudFrontEdgeDomain edge = CloudFrontEdgeDomain.create(region, config.services().cloudfront().domainSuffix());
+            domain.setDistributionDomainName(edge.domainName());
+            domain.setDistributionHostedZoneId(edge.hostedZoneId());
         }
     }
 
@@ -2414,7 +2464,7 @@ public class ApiGatewayService implements ResourceProvider {
         if (patchOperations != null) {
             // Worked out before anything is set: the store hands back the live API, and a rejected
             // endpoint change must leave it as it was.
-            EndpointConfiguration endpointConfiguration = patchEndpointConfiguration(api, patchOperations);
+            EndpointConfiguration endpointConfiguration = patchEndpointConfiguration(api, patchOperations, region);
             for (Map<String, String> op : patchOperations) {
                 if (!"replace" .equals(op.get("op"))) continue;
                 String path = op.getOrDefault("path", "");
@@ -2441,11 +2491,13 @@ public class ApiGatewayService implements ResourceProvider {
      * and disassociate a VPC endpoint.
      */
     private static EndpointConfiguration patchEndpointConfiguration(RestApi api,
-                                                                    List<Map<String, String>> patchOperations) {
+                                                                    List<Map<String, String>> patchOperations,
+                                                                    String region) {
         EndpointConfiguration current = api.getEndpointConfiguration();
         // An API stored without one is REGIONAL, which is also what GetRestApi reports for it.
-        EndpointType type = current == null || current.getTypes().isEmpty()
+        EndpointType currentType = current == null || current.getTypes().isEmpty()
                 ? EndpointType.REGIONAL : current.getTypes().getFirst();
+        EndpointType type = currentType;
         List<String> vpcEndpointIds = new ArrayList<>(current == null ? List.of() : current.getVpcEndpointIds());
         boolean patched = false;
         for (Map<String, String> op : patchOperations) {
@@ -2473,6 +2525,9 @@ public class ApiGatewayService implements ResourceProvider {
                     patched = true;
                 }
             }
+        }
+        if (type != currentType) {
+            requireEndpointTypeAvailable(type.name(), region);
         }
         return patched ? endpointConfigurationOf(type, vpcEndpointIds) : null;
     }
@@ -2680,6 +2735,8 @@ public class ApiGatewayService implements ResourceProvider {
     public Integration updateIntegration(String region, String apiId, String resourceId, String httpMethod, List<Map<String, String>> patchOperations) {
         Integration integration = getIntegration(region, apiId, resourceId, httpMethod);
         if (patchOperations != null) {
+            String nextType = integration.getType();
+            String nextTransferMode = integration.getResponseTransferMode();
             for (Map<String, String> op : patchOperations) {
                 String opType = op.get("op");
                 if (!"add".equals(opType) && !"replace".equals(opType)) {
@@ -2692,14 +2749,23 @@ public class ApiGatewayService implements ResourceProvider {
                 }
                 switch (path) {
                     case "/type":
+                        nextType = value;
+                        break;
                     case "/httpMethod":
                     case "/uri":
                     case "/passthroughBehavior":
+                        break;
+                    case "/timeoutInMillis":
+                        parseIntegrationTimeout(value);
+                        break;
+                    case "/responseTransferMode":
+                        nextTransferMode = transferMode(value);
                         break;
                     default:
                         throw new AwsException("BadRequestException", "Unsupported path: " + path, 400);
                 }
             }
+            validateTransferMode(nextTransferMode, nextType);
             for (Map<String, String> op : patchOperations) {
                 String path = op.get("path");
                 String value = op.get("value");
@@ -2716,6 +2782,12 @@ public class ApiGatewayService implements ResourceProvider {
                     case "/passthroughBehavior":
                         integration.setPassthroughBehavior(value);
                         break;
+                    case "/timeoutInMillis":
+                        integration.setTimeoutInMillis(parseIntegrationTimeout(value));
+                        break;
+                    case "/responseTransferMode":
+                        integration.setResponseTransferMode(transferMode(value));
+                        break;
                     default:
                         throw new IllegalStateException("Unreachable: validated above");
                 }
@@ -2723,6 +2795,36 @@ public class ApiGatewayService implements ResourceProvider {
         }
         resourceStore.put(resourceKey(region, apiId, resourceId), getResource(region, apiId, resourceId));
         return integration;
+    }
+
+    private int parseIntegrationTimeout(Object value) {
+        try {
+            int timeout = Integer.parseInt(String.valueOf(value));
+            if (timeout >= 50) {
+                return timeout;
+            }
+        } catch (NumberFormatException ignored) {
+            // Return the same AWS-style error for non-numeric and out-of-range values.
+        }
+        throw new AwsException("BadRequestException", "Invalid timeout value: " + value, 400);
+    }
+
+    private String transferMode(Object value) {
+        if (value == null) {
+            return "BUFFERED";
+        }
+        if ("BUFFERED".equals(value) || "STREAM".equals(value)) {
+            return (String) value;
+        }
+        throw new AwsException("BadRequestException", "Invalid response transfer mode: " + value, 400);
+    }
+
+    private void validateTransferMode(String mode, String type) {
+        if ("STREAM".equals(mode) && !"HTTP_PROXY".equalsIgnoreCase(type)
+                && !"AWS_PROXY".equalsIgnoreCase(type)) {
+            throw new AwsException("BadRequestException",
+                    "Response transfer mode STREAM requires HTTP_PROXY or AWS_PROXY integration type", 400);
+        }
     }
 
     // ──────────────────────────── Tags ────────────────────────────
@@ -3288,6 +3390,7 @@ public class ApiGatewayService implements ResourceProvider {
         // Lambda authorizer land as authorizationType=NONE and are silently open at runtime.
         Map<String, String> schemeToAuthorizerId = new HashMap<>();
         Map<String, String> schemeToAuthType = new HashMap<>();
+        Set<String> apiKeySchemes = new HashSet<>();
         Map<String, String> authorizerNameToId = new HashMap<>();
         for (Authorizer authorizer : getAuthorizers(region, apiId)) {
             if (authorizer.getName() != null) {
@@ -3305,6 +3408,12 @@ public class ApiGatewayService implements ResourceProvider {
                 SecurityScheme scheme = schemeEntry.getValue();
                 String authtype = importedAuthorizationType(scheme, schemeName);
                 Map<String, Object> authDef = importedAuthorizerDefinition(scheme, schemeName);
+                if (authDef == null && scheme != null
+                        && SecurityScheme.Type.APIKEY.equals(scheme.getType())
+                        && scheme.getIn() != null && "header".equalsIgnoreCase(scheme.getIn().toString())
+                        && scheme.getName() != null && "x-api-key".equalsIgnoreCase(scheme.getName())) {
+                    apiKeySchemes.add(schemeName);
+                }
                 if (authDef != null) {
                     String t = importedAuthorizerType(authDef, schemeName); // token | request | cognito_user_pools
                     Map<String, Object> req = new HashMap<>();
@@ -3399,7 +3508,8 @@ public class ApiGatewayService implements ResourceProvider {
                     String httpMethod = opEntry.getKey().name().toUpperCase();
                     try {
                         applyOperation(region, apiId, resourceId, httpMethod, opEntry.getValue(), openAPI,
-                                schemeToAuthorizerId, schemeToAuthType, validatorNameToId, defaultValidatorId);
+                                schemeToAuthorizerId, schemeToAuthType, apiKeySchemes,
+                                validatorNameToId, defaultValidatorId);
                     } catch (AwsException e) {
                         if (PARAMETER_NAME_ERROR.equals(e.getMessage())) {
                             throw importParameterNameFailure(httpMethod, path, e);
@@ -3420,7 +3530,8 @@ public class ApiGatewayService implements ResourceProvider {
                     Operation anyOperation = parseAnyMethodOperation(path, anyMethodExt);
                     try {
                         applyOperation(region, apiId, resourceId, "ANY", anyOperation, openAPI,
-                                schemeToAuthorizerId, schemeToAuthType, validatorNameToId, defaultValidatorId);
+                                schemeToAuthorizerId, schemeToAuthType, apiKeySchemes,
+                                validatorNameToId, defaultValidatorId);
                     } catch (AwsException e) {
                         if (PARAMETER_NAME_ERROR.equals(e.getMessage())) {
                             throw importParameterNameFailure("ANY", path, e);
@@ -3481,7 +3592,8 @@ public class ApiGatewayService implements ResourceProvider {
 
     private void applyOperation(String region, String apiId, String resourceId, String httpMethod,
             Operation operation, OpenAPI openAPI, Map<String, String> schemeToAuthorizerId,
-            Map<String, String> schemeToAuthType, Map<String, String> validatorNameToId,
+            Map<String, String> schemeToAuthType, Set<String> apiKeySchemes,
+            Map<String, String> validatorNameToId,
             String defaultValidatorId) {
         // Create the method
         Map<String, Object> methodRequest = new HashMap<>();
@@ -3489,12 +3601,14 @@ public class ApiGatewayService implements ResourceProvider {
         // to a method authorizationType (CUSTOM/AWS_IAM/COGNITO_USER_POOLS) + authorizerId.
         List<SecurityRequirement> secReqs = operation.getSecurity() != null
                 ? operation.getSecurity() : openAPI.getSecurity();
+        boolean apiKeyRequired = secReqs != null && !secReqs.isEmpty()
+                && secReqs.stream().allMatch(requirement -> requirement.keySet().stream()
+                        .anyMatch(apiKeySchemes::contains));
         String authType = "NONE";
         String authorizerId = null;
         List<String> authorizationScopes = List.of();
         if (secReqs != null) {
-            // AWS resolves the OR-list of security requirements to the first declared
-            // authorizer scheme (a method has exactly one authorizer), so stop at the first match.
+            // An API Gateway method can reference only one authorizer, so preserve the first match.
             resolveAuth:
             for (SecurityRequirement secReq : secReqs) {
                 for (String schemeName : secReq.keySet()) {
@@ -3513,6 +3627,7 @@ public class ApiGatewayService implements ResourceProvider {
             }
         }
         methodRequest.put("authorizationType", authType);
+        methodRequest.put("apiKeyRequired", apiKeyRequired);
         if (authorizerId != null) {
             methodRequest.put("authorizerId", authorizerId);
         }
@@ -3541,7 +3656,11 @@ public class ApiGatewayService implements ResourceProvider {
         // Map OpenAPI parameters to requestParameters
         if (operation.getParameters() != null && !operation.getParameters().isEmpty()) {
             Map<String, Boolean> requestParameters = new HashMap<>();
-            for (var param : operation.getParameters()) {
+            for (Parameter declared : operation.getParameters()) {
+                Parameter param = resolveParameter(declared, openAPI);
+                if (param == null) {
+                    continue;
+                }
                 String location = switch (param.getIn()) {
                     case "query" -> "method.request.querystring." + param.getName();
                     case "header" -> "method.request.header." + param.getName();
@@ -3594,6 +3713,56 @@ public class ApiGatewayService implements ResourceProvider {
         }
     }
 
+    private static final String PARAMETER_REF_PREFIX = "#/components/parameters/";
+    private static final String SWAGGER2_PARAMETER_REF_PREFIX = "#/parameters/";
+
+    /**
+     * Returns the parameter a local {@code #/components/parameters/} reference names, following a
+     * component that is itself a reference. The document is parsed without reference resolution, so
+     * a referenced parameter arrives carrying only its {@code $ref}. A Swagger 2 document is converted
+     * to OpenAPI 3, but an ANY method is read from its raw vendor extension, so its references keep
+     * the Swagger 2 form {@code #/parameters/}; they name the same converted components. A Swagger 2
+     * body or form data reference returns null, because the converter files it as a request body or a
+     * {@code formData_} schema, and is skipped like the in-place form.
+     *
+     * @throws AwsException if the reference names no component, or the references form a cycle
+     */
+    private static Parameter resolveParameter(Parameter param, OpenAPI openAPI) {
+        Map<String, Parameter> components = openAPI.getComponents() == null
+                ? null : openAPI.getComponents().getParameters();
+        Set<String> seen = new HashSet<>();
+        Parameter current = param;
+        while (current.get$ref() != null) {
+            String ref = current.get$ref();
+            String prefix = ref.startsWith(SWAGGER2_PARAMETER_REF_PREFIX)
+                    ? SWAGGER2_PARAMETER_REF_PREFIX : PARAMETER_REF_PREFIX;
+            Parameter target = components != null && ref.startsWith(prefix) && seen.add(ref)
+                    ? components.get(unescapeJsonPointer(ref.substring(prefix.length()))) : null;
+            if (target == null) {
+                if (ref.startsWith(SWAGGER2_PARAMETER_REF_PREFIX) && isSwagger2BodyOrFormDataParameter(openAPI,
+                        unescapeJsonPointer(ref.substring(SWAGGER2_PARAMETER_REF_PREFIX.length())))) {
+                    return null;
+                }
+                throw new AwsException("BadRequestException",
+                        "Unable to resolve parameter reference: " + ref, 400);
+            }
+            current = target;
+        }
+        return current;
+    }
+
+    private static boolean isSwagger2BodyOrFormDataParameter(OpenAPI openAPI, String name) {
+        if (openAPI.getComponents() == null) {
+            return false;
+        }
+        boolean body = openAPI.getComponents().getRequestBodies() != null
+                && openAPI.getComponents().getRequestBodies().containsKey(name);
+        // The converter keys a form data parameter's schema as formData_<name> so it cannot overwrite a model.
+        boolean formData = openAPI.getComponents().getSchemas() != null
+                && openAPI.getComponents().getSchemas().containsKey("formData_" + name);
+        return body || formData;
+    }
+
     private String ensureResourcePath(String region, String apiId, String path,
                                       Map<String, String> pathToResourceId) {
         if (pathToResourceId.containsKey(path)) {
@@ -3632,7 +3801,8 @@ public class ApiGatewayService implements ResourceProvider {
         integrationRequest.put("uri", integrationExt.get("uri"));
         integrationRequest.put("passthroughBehavior", integrationExt.get("passthroughBehavior"));
         for (String field : List.of("contentHandling", "timeoutInMillis", "connectionType",
-                "connectionId", "credentials", "cacheNamespace", "cacheKeyParameters", "tlsConfig")) {
+                "connectionId", "credentials", "cacheNamespace", "cacheKeyParameters", "tlsConfig",
+                "responseTransferMode")) {
             if (integrationExt.get(field) != null) {
                 integrationRequest.put(field, integrationExt.get(field));
             }

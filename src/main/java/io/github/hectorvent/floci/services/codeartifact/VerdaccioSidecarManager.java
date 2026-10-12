@@ -21,31 +21,14 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Lazily starts and manages one Verdaccio container per CodeArtifact repository backing the
- * {@code npm} format. Unlike Reposilite (Maven), Verdaccio has no native concept of multiple
- * named repositories inside one instance, so npm repositories each get their own container
- * instead of sharing one the way {@link ReposiliteSidecarManager} does. The actual per-key
- * container lifecycle (map of running containers, per-key start lock, health poll,
- * restart-on-unhealthy, stop-all on shutdown) is generic and lives in
- * {@link PerKeyContainerPool}; this class only knows how to build and configure a Verdaccio
- * container specifically.
- *
- * <p>Each container is configured with open access (no auth, no upstream proxying) since the
- * real CodeArtifact authorization check happens once at Floci's proxy layer
- * ({@code CodeArtifactNpmDataPlane}), before a request ever reaches the container; the container
- * itself is never reachable directly by a client.
- *
- * <p>Implements {@link ContainerTeardown} rather than observing {@code ShutdownEvent} directly:
- * {@code ContainerTeardowns.stopAll} already runs every implementation both at process shutdown
- * and on {@code /state/reset}/{@code /state/nuke}, so this is what actually stops every
- * repository's container on reset, driven by what {@link #pool} is really tracking rather than by
- * which repository records still exist in storage.
+ * Starts and stops one Verdaccio container per CodeArtifact npm repository, unlike Reposilite's one
+ * shared instance. The HTTP protocol lives in {@link VerdaccioSidecarClient}. Implements
+ * {@link ContainerTeardown} so reset, nuke, and shutdown stop every container this manager started.
  */
 @ApplicationScoped
-public class VerdaccioSidecarManager implements RepositorySidecarManager, ContainerTeardown {
+public class VerdaccioSidecarManager implements ContainerTeardown {
 
     private static final Logger LOG = Logger.getLogger(VerdaccioSidecarManager.class);
-    private static final String FORMAT = "npm";
     private static final int VERDACCIO_PORT = 4873;
     private static final String HEALTH_PATH = "/-/ping";
     private static final String CONFIG_REMOTE_DIR = "/verdaccio/conf";
@@ -89,30 +72,16 @@ public class VerdaccioSidecarManager implements RepositorySidecarManager, Contai
         this.pool = new PerKeyContainerPool(lifecycleManager, HEALTH_PATH);
     }
 
-    @Override
-    public String format() {
-        return FORMAT;
-    }
-
     /**
-     * Base URL of a ready Verdaccio instance for this npm repository, starting its container if
-     * this is the first use. Each repository's container is independent, so concurrent first-use
-     * of two different repositories never blocks on each other (unlike Reposilite's one shared
-     * instance, which does need a single lock around every provisioning call).
-     *
-     * @param publicUrl the externally reachable proxy URL for this specific repository (e.g.
-     *                  {@code http://localhost:4566/codeartifact/npm/<domain>/<repository>/}),
-     *                  passed to the container as {@code VERDACCIO_PUBLIC_URL} so package metadata
-     *                  it returns (notably {@code dist.tarball}) points back through Floci's proxy
-     *                  instead of the container's own internal, unreachable-by-the-client address.
+     * Base URL of a ready Verdaccio for this repository, starting its container on first use.
+     * {@code publicUrl} becomes {@code VERDACCIO_PUBLIC_URL}, so the {@code dist.tarball} links it
+     * returns point back through Floci's proxy.
      */
-    @Override
     public String ensureReady(String npmRepositoryId, String publicUrl) {
         return pool.ensureReady(npmRepositoryId, () -> startContainer(npmRepositoryId, publicUrl));
     }
 
     /** Stops and removes the container for one npm repository, if one was ever started. */
-    @Override
     public void release(String npmRepositoryId) {
         pool.stopContainer(npmRepositoryId);
     }

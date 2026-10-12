@@ -16,13 +16,13 @@ import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import io.quarkus.logging.Log;
 import io.quarkus.test.junit.QuarkusTest;
-
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.json.JsonObject;
 import io.vertx.mutiny.core.MultiMap;
 import io.vertx.mutiny.core.Vertx;
 import io.vertx.mutiny.core.buffer.Buffer;
 import io.vertx.mutiny.core.http.HttpServer;
+import io.vertx.mutiny.core.http.HttpServerRequest;
 import io.vertx.mutiny.ext.web.Router;
 import io.vertx.mutiny.ext.web.RoutingContext;
 import jakarta.enterprise.inject.Instance;
@@ -89,7 +89,7 @@ class AslExecutorHttpInvokeTest {
     void setUp() {
         server = vertx.createHttpServer();
 
-        var router = Router.router(vertx);
+        Router router = Router.router(vertx);
         router.get("/json")
             .handler(ctx -> {
                 ctx.request().body()
@@ -182,8 +182,8 @@ class AslExecutorHttpInvokeTest {
     }
 
     private void recordRequest(final RoutingContext ctx, String body) {
-        var request = ctx.request();
-        var requestRecord = new RecordedRequest(
+        HttpServerRequest request = ctx.request();
+        RecordedRequest requestRecord = new RecordedRequest(
             request.method().name(),
             request.uri(),
             request.query(),

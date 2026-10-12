@@ -34,12 +34,14 @@ For the upstream API shape, see the AWS documentation:
 
 ## Authentication modes
 
-A request identifies its target cluster one of two ways:
+A request identifies its target cluster or serverless workgroup one of three ways:
 
 - **`ClusterIdentifier` + `DbUser` + `Database`.** The `DbUser` is the cluster master, or the prefixed name returned by `GetClusterCredentials` / `GetClusterCredentialsWithIAM` (for example `IAM:analyst`) while that credential is unexpired. Floci connects to the container as the cluster master in both cases. Any other `DbUser` returns `ValidationException`.
 - **`SecretArn` + `ClusterIdentifier` + `Database`.** The secret must be a local Secrets Manager secret holding JSON credentials (`username` or `user`, plus `password`). A cross-region `SecretArn` is rejected.
 
-`WorkgroupName` (Amazon Redshift Serverless) is rejected with `ValidationException`. Redshift Serverless is not emulated.
+- **`WorkgroupName` + `Database`, with or without `SecretArn`.** `WorkgroupName` is a workgroup name or workgroup ARN created through [Redshift Serverless](redshift-serverless.md). `Database` must be the namespace `dbName`. Without a `SecretArn`, Floci connects as the namespace admin; AWS derives the database user from the signing identity (`IAM:<name>`), and `DbUser` is not used. With a `SecretArn`, the secret must hold credentials the workgroup backend accepts. Sending `ClusterIdentifier` as well returns `ValidationException`, and so does a workgroup whose runtime is not running.
+
+A statement run against a workgroup reports `WorkgroupName` and omits `ClusterIdentifier`, and the reverse holds for a cluster statement. `ListDatabases`, `ListSchemas`, `ListTables` and `DescribeTable` accept `WorkgroupName` the same way.
 
 ## Compatibility Notes
 
@@ -55,6 +57,20 @@ A request identifies its target cluster one of two ways:
 - **`WithEvent`** is accepted and ignored: no EventBridge event is published.
 - **`ExecuteSql` and `BatchExecuteSql`** (the deprecated pre-2020 operations) return `ValidationException`.
 - **Type mapping.** JDBC `BOOLEAN` and `BIT` map to `booleanValue`; integer types to `longValue`; floating-point types to `doubleValue`; `NUMERIC` and `DECIMAL` to `stringValue` (as AWS does); binary types to `blobValue`; everything else, including dates, timestamps, and uuid, to `stringValue`. A SQL `NULL` maps to `isNull`. A result column of type `line`, `json`, or `jsonb` fails the statement with the Redshift error text.
+
+## Spectrum relational queries
+
+The Data API prepares Glue-backed external CSV tables on the same JDBC connection that executes
+the SQL. JOINs with internal tables, multiple external tables, grouping, ordering and parameters
+follow the [Redshift Spectrum relational path](redshift.md#relational-queries-over-glue-backed-external-csv-tables).
+Create the external schema through either the wire endpoint or the Data API; both use the same
+runtime and database binding. Batch preparation runs inside the existing batch transaction, so
+failure rolls back the batch. External read or preparation failures are stored as `FAILED` and
+reported by `DescribeStatement`, as other SQL execution failures are.
+Create external schemas and tables outside a batch: `CREATE EXTERNAL TABLE` cannot run inside a transaction block on AWS, and a batch runs as one transaction, so both statements are rejected there.
+
+This does not add Data API session reuse or asynchronous execution. The legacy Phase 1 catalog
+is not the Glue-backed relational path.
 
 ## Configuration
 

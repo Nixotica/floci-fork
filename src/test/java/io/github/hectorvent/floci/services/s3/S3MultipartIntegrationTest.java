@@ -163,6 +163,27 @@ class S3MultipartIntegrationTest {
             .statusCode(200)
             .header("x-amz-checksum-sha256", equalTo(COMPOSITE_SHA256))
             .header("x-amz-checksum-type", equalTo("COMPOSITE"));
+
+        // The composite checksum is not the checksum of any one part, so not even a range covering
+        // the whole object gets it.
+        given()
+            .header("Range", "bytes=0-")
+            .header("x-amz-checksum-mode", "ENABLED")
+        .when()
+            .get("/" + BUCKET + "/" + KEY)
+        .then()
+            .statusCode(206)
+            .header("x-amz-checksum-sha256", nullValue())
+            .header("x-amz-checksum-type", nullValue())
+            .body(equalTo(PART_1 + PART_2));
+        given()
+            .header("Range", "bytes=0-")
+            .header("x-amz-checksum-mode", "ENABLED")
+        .when()
+            .head("/" + BUCKET + "/" + KEY)
+        .then()
+            .statusCode(200)
+            .header("x-amz-checksum-sha256", nullValue());
     }
 
     @Test
@@ -1030,6 +1051,16 @@ class S3MultipartIntegrationTest {
             .statusCode(200)
             .header("x-amz-checksum-crc64nvme", equalTo(fullObjectCrc64))
             .header("x-amz-checksum-type", equalTo("FULL_OBJECT"));
+
+        // A range covering an object of two parts is aligned with neither, so it gets no checksum.
+        given()
+            .header("Range", "bytes=0-")
+            .header("x-amz-checksum-mode", "ENABLED")
+        .when()
+            .get("/" + BUCKET + "/" + key)
+        .then()
+            .statusCode(206)
+            .header("x-amz-checksum-crc64nvme", nullValue());
     }
 
     @Test
@@ -1353,6 +1384,114 @@ class S3MultipartIntegrationTest {
     }
 
     @Test
+    @Order(38)
+    void uploadPartCopyAnswersBadRangesTheWayS3Does() {
+        given()
+            .body("ABCDEFGHIJ")
+        .when()
+            .put("/" + BUCKET + "/range-source.bin")
+        .then()
+            .statusCode(200);
+        String uploadId = given()
+            .when()
+                .post("/" + BUCKET + "/range-dest.bin?uploads")
+            .then()
+                .statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+
+        given()
+            .header("x-amz-copy-source", "/" + BUCKET + "/range-source.bin")
+            .header("x-amz-copy-source-range", "2-5")
+        .when()
+            .put("/" + BUCKET + "/range-dest.bin?uploadId=" + uploadId + "&partNumber=1")
+        .then()
+            .statusCode(400)
+            .body("Error.Code", equalTo("InvalidArgument"))
+            .body("Error.Message", startsWith("The x-amz-copy-source-range value must be of the form bytes=first-last"))
+            .body("Error.ArgumentName", equalTo("x-amz-copy-source-range"))
+            .body("Error.ArgumentValue", equalTo("2-5"));
+
+        given()
+            .header("x-amz-copy-source", "/" + BUCKET + "/range-source.bin")
+            .header("x-amz-copy-source-range", "bytes=0-100")
+        .when()
+            .put("/" + BUCKET + "/range-dest.bin?uploadId=" + uploadId + "&partNumber=1")
+        .then()
+            .statusCode(400)
+            .body("Error.Code", equalTo("InvalidArgument"))
+            .body("Error.Message", equalTo("Range specified is not valid for source object of size: 10"))
+            .body("Error.ArgumentName", equalTo("x-amz-copy-source-range"))
+            .body("Error.ArgumentValue", equalTo("bytes=0-100"));
+
+        given()
+            .header("x-amz-copy-source", "/" + BUCKET + "/range-source.bin")
+            .header("x-amz-copy-source-range", "bytes=100-200")
+        .when()
+            .put("/" + BUCKET + "/range-dest.bin?uploadId=" + uploadId + "&partNumber=1")
+        .then()
+            .statusCode(400)
+            .body("Error.Code", equalTo("InvalidRequest"))
+            .body("Error.Message", equalTo("The specified copy range is invalid for the source object size"))
+            .body(not(containsString("<ArgumentName>")));
+
+        given()
+        .when()
+            .delete("/" + BUCKET + "/range-dest.bin?uploadId=" + uploadId)
+        .then()
+            .statusCode(204);
+    }
+
+    @Test
+    @Order(39)
+    void aRangeCoveringAnUploadCompletedFromOnePartCarriesItsFullObjectChecksum() {
+        String key = "one-part-multipart.bin";
+        completeOnePartUpload(key, "CRC64NVME", "");
+
+        // The object is its one part, so a range covering it is aligned with that part, whose checksum
+        // the full-object checksum is.
+        String partCrc64 = S3Checksum.crc64NvmeBase64(PART_1.getBytes(StandardCharsets.UTF_8));
+        given()
+            .header("Range", "bytes=0-")
+            .header("x-amz-checksum-mode", "ENABLED")
+        .when()
+            .get("/" + BUCKET + "/" + key)
+        .then()
+            .statusCode(206)
+            .header("x-amz-checksum-crc64nvme", equalTo(partCrc64))
+            .header("x-amz-checksum-type", equalTo("FULL_OBJECT"))
+            .body(equalTo(PART_1));
+        given()
+            .header("Range", "bytes=0-")
+            .header("x-amz-checksum-mode", "ENABLED")
+        .when()
+            .head("/" + BUCKET + "/" + key)
+        .then()
+            .statusCode(200)
+            .header("x-amz-checksum-crc64nvme", equalTo(partCrc64));
+        given()
+            .header("Range", "bytes=1-")
+            .header("x-amz-checksum-mode", "ENABLED")
+        .when()
+            .get("/" + BUCKET + "/" + key)
+        .then()
+            .statusCode(206)
+            .header("x-amz-checksum-crc64nvme", nullValue());
+
+        // A composite checksum of one part is not that part's checksum, so its range gets none.
+        completeOnePartUpload("one-part-composite.bin", "SHA256",
+                "<ChecksumSHA256>" + sha256Base64(PART_1) + "</ChecksumSHA256>");
+        given()
+            .header("Range", "bytes=0-")
+            .header("x-amz-checksum-mode", "ENABLED")
+        .when()
+            .get("/" + BUCKET + "/one-part-composite.bin")
+        .then()
+            .statusCode(206)
+            .header("x-amz-checksum-sha256", nullValue())
+            .header("x-amz-checksum-type", nullValue());
+    }
+
+    @Test
     @Order(40)
     void cleanUp() {
         given().when().delete("/" + BUCKET + "/copy-of-multipart.bin").then().statusCode(204);
@@ -1369,6 +1508,9 @@ class S3MultipartIntegrationTest {
         given().when().delete("/" + BUCKET + "/checksum-match-multipart.bin").then().statusCode(204);
         given().when().delete("/" + BUCKET + "/checksum-type-multipart.bin").then().statusCode(204);
         given().when().delete("/" + BUCKET + "/completion-validation.bin").then().statusCode(204);
+        given().when().delete("/" + BUCKET + "/range-source.bin").then().statusCode(204);
+        given().when().delete("/" + BUCKET + "/one-part-multipart.bin").then().statusCode(204);
+        given().when().delete("/" + BUCKET + "/one-part-composite.bin").then().statusCode(204);
         given().when().delete("/" + BUCKET).then().statusCode(204);
     }
 
@@ -1381,6 +1523,26 @@ class S3MultipartIntegrationTest {
 
     private static String sha256Base64(String data) {
         return S3Checksum.sha256Base64(data.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static void completeOnePartUpload(String key, String checksumAlgorithm, String checksumElement) {
+        String newUploadId = given()
+            .header("x-amz-checksum-algorithm", checksumAlgorithm)
+        .when()
+            .post("/" + BUCKET + "/" + key + "?uploads")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        String partETag = given().body(PART_1).when()
+            .put("/" + BUCKET + "/" + key + "?uploadId=" + newUploadId + "&partNumber=1")
+            .then().statusCode(200).extract().header("ETag");
+        given()
+            .contentType("application/xml")
+            .body(singlePartCompleteXml(partETag, checksumElement))
+        .when()
+            .post("/" + BUCKET + "/" + key + "?uploadId=" + newUploadId)
+        .then()
+            .statusCode(200);
     }
 
     private static String compositeSha256(String... parts) {

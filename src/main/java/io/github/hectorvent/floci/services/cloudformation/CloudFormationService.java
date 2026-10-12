@@ -1,15 +1,19 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
-import io.quarkus.arc.Arc;
-import io.quarkus.arc.ManagedContext;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
@@ -24,9 +28,6 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCle
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.ssm.SsmService;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -37,23 +38,20 @@ import java.net.URI;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
-import io.github.hectorvent.floci.core.resource.ResourceProvider;
-import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -242,6 +240,54 @@ public class CloudFormationService implements ResourceProvider {
                 && (status.endsWith("_IN_PROGRESS") || "ROLLBACK_COMPLETE".equals(status));
     }
 
+    /**
+     * Validates the template source of an {@code UpdateStack} or {@code CreateChangeSet} request:
+     * {@code UsePreviousTemplate} excludes {@code TemplateBody} and {@code TemplateURL}, and
+     * without it one of the two is required.
+     */
+    public void validateTemplateSource(String templateBody, String templateUrl, boolean usePreviousTemplate) {
+        boolean hasTemplate = (templateBody != null && !templateBody.isBlank())
+                || (templateUrl != null && !templateUrl.isBlank());
+        if (usePreviousTemplate && hasTemplate) {
+            throw new AwsException("ValidationError",
+                    "UsePreviousTemplate cannot be specified together with TemplateBody or TemplateURL", 400);
+        }
+        if (!usePreviousTemplate && !hasTemplate) {
+            throw new AwsException("ValidationError",
+                    "Either Template URL or Template Body must be specified.", 400);
+        }
+    }
+
+    /**
+     * Creates an UPDATE change set from the template the stack currently holds, as submitted
+     * rather than SAM- or Include-expanded, so executing it keeps {@code GetTemplate}'s Original
+     * stage intact. The template is read outside the stack's lock, so the change set is only
+     * recorded if no other update replaced it in the meantime; otherwise it is read again.
+     */
+    public ChangeSet createChangeSetFromPreviousTemplate(String stackName, String changeSetName,
+                                                         Map<String, String> parameters,
+                                                         List<String> capabilities,
+                                                         Map<String, String> tags, String region) {
+        ChangeSet created = null;
+        while (created == null) {
+            Stack stack = resolveStack(stackName, region);
+            if (stack == null) {
+                throw new AwsException("ValidationError",
+                        "Stack with id " + stackName + " does not exist", 400);
+            }
+            String previousTemplate = previousTemplateOf(stack);
+            created = createChangeSet(stackName, changeSetName, "UPDATE", previousTemplate, null,
+                    parameters, capabilities, tags, region, currentAccount(), false, true);
+        }
+        return created;
+    }
+
+    private static String previousTemplateOf(Stack stack) {
+        return stack.getOriginalTemplateBody() != null
+                ? stack.getOriginalTemplateBody()
+                : stack.getTemplateBody();
+    }
+
     // ── CreateChangeSet ───────────────────────────────────────────────────────
 
     public ChangeSet createChangeSet(String stackName, String changeSetName, String changeSetType,
@@ -249,7 +295,7 @@ public class CloudFormationService implements ResourceProvider {
                                      Map<String, String> parameters, List<String> capabilities,
                                      Map<String, String> tags, String region) {
         return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
-                parameters, capabilities, tags, region, regionResolver.getAccountId(), false);
+                parameters, capabilities, tags, region, regionResolver.getAccountId(), false, false);
     }
 
     /**
@@ -273,7 +319,7 @@ public class CloudFormationService implements ResourceProvider {
                                                Map<String, String> parameters, List<String> capabilities,
                                                Map<String, String> tags, String region) {
         return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
-                parameters, capabilities, tags, region, regionResolver.getAccountId(), true);
+                parameters, capabilities, tags, region, regionResolver.getAccountId(), true, false);
     }
 
     /**
@@ -291,14 +337,14 @@ public class CloudFormationService implements ResourceProvider {
                                      Map<String, String> parameters, List<String> capabilities,
                                      Map<String, String> tags, String region, String accountId) {
         return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
-                parameters, capabilities, tags, region, accountId, false);
+                parameters, capabilities, tags, region, accountId, false, false);
     }
 
     private ChangeSet createChangeSet(String stackName, String changeSetName, String changeSetType,
                                       String templateBody, String templateUrl,
                                       Map<String, String> parameters, List<String> capabilities,
                                       Map<String, String> tags, String region, String accountId,
-                                      boolean attachToReviewInProgressStack) {
+                                      boolean attachToReviewInProgressStack, boolean fromPreviousTemplate) {
         String resolvedTemplate = resolveTemplate(templateBody, templateUrl);
 
         // Real CloudFormation runs a declared macro (here, only AWS::Serverless-2016-10-31)
@@ -309,13 +355,13 @@ public class CloudFormationService implements ResourceProvider {
         // of throwing, so this failure is reported by the change set, not by a 400 on creation.
         String samTransformFailureReason = samTransformFailureReason(stackName, resolvedTemplate);
 
-        // Reject an unresolvable condition dependency graph up front, before any stack state is
+        // Reject an unresolvable or circular dependency graph up front, before any stack state is
         // created, so CreateStack/UpdateStack fail synchronously the way real CloudFormation does.
-        // Unconditional: validateConditionDependencies already returns immediately for any
+        // Unconditional: validateResourceDependencies already returns immediately for any
         // template declaring the SAM transform, whether or not that transform succeeded, so
         // gating this call on samTransformFailureReason == null duplicates that check for no
         // effect.
-        validateConditionDependencies(resolvedTemplate, parameters, region, accountId);
+        validateResourceDependencies(resolvedTemplate, parameters, region, accountId);
 
         // A CREATE change set against a name that already has a stack of any status - including
         // ROLLBACK_COMPLETE - is a real conflict: AWS requires an explicit DeleteStack before a
@@ -345,14 +391,17 @@ public class CloudFormationService implements ResourceProvider {
         // was already released, losing an accepted change set or corrupting the map's links. Only
         // persistStack() stays outside: it is storage I/O, and compute()'s contract is that the
         // remapping function does short, non-blocking work.
-        boolean isCreateType = changeSetType == null || "CREATE".equalsIgnoreCase(changeSetType);
+        boolean isCreateType = "CREATE".equalsIgnoreCase(changeSetType);
+        // An update names its stack by name or stack ID; the map is keyed by name. One that names no
+        // live stack is keyed as given, so it lands in the missing-stack branch below.
+        Stack live = isCreateType ? null : resolveStack(stackName, region, accountId);
+        String canonicalStackName = live == null ? stackName : live.getStackName();
         ChangeSet[] created = new ChangeSet[1];
-        Stack stack = stacks.compute(stackKey(accountId, stackName, region), (k, existing) -> {
+        Stack stack = stacks.compute(stackKey(accountId, canonicalStackName, region), (k, existing) -> {
             Stack target;
             if (existing == null) {
                 if (!isCreateType) {
-                    throw new AwsException("ValidationError",
-                            "Stack with id " + stackName + " does not exist", 400);
+                    throw noStackToUpdate(stackName, region, accountId);
                 }
                 target = newStack(stackName, region, accountId);
                 if (tags != null) target.getTags().putAll(tags);
@@ -360,25 +409,32 @@ public class CloudFormationService implements ResourceProvider {
                 // matching stack-level event (as AWS and LocalStack do) so DescribeStackEvents is
                 // non-empty straight after change-set creation — tooling such as the AWS SAM CLI
                 // reads StackEvents[0] there and otherwise fails with an IndexError.
-                // (CreateChangeSet defaults a null type to CREATE.)
                 if (isCreateType) {
                     addEvent(target, target.getStackName(), target.getStackId(),
                             "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS", "User Initiated");
                 }
             } else {
+                String status = existing.getStatus();
                 boolean reusableReviewPlaceholder =
-                        attachToReviewInProgressStack && "REVIEW_IN_PROGRESS".equals(existing.getStatus());
+                        attachToReviewInProgressStack && "REVIEW_IN_PROGRESS".equals(status);
                 if (isCreateType && !reusableReviewPlaceholder) {
                     throw new AwsException("AlreadyExistsException",
                             "Stack [" + stackName + "] already exists", 400);
                 }
+                // A name whose stack has finished deleting names no live stack, even before it leaves the
+                // map, and neither does a stack ID that is not the live stack's.
+                if (!isCreateType && !stackName.equals(existing.getStackId())
+                        && ("DELETE_COMPLETE".equals(status) || AwsArnUtils.isArn(stackName))) {
+                    throw noStackToUpdate(stackName, region, accountId);
+                }
                 // The message is the one real CloudFormation emits, down to its own "can not"
                 // spelling and the stack id carried as "Stack:<arn>" with no space: clients match
                 // on this string.
-                if (!isCreateType && refusesUpdate(existing.getStatus())) {
-                    throw new AwsException("ValidationError",
-                            "Stack:" + existing.getStackId() + " is in " + existing.getStatus()
-                                    + " state and can not be updated.", 400);
+                if (!isCreateType && (refusesUpdate(status) || "DELETE_COMPLETE".equals(status))) {
+                    throw cannotBeUpdated(existing.getStackId(), status);
+                }
+                if (fromPreviousTemplate && !Objects.equals(templateBody, previousTemplateOf(existing))) {
+                    return existing;
                 }
                 target = existing;
             }
@@ -386,12 +442,13 @@ public class CloudFormationService implements ResourceProvider {
             ChangeSet cs = new ChangeSet();
             cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, accountId, "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
             cs.setChangeSetName(changeSetName);
-            cs.setStackName(stackName);
+            cs.setStackName(canonicalStackName);
             cs.setStackId(target.getStackId());
-            cs.setChangeSetType(changeSetType != null ? changeSetType : "CREATE");
+            cs.setChangeSetType(changeSetType != null ? changeSetType : "UPDATE");
             cs.setTemplateBody(resolvedTemplate);
             cs.setParameters(parameters);
             cs.setCapabilities(capabilities);
+            cs.setTags(tags);
             if (samTransformFailureReason != null) {
                 cs.setStatus("FAILED");
                 cs.setExecutionStatus("UNAVAILABLE");
@@ -405,8 +462,25 @@ public class CloudFormationService implements ResourceProvider {
             return target;
         });
 
-        persistStack(stack);
+        if (created[0] != null) {
+            persistStack(stack);
+        }
         return created[0];
+    }
+
+    private static AwsException cannotBeUpdated(String stackId, String status) {
+        return new AwsException("ValidationError",
+                "Stack:" + stackId + " is in " + status + " state and can not be updated.", 400);
+    }
+
+    // AWS refuses a deleted stack's ID by its state, while a name, or an ID it never issued,
+    // does not exist.
+    private AwsException noStackToUpdate(String stackName, String region, String accountId) {
+        Stack deleted = resolveDeletedStack(stackName, region, accountId);
+        if (deleted != null) {
+            return cannotBeUpdated(deleted.getStackId(), deleted.getStatus());
+        }
+        return new AwsException("ValidationError", "Stack with id " + stackName + " does not exist", 400);
     }
 
     /**
@@ -423,7 +497,7 @@ public class CloudFormationService implements ResourceProvider {
         try {
             template = parseTemplate(templateBody);
         } catch (Exception e) {
-            // Template parse failures are reported by validateConditionDependencies and by
+            // Template parse failures are reported by validateResourceDependencies and by
             // execution itself, with their own messages; not this transform-specific one.
             return null;
         }
@@ -452,14 +526,8 @@ public class CloudFormationService implements ResourceProvider {
     // ── DescribeChangeSet ─────────────────────────────────────────────────────
 
     public ChangeSet describeChangeSet(String stackName, String changeSetName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
-        ChangeSet cs = stack.getChangeSets().get(
-                resolveChangeSetName(changeSetName, region, currentAccount()));
-        if (cs == null) {
-            throw new AwsException("ChangeSetNotFoundException",
-                    "ChangeSet [" + changeSetName + "] does not exist", 400);
-        }
-        return cs;
+        Stack stack = getStackForChangeSet(stackName, changeSetName, region, currentAccount());
+        return getChangeSetOrThrow(stack, changeSetName, region, currentAccount());
     }
 
     /**
@@ -827,8 +895,8 @@ public class CloudFormationService implements ResourceProvider {
     // compute() holds the stack's per-key lock for the whole claim, so only one racing execution can win.
     private Future<?> claimAndSubmitExecution(String stackNameOrArn, String changeSetName, String region,
                                               String accountId, boolean requireAvailable) {
-        String canonicalStackName = getStackOrThrow(stackNameOrArn, region, accountId).getStackName();
-        String resolvedChangeSetName = resolveChangeSetName(changeSetName, region, accountId);
+        String canonicalStackName = getStackForChangeSet(stackNameOrArn, changeSetName, region,
+                accountId).getStackName();
 
         ClaimedExecution[] claimed = new ClaimedExecution[1];
         StackMutationSnapshot[] snapshot = new StackMutationSnapshot[1];
@@ -837,11 +905,7 @@ public class CloudFormationService implements ResourceProvider {
                 throw new AwsException("ValidationError",
                         "Stack with id " + stackNameOrArn + " does not exist", 400);
             }
-            ChangeSet cs = existing.getChangeSets().get(resolvedChangeSetName);
-            if (cs == null) {
-                throw new AwsException("ChangeSetNotFoundException",
-                        "ChangeSet [" + changeSetName + "] does not exist", 400);
-            }
+            ChangeSet cs = getChangeSetOrThrow(existing, changeSetName, region, accountId);
             String executionStatus = cs.getExecutionStatus();
             boolean eligible = requireAvailable
                     ? "AVAILABLE".equals(executionStatus)
@@ -898,8 +962,8 @@ public class CloudFormationService implements ResourceProvider {
         String templateBody = cs.getTemplateBody();
         Map<String, String> params = cs.getParameters() != null ? cs.getParameters() : Map.of();
 
-        return submitOperation(() -> runUnderScope(accountId, region, () -> {
-            executeTemplate(stack, templateBody, params, isCreate, region, accountId);
+        return submitOperation(() -> RequestScopes.runAs(accountId, region, () -> {
+            executeTemplate(stack, templateBody, params, cs.getTags(), isCreate, region, accountId);
             String status = stack.getStatus();
             cs.setExecutionStatus(status != null && (status.contains("ROLLBACK") || status.endsWith("_FAILED"))
                 ? "EXECUTE_FAILED" : "EXECUTE_COMPLETE");
@@ -907,54 +971,13 @@ public class CloudFormationService implements ResourceProvider {
         }));
     }
 
-    /**
-     * Runs {@code body} under the stack's account and region, so downstream services resolve the
-     * same scope as the CloudFormation request that submitted this background operation.
-     */
-    private void runUnderScope(String accountId, String region, Runnable body) {
-        ManagedContext requestContext = Arc.container().requestContext();
-        boolean alreadyActive = requestContext.isActive();
-        if (!alreadyActive) {
-            requestContext.activate();
-        }
-        // Background workers normally have no active scope, so a fresh one is activated and
-        // terminated below. But if we ran inside an already-active scope, restore its previous
-        // scope afterwards so we never leave the overridden values behind on a reused thread.
-        RequestContext ctx = Arc.container().instance(RequestContext.class).get();
-        String previousAccountId = alreadyActive ? ctx.getAccountId() : null;
-        String previousRegion = alreadyActive ? ctx.getRegion() : null;
-        String previousPartition = alreadyActive ? ctx.getPartition() : null;
-        try {
-            if (accountId != null) {
-                ctx.setAccountId(accountId);
-            }
-            if (region != null) {
-                ctx.setRegion(region);
-                ctx.setPartition(regionResolver.partitionForRegion(region));
-            }
-            body.run();
-        } finally {
-            if (!alreadyActive) {
-                requestContext.terminate();
-            } else {
-                ctx.setAccountId(previousAccountId);
-                ctx.setRegion(previousRegion);
-                ctx.setPartition(previousPartition);
-            }
-        }
-    }
-
     // ── DeleteChangeSet ───────────────────────────────────────────────────────
 
     public void deleteChangeSet(String stackName, String changeSetName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
-        String name = resolveChangeSetName(changeSetName, region, currentAccount());
-        ChangeSet cs = stack.getChangeSets().get(name);
-        if (cs == null) {
-            throw new AwsException("ChangeSetNotFoundException",
-                    "ChangeSet [" + changeSetName + "] does not exist", 400);
-        }
-        stack.getChangeSets().remove(name);
+        String accountId = currentAccount();
+        Stack stack = getStackForChangeSet(stackName, changeSetName, region, accountId);
+        ChangeSet cs = getChangeSetOrThrow(stack, changeSetName, region, accountId);
+        stack.getChangeSets().remove(cs.getChangeSetName());
         persistStack(stack);
     }
 
@@ -1003,7 +1026,7 @@ public class CloudFormationService implements ResourceProvider {
                 "AWS::CloudFormation::Stack", "DELETE_IN_PROGRESS", null);
 
         try {
-            return submitOperation(() -> runUnderScope(accountId, region,
+            return submitOperation(() -> RequestScopes.runAs(accountId, region,
                     () -> deleteStackResources(stack, region, accountId)));
         } catch (AwsException e) {
             if ("LimitExceededException".equals(e.getErrorCode())) {
@@ -1404,6 +1427,7 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private void executeTemplate(Stack stack, String templateBody, Map<String, String> params,
+                                 Map<String, String> tags,
                                  boolean isCreate, String region, String accountId) {
         StackUpdateSnapshot previousState = snapshotForUpdate(stack);
         boolean updateCommitted = false;
@@ -1502,7 +1526,10 @@ public class CloudFormationService implements ResourceProvider {
                         stack.getResources().put(logicalId, resource);
                     }
 
-                    String inProgressStatus = isCreate
+                    // A logical id the stack did not hold is created, even on an update, as AWS
+                    // reports it; that includes a resource whose condition just turned true.
+                    boolean creating = isCreate || previousResource == null;
+                    String inProgressStatus = creating
                             ? "CREATE_IN_PROGRESS"
                             : "UPDATE_IN_PROGRESS";
                     addEvent(
@@ -1526,7 +1553,7 @@ public class CloudFormationService implements ResourceProvider {
                     }
                     resource.setUpdateReplacePolicy(
                             resDef.path("UpdateReplacePolicy").asText(null));
-                    if (!isCreate) {
+                    if (!creating) {
                         if ("CREATE_COMPLETE".equals(resource.getStatus())) {
                             resource.setStatus("UPDATE_COMPLETE");
                         } else if ("CREATE_FAILED".equals(resource.getStatus())) {
@@ -1681,6 +1708,9 @@ public class CloudFormationService implements ResourceProvider {
 
             if (!isCreate) {
                 updateCommitted = true;
+                if (tags != null) {
+                    stack.replaceTags(tags);
+                }
                 if (hasReplacementUpdates(stack) || hasRemovedOrConditionFalseResources(stack, resources, conditions)) {
                     stack.setStatus("UPDATE_COMPLETE_CLEANUP_IN_PROGRESS");
                     stack.setLastUpdatedTime(now());
@@ -1836,6 +1866,10 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private List<UpdateCleanupFailure> finishCommittedResourceCleanup(Stack stack, String region) {
+        return finishCommittedResourceCleanup(stack, region, false);
+    }
+
+    private List<UpdateCleanupFailure> finishCommittedResourceCleanup(Stack stack, String region, boolean deleting) {
         List<UpdateCleanupFailure> failures = new ArrayList<>();
         // Dependents go before what they depend on, as when the stack is deleted: a displaced
         // listener has to go before the displaced target group it still forwards to, or that
@@ -1856,7 +1890,8 @@ public class CloudFormationService implements ResourceProvider {
                         null);
             }
             while (true) {
-                UpdateCleanupResult result = dispatcher.completeUpdate(resource);
+                UpdateCleanupResult result = deleting ? dispatcher.completeDeleteCleanup(resource)
+                        : dispatcher.completeUpdate(resource);
                 if (!result.applicable()) {
                     break;
                 }
@@ -1870,7 +1905,11 @@ public class CloudFormationService implements ResourceProvider {
                                 "DELETE_COMPLETE",
                                 null);
                     }
-                    dispatcher.clearUpdate(resource);
+                    if (deleting) {
+                        dispatcher.clearDeleteCleanup(resource);
+                    } else {
+                        dispatcher.clearUpdate(resource);
+                    }
                     break;
                 }
                 if (result.attempts() < 3) {
@@ -1889,7 +1928,11 @@ public class CloudFormationService implements ResourceProvider {
                         resource.getResourceType(),
                         "DELETE_FAILED",
                         reason);
-                dispatcher.clearUpdate(resource);
+                if (deleting) {
+                    dispatcher.clearDeleteCleanup(resource);
+                } else {
+                    dispatcher.clearUpdate(resource);
+                }
                 break;
             }
         }
@@ -2298,7 +2341,9 @@ public class CloudFormationService implements ResourceProvider {
             }
             Map<String, Boolean> conditions = resolveConditions(
                     template, stack.parametersSnapshot(), stack, region, regionResolver.getAccountId());
-            List<String> creationOrder = topologicalSort(resources, conditions);
+            // A stack saved before circular templates were rejected may still have one; order it
+            // by its dependencies anyway rather than giving up.
+            List<String> creationOrder = creationOrder(resources, conditions).sorted();
             Map<String, Integer> rank = new HashMap<>();
             for (int i = 0; i < creationOrder.size(); i++) {
                 rank.put(creationOrder.get(i), i);
@@ -2321,7 +2366,7 @@ public class CloudFormationService implements ResourceProvider {
             // last update left in place. An entity displaced by a replacement whose cleanup phase
             // never ended is named only by the cleanup the resource still carries, so the stack
             // deletes that one too: nothing else ever will.
-            for (UpdateCleanupFailure displacedFailure : finishCommittedResourceCleanup(stack, region)) {
+            for (UpdateCleanupFailure displacedFailure : finishCommittedResourceCleanup(stack, region, true)) {
                 failedResources.add(displacedFailure.logicalId());
             }
             for (StackResource resource : resources) {
@@ -2478,16 +2523,17 @@ public class CloudFormationService implements ResourceProvider {
 
     /**
      * Fails a create/update before any stack state is mutated when a resource that will be created
-     * depends on a resource excluded by a false condition. Real CloudFormation rejects such a
-     * template synchronously ("Template format error: Unresolved resource dependencies [...]")
-     * rather than silently skipping the dependent, so mirror that instead of dropping the resource.
+     * depends on a resource excluded by a false condition, or when resources depend on each other
+     * in a cycle. Real CloudFormation rejects such a template synchronously ("Template format
+     * error: Unresolved resource dependencies [...]" or "Circular dependency between resources:
+     * [...]") rather than skipping the dependent or picking an arbitrary order, so mirror that.
      * Malformed or SAM templates are left for the execution path, which surfaces their own errors.
      * A template carrying an unexpanded {@code Fn::Transform}/{@code AWS::Include} is left for the
      * same reason: a {@code Conditions} section spliced in from a snippet is invisible here, since
      * the merge has not run yet, and treating it as absent would fail a template whose dependency
      * graph the execution path resolves correctly.
      */
-    private void validateConditionDependencies(String templateBody, Map<String, String> params,
+    private void validateResourceDependencies(String templateBody, Map<String, String> params,
                                                String region, String accountId) {
         JsonNode template;
         try {
@@ -2509,23 +2555,8 @@ public class CloudFormationService implements ResourceProvider {
         Map<String, Boolean> conditions =
                 resolveConditions(template, resolvedParams, null, region, accountId);
 
-        Set<String> allIds = new LinkedHashSet<>();
-        resources.fieldNames().forEachRemaining(allIds::add);
-        Set<String> activeIds = new LinkedHashSet<>();
-        Map<String, Set<String>> dependencies = new HashMap<>();
-        for (String logicalId : allIds) {
-            JsonNode resDef = resources.get(logicalId);
-            String condition = resDef.path("Condition").asText(null);
-            if (condition == null || conditions.getOrDefault(condition, false)) {
-                activeIds.add(logicalId);
-            }
-            dependencies.put(logicalId, collectResourceDependencies(resDef, allIds, conditions));
-        }
-
-        Set<String> unresolved = unresolvedConditionDependencies(activeIds, allIds, dependencies);
-        if (!unresolved.isEmpty()) {
-            throw unresolvedDependenciesError(unresolved);
-        }
+        // Throws the ValidationError for either case; the order itself is computed again on execution.
+        topologicalSort(resources, conditions);
     }
 
     private boolean evaluateCondition(JsonNode expr, Map<String, String> params,
@@ -2803,7 +2834,7 @@ public class CloudFormationService implements ResourceProvider {
                     childParams.put(e.getKey(), engine.resolve(e.getValue())));
         }
 
-        executeTemplate(childStack, childTemplate, childParams, childCreate, region, accountId);
+        executeTemplate(childStack, childTemplate, childParams, null, childCreate, region, accountId);
 
         resource.setPhysicalId(childStack.getStackId());
         resource.getAttributes().put("Arn", childStack.getStackId());
@@ -2878,6 +2909,10 @@ public class CloudFormationService implements ResourceProvider {
         if (stack != null) {
             return stack;
         }
+        return resolveDeletedStack(stackNameOrArn, region, accountId);
+    }
+
+    private Stack resolveDeletedStack(String stackNameOrArn, String region, String accountId) {
         if (stackNameOrArn != null && stackNameOrArn.startsWith("arn:")) {
             DeletedStackEntry deleted = deletedStacks.get(stackNameOrArn);
             if (deleted != null) {
@@ -2937,10 +2972,45 @@ public class CloudFormationService implements ResourceProvider {
                 "Invalid change set ARN: " + changeSetNameOrArn, 400);
     }
 
+    private Stack getStackForChangeSet(String stackNameOrArn, String changeSetNameOrArn,
+                                       String region, String accountId) {
+        if (stackNameOrArn != null && !stackNameOrArn.isBlank()) {
+            return getStackOrThrow(stackNameOrArn, region, accountId);
+        }
+        if (changeSetNameOrArn == null || !changeSetNameOrArn.startsWith("arn:")) {
+            throw new AwsException("ValidationError", "StackName is required when ChangeSetName is not an ARN", 400);
+        }
+        // A change-set ARN contains its name and UUID, but not its stack name. Search only
+        // stacks in the caller's account and region, and match the complete ARN so another
+        // stack's change set with the same short name cannot be selected accidentally.
+        String changeSetName = resolveChangeSetName(changeSetNameOrArn, region, accountId);
+        for (Stack stack : stacks.values()) {
+            if (accountId.equals(ownerAccount(stack)) && region.equals(stack.getRegion())) {
+                ChangeSet changeSet = stack.getChangeSets().get(changeSetName);
+                if (changeSet != null && changeSetNameOrArn.equals(changeSet.getChangeSetId())) {
+                    return stack;
+                }
+            }
+        }
+        throw new AwsException("ChangeSetNotFoundException",
+                "ChangeSet [" + changeSetNameOrArn + "] does not exist", 400);
+    }
+
+    private ChangeSet getChangeSetOrThrow(Stack stack, String changeSetNameOrArn,
+                                          String region, String accountId) {
+        ChangeSet changeSet = stack.getChangeSets().get(
+                resolveChangeSetName(changeSetNameOrArn, region, accountId));
+        if (changeSet == null || (changeSetNameOrArn != null && changeSetNameOrArn.startsWith("arn:")
+                && !changeSetNameOrArn.equals(changeSet.getChangeSetId()))) {
+            throw new AwsException("ChangeSetNotFoundException",
+                    "ChangeSet [" + changeSetNameOrArn + "] does not exist", 400);
+        }
+        return changeSet;
+    }
+
     /**
-     * Resolves a stack by name or ARN. When an ARN is provided the stack name
-     * is extracted from the ARN path segment ({@code …:stack/<name>/<id>}).
-     * Falls back to a linear scan matching on stackId for robustness.
+     * Resolves a live stack by name or ARN. An ARN is a stack id and resolves only to the stack
+     * carrying that exact id, never to a newer stack that reused the name.
      */
     private Stack resolveStack(String stackNameOrArn, String region) {
         return resolveStack(stackNameOrArn, region, currentAccount());
@@ -2966,7 +3036,9 @@ public class CloudFormationService implements ResourceProvider {
             String extractedName = extractStackNameFromArn(stackNameOrArn);
             if (extractedName != null) {
                 stack = stacks.get(stackKey(accountId, extractedName, region));
-                if (stack != null) {
+                // A stack id names one stack: a live stack that reused the name is a different
+                // stack, so the id resolves to it only when the ids match.
+                if (stack != null && stackNameOrArn.equals(stack.getStackId())) {
                     return stack;
                 }
             }
@@ -3000,6 +3072,25 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private List<String> topologicalSort(JsonNode resources, Map<String, Boolean> conditions) {
+        // A resource left unsorted is in a dependency cycle or depends on one, so no creation
+        // order exists; AWS rejects such a template instead of creating it in an arbitrary order.
+        CreationOrder order = creationOrder(resources, conditions);
+        if (!order.circular().isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "Circular dependency between resources: [" + String.join(", ", order.circular()) + "]", 400);
+        }
+        return order.sorted();
+    }
+
+    /**
+     * The template's resources, dependencies first, and those in a dependency cycle. Resources in or
+     * depending on a cycle are still placed in {@code sorted}, each cycle after the cycles it depends
+     * on, so every dependency outside a cycle keeps its order.
+     */
+    private record CreationOrder(List<String> sorted, Set<String> circular) {
+    }
+
+    private CreationOrder creationOrder(JsonNode resources, Map<String, Boolean> conditions) {
         Set<String> allIds = new LinkedHashSet<>();
         resources.fieldNames().forEachRemaining(allIds::add);
 
@@ -3059,13 +3150,81 @@ public class CloudFormationService implements ResourceProvider {
             }
         }
 
-        for (String id : activeIds) {
-            if (!sorted.contains(id)) {
-                sorted.add(id);
+        // Every resource left waits on another one left. Ordering their strongly connected
+        // components dependencies first still respects every dependency outside a cycle; only the
+        // components that are cycles themselves are circular.
+        Set<String> circular = new LinkedHashSet<>();
+        if (sorted.size() < activeIds.size()) {
+            Set<String> placed = new HashSet<>(sorted);
+            for (List<String> component : componentsDependenciesFirst(activeIds, placed, dependencies)) {
+                sorted.addAll(component);
+                String first = component.get(0);
+                if (component.size() > 1 || dependencies.get(first).contains(first)) {
+                    circular.addAll(component);
+                }
             }
         }
+        return new CreationOrder(sorted, circular);
+    }
 
-        return sorted;
+    /**
+     * The strongly connected components of the resources not yet placed, each after every component
+     * it depends on: Tarjan's algorithm completes a component only once those are complete. The
+     * search keeps its own stack so a long dependency chain cannot exhaust the thread's.
+     */
+    private static List<List<String>> componentsDependenciesFirst(Set<String> activeIds, Set<String> placed,
+                                                                  Map<String, Set<String>> dependencies) {
+        Map<String, Integer> index = new HashMap<>();
+        Map<String, Integer> lowLink = new HashMap<>();
+        Deque<String> open = new ArrayDeque<>();
+        Set<String> onOpen = new HashSet<>();
+        List<List<String>> components = new ArrayList<>();
+        Deque<Map.Entry<String, Iterator<String>>> path = new ArrayDeque<>();
+        for (String root : activeIds) {
+            if (placed.contains(root) || index.containsKey(root)) {
+                continue;
+            }
+            String next = root;
+            while (next != null || !path.isEmpty()) {
+                if (next != null) {
+                    index.put(next, index.size());
+                    lowLink.put(next, index.get(next));
+                    open.push(next);
+                    onOpen.add(next);
+                    path.push(Map.entry(next, dependencies.get(next).iterator()));
+                    next = null;
+                }
+                String id = path.peek().getKey();
+                Iterator<String> deps = path.peek().getValue();
+                if (deps.hasNext()) {
+                    String dep = deps.next();
+                    if (!dependencies.containsKey(dep) || placed.contains(dep)) {
+                        continue;
+                    }
+                    if (!index.containsKey(dep)) {
+                        next = dep;
+                    } else if (onOpen.contains(dep)) {
+                        lowLink.merge(id, index.get(dep), Math::min);
+                    }
+                    continue;
+                }
+                path.pop();
+                if (!path.isEmpty()) {
+                    lowLink.merge(path.peek().getKey(), lowLink.get(id), Math::min);
+                }
+                if (lowLink.get(id).equals(index.get(id))) {
+                    List<String> component = new ArrayList<>();
+                    String member;
+                    do {
+                        member = open.pop();
+                        onOpen.remove(member);
+                        component.add(member);
+                    } while (!member.equals(id));
+                    components.add(component);
+                }
+            }
+        }
+        return components;
     }
 
     private static final Pattern SUB_VAR_PATTERN = Pattern.compile("\\$\\{([^}]+)}");

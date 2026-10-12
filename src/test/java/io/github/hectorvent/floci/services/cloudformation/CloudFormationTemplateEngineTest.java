@@ -14,6 +14,7 @@ import java.util.function.Function;
 import java.util.function.UnaryOperator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -34,6 +35,81 @@ class CloudFormationTemplateEngineTest {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    @Test
+    void selectedNoValueOmitsTheOptionalPropertyWhileKeepingLiteralEmptyText() {
+        JsonNode source = json("""
+                {"Scopes":{"Fn::If":["Include",[],{"Ref":"AWS::NoValue"}]},"Name":""}
+                """);
+        assertEquals(json("{\"Name\":\"\"}"),
+                engineWithCondition("Include", false).resolveNodeOmittingNoValue(source));
+    }
+
+    @Test
+    void selectedNoValueOmitsTheOptionalArrayEntryWhileKeepingLiteralEmptyText() {
+        JsonNode source = json("""
+                ["first",{"Fn::If":["Include","read",{"Ref":"AWS::NoValue"}]},"","last"]
+                """);
+        assertEquals(json("[\"first\",\"\",\"last\"]"),
+                engineWithCondition("Include", false).resolveNodeOmittingNoValue(source));
+    }
+
+    @Test
+    void optionalNodeResolutionPreservesTheLegacyNoValueContract() {
+        JsonNode noValue = json("{\"Ref\":\"AWS::NoValue\"}");
+        assertEquals("", engine().resolveNode(noValue).asText());
+        assertTrue(engine().resolveNodeOmittingNoValue(noValue).isMissingNode());
+        assertEquals(json("\"\""), engine().resolveNodeOmittingNoValue(json("\"\"")));
+        assertEquals(json("\"AWS::NoValue\""), engine().resolveNodeOmittingNoValue(json("\"AWS::NoValue\"")));
+    }
+
+    @Test
+    void optionalNodeResolutionDoesNotRewriteOtherIntrinsicArguments() {
+        JsonNode joined = json("""
+                {"Fn::Join": ["-", ["read", {"Ref": "AWS::NoValue"}, "all"]]}
+                """);
+        assertEquals("read--all", engine().resolveNodeOmittingNoValue(joined).asText());
+        JsonNode malformedConditional = json("{\"Fn::If\":[\"IncludeScopes\"]}");
+        assertEquals(engine().resolveNode(malformedConditional),
+                engine().resolveNodeOmittingNoValue(malformedConditional));
+        assertEquals(json("{\"keep\":\"\"}"), engine().resolveNodeOmittingNoValue(
+                json("{\"keep\":{\"Ref\":\"AWS::NoValue\",\"extra\":true}}")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void optionalNodeResolutionOmitsSelectedNestedValuesWithoutMutatingInput(boolean include) {
+        CloudFormationTemplateEngine e = engineWithCondition("Include", include);
+        JsonNode source = json("""
+                {"nested":{"optional":{"Fn::If":["Include",{"list":[0,false,""]},{"Ref":"AWS::NoValue"}]},
+                  "empty":"","literal":"AWS::NoValue","nil":null},
+                 "items":["first",{"Fn::If":["Include",{"Ref":"AWS::Region"},{"Ref":"AWS::NoValue"}]},"last"]}
+                """);
+        JsonNode before = source.deepCopy();
+        JsonNode expected = json(include ? """
+                {"nested":{"optional":{"list":[0,false,""]},"empty":"","literal":"AWS::NoValue","nil":null},
+                 "items":["first","us-east-1","last"]}
+                """ : """
+                {"nested":{"empty":"","literal":"AWS::NoValue","nil":null},"items":["first","last"]}
+                """);
+        assertEquals(expected, e.resolveNodeOmittingNoValue(source));
+        assertEquals(before, source);
+    }
+
+    @Test
+    void optionalNodeResolutionOnlyResolvesTheSelectedDynamicReferenceOnce() {
+        List<String> calls = new ArrayList<>();
+        CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000",
+                "us-east-1", "my-stack", "stack/id", Map.of(), Map.of(), Map.of(),
+                Map.of("Include", true), Map.of(), mapper, name -> null, value -> {
+                    calls.add(value);
+                    return "{{resolve:ssm:/literal-result}}";
+                });
+        assertEquals("{{resolve:ssm:/literal-result}}", e.resolveNodeOmittingNoValue(json("""
+                {"Fn::If":["Include","{{resolve:ssm:/selected}}","{{resolve:ssm:/unselected}}"]}
+                """)).asText());
+        assertEquals(List.of("{{resolve:ssm:/selected}}"), calls);
     }
 
     @Test
@@ -145,6 +221,19 @@ class CloudFormationTemplateEngineTest {
                 "{\"deadLetterTargetArn\":\"Dlq.Arn\"}",
                 engine().resolveJsonAttribute(json(
                         "{\"deadLetterTargetArn\":{\"Fn::GetAtt\":[\"Dlq\",\"Arn\"]}}")));
+    }
+
+    @Test
+    void getAttDoesNotExposeFlociInternalAttributes() {
+        CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000",
+                "us-east-1", "my-stack", "stack/id", Map.of(), Map.of(),
+                Map.of("Res", Map.of("Arn", "arn:res", "__FlociSecret", "secret-value")),
+                Map.of(), Map.of(), mapper, (Function<String, String>) name -> null);
+
+        assertEquals("arn:res", e.resolve(json("{\"Fn::GetAtt\": [\"Res\", \"Arn\"]}")));
+        assertEquals("Res.__FlociSecret",
+                e.resolve(json("{\"Fn::GetAtt\": [\"Res\", \"__FlociSecret\"]}")));
+        assertNotEquals("secret-value", e.resolve(json("{\"Fn::Sub\": \"${Res.__FlociSecret}\"}")));
     }
 
     @Test

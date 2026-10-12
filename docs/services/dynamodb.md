@@ -70,6 +70,26 @@ epoch time in the past. Each deletion writes a `REMOVE` record to the table's st
 forwarded to an active Kinesis streaming destination. Between sweeps, reads already leave expired
 items out.
 
+As in AWS, the records of a TTL deletion carry the DynamoDB service identity, which a `DeleteItem`
+removal does not. The member names depend on where the record is read. The DynamoDB Streams API
+(`GetRecords`) capitalises them, as the SDK's `Identity` shape expects:
+
+```json
+"userIdentity": {"PrincipalId": "dynamodb.amazonaws.com", "Type": "Service"}
+```
+
+The records that Lambda event source mappings and EventBridge Pipes deliver and filter use the
+lowercase names the DynamoDB developer guide shows, and so does the Kinesis streaming destination
+record:
+
+```json
+"userIdentity": {"type": "Service", "principalId": "dynamodb.amazonaws.com"}
+```
+
+A Lambda event source mapping or an EventBridge pipe that should see only TTL deletions filters on
+it with the pattern
+`{"userIdentity": {"type": ["Service"], "principalId": ["dynamodb.amazonaws.com"]}}`.
+
 ## DynamoDB Local backend
 
 By default Floci stores tables in its own engine, the `native` backend. With
@@ -128,6 +148,11 @@ region is rejected.
   `memory` storage they are lost when Floci restarts while the tables stay in DynamoDB Local.
 - **Stream consumers.** Lambda event source mappings, EventBridge Pipes and other Floci stream
   consumers read the DynamoDB Local streams through the Streams API.
+- **Time to live deletions.** DynamoDB Local deletes expired items itself and writes each deletion
+  to the stream with the event name `UNKNOWN_TO_SDK_VERSION` and no `userIdentity`. Floci's
+  `GetRecords` returns it as AWS writes it, a `REMOVE` record with the DynamoDB service
+  `userIdentity` (see [Time to Live](#time-to-live)), so every stream consumer and event filter
+  sees the AWS shape.
 
 ### Limits
 
@@ -392,12 +417,17 @@ AWS CDC envelope (`eventName`, `dynamodb.Keys`, `NewImage`/`OldImage`, `Approxim
 
 `ApproximateCreationDateTime` follows the destination's
 `EnableKinesisStreamingConfiguration.ApproximateCreationDateTimePrecision`: epoch milliseconds for
-`MILLISECOND` (the default) and epoch microseconds for `MICROSECOND`. The precision is returned by
-`DescribeKinesisStreamingDestination` and stamped on each record as
-`dynamodb.ApproximateCreationDateTimePrecision`.
+`MILLISECOND` (the default) and epoch microseconds for `MICROSECOND`. The precision is stamped on each
+record as `dynamodb.ApproximateCreationDateTimePrecision`, and reported by
+`DescribeKinesisStreamingDestination` as well as in the `EnableKinesisStreamingConfiguration` member of
+the `EnableKinesisStreamingDestination` and `DisableKinesisStreamingDestination` responses.
 
 Enabling a Kinesis streaming destination does not change the table's DynamoDB Streams setting.
 Kinesis forwarding works whether or not `StreamSpecification.StreamEnabled` is set.
+
+Both calls take effect at once, so `EnableKinesisStreamingDestination` answers `ACTIVE` and
+`DisableKinesisStreamingDestination` answers `DISABLED`. AWS reports the transitional `ENABLING` and
+`DISABLING` first, because it enables and disables the destination in the background.
 
 ### Delivery contract
 

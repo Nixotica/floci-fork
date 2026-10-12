@@ -9,9 +9,9 @@ import software.amazon.awssdk.services.guardduty.model.AutoEnableMembers;
 import software.amazon.awssdk.services.guardduty.model.BadRequestException;
 import software.amazon.awssdk.services.guardduty.model.CreateDetectorResponse;
 import software.amazon.awssdk.services.guardduty.model.DescribeOrganizationConfigurationResponse;
+import software.amazon.awssdk.services.guardduty.model.DetectorAdditionalConfiguration;
 import software.amazon.awssdk.services.guardduty.model.DetectorFeature;
 import software.amazon.awssdk.services.guardduty.model.DetectorFeatureConfiguration;
-import software.amazon.awssdk.services.guardduty.model.DetectorAdditionalConfiguration;
 import software.amazon.awssdk.services.guardduty.model.DetectorStatus;
 import software.amazon.awssdk.services.guardduty.model.FeatureAdditionalConfiguration;
 import software.amazon.awssdk.services.guardduty.model.FeatureStatus;
@@ -99,7 +99,7 @@ class GuardDutyTest {
                         .isEqualTo(FindingPublishingFrequency.ONE_HOUR);
 
                 String detectorArn =
-                        "arn:aws:guardduty:us-east-1:000000000000:detector/" + detectorId;
+                        TestFixtures.arn("guardduty", "000000000000", "detector/" + detectorId);
                 guardduty.tagResource(request -> request
                         .resourceArn(detectorArn)
                         .tags(Map.of("team", "security")));

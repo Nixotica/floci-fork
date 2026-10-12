@@ -1,9 +1,13 @@
 package io.github.hectorvent.floci.services.redshiftdata;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.redshift.spectrum.SpectrumQueryPreparation;
+import io.github.hectorvent.floci.services.redshift.spectrum.SpectrumReadException;
+import io.github.hectorvent.floci.services.redshift.spectrum.SpectrumSession;
 import org.h2.Driver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -12,6 +16,7 @@ import java.sql.DriverManager;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.time.Clock;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -19,7 +24,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class RedshiftDataServiceTest {
@@ -33,6 +42,7 @@ class RedshiftDataServiceTest {
     private final ObjectMapper om = new ObjectMapper();
     private String jdbcUrl;
     private RedshiftDataService service;
+    private SpectrumQueryPreparation preparation;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -40,13 +50,15 @@ class RedshiftDataServiceTest {
 
         RedshiftDataResourceResolver resolver = mock(RedshiftDataResourceResolver.class);
         when(resolver.resolve(any(), any())).thenReturn(new RedshiftDataResourceResolver.DatabaseTarget(
-                "arn:aws:redshift:us-east-1:000000000000:cluster:wh", "127.0.0.1", 5439, "dev", "admin", "x"));
+                "arn:aws:redshift:us-east-1:000000000000:cluster:wh", "127.0.0.1", 5439, "dev", "admin", "x",
+                new SpectrumSession("000000000000", "000000000000:wh", "dev", List.of(), false)));
 
         RedshiftDataConnectionFactory factory = mock(RedshiftDataConnectionFactory.class);
         when(factory.open(any())).thenAnswer(inv -> DriverManager.getConnection(jdbcUrl, "sa", ""));
 
+        preparation = mock(SpectrumQueryPreparation.class);
         service = new RedshiftDataService(resolver, factory,
-                new RedshiftDataStatementStore(24, Clock.systemUTC()), om);
+                new RedshiftDataStatementStore(24, Clock.systemUTC()), om, preparation);
     }
 
     private ObjectNode req(String sql) {
@@ -60,6 +72,68 @@ class RedshiftDataServiceTest {
 
     private ObjectNode idOf(String id) {
         return om.createObjectNode().put("Id", id);
+    }
+
+    @Test
+    void preparationFailureIsStoredAsFailedStatement() {
+        doThrow(new SpectrumReadException("42501", "S3 access denied")).when(preparation)
+                .prepare(eq("SELECT * FROM lake.events"), any(), any());
+        ObjectNode executed = service.executeStatement(req("SELECT * FROM lake.events"), REGION);
+        ObjectNode described = service.describeStatement(idOf(executed.path("Id").asText()));
+        assertEquals("FAILED", described.path("Status").asText());
+        assertEquals("S3 access denied", described.path("Error").asText());
+    }
+
+    @Test
+    void batchPreparationUsesTransactionContext() {
+        ObjectNode request = req("unused");
+        request.putArray("Sqls").add("SELECT 1");
+        service.batchExecuteStatement(request, REGION);
+        verify(preparation).prepare(eq("SELECT 1"), argThat(SpectrumSession::inTransaction), any());
+    }
+
+    @Test
+    void aWorkgroupStatementNamesItsWorkgroupAndOmitsTheClusterIdentifier() {
+        ObjectNode request = om.createObjectNode();
+        request.put("Sql", "select 1");
+        request.put("WorkgroupName", "wg-1");
+        request.put("Database", "dev");
+
+        ObjectNode executed = service.executeStatement(request, REGION);
+
+        assertEquals("wg-1", executed.get("WorkgroupName").asText());
+        assertFalse(executed.has("ClusterIdentifier"),
+                "AWS does not return ClusterIdentifier when connecting to a serverless workgroup");
+        ObjectNode described = service.describeStatement(idOf(executed.get("Id").asText()));
+        assertEquals("wg-1", described.get("WorkgroupName").asText());
+        assertFalse(described.has("ClusterIdentifier"));
+    }
+
+    @Test
+    void aClusterStatementKeepsItsNullWorkgroupName() {
+        ObjectNode executed = service.executeStatement(req("select 1"), REGION);
+
+        assertEquals("wh", executed.get("ClusterIdentifier").asText());
+        assertTrue(executed.get("WorkgroupName").isNull());
+        ObjectNode described = service.describeStatement(idOf(executed.get("Id").asText()));
+        assertEquals("wh", described.get("ClusterIdentifier").asText());
+        assertTrue(described.get("WorkgroupName").isNull());
+    }
+
+    @Test
+    void aWorkgroupBatchPassesItsWorkgroupToEverySubStatement() {
+        ObjectNode request = om.createObjectNode();
+        request.putArray("Sqls").add("select 1").add("select 2");
+        request.put("WorkgroupName", "wg-1");
+        request.put("Database", "dev");
+
+        ObjectNode executed = service.batchExecuteStatement(request, REGION);
+
+        ObjectNode described = service.describeStatement(idOf(executed.get("Id").asText()));
+        assertEquals("wg-1", described.get("WorkgroupName").asText());
+        for (JsonNode sub : described.get("SubStatements")) {
+            assertFalse(sub.has("ClusterIdentifier"));
+        }
     }
 
     /**

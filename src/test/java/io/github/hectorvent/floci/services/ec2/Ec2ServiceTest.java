@@ -1,39 +1,38 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import java.util.ArrayList;
-import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
-import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceListResult;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
+import io.github.hectorvent.floci.services.ec2.model.IpPermission;
+import io.github.hectorvent.floci.services.ec2.model.IpRange;
 import io.github.hectorvent.floci.services.ec2.model.Ipv6Range;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
-import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
-import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
-import io.github.hectorvent.floci.services.ec2.model.InstanceState;
-import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.ManagedPrefixList;
-import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
-import io.github.hectorvent.floci.services.ec2.model.PrefixListId;
-import io.github.hectorvent.floci.services.ec2.model.IpPermission;
-import io.github.hectorvent.floci.services.ec2.model.IpRange;
-import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceListResult;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
+import io.github.hectorvent.floci.services.ec2.model.PrefixList;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListId;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.Snapshot;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
@@ -44,19 +43,26 @@ import io.github.hectorvent.floci.services.ec2.model.TransitGatewayRouteTable;
 import io.github.hectorvent.floci.services.ec2.model.TransitGatewayRouteTablePropagation;
 import io.github.hectorvent.floci.services.ec2.model.TransitGatewayVpcAttachment;
 import io.github.hectorvent.floci.services.ec2.model.TransitGatewayVpcAttachmentOptions;
-import io.github.hectorvent.floci.services.ec2.model.Vpc;
-import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
-import io.github.hectorvent.floci.services.ec2.model.VpcEndpointSubnetConfiguration;
+import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
+import io.github.hectorvent.floci.services.ec2.model.Vpc;
+import io.github.hectorvent.floci.services.ec2.model.VpcCidrBlockAssociation;
+import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
+import io.github.hectorvent.floci.services.ec2.model.VpcEndpointSubnetConfiguration;
+import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
+import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
+import org.awaitility.Awaitility;
 import org.bouncycastle.openssl.PEMKeyPair;
 import org.bouncycastle.openssl.PEMParser;
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
 import org.junit.jupiter.api.Test;
 
 import java.io.StringReader;
+import java.lang.reflect.Field;
 import java.security.interfaces.RSAPrivateCrtKey;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -68,6 +74,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 
@@ -82,14 +89,39 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class Ec2ServiceTest {
+
+    @Test
+    void createAndDescribeVpcsDoNotContactDockerEvenOnFirstUse() {
+        EmulatorConfig config = mockConfig(false);
+        EmulatorConfig.VpcNetworksConfig networks = mock(EmulatorConfig.VpcNetworksConfig.class);
+        when(config.services().ec2().vpcNetworks()).thenReturn(networks);
+        when(networks.enabled()).thenReturn(true);
+        when(config.docker()).thenReturn(mock(EmulatorConfig.DockerConfig.class));
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        DockerClient docker = mock(DockerClient.class);
+        VpcNetworkManager manager = new VpcNetworkManager(config, docker, null);
+        Ec2Service service = new Ec2Service(config, mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(), manager);
+
+        Vpc created = service.createVpc("eu-central-1", "42.0.0.0/16", false);
+        service.createTags("eu-central-1", List.of(created.getVpcId()), List.of(new Tag("Name", "probe")));
+        List<Vpc> found = service.describeVpcs("eu-central-1", List.of(), Map.of("tag:Name", List.of("probe")));
+
+        assertEquals(List.of(created.getVpcId()), found.stream().map(Vpc::getVpcId).toList());
+        assertTrue(service.describeVpcs("eu-central-1", List.of(), Map.of()).stream().anyMatch(Vpc::isDefault));
+        verifyNoInteractions(docker);
+    }
 
     @Test
     void sharedDescribeVpcsOmitsUnknownIdsButExplicitLookupStillRejectsThem() {
@@ -687,6 +719,48 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void createVpcAndCreateSubnetStoreTheCidrBlockInCanonicalForm() {
+        // AWS CreateVpc/CreateSubnet: "We modify the specified CIDR block to its canonical form; for
+        // example, if you specify 100.68.0.18/18, we modify it to 100.68.0.0/18."
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-east-1", "10.20.0.5/16", false).getVpcId();
+        String subnetId = service.createSubnet("us-east-1", vpcId, "10.20.1.9/24", "us-east-1a").getSubnetId();
+        String canonicalSubnetId = service.createSubnet("us-east-1", vpcId, "10.20.2.0/24", "us-east-1a").getSubnetId();
+
+        Vpc vpc = service.describeVpcs("us-east-1", List.of(vpcId), Map.of()).get(0);
+        assertEquals("10.20.0.0/16", vpc.getCidrBlock());
+        assertEquals(List.of("10.20.0.0/16"), vpc.getCidrBlockAssociationSet().stream()
+                .map(a -> a.getCidrBlock()).toList());
+        assertEquals("10.20.1.0/24",
+                service.describeSubnets("us-east-1", List.of(subnetId), Map.of()).get(0).getCidrBlock());
+        assertEquals("10.20.2.0/24",
+                service.describeSubnets("us-east-1", List.of(canonicalSubnetId), Map.of()).get(0).getCidrBlock());
+
+        // The conflict check runs on the canonical form, and reports it.
+        AwsException error = assertThrows(AwsException.class, () -> service.createSubnet(
+                "us-east-1", vpcId, "10.20.1.0/24", "us-east-1a"));
+        assertEquals("InvalidSubnet.Conflict", error.getErrorCode());
+        AwsException hostBits = assertThrows(AwsException.class, () -> service.createSubnet(
+                "us-east-1", vpcId, "10.20.2.77/24", "us-east-1a"));
+        assertEquals("The CIDR '10.20.2.0/24' conflicts with another subnet", hostBits.getMessage());
+    }
+
+    @Test
+    void createVpcKeepsAnAlreadyCanonicalCidrBlockUnchanged() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-east-1", "10.30.0.0/16", false).getVpcId();
+
+        assertEquals("10.30.0.0/16",
+                service.describeVpcs("us-east-1", List.of(vpcId), Map.of()).get(0).getCidrBlock());
+    }
+
+    @Test
     void createSubnetRejectsCidrThatPartiallyOverlapsAnExistingSubnet() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class),
@@ -719,6 +793,84 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void createSubnetRejectsCidrOutsideVpcWithoutStoringSubnet() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-east-1", "10.0.0.0/16", false).getVpcId();
+        for (String cidr : List.of("192.168.1.0/24", "10.0.0.0/15", "10.1.0.0/24", "2001:db8::/56")) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> service.createSubnet("us-east-1", vpcId, cidr, "us-east-1a"));
+            assertEquals("InvalidSubnet.Range", error.getErrorCode());
+            assertEquals(400, error.getHttpStatus());
+        }
+        assertTrue(service.describeSubnets("us-east-1", List.of(), Map.of()).stream()
+                .noneMatch(subnet -> vpcId.equals(subnet.getVpcId())));
+    }
+
+    @Test
+    void createSubnetAllowsPrimaryAndSecondaryBlocksButNotDisassociatedBlocks() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-east-1", "10.0.0.0/16", false).getVpcId();
+        String associationId = service.associateVpcCidrBlock("us-east-1", vpcId, "192.168.0.0/16").getAssociationId();
+        assertEquals("10.0.255.0/24",
+                service.createSubnet("us-east-1", vpcId, "10.0.255.9/24", "us-east-1a").getCidrBlock());
+        assertEquals("192.168.1.0/24",
+                service.createSubnet("us-east-1", vpcId, "192.168.1.9/24", "us-east-1a").getCidrBlock());
+        service.disassociateVpcCidrBlock("us-east-1", associationId);
+        assertEquals("InvalidSubnet.Range", assertThrows(AwsException.class,
+                () -> service.createSubnet("us-east-1", vpcId, "192.168.2.0/24", "us-east-1a")).getErrorCode());
+    }
+
+    @Test
+    void cidrAssociationEditsWaitForSubnetContainmentValidation() throws Exception {
+        for (boolean remove : List.of(false, true)) {
+            Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                    mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                    new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+            Vpc vpc = service.createVpc("us-east-1", "10.0.0.0/16", false);
+            String associationId = service.associateVpcCidrBlock("us-east-1", vpc.getVpcId(), "192.168.0.0/16")
+                    .getAssociationId();
+            CountDownLatch scanning = new CountDownLatch(1);
+            CountDownLatch resume = new CountDownLatch(1);
+            VpcCidrBlockAssociation first = spy(vpc.getCidrBlockAssociationSet().getFirst());
+            doAnswer(call -> {
+                scanning.countDown();
+                assertTrue(resume.await(15, TimeUnit.SECONDS));
+                return call.callRealMethod();
+            }).when(first).getCidrBlockState();
+            vpc.getCidrBlockAssociationSet().set(0, first);
+            AtomicReference<Thread> editor = new AtomicReference<>();
+            ExecutorService workers = Executors.newFixedThreadPool(2);
+            try {
+                Future<Subnet> creating = workers.submit(() ->
+                        service.createSubnet("us-east-1", vpc.getVpcId(), "192.168.1.0/24", "us-east-1a"));
+                assertTrue(scanning.await(5, TimeUnit.SECONDS));
+                Future<?> editing = workers.submit(() -> {
+                    editor.set(Thread.currentThread());
+                    if (remove) {
+                        service.disassociateVpcCidrBlock("us-east-1", associationId);
+                    } else {
+                        service.associateVpcCidrBlock("us-east-1", vpc.getVpcId(), "198.18.0.0/16");
+                    }
+                });
+                Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> editing.isDone()
+                        || (editor.get() != null && editor.get().getState() == Thread.State.BLOCKED));
+                assertFalse(editing.isDone(), "CIDR edits must not mutate the list while subnet validation scans it");
+                resume.countDown();
+                assertEquals("192.168.1.0/24", creating.get(5, TimeUnit.SECONDS).getCidrBlock());
+                editing.get(5, TimeUnit.SECONDS);
+            } finally {
+                resume.countDown();
+                workers.shutdownNow();
+                assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    @Test
     void createSubnetAllowsConflictingCidrsInDifferentVpcs() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class),
@@ -744,6 +896,7 @@ class Ec2ServiceTest {
                 1, 1, null, List.of(), null, null, List.of(), null, null);
 
         assertEquals("arm64", reservation.getInstances().getFirst().getArchitecture());
+        assertEquals(reservation.getOwnerId(), reservation.getInstances().getFirst().getOwnerId());
     }
 
     @Test
@@ -1258,9 +1411,9 @@ class Ec2ServiceTest {
     @SuppressWarnings("unchecked")
     private static <T> void putViaReflection(Ec2Service service, String fieldName, String key, T value)
             throws Exception {
-        var field = Ec2Service.class.getDeclaredField(fieldName);
+        Field field = Ec2Service.class.getDeclaredField(fieldName);
         field.setAccessible(true);
-        var backend = (io.github.hectorvent.floci.core.storage.StorageBackend<String, T>) field.get(service);
+        StorageBackend<String, T> backend = (StorageBackend<String, T>) field.get(service);
         backend.put(key, value);
     }
 
@@ -1294,6 +1447,309 @@ class Ec2ServiceTest {
 
         assertTrue(service.endpointNetworkInterfaces("eu-west-1").isEmpty(),
                 "endpoints are regional");
+    }
+
+    @Test
+    void endpointFallbackAddressesResolveSubnetHashCollisions() {
+        EndpointAddressFixture fixture = endpointAddressFixture("2001:db8:1::/64", "2001:db8:2::/64");
+        String firstSubnet = "subnet-00000000";
+        String secondSubnet = "subnet-00000088";
+        assertEquals(Math.floorMod(firstSubnet.hashCode(), 256), Math.floorMod(secondSubnet.hashCode(), 256));
+
+        Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+        assertEquals(2, addresses.size());
+        assertNotEquals(addresses.get(firstSubnet), addresses.get(secondSubnet));
+        assertEquals(addresses, endpointAddressesBySubnet(fixture.service()));
+
+        fixture.endpoint().setSubnetIds(List.of(secondSubnet, firstSubnet));
+        assertEquals(addresses, endpointAddressesBySubnet(fixture.service()),
+                "reordering subnets must not change their fallback addresses");
+    }
+
+    @Test
+    void endpointFallbackAddressesAreDistinctForSubnetsWithNoIpv4Cidr() {
+        EndpointAddressFixture fixture = endpointAddressFixture(null, null);
+
+        Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+        assertEquals(2, addresses.size());
+        assertNotEquals(addresses.get("subnet-00000000"), addresses.get("subnet-00000088"));
+        assertEquals(addresses, endpointAddressesBySubnet(fixture.service()));
+    }
+
+    @Test
+    void endpointFallbackAddressesDoNotReusePinnedOrIpv4DerivedAddresses() {
+        for (boolean pinned : new boolean[]{false, true}) {
+            EndpointAddressFixture fixture = endpointAddressFixture("2001:db8:1::/64", "172.31.112.0/24");
+            int host = 200 + Math.floorMod(fixture.endpoint().getVpcEndpointId().hashCode(), 50);
+            String fixedAddress = "172.31.112." + host;
+            if (pinned) {
+                fixture.endpoint().setSubnetConfigurations(List.of(
+                        new VpcEndpointSubnetConfiguration("subnet-00000088", fixedAddress, null)));
+            }
+
+            Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+            assertEquals(fixedAddress, addresses.get("subnet-00000088"));
+            assertNotEquals(fixedAddress, addresses.get("subnet-00000000"));
+            assertEquals(addresses, endpointAddressesBySubnet(fixture.service()));
+        }
+    }
+
+    @Test
+    void endpointFallbackAddressesDoNotReusePinnedAddressesWithLeadingZeros() {
+        EndpointAddressFixture fixture = endpointAddressFixture("2001:db8:1::/64", "172.31.112.0/24");
+        int host = 200 + Math.floorMod(fixture.endpoint().getVpcEndpointId().hashCode(), 50);
+        String pinnedAddress = "172.31.112.0" + host;
+        fixture.service().modifyVpcEndpoint("us-east-1", fixture.endpoint().getVpcEndpointId(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), null, null, null,
+                List.of(new VpcEndpointSubnetConfiguration("subnet-00000088", pinnedAddress, null)));
+
+        Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+        assertEquals(pinnedAddress, addresses.get("subnet-00000088"));
+        assertNotEquals("172.31.112." + host, addresses.get("subnet-00000000"));
+        assertEquals(addresses, endpointAddressesBySubnet(fixture.service()));
+    }
+
+    @Test
+    void endpointIpv4AddressesStayInsideTheirOwnHalfOfASplitSlash24() {
+        EndpointAddressFixture fixture = endpointAddressFixture("10.0.1.0/25", "10.0.1.128/25");
+
+        Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+        assertUsableEndpointAddress("10.0.1.0/25", addresses.get("subnet-00000000"));
+        assertUsableEndpointAddress("10.0.1.128/25", addresses.get("subnet-00000088"));
+        assertNotEquals(addresses.get("subnet-00000000"), addresses.get("subnet-00000088"));
+        assertEquals(addresses, endpointAddressesBySubnet(fixture.service()),
+                "a second read must answer with the same addresses");
+
+        fixture.endpoint().setSubnetIds(List.of("subnet-00000088", "subnet-00000000"));
+        assertEquals(addresses, endpointAddressesBySubnet(fixture.service()),
+                "reordering subnets must not change their addresses");
+    }
+
+    @Test
+    void endpointIpv4AddressesRespectEverySubnetPrefixLength() {
+        for (int prefix = 16; prefix <= 28; prefix++) {
+            String first = "10.20.0.0/" + prefix;
+            String second = "10.30.0.0/" + prefix;
+            EndpointAddressFixture fixture = endpointAddressFixture(first, second);
+
+            Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+            assertUsableEndpointAddress(first, addresses.get("subnet-00000000"));
+            assertUsableEndpointAddress(second, addresses.get("subnet-00000088"));
+            assertEquals(addresses, endpointAddressesBySubnet(fixture.service()), "/" + prefix);
+        }
+    }
+
+    @Test
+    void endpointIpv4AddressesNeverLandOnAwsReservedAddressesInASlash28() {
+        for (int i = 0; i < 40; i++) {
+            EndpointAddressFixture fixture = endpointAddressFixture("10.0.1.0/28", "10.0.1.16/28");
+
+            Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+            assertUsableEndpointAddress("10.0.1.0/28", addresses.get("subnet-00000000"));
+            assertUsableEndpointAddress("10.0.1.16/28", addresses.get("subnet-00000088"));
+        }
+    }
+
+    @Test
+    void endpointIpv4AddressesKeepTheSlash24LayoutForLargerSubnets() {
+        EndpointAddressFixture fixture = endpointAddressFixture("10.40.0.0/20", "10.40.16.0/24");
+        int host = 200 + Math.floorMod(fixture.endpoint().getVpcEndpointId().hashCode(), 50);
+
+        Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+        assertEquals("10.40.0." + host, addresses.get("subnet-00000000"));
+        assertEquals("10.40.16." + host, addresses.get("subnet-00000088"));
+    }
+
+    @Test
+    void endpointIpv4AddressesProbePastAPinnedAddressInTheSameRange() {
+        // Two records over the same /29 leave three usable addresses (.4, .5, .6). Whatever the
+        // endpoint id prefers, the derived interface must step past the pinned one.
+        for (String pinnedAddress : List.of("10.0.1.4", "10.0.1.5", "10.0.1.6")) {
+            EndpointAddressFixture fixture = endpointAddressFixture("10.0.1.0/29", "10.0.1.0/29");
+            fixture.endpoint().setSubnetConfigurations(List.of(
+                    new VpcEndpointSubnetConfiguration("subnet-00000088", pinnedAddress, null)));
+
+            Map<String, String> addresses = endpointAddressesBySubnet(fixture.service());
+            assertEquals(pinnedAddress, addresses.get("subnet-00000088"));
+            assertUsableEndpointAddress("10.0.1.0/29", addresses.get("subnet-00000000"));
+            assertNotEquals(pinnedAddress, addresses.get("subnet-00000000"));
+            assertEquals(addresses, endpointAddressesBySubnet(fixture.service()), pinnedAddress);
+        }
+    }
+
+    @Test
+    void interfaceEndpointIsRefusedInASubnetWithNoAssignableAddress() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-east-1", "10.64.0.0/16", false).getVpcId();
+        String tiny = service.createSubnet("us-east-1", vpcId, "10.64.1.0/30", "us-east-1a").getSubnetId();
+        String roomy = service.createSubnet("us-east-1", vpcId, "10.64.2.0/28", "us-east-1b").getSubnetId();
+
+        AwsException createError = assertThrows(AwsException.class, () ->
+                service.createVpcEndpoint("us-east-1", vpcId, "com.amazonaws.us-east-1.ecs", "Interface",
+                        List.of(), List.of(tiny), List.of(), null, null, List.of()));
+        assertEquals("InsufficientFreeAddressesInSubnet", createError.getErrorCode());
+        assertTrue(service.describeVpcEndpoints("us-east-1", List.of(), Map.of()).isEmpty(),
+                "a refused endpoint must not be stored");
+
+        VpcEndpoint endpoint = service.createVpcEndpoint("us-east-1", vpcId, "com.amazonaws.us-east-1.ecs",
+                "Interface", List.of(), List.of(roomy), List.of(), null, null, List.of());
+        AwsException modifyError = assertThrows(AwsException.class, () ->
+                service.modifyVpcEndpoint("us-east-1", endpoint.getVpcEndpointId(), List.of(), List.of(),
+                        List.of(tiny), List.of(), List.of(), List.of(), null, null, null));
+        assertEquals("InsufficientFreeAddressesInSubnet", modifyError.getErrorCode());
+        assertEquals(List.of(roomy), endpoint.getSubnetIds(), "a refused modification must not add the subnet");
+        assertUsableEndpointAddress("10.64.2.0/28", endpointAddressesBySubnet(service).get(roomy));
+    }
+
+    @Test
+    void storedEndpointInASubnetTooSmallForItDegradesInsteadOfFailingReads() {
+        // An endpoint stored before CreateVpcEndpoint refused undersized subnets: written
+        // straight into the subnet store, then the endpoint is pointed at it, as old state is.
+        AccountAwareStorageBackend<Subnet> subnetStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-subnets.json", subnetStore)));
+        String vpcId = service.createVpc("us-east-1", "10.65.0.0/16", false).getVpcId();
+        String roomy = service.createSubnet("us-east-1", vpcId, "10.65.2.0/28", "us-east-1b").getSubnetId();
+        Subnet tiny = new Subnet();
+        tiny.setSubnetId("subnet-0000000000000030");
+        tiny.setVpcId(vpcId);
+        tiny.setRegion("us-east-1");
+        tiny.setCidrBlock("10.65.1.0/30");
+        tiny.setAvailabilityZone("us-east-1a");
+        subnetStore.put("us-east-1::" + tiny.getSubnetId(), tiny);
+        VpcEndpoint endpoint = service.createVpcEndpoint("us-east-1", vpcId, "com.amazonaws.us-east-1.ecs",
+                "Interface", List.of(), List.of(roomy), List.of(), null, null, List.of());
+        endpoint.setSubnetIds(List.of(tiny.getSubnetId(), roomy));
+        String unrelatedEni = service.createNetworkInterface("us-east-1", roomy, "unrelated", null, null,
+                List.of(), List.of()).getNetworkInterfaceId();
+
+        Map<String, String> addresses = endpointAddressesBySubnet(service);
+        String degraded = addresses.get(tiny.getSubnetId());
+        assertNotNull(degraded, "the undersized subnet's interface still gets an address");
+        assertTrue(degraded.startsWith("172.31."), degraded + " should come from the synthetic fallback");
+        assertUsableEndpointAddress("10.65.2.0/28", addresses.get(roomy));
+        assertEquals(addresses, endpointAddressesBySubnet(service), "a second read must answer the same");
+
+        List<String> described = service.describeNetworkInterfaces("us-east-1", List.of(), Map.of())
+                .networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList();
+        assertTrue(described.contains(unrelatedEni), "DescribeNetworkInterfaces must still list other ENIs");
+        assertTrue(described.containsAll(service.endpointNetworkInterfaceIds(endpoint)));
+        assertEquals(2, service.endpointNetworkInterfaceIds(endpoint).size());
+    }
+
+    @Test
+    void endpointInASubnetOtherResourcesHaveFilledDegradesInsteadOfFailingReads() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-east-1", "10.66.0.0/16", false).getVpcId();
+        String subnetId = service.createSubnet("us-east-1", vpcId, "10.66.1.0/28", "us-east-1a").getSubnetId();
+        Set<String> instanceAddresses = new HashSet<>(launchAddresses(service, subnetId, 11));
+        assertEquals(11, instanceAddresses.size(), "a /28 holds eleven assignable addresses");
+
+        service.createVpcEndpoint("us-east-1", vpcId, "com.amazonaws.us-east-1.ecs",
+                "Interface", List.of(), List.of(subnetId), List.of(), null, null, List.of());
+
+        String address = endpointAddressesBySubnet(service).get(subnetId);
+        assertNotNull(address);
+        assertFalse(instanceAddresses.contains(address), address + " is already an instance's");
+        assertFalse(service.describeNetworkInterfaces("us-east-1", List.of(), Map.of())
+                .networkInterfaces().isEmpty());
+    }
+
+    @Test
+    void endpointCreatedFirstInASlash28KeepsItsAddressAndInstancesStepAroundIt() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-east-1", "10.67.0.0/16", false).getVpcId();
+        String subnetId = service.createSubnet("us-east-1", vpcId, "10.67.1.0/28", "us-east-1a").getSubnetId();
+        service.createVpcEndpoint("us-east-1", vpcId, "com.amazonaws.us-east-1.ecs",
+                "Interface", List.of(), List.of(subnetId), List.of(), null, null, List.of());
+        String endpointAddress = endpointAddressesBySubnet(service).get(subnetId);
+        assertUsableEndpointAddress("10.67.1.0/28", endpointAddress);
+
+        // One at a time, so every launch re-reads what the endpoint holds; the endpoint takes
+        // one of the eleven assignable addresses, which leaves room for exactly ten instances.
+        Set<String> instanceAddresses = new HashSet<>();
+        for (int i = 0; i < 10; i++) {
+            instanceAddresses.addAll(launchAddresses(service, subnetId, 1));
+            assertEquals(endpointAddress, endpointAddressesBySubnet(service).get(subnetId),
+                    "a later instance must not move the endpoint");
+        }
+        assertEquals(10, instanceAddresses.size());
+        assertFalse(instanceAddresses.contains(endpointAddress), endpointAddress + " was handed to an instance");
+        AwsException full = assertThrows(AwsException.class, () -> launchAddresses(service, subnetId, 1));
+        assertEquals("InsufficientFreeAddressesInSubnet", full.getErrorCode());
+    }
+
+    @Test
+    void endpointCreatedAfterInstancesInASlash28TakesAnAddressNoInstanceHolds() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-east-1", "10.68.0.0/16", false).getVpcId();
+        String subnetId = service.createSubnet("us-east-1", vpcId, "10.68.1.0/28", "us-east-1a").getSubnetId();
+        // Ten of the eleven assignable addresses, so whatever the endpoint id prefers, it must
+        // land on the one left over rather than on an instance's.
+        Set<String> instanceAddresses = new HashSet<>(launchAddresses(service, subnetId, 10));
+        assertEquals(10, instanceAddresses.size());
+
+        service.createVpcEndpoint("us-east-1", vpcId, "com.amazonaws.us-east-1.ecs",
+                "Interface", List.of(), List.of(subnetId), List.of(), null, null, List.of());
+        String endpointAddress = endpointAddressesBySubnet(service).get(subnetId);
+        assertUsableEndpointAddress("10.68.1.0/28", endpointAddress);
+        assertFalse(instanceAddresses.contains(endpointAddress), endpointAddress + " is already an instance's");
+        assertEquals(endpointAddress, endpointAddressesBySubnet(service).get(subnetId));
+
+        AwsException full = assertThrows(AwsException.class, () -> launchAddresses(service, subnetId, 1));
+        assertEquals("InsufficientFreeAddressesInSubnet", full.getErrorCode());
+    }
+
+    private static List<String> launchAddresses(Ec2Service service, String subnetId, int count) {
+        return service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                        count, count, null, List.of(), subnetId, null, List.of(), null, null)
+                .getInstances().stream().map(Instance::getPrivateIpAddress).toList();
+    }
+
+    private static void assertUsableEndpointAddress(String cidr, String address) {
+        assertNotNull(address, cidr);
+        assertTrue(Ipv4Cidrs.contains(cidr, address + "/32"), address + " must lie inside " + cidr);
+        assertFalse(Ipv4Cidrs.isSubnetReserved(cidr, address + "/32"), address + " is reserved in " + cidr);
+    }
+
+    private static EndpointAddressFixture endpointAddressFixture(String firstCidr, String secondCidr) {
+        AccountAwareStorageBackend<Subnet> subnetStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-subnets.json", subnetStore)));
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "172.31.0.0/16", false).getVpcId();
+        String[] subnetIds = {"subnet-00000000", "subnet-00000088"};
+        String[] cidrs = {firstCidr, secondCidr};
+        for (int i = 0; i < subnetIds.length; i++) {
+            Subnet subnet = new Subnet();
+            subnet.setSubnetId(subnetIds[i]);
+            subnet.setVpcId(vpcId);
+            subnet.setRegion(region);
+            subnet.setCidrBlock(cidrs[i]);
+            subnet.setAvailabilityZone(region + (i == 0 ? "a" : "b"));
+            subnetStore.put(region + "::" + subnetIds[i], subnet);
+        }
+        VpcEndpoint endpoint = service.createVpcEndpoint(region, vpcId,
+                "com.amazonaws.us-east-1.ec2", "Interface",
+                List.of(), List.of(subnetIds), List.of(), null, null, List.of());
+        return new EndpointAddressFixture(service, endpoint);
+    }
+
+    private record EndpointAddressFixture(Ec2Service service, VpcEndpoint endpoint) {
     }
 
     @Test
@@ -2103,6 +2559,25 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void standaloneNetworkInterfaceNamesAllPrivateIpsForTheRegion() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String vpcId = service.createVpc("us-west-2", "10.72.0.0/16", false).getVpcId();
+        String subnetId = service.createSubnet("us-west-2", vpcId, "10.72.0.0/24", "us-west-2a")
+                .getSubnetId();
+
+        NetworkInterface eni = service.createNetworkInterface("us-west-2", subnetId, null,
+                "10.72.0.10", List.of("10.72.0.11"), List.of(), List.of());
+
+        assertEquals("ip-10-72-0-10.us-west-2.compute.internal", eni.getPrivateDnsName());
+        assertEquals("ip-10-72-0-10.us-west-2.compute.internal",
+                eni.getPrivateIpAddresses().get(0).getPrivateDnsName());
+        assertEquals("ip-10-72-0-11.us-west-2.compute.internal",
+                eni.getPrivateIpAddresses().get(1).getPrivateDnsName());
+    }
+
+    @Test
     void synthesisedAddressesSkipReservedOnesAndReportExhaustion() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
@@ -2747,7 +3222,7 @@ class Ec2ServiceTest {
     void legacyDescribePrefixListsProjectsTheSameAwsManagedData() {
         Ec2Service service = prefixListService();
 
-        var legacy = service.describePrefixLists("us-east-1", List.of(),
+        List<PrefixList> legacy = service.describePrefixLists("us-east-1", List.of(),
                 Map.of("prefix-list-name", List.of("com.amazonaws.us-east-1.s3")));
 
         assertEquals(1, legacy.size());
@@ -4452,6 +4927,7 @@ class Ec2ServiceTest {
     private static final class InMemoryStorageFactory extends StorageFactory {
         private final Map<String, AccountAwareStorageBackend<?>> overrides;
         private final jakarta.enterprise.inject.Instance<RequestContext> requestContextInstance;
+        private final List<AccountAwareStorageBackend<?>> created = new ArrayList<>();
 
         private InMemoryStorageFactory() {
             this(Map.of(), null);
@@ -4480,11 +4956,18 @@ class Ec2ServiceTest {
             if (override != null) {
                 return (AccountAwareStorageBackend<V>) override;
             }
-            if (requestContextInstance != null) {
-                return new AccountAwareStorageBackend<>(new io.github.hectorvent.floci.core.storage.InMemoryStorage<>(),
-                        requestContextInstance, "000000000000");
-            }
-            return AccountAwareStorageBackend.inMemory("000000000000");
+            AccountAwareStorageBackend<V> backend = requestContextInstance != null
+                    ? new AccountAwareStorageBackend<>(new io.github.hectorvent.floci.core.storage.InMemoryStorage<>(),
+                            requestContextInstance, "000000000000")
+                    : AccountAwareStorageBackend.inMemory("000000000000");
+            created.add(backend);
+            return backend;
+        }
+
+        // Same effect as StorageFactory.clearAll() on the backends this factory handed out.
+        @Override
+        public synchronized void clearAll() {
+            created.forEach(AccountAwareStorageBackend::clear);
         }
     }
 
@@ -4897,5 +5380,87 @@ class Ec2ServiceTest {
 
         // Provider remains untouched
         assertEquals(1, nodeInstance.getTags().size());
+    }
+
+    // The host is released after runInstances' unlocked availability check and before its instances
+    // are stored. The instance-type catalog lookup sits between the two, so it stands in for the
+    // concurrent ReleaseHosts. Only the re-check under hostLock can still reject the launch.
+    @Test
+    void launchOntoAHostReleasedAfterTheUnlockedCheckIsRejected() {
+        Ec2Service[] holder = new Ec2Service[1];
+        String[] hostId = new String[1];
+        boolean[] released = {false};
+        Ec2InstanceTypeCatalog releasingCatalog = new Ec2InstanceTypeCatalog() {
+            @Override
+            public Optional<CatalogInstanceType> find(String instanceType) {
+                if (hostId[0] != null && !released[0]) {
+                    released[0] = true;
+                    holder[0].releaseHost("us-east-1", hostId[0]);
+                }
+                return super.find(instanceType);
+            }
+        };
+        Ec2ImageCatalog imageCatalog = new Ec2ImageCatalog();
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), new AmiImageResolver(imageCatalog), imageCatalog,
+                releasingCatalog, new InMemoryStorageFactory());
+        holder[0] = service;
+        hostId[0] = service.allocateHosts("us-east-1", "us-east-1a", "m5.large", null, 1,
+                null, null, null, null, null).get(0).getHostId();
+
+        AwsException e = assertThrows(AwsException.class, () -> service.runInstances("us-east-1",
+                "ami-ubuntu2404-amd64", "m5.large", 1, 1, null, List.of(), null, null, List.of(), null, null,
+                null, null, 0, null, null, null, null, false, hostId[0], null));
+
+        assertTrue(released[0], "the hook must have released the host between the two checks");
+        assertEquals("InvalidHostID.NotFound", e.getErrorCode());
+        assertTrue(service.hostInstances("us-east-1", hostId[0]).isEmpty());
+    }
+
+    @Test
+    void seedDefaultRegionIfEnabledDoesNothingWhenEc2IsDisabled() {
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().enabled()).thenReturn(false);
+        when(config.defaultRegion()).thenReturn("us-east-1");
+        Ec2Service service = spy(new Ec2Service(config, mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory()));
+
+        service.seedDefaultRegionIfEnabled();
+
+        verify(service, never()).ensureDefaultResources(anyString());
+    }
+
+    @Test
+    void clearSeedsDefaultVpcAndSubnetsAgainAfterStorageWipe() {
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().enabled()).thenReturn(true);
+        when(config.defaultRegion()).thenReturn("us-east-1");
+        InMemoryStorageFactory storageFactory = new InMemoryStorageFactory();
+        Ec2Service service = new Ec2Service(config, mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), storageFactory);
+        service.ensureDefaultResources("us-east-1");
+        // A reset wipes storage before it calls clear().
+        storageFactory.clearAll();
+        assertTrue(service.describeVpcs("us-east-1", List.of(), Map.of()).isEmpty());
+
+        service.clear();
+
+        assertTrue(service.describeVpcs("us-east-1", List.of(), Map.of()).stream().anyMatch(Vpc::isDefault));
+        assertFalse(service.describeSubnets("us-east-1", List.of(), Map.of()).isEmpty());
+    }
+
+    @Test
+    void allocateHostsAcceptsModelledZoneWithNoSubnet() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        service.describeSubnets("us-east-1", List.of(), Map.of()).stream()
+                .filter(sn -> "us-east-1c".equals(sn.getAvailabilityZone()))
+                .forEach(sn -> service.deleteSubnet("us-east-1", sn.getSubnetId()));
+
+        assertEquals(1, service.allocateHosts("us-east-1", "us-east-1c", "m5.large", null, 1,
+                null, null, null, null, null).size());
     }
 }
