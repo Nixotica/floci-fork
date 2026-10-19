@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.firehose;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.OpenXJsonSerDe;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.OrcSerDe;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.ParquetSerDe;
@@ -13,8 +15,8 @@ import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescript
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -128,7 +130,7 @@ final class S3DestinationValidator {
      */
     private static void collectSchemaViolations(S3Destination config, String shapeName,
                                                 List<String> violations) {
-        var conversion = config.getDataFormatConversionConfiguration();
+        DeliveryStreamDescription.DataFormatConversionConfiguration conversion = config.getDataFormatConversionConfiguration();
         if (conversion == null || conversion.getSchemaConfiguration() == null) {
             return;
         }
@@ -168,7 +170,7 @@ final class S3DestinationValidator {
      */
     private static void collectOpenXMappingViolations(S3Destination config, String shapeName,
                                                       List<String> violations) {
-        var conversion = config.getDataFormatConversionConfiguration();
+        DeliveryStreamDescription.DataFormatConversionConfiguration conversion = config.getDataFormatConversionConfiguration();
         if (conversion == null || conversion.getInputFormatConfiguration() == null
                 || conversion.getInputFormatConfiguration().getDeserializer() == null) {
             return;
@@ -214,7 +216,7 @@ final class S3DestinationValidator {
     }
 
     private static Serializer serializer(S3Destination config) {
-        var conversion = config.getDataFormatConversionConfiguration();
+        DeliveryStreamDescription.DataFormatConversionConfiguration conversion = config.getDataFormatConversionConfiguration();
         if (conversion == null || conversion.getOutputFormatConfiguration() == null) {
             return null;
         }
@@ -417,9 +419,6 @@ final class S3DestinationValidator {
     }
 
     private static AwsException constraintViolations(List<String> violations) {
-        String header = violations.size() == 1
-                ? "1 validation error detected: "
-                : violations.size() + " validation errors detected: ";
-        return new AwsException("ValidationException", header + String.join("; ", violations), 400);
+        return SmithyValidationErrors.validationException(violations);
     }
 }

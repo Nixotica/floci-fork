@@ -11,9 +11,9 @@ import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbRuntime;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.ecs.container.EcsTaskRoleCredentialsServer;
-import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheMemcachedService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheService;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
+import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionService;
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerManager;
 import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
 import io.github.hectorvent.floci.services.pipes.PipesService;
@@ -46,6 +47,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InOrder;
 import org.mockito.Mock;
+import org.mockito.MockMakers;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -57,8 +59,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
@@ -73,6 +75,7 @@ class EmulatorLifecycleTest {
     @Mock private EmulatorConfig config;
     @Mock private EmulatorConfig.StorageConfig storageConfig;
     @Mock private EmulatorConfig.ServicesConfig servicesConfig;
+    @Mock private EmulatorConfig.LambdaServiceConfig lambdaServiceConfig;
     @Mock private EmulatorConfig.Ec2ServiceConfig ec2ServiceConfig;
     @Mock private EmulatorConfig.EcsServiceConfig ecsServiceConfig;
     @Mock private EmulatorConfig.EcsTaskRoleCredentialsConfig ecsTaskRoleCredentialsConfig;
@@ -116,6 +119,7 @@ class EmulatorLifecycleTest {
     @Mock private EmulatorConfig.IamServiceConfig iamServiceConfig;
     @Mock private SchemaCreationWorker schemaCreationWorker;
     @Mock private StepFunctionsService stepFunctionsService;
+    @Mock private DurableExecutionService durableExecutionService;
     @Mock private Instance<ContainerTeardown> containerTeardowns;
     @Mock private DynamoDbRuntime dynamoDbRuntime;
     @Mock private RedshiftDynamoDbZeroEtlConsumer redshiftZeroEtlConsumer;
@@ -137,6 +141,8 @@ class EmulatorLifecycleTest {
         Mockito.lenient().when(elastiCacheServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(servicesConfig.elb()).thenReturn(elbServiceConfig);
         Mockito.lenient().when(elbServiceConfig.enabled()).thenReturn(false);
+        Mockito.lenient().when(servicesConfig.lambda()).thenReturn(lambdaServiceConfig);
+        Mockito.lenient().when(lambdaServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(servicesConfig.eks()).thenReturn(eksServiceConfig);
         Mockito.lenient().when(eksServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(servicesConfig.timestreamInfluxdb()).thenReturn(timestreamInfluxDbServiceConfig);
@@ -158,7 +164,8 @@ class EmulatorLifecycleTest {
                 elbV2Service, elbClassicService, ecsService,
                 initializationHooksRunner, sqsPoller, kinesisPoller, dynamodbStreamsPoller,
                 pipesService, ec2MetadataServer, ecsTaskRoleCredentialsServer, ecrRegistryManager, flociUiManager, initLifecycleState,
-                schemaCreationWorker, stepFunctionsService, containerTeardowns, persistentPathValidator,
+                schemaCreationWorker, stepFunctionsService, durableExecutionService, containerTeardowns,
+                persistentPathValidator,
                 dynamoDbRuntime, redshiftZeroEtlConsumer);
         Mockito.lenient().when(containerTeardowns.iterator())
                 .thenReturn(java.util.Collections.emptyIterator());
@@ -179,7 +186,7 @@ class EmulatorLifecycleTest {
 
         emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
 
-        var inOrder = Mockito.inOrder(initializationHooksRunner, storageFactory, initLifecycleState,
+        InOrder inOrder = Mockito.inOrder(initializationHooksRunner, storageFactory, initLifecycleState,
                 iamService, rdsService);
         inOrder.verify(initializationHooksRunner).run(InitializationHook.BOOT);
         inOrder.verify(initLifecycleState).markBootCompleted();
@@ -242,7 +249,7 @@ class EmulatorLifecycleTest {
 
         emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
 
-        var inOrder = Mockito.inOrder(storageFactory, elbV2Service);
+        InOrder inOrder = Mockito.inOrder(storageFactory, elbV2Service);
         inOrder.verify(storageFactory).loadAll();
         inOrder.verify(elbV2Service).restorePersistedRuntime();
     }
@@ -331,7 +338,7 @@ class EmulatorLifecycleTest {
 
         emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
 
-        var inOrder = Mockito.inOrder(storageFactory, schemaCreationWorker);
+        InOrder inOrder = Mockito.inOrder(storageFactory, schemaCreationWorker);
         inOrder.verify(storageFactory).loadAll();
         inOrder.verify(schemaCreationWorker).recoverOrphans();
         inOrder.verify(schemaCreationWorker).rehydrateSchemas();
@@ -346,7 +353,7 @@ class EmulatorLifecycleTest {
 
         emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
 
-        var inOrder = Mockito.inOrder(storageFactory, stepFunctionsService);
+        InOrder inOrder = Mockito.inOrder(storageFactory, stepFunctionsService);
         inOrder.verify(storageFactory).loadAll();
         inOrder.verify(stepFunctionsService).abortAbandonedExecutions();
     }
@@ -360,7 +367,7 @@ class EmulatorLifecycleTest {
 
         emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
 
-        var inOrder = Mockito.inOrder(initLifecycleState, persistentPathValidator, storageFactory);
+        InOrder inOrder = Mockito.inOrder(initLifecycleState, persistentPathValidator, storageFactory);
         inOrder.verify(initLifecycleState).markBootCompleted();
         inOrder.verify(persistentPathValidator).validateAtBoot();
         inOrder.verify(storageFactory).loadAll();
@@ -411,7 +418,6 @@ class EmulatorLifecycleTest {
     @Test
     @DisplayName("onHttpStart on port 4566 (non-TLS) triggers hook execution and marks lifecycle completed")
     void onHttpStart_nonTls_triggersHooksOnPort4566() throws IOException, InterruptedException {
-        when(tlsConfig.enabled()).thenReturn(false);
         when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(true);
         when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
 
@@ -425,7 +431,7 @@ class EmulatorLifecycleTest {
     @DisplayName("onHttpStart on a non-default floci.port (non-TLS) triggers hook execution (#2437)")
     void onHttpStart_nonTls_triggersHooksOnCustomPort() throws IOException, InterruptedException {
         Mockito.lenient().when(config.port()).thenReturn(4577);
-        when(tlsConfig.enabled()).thenReturn(false);
+        emulatorLifecycle.httpPort = 4577;
         when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(true);
         when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(true);
 
@@ -438,9 +444,22 @@ class EmulatorLifecycleTest {
     }
 
     @Test
+    @DisplayName("onHttpStart on quarkus.http.port overridden alone (non-TLS) triggers hook execution")
+    void onHttpStart_nonTls_triggersHooksOnHttpPortOverride() throws IOException, InterruptedException {
+        // QUARKUS_HTTP_PORT=4811 with floci.port left at 4566: the server listens on 4811.
+        emulatorLifecycle.httpPort = 4811;
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(true);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onHttpStart(new HttpServerStart(new HttpServerOptions().setPort(4811)));
+
+        verify(initializationHooksRunner).run(InitializationHook.START);
+        verify(initLifecycleState).markStartCompleted();
+    }
+
+    @Test
     @DisplayName("onHttpStart on wrong port (non-TLS) is ignored")
     void onHttpStart_nonTls_ignoresWrongPort() throws IOException, InterruptedException {
-        when(tlsConfig.enabled()).thenReturn(false);
 
         emulatorLifecycle.onHttpStart(new HttpServerStart(new HttpServerOptions().setPort(4510)));
 
@@ -451,7 +470,8 @@ class EmulatorLifecycleTest {
     @Test
     @DisplayName("onHttpStart on port 4510 (TLS mode) triggers hook execution and marks lifecycle completed")
     void onHttpStart_tls_triggersHooksOnBackendPort4510() throws IOException, InterruptedException {
-        when(tlsConfig.enabled()).thenReturn(true);
+        // TlsConfigSource pins quarkus.http.port to the internal HTTP backend.
+        emulatorLifecycle.httpPort = 4510;
         when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(true);
         when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
 
@@ -464,7 +484,8 @@ class EmulatorLifecycleTest {
     @Test
     @DisplayName("onHttpStart on port 4566 (TLS mode) is ignored — public port is not the backend port")
     void onHttpStart_tls_ignoresPublicPort4566() throws IOException, InterruptedException {
-        when(tlsConfig.enabled()).thenReturn(true);
+        // TlsConfigSource pins quarkus.http.port to the internal HTTP backend.
+        emulatorLifecycle.httpPort = 4510;
 
         emulatorLifecycle.onHttpStart(new HttpServerStart(new HttpServerOptions().setPort(4566)));
 
@@ -475,14 +496,14 @@ class EmulatorLifecycleTest {
     @Test
     @DisplayName("onHttpStart exits the process when a startup hook is interrupted")
     void onHttpStart_hookInterrupted_exitsProcess() throws IOException, InterruptedException {
-        when(tlsConfig.enabled()).thenReturn(false);
         when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(true);
         when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
         doThrow(new InterruptedException("interrupted"))
                 .when(initializationHooksRunner).run(InitializationHook.START);
 
         Thread.interrupted();
-        try (MockedStatic<Quarkus> quarkus = Mockito.mockStatic(Quarkus.class)) {
+        try (MockedStatic<Quarkus> quarkus = Mockito.mockStatic(Quarkus.class,
+                Mockito.withSettings().mockMaker(MockMakers.INLINE))) {
             try {
                 emulatorLifecycle.onHttpStart(new HttpServerStart(new HttpServerOptions().setPort(4566)));
 
@@ -572,7 +593,7 @@ class EmulatorLifecycleTest {
         // shutdown can't be cut off by the SIGTERM grace window before data is persisted
         // (regression guard for issue #1521). shutdownAll() still runs last to stop the flush
         // schedulers and capture any shutdown-time writes.
-        var inOrder = Mockito.inOrder(storageFactory, rdsContainerManager, elastiCacheContainerManager);
+        InOrder inOrder = Mockito.inOrder(storageFactory, rdsContainerManager, elastiCacheContainerManager);
         inOrder.verify(storageFactory).flushAll();
         inOrder.verify(elastiCacheContainerManager).stopAll();
         inOrder.verify(rdsContainerManager).stopAll();
@@ -733,7 +754,6 @@ class EmulatorLifecycleTest {
     @Test
     @DisplayName("Should emit the parity \"Ready.\" line on the deferred onHttpStart ready path too")
     void shouldEmitParityReadyLineOnHttpStartPath() throws IOException, InterruptedException {
-        when(tlsConfig.enabled()).thenReturn(false);
         when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(true);
         when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
 

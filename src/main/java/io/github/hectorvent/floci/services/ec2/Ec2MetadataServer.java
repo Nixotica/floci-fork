@@ -1,11 +1,15 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
@@ -21,6 +25,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -45,6 +50,7 @@ public class Ec2MetadataServer {
             .withZone(ZoneOffset.UTC);
     /** IMDSv2 tokens live from one second up to six hours. */
     private static final int MAX_TOKEN_TTL_SECONDS = 21_600;
+    private static final String IDENTITY_ROLE = "ec2-instance";
     private static final String INSTANCE_TAGS_PREFIX = "/latest/meta-data/tags/instance/";
 
     private final Vertx vertx;
@@ -56,6 +62,8 @@ public class Ec2MetadataServer {
     private final Map<String, SessionToken> tokens = new ConcurrentHashMap<>();
     /** IMDSv1 fallback: container bridge IP → Instance */
     private final Map<String, Instance> containerIpToInstance = new ConcurrentHashMap<>();
+    /** Cluster nodes whose instance-profile identity their registrar synthesizes rather than IAM holding it. */
+    private final Set<Instance> synthesizedProfiles = ConcurrentHashMap.newKeySet();
 
     private volatile HttpServer httpServer;
 
@@ -96,8 +104,19 @@ public class Ec2MetadataServer {
                 entry.getValue() == instance && !addresses.contains(entry.getKey()));
     }
 
+    /**
+     * Registers a cluster node that another service synthesizes instead of EC2 launching it. Its
+     * instance-profile ARN and ID are the registrar's own, so {@code iam/info} reports them while IAM
+     * holds no such profile.
+     */
+    public void reconcileClusterNodeAddresses(Set<String> addresses, Instance instance) {
+        synthesizedProfiles.add(instance);
+        reconcileContainerAddresses(addresses, instance);
+    }
+
     public void unregisterInstance(Instance instance) {
         if (instance != null) {
+            synthesizedProfiles.remove(instance);
             credentials.unregister(instance);
             tokens.values().removeIf(token -> token.instance() == instance);
             containerIpToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
@@ -140,6 +159,17 @@ public class Ec2MetadataServer {
         router.get("/latest/meta-data/iam/info").handler(ctx -> handleIamInfo(ctx));
         router.get("/latest/meta-data/iam/security-credentials/").handler(ctx -> handleCredentialsList(ctx));
         router.get("/latest/meta-data/iam/security-credentials/:role").handler(ctx -> handleCredentials(ctx));
+        router.get("/latest/meta-data/identity-credentials").handler(ctx -> handleListing(ctx, "ec2/"));
+        router.get("/latest/meta-data/identity-credentials/").handler(ctx -> handleListing(ctx, "ec2/"));
+        router.get("/latest/meta-data/identity-credentials/ec2").handler(ctx -> handleListing(ctx, "info\nsecurity-credentials/"));
+        router.get("/latest/meta-data/identity-credentials/ec2/").handler(ctx -> handleListing(ctx, "info\nsecurity-credentials/"));
+        router.get("/latest/meta-data/identity-credentials/ec2/info").handler(ctx -> handleIdentityInfo(ctx));
+        router.get("/latest/meta-data/identity-credentials/ec2/security-credentials")
+                .handler(ctx -> handleListing(ctx, IDENTITY_ROLE));
+        router.get("/latest/meta-data/identity-credentials/ec2/security-credentials/")
+                .handler(ctx -> handleListing(ctx, IDENTITY_ROLE));
+        router.get("/latest/meta-data/identity-credentials/ec2/security-credentials/" + IDENTITY_ROLE)
+                .handler(ctx -> handleIdentityCredentials(ctx));
         router.get("/latest/meta-data/tags/instance").handler(ctx -> handleInstanceTagKeys(ctx));
         router.get("/latest/meta-data/tags/instance/").handler(ctx -> handleInstanceTagKeys(ctx));
         router.getWithRegex("/latest/meta-data/tags/instance/.+").handler(ctx -> handleInstanceTagValue(ctx));
@@ -163,6 +193,7 @@ public class Ec2MetadataServer {
         credentials.clear();
         tokens.clear();
         containerIpToInstance.clear();
+        synthesizedProfiles.clear();
         if (httpServer != null) {
             httpServer.close();
             httpServer = null;
@@ -258,7 +289,7 @@ public class Ec2MetadataServer {
             return;
         }
         StringBuilder sb = new StringBuilder();
-        for (var sg : inst.getSecurityGroups()) {
+        for (GroupIdentifier sg : inst.getSecurityGroups()) {
             if (!sb.isEmpty()) {
                 sb.append("\n");
             }
@@ -274,18 +305,25 @@ public class Ec2MetadataServer {
         if (inst == null) {
             return;
         }
-        String profileArn = inst.getIamInstanceProfileArn();
-        if (profileArn == null) {
+        Optional<InstanceProfile> resolved = credentials.profile(inst);
+        String profileArn;
+        String profileId;
+        if (resolved.isPresent()) {
+            profileArn = resolved.get().getArn();
+            profileId = resolved.get().getInstanceProfileId();
+        } else if (synthesizedProfiles.contains(inst) && inst.getIamInstanceProfileArn() != null
+                && !credentials.holdsProfile(inst)) {
+            profileArn = inst.getIamInstanceProfileArn();
+            profileId = inst.getIamInstanceProfileId();
+        } else {
             ctx.response().setStatusCode(404).end("{}");
             return;
         }
-        String profileId = "AIPA" + inst.getInstanceId().toUpperCase().substring(2, 16);
-        String body = "{\"Code\":\"Success\",\"LastUpdated\":\"" + now() + "\","
-                + "\"InstanceProfileArn\":\"" + profileArn + "\","
-                + "\"InstanceProfileId\":\"" + profileId + "\"}";
         ctx.response().setStatusCode(200)
                 .putHeader("content-type", "application/json")
-                .end(body);
+                .end(new JsonObject().put("Code", "Success").put("LastUpdated", now())
+                        .put("InstanceProfileArn", profileArn)
+                        .put("InstanceProfileId", profileId).encode());
     }
 
     private void handleCredentialsList(RoutingContext ctx) {
@@ -312,14 +350,55 @@ public class Ec2MetadataServer {
             return;
         }
         SessionCredential session = result.get();
+        ctx.response().putHeader("content-type", "application/json").end(credentialsJson(session));
+    }
+
+    private void handleListing(RoutingContext ctx, String entries) {
+        Instance inst = resolveInstance(ctx);
+        if (inst == null) {
+            return;
+        }
+        ctx.response().setStatusCode(200).putHeader("content-type", "text/plain").end(entries);
+    }
+
+    private void handleIdentityInfo(RoutingContext ctx) {
+        Instance inst = resolveInstance(ctx);
+        if (inst == null) {
+            return;
+        }
         ctx.response().putHeader("content-type", "application/json").end(new JsonObject()
+                .put("Code", "Success")
+                .put("LastUpdated", ISO.format(clock.instant()))
+                .put("AccountId", ownerAccount(inst)).encode());
+    }
+
+    private void handleIdentityCredentials(RoutingContext ctx) {
+        Instance inst = resolveInstance(ctx);
+        if (inst == null) {
+            return;
+        }
+        Optional<SessionCredential> result = credentials.identity(inst, ownerAccount(inst), clock.instant());
+        if (result.isEmpty()) {
+            ctx.response().setStatusCode(404).end();
+            return;
+        }
+        ctx.response().putHeader("content-type", "application/json").end(credentialsJson(result.get()));
+    }
+
+    /** The account that launched the instance; instances persisted before it was recorded belong to the default one. */
+    private String ownerAccount(Instance inst) {
+        return inst.getOwnerId() != null ? inst.getOwnerId() : config.defaultAccountId();
+    }
+
+    private static String credentialsJson(SessionCredential session) {
+        return new JsonObject()
                 .put("Code", "Success")
                 .put("LastUpdated", ISO.format(session.getExpiration().minusSeconds(3600)))
                 .put("Type", "AWS-HMAC")
                 .put("AccessKeyId", session.getAccessKeyId())
                 .put("SecretAccessKey", session.getSecretAccessKey())
                 .put("Token", session.getSessionToken())
-                .put("Expiration", ISO.format(session.getExpiration())).encode());
+                .put("Expiration", ISO.format(session.getExpiration())).encode();
     }
 
     private void handleInstanceTagKeys(RoutingContext ctx) {
@@ -357,14 +436,25 @@ public class Ec2MetadataServer {
         if (inst == null) {
             return;
         }
-        String userData = inst.getUserData();
-        if (userData == null || userData.isBlank()) {
+        String encoded = inst.getEncodedUserData();
+        byte[] userData;
+        if (encoded != null) {
+            try {
+                userData = encoded.isBlank() ? null : Base64.getDecoder().decode(encoded);
+            } catch (IllegalArgumentException e) {
+                LOG.warnv("Ignoring malformed saved user-data encoding for instance {0}", inst.getInstanceId());
+                userData = inst.getUserData() == null ? null : inst.getUserData().getBytes(StandardCharsets.UTF_8);
+            }
+        } else {
+            userData = inst.getUserData() == null ? null : inst.getUserData().getBytes(StandardCharsets.UTF_8);
+        }
+        if (userData == null || userData.length == 0) {
             ctx.response().setStatusCode(404).end();
             return;
         }
         ctx.response().setStatusCode(200)
-                .putHeader("content-type", "text/plain")
-                .end(userData);
+                .putHeader("content-type", "application/octet-stream")
+                .end(Buffer.buffer(userData));
     }
 
     private void handleIdentityDocument(RoutingContext ctx) {
@@ -372,14 +462,18 @@ public class Ec2MetadataServer {
         if (inst == null) {
             return;
         }
-        String body = instanceIdentityDocument(inst, config.defaultAccountId());
+        String body = instanceIdentityDocument(inst, ownerAccount(inst), config.defaultAvailabilityZone());
         ctx.response().setStatusCode(200)
                 .putHeader("content-type", "application/json")
                 .end(body);
     }
 
-    static String instanceIdentityDocument(Instance inst, String accountId) {
-        String az = inst.getPlacement() != null ? inst.getPlacement().getAvailabilityZone() : "us-east-1a"; // partition-literal: fallback only when the record carries no region; no resolver in scope (follow-up)
+    /**
+     * {@code defaultAvailabilityZone} answers for an instance with no placement, the same configured
+     * zone {@code /latest/meta-data/placement/availability-zone} reports for it.
+     */
+    static String instanceIdentityDocument(Instance inst, String accountId, String defaultAvailabilityZone) {
+        String az = inst.getPlacement() != null ? inst.getPlacement().getAvailabilityZone() : defaultAvailabilityZone;
         String architecture = inst.getArchitecture() == null || inst.getArchitecture().isBlank()
                 ? "x86_64"
                 : inst.getArchitecture();
@@ -469,7 +563,7 @@ public class Ec2MetadataServer {
         if (instance == null || instance.getTags() == null) {
             return "";
         }
-        for (var tag : instance.getTags()) {
+        for (Tag tag : instance.getTags()) {
             if (tag.getKey() == null || tag.getKey().isBlank()) {
                 continue;
             }
@@ -485,7 +579,7 @@ public class Ec2MetadataServer {
         if (instance == null || instance.getTags() == null || key == null) {
             return Optional.empty();
         }
-        for (var tag : instance.getTags()) {
+        for (Tag tag : instance.getTags()) {
             if (key.equals(tag.getKey())) {
                 return Optional.of(nvl(tag.getValue()));
             }

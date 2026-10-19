@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 
 import java.util.regex.Pattern;
 
@@ -22,12 +23,19 @@ public final class LambdaArnUtils {
     private static final Pattern NAME_PATTERN = Pattern.compile("[a-zA-Z0-9-_]+");
     private static final int MAX_NAME_LENGTH = 64;
     private static final int MAX_TOTAL_LENGTH = 140;
-    private static final String NAME_REGEX = "(arn:(aws[a-zA-Z-]*)?:lambda:)?([a-z]{2}(-gov)?-[a-z]+-\\d{1}:)?"
+    /** The model's {@code FunctionName} pattern, quoted in the ValidationException a bad name gets. */
+    private static final String NAME_REGEX = "(arn:(aws[a-zA-Z-]*)?:lambda:)?"
+            + "((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"
             + "(\\d{12}:)?(function:)?([a-zA-Z0-9-_]+)(:(\\$LATEST|[a-zA-Z0-9-_]+))?";
     private static final Pattern ACCOUNT_PATTERN = Pattern.compile("\\d{12}");
     private static final Pattern QUALIFIER_PATTERN = Pattern.compile("\\$LATEST|[a-zA-Z0-9-_]+");
 
     private static final String EVENT_SOURCE_MAPPING_PREFIX = "event-source-mapping:";
+
+    /** The pattern AWS validates a durable execution ARN with, and quotes in its ValidationException. */
+    public static final Pattern DURABLE_EXECUTION_ARN = Pattern.compile(
+            "arn:([a-zA-Z0-9-]+):lambda:([a-zA-Z0-9-]+):(\\d{12}):function:([a-zA-Z0-9_-]+):"
+                    + "(\\$LATEST(?:\\.PUBLISHED)?|[0-9]+)/durable-execution/([a-zA-Z0-9_-]+)/([a-zA-Z0-9_-]+)");
 
     private LambdaArnUtils() {}
 
@@ -223,9 +231,9 @@ public final class LambdaArnUtils {
     }
 
     private static AwsException validationFailure(String value, String constraint) {
-        return new AwsException("ValidationException",
-                "1 validation error detected: Value '" + value + "' at 'functionName' failed to satisfy "
-                        + "constraint: " + constraint, 400);
+        return SmithyValidationErrors.validationException(
+                "Value '" + value + "' at 'functionName' failed to satisfy "
+                        + "constraint: " + constraint);
     }
 
     /**

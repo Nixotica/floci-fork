@@ -1,8 +1,22 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectVolumeResponse;
+import com.github.dockerjava.api.command.ListVolumesResponse;
+import com.github.dockerjava.api.command.StatsCmd;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.ExposedPort;
+import com.github.dockerjava.api.model.LogConfig;
+import com.github.dockerjava.api.model.Ports;
+import com.github.dockerjava.api.model.StatisticNetworksConfig;
+import com.github.dockerjava.api.model.Statistics;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -12,13 +26,13 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
-import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.Container;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
@@ -27,6 +41,7 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.EfsVolumeConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.LogConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.ManagedAgent;
 import io.github.hectorvent.floci.services.ecs.model.MountPoint;
@@ -38,41 +53,35 @@ import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.ecs.model.TaskNetworkInterface;
 import io.github.hectorvent.floci.services.ecs.model.Volume;
 import io.github.hectorvent.floci.services.ecs.model.VolumeFrom;
+import io.github.hectorvent.floci.services.efs.EfsService;
+import io.github.hectorvent.floci.services.efs.model.AccessPointDescription;
+import io.github.hectorvent.floci.services.efs.model.CreationInfo;
+import io.github.hectorvent.floci.services.efs.model.PosixUser;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
 import io.github.hectorvent.floci.services.ssm.SsmService;
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.async.ResultCallback;
-import com.github.dockerjava.api.command.InspectContainerResponse;
-import com.github.dockerjava.api.command.StatsCmd;
-import com.github.dockerjava.api.exception.NotFoundException;
-import com.github.dockerjava.api.model.ContainerNetwork;
-import com.github.dockerjava.api.model.ExposedPort;
-import com.github.dockerjava.api.model.LogConfig;
-import com.github.dockerjava.api.model.StatisticNetworksConfig;
-import com.github.dockerjava.api.model.Statistics;
+import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.jboss.logging.Logger;
 
-import java.io.Closeable;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -137,11 +146,14 @@ public class EcsContainerManager {
     private final EcsTaskRoleCredentials taskRoleCredentials;
     private final EcsCredentialsProxy credentialsProxy;
     private final EcsTaskLinkLocalAddresses linkLocalAddresses;
+    private final EfsService efsService;
     // Stamped as RUN_LABEL on every container this process creates, so a sweep can tell its own apart.
     private final String runId = UUID.randomUUID().toString();
     // A sweep failure is retried before each task launch; each distinct failure is a WARN once.
     private volatile boolean leftoverListFailureReported;
     private final Set<String> leftoverRemovalFailuresReported = ConcurrentHashMap.newKeySet();
+    private volatile boolean leftoverTaskVolumeListFailureReported;
+    private final Set<String> leftoverTaskVolumeRemovalFailuresReported = ConcurrentHashMap.newKeySet();
 
     @Inject
     public EcsContainerManager(ContainerBuilder containerBuilder,
@@ -160,7 +172,8 @@ public class EcsContainerManager {
                                SecurityGroupFirewallManager firewallManager,
                                EcsTaskRoleCredentials taskRoleCredentials,
                                EcsCredentialsProxy credentialsProxy,
-                               EcsTaskLinkLocalAddresses linkLocalAddresses) {
+                               EcsTaskLinkLocalAddresses linkLocalAddresses,
+                               EfsService efsService) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -178,6 +191,29 @@ public class EcsContainerManager {
         this.taskRoleCredentials = taskRoleCredentials;
         this.credentialsProxy = credentialsProxy;
         this.linkLocalAddresses = linkLocalAddresses;
+        this.efsService = efsService;
+    }
+
+    public EcsContainerManager(ContainerBuilder containerBuilder,
+                               ContainerLifecycleManager lifecycleManager,
+                               ContainerLogStreamer logStreamer,
+                               ContainerDetector containerDetector,
+                               EmulatorConfig config,
+                               RegionResolver regionResolver,
+                               LaunchedContainerAwsEnv awsEnv,
+                               SsmService ssmService,
+                               SecretsManagerService secretsManagerService,
+                               S3Service s3Service,
+                               EcrRegistryManager ecrRegistryManager,
+                               HostVolumePolicy hostVolumePolicy,
+                               Ec2Service ec2Service,
+                               SecurityGroupFirewallManager firewallManager,
+                               EcsTaskRoleCredentials taskRoleCredentials,
+                               EcsCredentialsProxy credentialsProxy,
+                               EcsTaskLinkLocalAddresses linkLocalAddresses) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config, regionResolver,
+                awsEnv, ssmService, secretsManagerService, s3Service, ecrRegistryManager, hostVolumePolicy,
+                ec2Service, firewallManager, taskRoleCredentials, credentialsProxy, linkLocalAddresses, null);
     }
 
     public EcsContainerManager(ContainerBuilder containerBuilder,
@@ -228,15 +264,19 @@ public class EcsContainerManager {
         // name -> EFS configuration (materialised below as a shared local Docker volume).
         Map<String, String> volumeSourcePaths = new LinkedHashMap<>();
         Map<String, EfsVolumeConfiguration> efsVolumes = new LinkedHashMap<>();
+        Map<String, String> ephemeralVolumes = new LinkedHashMap<>();
+        Set<String> taskVolumeNames = new LinkedHashSet<>();
         if (taskDef.getVolumes() != null) {
             for (Volume v : taskDef.getVolumes()) {
                 if (v.name() == null) {
                     continue;
                 }
-                if (v.hostSourcePath() != null) {
+                if (v.hostSourcePath() != null && !v.hostSourcePath().isBlank()) {
                     volumeSourcePaths.put(v.name(), v.hostSourcePath());
                 } else if (v.efs() != null) {
                     efsVolumes.put(v.name(), v.efs());
+                } else if (isEphemeralVolume(v)) {
+                    ephemeralVolumes.put(v.name(), taskVolumeName(task, v));
                 }
             }
         }
@@ -295,6 +335,13 @@ public class EcsContainerManager {
             revokeTaskRoleCredentials(task.getTaskArn());
             releaseTaskLinkLocalAddresses(task.getTaskArn());
             throw e;
+        }
+
+        Map<String, Integer> stopTimeouts = new LinkedHashMap<>();
+        for (ContainerDefinition def : taskDef.getContainerDefinitions()) {
+            if (def.getStopTimeout() != null) {
+                stopTimeouts.put(def.getName(), def.getStopTimeout());
+            }
         }
 
         String fluentHost = null;
@@ -388,6 +435,11 @@ public class EcsContainerManager {
                 if (Boolean.TRUE.equals(def.getReadonlyRootFilesystem())) {
                     specBuilder.withReadonlyRootfs();
                 }
+                // Checked at registration too; again here, as for a host volume, for a definition
+                // persisted before the policy covered devices.
+                checkDeviceHostPaths(def);
+                EcsLinuxParameters.apply(specBuilder, def,
+                        def.getMemory() != null ? def.getMemory() : parseTaskMemoryMb(task.getMemory()));
 
                 // Add port mappings. In bridge/host mode an explicit hostPort is
                 // published to the Docker host literally, matching AWS bridge mode
@@ -443,6 +495,7 @@ public class EcsContainerManager {
                         }
                         String sourcePath = volumeSourcePaths.get(mp.sourceVolume());
                         EfsVolumeConfiguration efs = efsVolumes.get(mp.sourceVolume());
+                        String ephemeralVolume = ephemeralVolumes.get(mp.sourceVolume());
                         if (sourcePath != null) {
                             // Host volume: bind-mount an absolute path on the Docker host. Re-validate
                             // here (not just at RegisterTaskDefinition time): this narrows the window
@@ -457,7 +510,14 @@ public class EcsContainerManager {
                                 specBuilder.withBind(sourcePath, mp.containerPath());
                             }
                         } else if (efs != null) {
-                            mountEfsVolume(specBuilder, efs, mp);
+                            mountEfsVolume(specBuilder, efs, mp, region);
+                        } else if (ephemeralVolume != null) {
+                            if (taskVolumeNames.add(ephemeralVolume)) {
+                                Map<String, String> labels = new LinkedHashMap<>(ownerLabels());
+                                labels.put(ContainerStorageHelper.SERVICE_LABEL, "ecs");
+                                lifecycleManager.ensureVolume(ephemeralVolume, labels);
+                            }
+                            specBuilder.withNamedVolume(ephemeralVolume, mp.containerPath(), mp.readOnly());
                         } else {
                             LOG.warnv("Skipping mountPoint with unresolved volume {0} on container {1}",
                                     mp.sourceVolume(), def.getName());
@@ -495,6 +555,8 @@ public class EcsContainerManager {
                     dockerId = info.containerId();
                 }
 
+                containerIds.put(def.getName(), dockerId);
+
                 LOG.infov("Created ECS container {0} for task {1} container {2}", dockerId, taskId, def.getName());
 
                 // Resolve network bindings for ECS-specific model
@@ -506,7 +568,6 @@ public class EcsContainerManager {
                         metadataIdsByContainer.get(def.getName()));
                 container.setImageDigest(imageDigestsByContainer.get(def.getName()));
                 runtimeContainers.add(container);
-                containerIds.put(def.getName(), dockerId);
 
                 // awsfirelens containers are shipped to Fluent Bit by Docker; don't also scrape json-file.
                 // Only awslogs containers go to CloudWatch Logs; the others stay on the console.
@@ -526,23 +587,16 @@ public class EcsContainerManager {
                 }
             }
         } catch (Exception e) {
-            boolean allRemoved = true;
-            for (String dockerId : containerIds.values()) {
-                if (!stopAndConfirmRemoved(dockerId)) {
-                    allRemoved = false;
-                }
-            }
-            if (firelensVolumeName != null) {
-                lifecycleManager.removeVolume(firelensVolumeName);
-            }
+            EcsTaskHandle partial = new EcsTaskHandle(task.getTaskArn(), containerIds, logStreamsByContainerId,
+                    firelensVolumeName,
+                    protectedNetwork == null ? null : protectedNetwork.eni().getNetworkInterfaceId(), region,
+                    stopTimeouts, taskVolumeNames);
+            cleanupStoppedTask(partial);
             if (protectedNetwork != null) {
                 releaseTaskNetwork(task, region);
             }
-            revokeTaskRoleCredentials(task.getTaskArn());
-            // A container left behind by a failed removal is still on the network holding its
-            // address, exactly as on the stop path.
-            if (allRemoved) {
-                releaseTaskLinkLocalAddresses(task.getTaskArn());
+            if (!partial.allContainersRemoved() || partial.hasTaskVolumes() || partial.hasOpenLogStreams()) {
+                throw new EcsTaskLaunchException(e, partial);
             }
             throw e;
         }
@@ -575,16 +629,44 @@ public class EcsContainerManager {
         task.setDesiredStatus(TaskStatus.RUNNING.name());
         task.setStartedAt(Instant.now());
 
-        Map<String, Integer> stopTimeouts = new LinkedHashMap<>();
-        for (ContainerDefinition def : taskDef.getContainerDefinitions()) {
-            if (def.getStopTimeout() != null) {
-                stopTimeouts.put(def.getName(), def.getStopTimeout());
-            }
-        }
         return new EcsTaskHandle(task.getTaskArn(), containerIds, logStreamsByContainerId,
                 firelensVolumeName,
                 protectedNetwork == null ? null : protectedNetwork.eni().getNetworkInterfaceId(), region,
-                stopTimeouts);
+                stopTimeouts, taskVolumeNames);
+    }
+
+    private String taskVolumeName(EcsTask task, Volume volume) {
+        return ContainerStorageHelper.dockerName(config,
+                "ecs-task-volume-" + Digests.sha256Hex(task.getTaskArn() + "|" + volume.name()));
+    }
+
+    /** Reconstructs only task-owned volumes referenced by a container, without creating them. */
+    public Set<String> taskVolumeNames(EcsTask task, TaskDefinition definition) {
+        Set<String> referenced = new HashSet<>();
+        for (ContainerDefinition container : definition.getContainerDefinitions()) {
+            if (container.getMountPoints() != null) {
+                container.getMountPoints().forEach(mount -> referenced.add(mount.sourceVolume()));
+            }
+        }
+        Set<String> names = new LinkedHashSet<>();
+        if (definition.getVolumes() != null) {
+            for (Volume volume : definition.getVolumes()) {
+                if (referenced.contains(volume.name()) && isEphemeralVolume(volume)) {
+                    names.add(taskVolumeName(task, volume));
+                }
+            }
+        }
+        return names;
+    }
+
+    private static boolean isEphemeralVolume(Volume volume) {
+        Map<String, Object> properties = volume.unparsed();
+        return (volume.hostSourcePath() == null || volume.hostSourcePath().isBlank()) && volume.efs() == null
+                && (properties == null || (properties.get("efsVolumeConfiguration") == null
+                && properties.get("dockerVolumeConfiguration") == null
+                && properties.get("fsxWindowsFileServerVolumeConfiguration") == null
+                && properties.get("s3filesVolumeConfiguration") == null
+                && !Boolean.TRUE.equals(properties.get("configuredAtLaunch"))));
     }
 
     /** A task-level {@code memory} is MiB as a plain number, or a {@code "1GB"}-style string. */
@@ -1161,6 +1243,61 @@ public class EcsContainerManager {
         return allRemoved;
     }
 
+    /** Removes previous-run task volumes independently of the container launch gate. */
+    public boolean removeLeftoverTaskVolumes() {
+        return removeLeftoverTaskVolumes(runId);
+    }
+
+    /** {@link #removeLeftoverTaskVolumes()} keeping volumes of {@code currentRunId}. */
+    public boolean removeLeftoverTaskVolumes(String currentRunId) {
+        String owner = ContainerStorageHelper.ownerIdentity(config);
+        ContainerStorageHelper.LabelAliases aliases = ContainerStorageHelper.CONTAINER_LABEL_ALIASES;
+        try {
+            List<InspectVolumeResponse> volumes = aliases.listByLabels(
+                    Map.of(ContainerStorageHelper.SERVICE_LABEL, "ecs", ContainerStorageHelper.OWNER_LABEL, owner),
+                    filter -> {
+                        ListVolumesResponse response = lifecycleManager.getDockerClient().listVolumesCmd()
+                                .withFilter("label", filter.entrySet().stream()
+                                        .map(entry -> entry.getKey() + "=" + entry.getValue()).toList()).exec();
+                        if (response == null || response.getVolumes() == null) {
+                            throw new IllegalStateException("Docker returned no volume inventory");
+                        }
+                        return response.getVolumes();
+                    }, InspectVolumeResponse::getName);
+            leftoverTaskVolumeListFailureReported = false;
+            boolean allRemoved = true;
+            for (InspectVolumeResponse volume : volumes) {
+                Map<String, String> labels = volume.getLabels();
+                String previousRun = aliases.labelValue(labels, RUN_LABEL);
+                if (!aliases.consistent(volume.getName(), labels)
+                        || !aliases.matches(labels, ContainerStorageHelper.SERVICE_LABEL, "ecs")
+                        || !aliases.matches(labels, ContainerStorageHelper.OWNER_LABEL, owner)
+                        || previousRun == null || currentRunId.equals(previousRun)) {
+                    continue;
+                }
+                try {
+                    lifecycleManager.removeVolumeStrict(volume.getName());
+                    leftoverTaskVolumeRemovalFailuresReported.remove(volume.getName());
+                } catch (RuntimeException e) {
+                    allRemoved = false;
+                    Logger.Level level = leftoverTaskVolumeRemovalFailuresReported.add(volume.getName())
+                            ? Logger.Level.WARN : Logger.Level.DEBUG;
+                    LOG.logv(level, "Could not remove ECS task volume {0} left by a previous run: {1}",
+                            volume.getName(), e.getMessage());
+                }
+            }
+            if (allRemoved) {
+                leftoverTaskVolumeRemovalFailuresReported.clear();
+            }
+            return allRemoved;
+        } catch (RuntimeException e) {
+            LOG.logv(leftoverTaskVolumeListFailureReported ? Logger.Level.DEBUG : Logger.Level.WARN,
+                    "Could not list ECS task volumes from a previous run: {0}", e.getMessage());
+            leftoverTaskVolumeListFailureReported = true;
+            return false;
+        }
+    }
+
     /** The ENI {@link #attachTaskNetwork} allocated for this task, or null if it is already gone. */
     private NetworkInterface existingTaskEni(EcsTask task, String region) {
         if (task.getNetworkInterfaceId() == null) {
@@ -1272,8 +1409,10 @@ public class EcsContainerManager {
             return;
         }
         boolean allRemoved = true;
-        for (String dockerId : handle.getContainerIds().values()) {
-            if (!stopAndConfirmRemoved(dockerId)) {
+        for (Map.Entry<String, String> entry : handle.getContainerIds().entrySet()) {
+            if (stopAndConfirmRemoved(entry.getValue())) {
+                handle.recordContainerRemoved(entry.getKey());
+            } else {
                 allRemoved = false;
             }
         }
@@ -1283,6 +1422,7 @@ public class EcsContainerManager {
         removeFirelensVolume(handle);
         revokeTaskRoleCredentials(handle.getTaskArn());
         if (allRemoved) {
+            removeTaskVolumes(handle);
             releaseTaskLinkLocalAddresses(handle.getTaskArn());
         }
     }
@@ -1371,6 +1511,7 @@ public class EcsContainerManager {
         if (handle.allContainersRemoved()) {
             cleanupProtectedNetwork(handle);
             removeFirelensVolume(handle);
+            removeTaskVolumes(handle);
             // Only now: a container that survived a failed removal still holds its address.
             releaseTaskLinkLocalAddresses(handle.getTaskArn());
         }
@@ -1419,6 +1560,14 @@ public class EcsContainerManager {
             return;
         }
         lifecycleManager.removeVolume(handle.getFirelensVolumeName());
+    }
+
+    private void removeTaskVolumes(EcsTaskHandle handle) {
+        for (String volumeName : handle.getTaskVolumeNames()) {
+            if (lifecycleManager.removeVolume(volumeName)) {
+                handle.recordTaskVolumeRemoved(volumeName);
+            }
+        }
     }
 
     private static ContainerDefinition findFirelensRouter(List<ContainerDefinition> defs) {
@@ -1809,7 +1958,7 @@ public class EcsContainerManager {
      */
     public Integer getExitCodeIfStopped(String dockerId) {
         try {
-            var inspect = lifecycleManager.getDockerClient().inspectContainerCmd(dockerId).exec();
+            InspectContainerResponse inspect = lifecycleManager.getDockerClient().inspectContainerCmd(dockerId).exec();
             if (Boolean.TRUE.equals(inspect.getState().getRunning())) {
                 return null;
             }
@@ -1852,7 +2001,7 @@ public class EcsContainerManager {
             envMap.put("ECS_CONTAINER_METADATA_URI_V4", flociEndpoint + "/v4/" + metadataId);
         }
         if (def.getEnvironment() != null) {
-            for (var kv : def.getEnvironment()) {
+            for (KeyValuePair kv : def.getEnvironment()) {
                 envMap.put(kv.name(), kv.value());
             }
         }
@@ -1862,12 +2011,12 @@ public class EcsContainerManager {
             }
         }
         if (override != null && override.getEnvironment() != null) {
-            for (var kv : override.getEnvironment()) {
+            for (KeyValuePair kv : override.getEnvironment()) {
                 envMap.put(kv.name(), kv.value());
             }
         }
         List<String> envVars = new ArrayList<>();
-        for (var entry : envMap.entrySet()) {
+        for (Map.Entry<String, String> entry : envMap.entrySet()) {
             envVars.add(entry.getKey() + "=" + entry.getValue());
         }
         return envVars;
@@ -1898,14 +2047,14 @@ public class EcsContainerManager {
                 // The valueFrom may carry the ECS selector suffix
                 // (:json-key:version-stage:version-id); the parser strips it so the base ARN
                 // reaches SecretsManagerService intact, keeping its partial-ARN fallback working.
-                var selector = SecretsManagerSelector.parse(valueFrom);
+                SecretsManagerSelector selector = SecretsManagerSelector.parse(valueFrom);
                 jsonKey = selector.jsonKey();
-                var secret = secretsManagerService.getSecretValue(selector.secretId(),
+                SecretVersion secret = secretsManagerService.getSecretValue(selector.secretId(),
                         selector.versionId(), selector.versionStage(), secretRegion);
                 value = secret == null ? null : secret.getSecretString();
             } else {
                 String parameterName = ssmParameterName(valueFrom);
-                var parameter = ssmService.getParameter(parameterName, secretRegion);
+                Parameter parameter = ssmService.getParameter(parameterName, secretRegion);
                 value = parameter == null ? null : parameter.getValue();
             }
         } catch (AwsException e) {
@@ -2053,12 +2202,12 @@ public class EcsContainerManager {
         }
 
         DockerClient dockerClient = lifecycleManager.getDockerClient();
-        var inspect = dockerClient.inspectContainerCmd(dockerId).exec();
-        var portBindingsMap = inspect.getNetworkSettings().getPorts().getBindings();
+        InspectContainerResponse inspect = dockerClient.inspectContainerCmd(dockerId).exec();
+        Map<ExposedPort, Ports.Binding[]> portBindingsMap = inspect.getNetworkSettings().getPorts().getBindings();
 
         for (PortMapping pm : def.getPortMappings()) {
             ExposedPort ep = ExposedPort.tcp(pm.containerPort());
-            var binding = portBindingsMap.get(ep);
+            Ports.Binding[] binding = portBindingsMap.get(ep);
             int hostPort = pm.containerPort();
             String bindIp = "0.0.0.0";
 
@@ -2166,17 +2315,50 @@ public class EcsContainerManager {
      * Materialises an EFS-configured task volume as a shared local Docker named volume scoped to
      * both the file system and the mount's effective root (see {@link #efsVolumeToken}), then
      * initialises the volume root's POSIX ownership to emulate the EFS access point's
-     * RootDirectory.CreationInfo (no-op unless {@code floci.storage.efs} configures owner/permissions)
-     * and applies the configured PosixUser emulation (uid[:gid] and/or supplementary group) so a
-     * non-root task image can read/write the shared volume.
+     * RootDirectory.CreationInfo and PosixUser. Missing access point metadata falls back to
+     * {@code floci.storage.efs}. Identity is emulated by changing the container's user and groups.
      */
-    private void mountEfsVolume(ContainerBuilder.Builder specBuilder, EfsVolumeConfiguration efs, MountPoint mp) {
+    private void mountEfsVolume(ContainerBuilder.Builder specBuilder, EfsVolumeConfiguration efs, MountPoint mp,
+                                String region) {
         String efsVolumeName = efsVolumeName(efs.fileSystemId(), efs.accessPointId(), efs.rootDirectory());
-        var efsCfg = config.storage().efs();
-        lifecycleManager.ensureSharedVolume(efsVolumeName,
-                efsCfg.ownerUid(), efsCfg.ownerGid(), efsCfg.rootPermissions(),
-                efsCfg.initImage());
+        EmulatorConfig.EfsSharingConfig efsCfg = config.storage().efs();
+        AccessPointDescription accessPoint = resolveEfsAccessPoint(efs, region);
+        CreationInfo creation = accessPoint != null && accessPoint.getRootDirectory() != null
+                ? accessPoint.getRootDirectory().getCreationInfo() : null;
+        if (creation != null) {
+            if (creation.getOwnerUid() == null || creation.getOwnerGid() == null
+                    || creation.getPermissions() == null) {
+                throw new AwsException("ClientException",
+                        "EFS access point " + efs.accessPointId() + " has incomplete CreationInfo", 400);
+            }
+            if (!ContainerLifecycleManager.isValidPermissions(creation.getPermissions())) {
+                throw new AwsException("ClientException",
+                        "EFS access point " + efs.accessPointId() + " has invalid CreationInfo permissions: "
+                                + creation.getPermissions(), 400);
+            }
+            lifecycleManager.ensureSharedVolume(efsVolumeName, creation.getOwnerUid(), creation.getOwnerGid(),
+                    creation.getPermissions(), efsCfg.initImage());
+        } else {
+            lifecycleManager.ensureSharedVolume(efsVolumeName,
+                    efsCfg.ownerUid(), efsCfg.ownerGid(), efsCfg.rootPermissions(), efsCfg.initImage());
+        }
         specBuilder.withNamedVolume(efsVolumeName, mp.containerPath(), mp.readOnly());
+        PosixUser posixUser = accessPoint != null ? accessPoint.getPosixUser() : null;
+        if (posixUser != null) {
+            if (posixUser.getUid() == null || posixUser.getGid() == null) {
+                throw new AwsException("ClientException",
+                        "EFS access point " + efs.accessPointId() + " has incomplete PosixUser", 400);
+            }
+            specBuilder.withGroupAdd(String.valueOf(posixUser.getGid()));
+            if (posixUser.getSecondaryGids() != null) {
+                for (Long gid : posixUser.getSecondaryGids()) {
+                    if (gid != null) {
+                        specBuilder.withGroupAdd(String.valueOf(gid));
+                    }
+                }
+            }
+            return;
+        }
         efsCfg.mountUser().ifPresent(u -> {
             if (!u.matches("^\\d+(:\\d+)?$")) {
                 throw new IllegalArgumentException(
@@ -2185,6 +2367,26 @@ public class EcsContainerManager {
             specBuilder.withUser(u);
         });
         efsCfg.mountGroupAdd().ifPresent(gid -> specBuilder.withGroupAdd(String.valueOf(gid)));
+    }
+
+    private AccessPointDescription resolveEfsAccessPoint(EfsVolumeConfiguration efs, String region) {
+        if (efs.accessPointId() == null || efs.accessPointId().isBlank()) {
+            return null;
+        }
+        List<AccessPointDescription> accessPoints = efsService != null
+                ? efsService.describeAccessPoints(region, null, efs.accessPointId()) : List.of();
+        if (accessPoints.isEmpty()) {
+            LOG.warnv("EFS access point {0} metadata unavailable in region {1}; using floci.storage.efs fallback",
+                    efs.accessPointId(), region);
+            return null;
+        }
+        AccessPointDescription accessPoint = accessPoints.getFirst();
+        if (!efs.fileSystemId().equals(accessPoint.getFileSystemId())) {
+            throw new AwsException("ClientException",
+                    "EFS access point " + efs.accessPointId() + " does not belong to file system " + efs.fileSystemId(),
+                    400);
+        }
+        return accessPoint;
     }
 
     /**
@@ -2198,13 +2400,13 @@ public class EcsContainerManager {
      */
     static String efsVolumeToken(String fileSystemId, String accessPointId, String rootDirectory) {
         if (accessPointId != null && !accessPointId.isBlank()) {
-            return "efs-" + fileSystemId + "-" + sha256Hex("accessPoint:" + accessPointId);
+            return "efs-" + fileSystemId + "-" + Digests.sha256Hex("accessPoint:" + accessPointId);
         }
         String normalizedRoot = normalizeRootDirectory(rootDirectory);
         if ("/".equals(normalizedRoot)) {
             return "efs-" + fileSystemId;
         }
-        return "efs-" + fileSystemId + "-" + sha256Hex(normalizedRoot);
+        return "efs-" + fileSystemId + "-" + Digests.sha256Hex(normalizedRoot);
     }
 
     /**
@@ -2240,12 +2442,15 @@ public class EcsContainerManager {
         return collapsed.startsWith("/") ? collapsed : "/" + collapsed;
     }
 
-    private static String sha256Hex(String value) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is required but not available", e);
+    /**
+     * Refuses a device whose host path {@link HostVolumePolicy} does not allow, as it refuses a host
+     * volume: by default, unless {@code floci.services.ecs.host-volume-roots} holds it or
+     * {@code floci.services.ecs.allow-unsafe-host-volumes} is set. A device hands the container the
+     * host's hardware directly, so it is no less exposed than a bind mount.
+     */
+    public void checkDeviceHostPaths(ContainerDefinition def) {
+        for (String hostPath : EcsLinuxParameters.deviceHostPaths(def)) {
+            hostVolumePolicy.validate(hostPath, HostVolumePolicy.DEVICE_HOST_PATH);
         }
     }
 

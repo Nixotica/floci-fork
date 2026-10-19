@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.route53;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -468,15 +469,24 @@ public class Route53Service implements Resettable {
 
     // ── Health Checks ─────────────────────────────────────────────────────────
 
-    public synchronized HealthCheck createHealthCheck(String callerReference, HealthCheckConfig cfg) {
+    /**
+     * A caller reference makes the create safe to retry: the same reference with the same settings
+     * (the request's canonical {@code requestSettings}) returns the health check it already created,
+     * and different settings are refused.
+     */
+    public synchronized HealthCheck createHealthCheck(String callerReference, HealthCheckConfig cfg,
+                                                      String requestSettings) {
         for (HealthCheck existing : healthCheckStore.scan(k -> true)) {
             if (existing.getCallerReference().equals(callerReference)) {
+                if (requestSettings.equals(existing.getRequestSettings())) {
+                    return existing;
+                }
                 throw new AwsException("HealthCheckAlreadyExists",
                         "A health check with caller reference " + callerReference + " already exists.", 409);
             }
         }
         String id = UUID.randomUUID().toString();
-        HealthCheck hc = new HealthCheck(id, callerReference, cfg);
+        HealthCheck hc = new HealthCheck(id, callerReference, cfg, requestSettings);
         healthCheckStore.put(id, hc);
         return hc;
     }
@@ -593,7 +603,7 @@ public class Route53Service implements Resettable {
         }
         String normalizedQname = normalizeName(qname).toLowerCase();
         if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> normalizedQname.equals(z) || normalizedQname.endsWith("." + z))) {
+                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
             return false;
         }
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
@@ -602,7 +612,7 @@ public class Route53Service implements Resettable {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();
-            if (normalizedQname.equals(zoneName) || normalizedQname.endsWith("." + zoneName)) {
+            if (DomainNames.isWithin(normalizedQname, zoneName)) {
                 return true;
             }
         }
@@ -687,7 +697,7 @@ public class Route53Service implements Resettable {
     /** The private zones with the longest name containing {@code normalizedQname}, so a parent zone never answers for a child. */
     private List<OwnedZone> mostSpecificPrivateZones(String normalizedQname) {
         if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> normalizedQname.equals(z) || normalizedQname.endsWith("." + z))) {
+                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
             return List.of();
         }
         List<OwnedZone> matchingZones = new ArrayList<>();
@@ -698,7 +708,7 @@ public class Route53Service implements Resettable {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();
-            if (!normalizedQname.equals(zoneName) && !normalizedQname.endsWith("." + zoneName)) {
+            if (!DomainNames.isWithin(normalizedQname, zoneName)) {
                 continue;
             }
             if (zoneName.length() > maxZoneLength) {
@@ -919,10 +929,7 @@ public class Route53Service implements Resettable {
                     "Invalid resource record set: Deleting the SOA or NS record at the zone apex is not permitted.", 400);
         }
         if ("CREATE".equals(action)) {
-            boolean exists = current.stream().anyMatch(r ->
-                    r.getName().equals(rrs.getName()) &&
-                    r.getType().equals(rrs.getType()) &&
-                    equalOrNull(r.getSetIdentifier(), rrs.getSetIdentifier()));
+            boolean exists = current.stream().anyMatch(r -> sameRecord(r, rrs));
             if (exists) {
                 throw new AwsException("InvalidChangeBatch",
                         "Tried to create resource record set [name='" + rrs.getName() +
@@ -930,13 +937,13 @@ public class Route53Service implements Resettable {
             }
         }
         if ("DELETE".equals(action)) {
-            ResourceRecordSet existing = findByNameTypeAndSetIdentifier(current, rrs);
-            if (existing == null) {
+            List<ResourceRecordSet> existing = current.stream().filter(r -> sameRecord(r, rrs)).toList();
+            if (existing.isEmpty()) {
                 throw new AwsException("InvalidChangeBatch",
                         "Tried to delete resource record set " + deleteTargetDescription(rrs)
                                 + " but it was not found", 400);
             }
-            if (!recordSetsMatch(existing, rrs)) {
+            if (existing.stream().noneMatch(r -> recordSetsMatch(r, rrs))) {
                 throw new AwsException("InvalidChangeBatch",
                         "Tried to delete resource record set " + deleteTargetDescription(rrs)
                                 + " but the values provided do not match the current values", 400);
@@ -947,30 +954,37 @@ public class Route53Service implements Resettable {
     private void applyChange(String action, ResourceRecordSet rrs, List<ResourceRecordSet> current) {
         switch (action) {
             case "CREATE" -> current.add(rrs);
-            case "DELETE" -> current.removeIf(r -> recordSetsMatch(r, rrs));
+            case "DELETE" -> current.remove(deleteTarget(current, rrs));
             case "UPSERT" -> {
-                current.removeIf(r ->
-                        r.getName().equals(rrs.getName()) && r.getType().equals(rrs.getType()) &&
-                        equalOrNull(r.getSetIdentifier(), rrs.getSetIdentifier()));
+                current.removeIf(r -> sameRecord(r, rrs));
                 current.add(rrs);
             }
         }
     }
 
-    private static boolean equalOrNull(String a, String b) {
-        if (a == null && b == null) return true;
-        if (a == null || b == null) return false;
-        return a.equals(b);
+    /**
+     * Whether two record sets share an identity: name, type and set identifier. Route 53 treats a
+     * name with or without the trailing dot as the same, and requires a set identifier of at least one
+     * character, so a blank one is none. That also matches a record an earlier CloudFormation
+     * provisioner stored with the template's undotted Name or empty SetIdentifier.
+     */
+    public static boolean sameRecord(ResourceRecordSet a, ResourceRecordSet b) {
+        return normalizeName(a.getName()).equals(normalizeName(b.getName()))
+                && a.getType().equals(b.getType())
+                && Objects.equals(blankToNull(a.getSetIdentifier()), blankToNull(b.getSetIdentifier()));
     }
 
-    private static ResourceRecordSet findByNameTypeAndSetIdentifier(List<ResourceRecordSet> current,
-                                                                     ResourceRecordSet rrs) {
-        return current.stream()
-                .filter(r -> r.getName().equals(rrs.getName())
-                        && r.getType().equals(rrs.getType())
-                        && Objects.equals(r.getSetIdentifier(), rrs.getSetIdentifier()))
-                .findFirst()
-                .orElse(null);
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    /**
+     * One DELETE removes one record. An earlier version could store the same record both undotted and
+     * dotted, possibly for two owners, so prefer the copy named exactly as the request names it.
+     */
+    private static ResourceRecordSet deleteTarget(List<ResourceRecordSet> current, ResourceRecordSet rrs) {
+        List<ResourceRecordSet> matches = current.stream().filter(r -> recordSetsMatch(r, rrs)).toList();
+        return matches.stream().filter(r -> r.getName().equals(rrs.getName())).findFirst().orElse(matches.get(0));
     }
 
     private static String deleteTargetDescription(ResourceRecordSet rrs) {
@@ -982,9 +996,7 @@ public class Route53Service implements Resettable {
     }
 
     private static boolean recordSetsMatch(ResourceRecordSet a, ResourceRecordSet b) {
-        return a.getName().equals(b.getName())
-                && a.getType().equals(b.getType())
-                && Objects.equals(a.getSetIdentifier(), b.getSetIdentifier())
+        return sameRecord(a, b)
                 && Objects.equals(a.getTtl(), b.getTtl())
                 && Objects.equals(a.getWeight(), b.getWeight())
                 && Objects.equals(a.getRegion(), b.getRegion())

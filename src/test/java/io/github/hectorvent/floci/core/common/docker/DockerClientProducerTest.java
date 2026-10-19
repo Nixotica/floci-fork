@@ -3,7 +3,9 @@ package io.github.hectorvent.floci.core.common.docker;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.core.DefaultDockerClientConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.Digests;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -18,8 +20,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -255,6 +256,36 @@ class DockerClientProducerTest {
                 "An explicitly-configured docker-host should take priority over the Windows named-pipe fallback");
     }
 
+    // Control-plane calls (create/start/stop/remove/copyArchive) and long-lived streaming
+    // calls (log-follow, exec output streams) must not share one connection pool: a
+    // container's whole-lifetime streams would otherwise occupy pool slots that
+    // short-lived control-plane calls need, starving them into
+    // ConnectionRequestTimeoutException. The @Default and @StreamingDocker beans must
+    // therefore be genuinely separate DockerClient instances (and thus separate pools),
+    // not the same instance handed out under two qualifiers.
+    @Test
+    void dockerClientAndStreamingDockerClient_areDistinctInstances() {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
+        when(config.docker()).thenReturn(docker);
+        when(docker.dockerHost()).thenReturn("unix:///var/run/docker.sock");
+        when(docker.dockerConfigPath()).thenReturn(Optional.empty());
+        when(docker.maxConnections()).thenReturn(100);
+        when(docker.streamingMaxConnections()).thenReturn(512);
+        when(docker.connectionRequestTimeoutSeconds()).thenReturn(30);
+        when(docker.apiTimeoutSeconds()).thenReturn(300);
+
+        DockerClientProducer producer = new DockerClientProducer(config);
+
+        DockerClient controlPlaneClient = producer.dockerClient();
+        DockerClient streamingClient = producer.streamingDockerClient();
+
+        assertNotNull(controlPlaneClient);
+        assertNotNull(streamingClient);
+        assertNotSame(controlPlaneClient, streamingClient,
+                "Control-plane and streaming DockerClient beans must use separate connection pools");
+    }
+
     private static void writeContextFixture(Path dockerConfigDir, String contextName, String host)
             throws IOException {
         writeContextFixture(dockerConfigDir, contextName, host, false);
@@ -265,26 +296,12 @@ class DockerClientProducerTest {
         Files.createDirectories(dockerConfigDir);
         Files.writeString(dockerConfigDir.resolve("config.json"),
                 "{\"currentContext\":\"" + contextName + "\"}");
-        Path metaDir = dockerConfigDir.resolve("contexts").resolve("meta").resolve(sha256Hex(contextName));
+        Path metaDir = dockerConfigDir.resolve("contexts").resolve("meta").resolve(Digests.sha256Hex(contextName));
         Files.createDirectories(metaDir);
         Files.writeString(metaDir.resolve("meta.json"),
                 "{\"Name\":\"" + contextName + "\",\"Metadata\":{},"
                         + "\"Endpoints\":{\"docker\":{\"Host\":\"" + host + "\",\"SkipTLSVerify\":"
                         + skipTlsVerify + "}}}");
-    }
-
-    private static String sha256Hex(String value) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(hash.length * 2);
-            for (byte b : hash) {
-                hex.append(String.format("%02x", b));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 algorithm not available", e);
-        }
     }
 
     /**
@@ -539,7 +556,7 @@ class DockerClientProducerTest {
             Path dockerConfigDir, String contextName, boolean withCa, boolean withCert, boolean withKey)
             throws IOException {
         Path tlsDir = dockerConfigDir.resolve("contexts").resolve("tls")
-                .resolve(sha256Hex(contextName)).resolve("docker");
+                .resolve(Digests.sha256Hex(contextName)).resolve("docker");
         Files.createDirectories(tlsDir);
         if (withCa) {
             Files.writeString(tlsDir.resolve("ca.pem"), "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----");
@@ -570,7 +587,7 @@ class DockerClientProducerTest {
 
         assertEquals("tcp://remote-docker:2376", result.host());
         assertTrue(result.tlsCertPath().isPresent(), "TLS material should be surfaced when present");
-        assertEquals(tempDir.resolve("contexts").resolve("tls").resolve(sha256Hex("remote-tls")).resolve("docker"),
+        assertEquals(tempDir.resolve("contexts").resolve("tls").resolve(Digests.sha256Hex("remote-tls")).resolve("docker"),
                 result.tlsCertPath().get());
         assertFalse(result.skipTlsVerify(), "SkipTLSVerify defaults to false and should be reported as such");
     }
@@ -641,6 +658,40 @@ class DockerClientProducerTest {
         assertEquals(1024, DockerClientProducer.validateMaxConnections(1024));
     }
 
+    // Catches: a zero lease timeout reaching httpclient5, which reads it as no timeout, so a call
+    // on a full pool would wait forever.
+    @ParameterizedTest
+    @ValueSource(ints = {0, -1})
+    void validateConnectionRequestTimeoutSeconds_belowOne_throwsNamingTheSetting(int seconds) {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> DockerClientProducer.validateConnectionRequestTimeoutSeconds(seconds));
+
+        assertThat(e.getMessage(), containsString("floci.docker.connection-request-timeout-seconds"));
+    }
+
+    @Test
+    void validateConnectionRequestTimeoutSeconds_positive_returnsItUnchanged() {
+        assertEquals(1, DockerClientProducer.validateConnectionRequestTimeoutSeconds(1));
+        assertEquals(30, DockerClientProducer.validateConnectionRequestTimeoutSeconds(30));
+    }
+
+    // Catches: a zero response timeout reaching httpclient5, which reads it as no timeout, so a
+    // hung daemon would hold a call forever.
+    @ParameterizedTest
+    @ValueSource(ints = {0, -1})
+    void validateApiTimeoutSeconds_belowOne_throwsNamingTheSetting(int seconds) {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> DockerClientProducer.validateApiTimeoutSeconds(seconds));
+
+        assertThat(e.getMessage(), containsString("floci.docker.api-timeout-seconds"));
+    }
+
+    @Test
+    void validateApiTimeoutSeconds_positive_returnsItUnchanged() {
+        assertEquals(1, DockerClientProducer.validateApiTimeoutSeconds(1));
+        assertEquals(300, DockerClientProducer.validateApiTimeoutSeconds(300));
+    }
+
     /**
      * The pool size comes from {@code floci.docker.max-connections}. A followed log stream holds
      * its connection until the container exits, and this fake daemon never answers, so with a
@@ -668,6 +719,8 @@ class DockerClientProducerTest {
             when(docker.dockerHost()).thenReturn("tcp://127.0.0.1:" + daemon.getLocalPort());
             when(docker.dockerConfigPath()).thenReturn(Optional.empty());
             when(docker.maxConnections()).thenReturn(2);
+            when(docker.connectionRequestTimeoutSeconds()).thenReturn(30);
+            when(docker.apiTimeoutSeconds()).thenReturn(300);
 
             DockerClient client = new DockerClientProducer(config).dockerClient();
             try {
@@ -683,16 +736,54 @@ class DockerClientProducerTest {
                             });
                 }
 
-                assertNotNull(accepted.poll(10, TimeUnit.SECONDS), "first stream should connect");
-                assertNotNull(accepted.poll(10, TimeUnit.SECONDS), "second stream should connect");
-                assertNull(accepted.poll(1, TimeUnit.SECONDS),
-                        "third stream should wait for a pooled connection instead of opening one");
+                try (Socket first = accepted.poll(10, TimeUnit.SECONDS);
+                     Socket second = accepted.poll(10, TimeUnit.SECONDS);
+                     Socket third = accepted.poll(1, TimeUnit.SECONDS)) {
+                    assertNotNull(first, "first stream should connect");
+                    assertNotNull(second, "second stream should connect");
+                    assertNull(third, "third stream should wait for a pooled connection instead of opening one");
+                }
             } finally {
                 client.close();
                 for (Socket socket : accepted) {
                     socket.close();
                 }
             }
+        }
+    }
+
+    @Test
+    void newHttpClient_tlsVerifyConfig_loadsTheConfiguredCertificates(@TempDir Path certDir) throws IOException {
+        // Catches: TLS material resolved onto the client config but never handed to the HTTP transport
+        Files.writeString(certDir.resolve("ca.pem"), "not a certificate");
+        Files.writeString(certDir.resolve("cert.pem"), "not a certificate");
+        Files.writeString(certDir.resolve("key.pem"), "not a key");
+        DefaultDockerClientConfig tlsConfig =
+                DefaultDockerClientConfig.createDefaultConfigBuilder()
+                        .withDockerHost("tcp://127.0.0.1:2376")
+                        .withDockerTlsVerify(true)
+                        .withDockerCertPath(certDir.toString())
+                        .build();
+
+        // An HTTP client that actually uses the SSL config must read the certificates, so
+        // unreadable ones fail the build; one that ignores the config builds silently.
+        assertThrows(RuntimeException.class,
+                () -> DockerClientProducer.newHttpClient(tlsConfig, 10, Duration.ofMinutes(5), Duration.ofSeconds(30)));
+    }
+
+    @Test
+    void newHttpClient_plainTcpConfig_buildsWithoutTls() throws IOException {
+        // Catches: passing the SSL config breaking hosts that have no TLS material
+        DefaultDockerClientConfig plainConfig =
+                DefaultDockerClientConfig.createDefaultConfigBuilder()
+                        .withDockerHost("tcp://127.0.0.1:2375")
+                        .withDockerTlsVerify(false)
+                        .build();
+
+        try (FlociDockerHttpClient client =
+                DockerClientProducer.newHttpClient(plainConfig, 10, Duration.ofMinutes(5), Duration.ofSeconds(30))) {
+            assertNull(plainConfig.getSSLConfig(), "a config without TLS verify carries no SSL config");
+            assertEquals("tcp://127.0.0.1:2375", plainConfig.getDockerHost().toString());
         }
     }
 }

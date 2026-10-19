@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -19,8 +20,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -46,7 +47,7 @@ class ApiGatewayDomainTlsServiceTest {
         when(storageFactory.create(anyString(), anyString(), any())).thenAnswer(invocation -> AccountAwareStorageBackend.inMemory("000000000000"));
         certificateManager = mock(TlsCertificateManager.class);
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(config.services().cloudfront().domainSuffix()).thenReturn("cloudfront.net");
+        when(config.services().cloudfront().domainSuffix()).thenReturn(Optional.empty());
         service = new ApiGatewayService(storageFactory, config, certificateManager,
                 new RegionResolver(REGION, "000000000000"));
     }

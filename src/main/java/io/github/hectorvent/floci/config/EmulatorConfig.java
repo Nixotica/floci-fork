@@ -2,8 +2,10 @@ package io.github.hectorvent.floci.config;
 
 import io.smallrye.config.ConfigMapping;
 import io.smallrye.config.WithDefault;
+
 import java.net.URI;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 
@@ -76,7 +78,7 @@ public interface EmulatorConfig {
 
         /**
          * Refuse requests signed for a service AWS does not publish in the request's partition
-         * (CloudFront in GovCloud, IAM in {@code aws-eusc}). On AWS such a request never reaches
+         * (CloudFront in GovCloud, Lightsail in China). On AWS such a request never reaches
          * an API because its endpoint does not resolve; Floci serves every enabled service in
          * every partition unless this is set.
          */
@@ -876,6 +878,24 @@ public interface EmulatorConfig {
          */
         @WithDefault("verdaccio/verdaccio:6.10.4")
         String npmImage();
+
+        /**
+         * Image used for the per-repository pypiserver container backing the {@code pypi} format.
+         * Same reasoning as {@link #npmImage()}: pypiserver has no native concept of multiple
+         * named indexes inside one instance either, so this gets one container per CodeArtifact
+         * repository too, and there is no single external instance a URL override could name.
+         */
+        @WithDefault("pypiserver/pypiserver:v2.4.2")
+        String pypiImage();
+
+        /**
+         * Image used for the per-repository BaGetter container backing the {@code nuget} format.
+         * Same reasoning as {@link #npmImage()}: BaGetter has no native concept of multiple named
+         * feeds inside one instance either, so this gets one container per CodeArtifact
+         * repository too, and there is no single external instance a URL override could name.
+         */
+        @WithDefault("bagetter/bagetter:1.6.5")
+        String nugetImage();
     }
 
     interface ConnectServiceConfig {
@@ -1074,6 +1094,9 @@ public interface EmulatorConfig {
     interface ServiceQuotasServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("5")
+        int standardOnDemandVcpus();
     }
 
     interface VerifiedPermissionsServiceConfig {
@@ -1110,6 +1133,20 @@ public interface EmulatorConfig {
     interface CloudControlServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * Worker threads that run CreateResource provisioning.
+         * Env: FLOCI_SERVICES_CLOUDCONTROL_CREATE_WORKER_THREADS
+         */
+        @WithDefault("4")
+        int createWorkerThreads();
+
+        /**
+         * CreateResource requests that may wait for a worker; past that a new create is refused with
+         * ThrottlingException. Env: FLOCI_SERVICES_CLOUDCONTROL_CREATE_QUEUE_CAPACITY
+         */
+        @WithDefault("64")
+        int createQueueCapacity();
     }
     interface S3VectorsServiceConfig {
         @WithDefault("true")
@@ -1354,6 +1391,23 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean globalBucketNamespace();
+
+        /**
+         * Run the background sweep that applies bucket lifecycle expiration rules: Expiration,
+         * NoncurrentVersionExpiration and AbortIncompleteMultipartUpload. When off, rules are
+         * stored and reported in {@code x-amz-expiration} but nothing expires.
+         * Env: FLOCI_SERVICES_S3_LIFECYCLE_SWEEP_ENABLED
+         */
+        @WithDefault("true")
+        boolean lifecycleSweepEnabled();
+
+        /**
+         * How often the lifecycle sweep runs. S3 itself applies lifecycle about once a day, to
+         * expiry times rounded to midnight UTC, so the interval only bounds how late Floci is.
+         * Env: FLOCI_SERVICES_S3_LIFECYCLE_SWEEP_INTERVAL_SECONDS
+         */
+        @WithDefault("60")
+        long lifecycleSweepIntervalSeconds();
     }
 
     interface DynamoDbServiceConfig {
@@ -1452,6 +1506,20 @@ public interface EmulatorConfig {
 
         @WithDefault("9399")
         int kafkaHostPortMax();
+
+        /**
+         * Only applies when Floci runs in a container. Each broker then has a second Kafka
+         * listener, published to a host port from the kafka-host-port range so clients on the
+         * Docker host can reach it, and advertised as {@code <this hostname>:<port>}
+         * ({@code localhost} when unset).
+         *
+         * <p>When set, GetBootstrapBrokers returns both listeners,
+         * {@code <container-name>:9092,<this hostname>:<port>}, so clients on the Docker host
+         * and in sibling containers can each discover the broker. When unset or blank, it
+         * returns the broker's Docker-network address, which sibling containers use.
+         * Env: FLOCI_SERVICES_MSK_BOOTSTRAP_HOSTNAME
+         */
+        Optional<String> bootstrapHostname();
     }
 
     interface AmazonMqServiceConfig {
@@ -1592,6 +1660,9 @@ public interface EmulatorConfig {
         int proxyBackendConnectTimeoutMillis();
         @WithDefault("100")
         int proxyMaxConnections();
+
+        @WithDefault("1000000")
+        long spectrumMaxRows();
     }
 
     interface RdsServiceConfig {
@@ -1670,6 +1741,9 @@ public interface EmulatorConfig {
 
         @WithDefault("180")
         long transactionTtlSeconds();
+
+        @WithDefault("false")
+        boolean databaseResumingExceptionEnabled();
     }
 
     interface RedshiftDataServiceConfig {
@@ -1678,6 +1752,15 @@ public interface EmulatorConfig {
 
         @WithDefault("24")
         int resultTtlHours();
+
+        @WithDefault("10")
+        int maxConcurrentStatements();
+
+        @WithDefault("100")
+        int queueCapacity();
+
+        @WithDefault("10")
+        int shutdownTimeoutSeconds();
     }
 
     interface RedshiftServerlessServiceConfig {
@@ -1850,9 +1933,11 @@ public interface EmulatorConfig {
 
         /**
          * How often the buffer flusher checks for streams whose buffering
-         * interval (BufferingHints.IntervalInSeconds) has elapsed.
+         * interval (BufferingHints.IntervalInSeconds) has elapsed. AWS delivers once
+         * the first buffer condition is met, so a buffer is delivered at most this
+         * long after its interval ends.
          */
-        @WithDefault("10")
+        @WithDefault("1")
         long tickIntervalSeconds();
 
         /**
@@ -1881,6 +1966,22 @@ public interface EmulatorConfig {
     interface CognitoServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /** Google federation issuer; override to use a local OIDC provider for testing. */
+        @WithDefault("https://accounts.google.com")
+        String googleIssuer();
+
+        /**
+         * Rejects an app client whose token validity is outside AWS's limits: access and ID tokens
+         * between 5 minutes and 1 day, refresh tokens between 60 minutes and 3,650 days. Env:
+         * {@code FLOCI_SERVICES_COGNITO_ENFORCE_TOKEN_VALIDITY_LIMITS}
+         *
+         * <p>On by default, because a client that Floci accepts and AWS refuses only fails when it is
+         * deployed. Turn it off to keep tokens shorter than AWS allows, such as a one-minute access
+         * token for a test of what happens when it expires.
+         */
+        @WithDefault("true")
+        boolean enforceTokenValidityLimits();
     }
 
     interface StepFunctionsServiceConfig {
@@ -2065,6 +2166,29 @@ public interface EmulatorConfig {
         @WithDefault("${floci.storage.persistent-path}/opensearch")
         String dataPath();
 
+        /**
+         * Optional data volume for the domain containers Floci spawns, replacing the
+         * per-domain volume Floci derives by default. An absolute path is bind-mounted as
+         * {@code <path>/<account-id>/<region>/<domain-name>}, nested under a {@code <namespace>} subdirectory
+         * when a resource namespace is configured; any other value is a Docker volume
+         * name and each domain gets its own {@code <name>-<namespace>-<account-id>-<region>-<domain-name>}
+         * volume, without the namespace segment when none is configured. No two domains
+         * and no two namespaced deployments sharing a Docker daemon ever share a data
+         * directory. Storage named here is never removed on domain delete,
+         * regardless of storage mode and prune policy: the operator named it, so its
+         * lifecycle is theirs. A volume Floci creates when absent carries no Floci
+         * label, so neither a floci-scoped volume prune nor a sweep of Floci-labelled
+         * child resources, a testcontainers module reaping a run's labelled children,
+         * removes it. When Floci itself runs in a container, an absolute path
+         * resolves on the Docker daemon's host. Paths starting with / retain Linux path syntax
+         * even when Floci runs on Windows. A temporary root container using the selected
+         * image creates and prepares bind-directory ownership and owner write access there;
+         * existing files are untouched, and preparation failure aborts domain startup.
+         *
+         * Env var: FLOCI_SERVICES_OPENSEARCH_DATA_VOLUME
+         */
+        Optional<String> dataVolume();
+
         @WithDefault("false")
         boolean keepRunningOnShutdown();
     }
@@ -2095,15 +2219,16 @@ public interface EmulatorConfig {
 
         /**
          * Approved parent directories for task definition host volume bind mounts
-         * (volumes[].host.sourcePath). A sourcePath must resolve under one of these roots.
-         * Empty (the default) rejects every host volume sourcePath unless
+         * (volumes[].host.sourcePath) and container devices (linuxParameters.devices[].hostPath).
+         * A host path must resolve under one of these roots. Empty (the default) rejects every
+         * host volume sourcePath and device hostPath unless
          * {@link #allowUnsafeHostVolumes()} is set, subject to the always-on traversal,
          * bare-root, and Docker socket blocks below.
          */
         Optional<List<String>> hostVolumeRoots();
 
         /**
-         * When true, bypasses the {@link #hostVolumeRoots()} allowlist check for host volumes,
+         * When true, bypasses the {@link #hostVolumeRoots()} allowlist check for host volumes and devices,
          * allowing any absolute path. Traversal segments, the bare root "/", and the Docker
          * socket (or any ancestor directory that contains it) are still always rejected.
          */
@@ -2251,6 +2376,14 @@ public interface EmulatorConfig {
          */
         @WithDefault("60")
         int requestTimeoutSeconds();
+
+        /**
+         * How long to collect an upstream error response body before returning the
+         * known model error without its details. Bounds a backend that sends an error
+         * status and then stalls, since the request timeout stops at the headers.
+         */
+        @WithDefault("1000")
+        int errorBodyTimeoutMillis();
     }
 
     interface TextractServiceConfig {
@@ -2332,8 +2465,11 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
-        @WithDefault("cloudfront.net") // partition-literal: configurable; the China CDN suffix has no published source
-        String domainSuffix();
+        /**
+         * Suffix of generated distribution domain names, in every partition when set. Unset, the
+         * suffix follows the request's partition ({@code CloudFrontEdgeDomain#domainSuffix}).
+         */
+        Optional<String> domainSuffix();
 
         /**
          * Exact custom-origin hostnames allowed to resolve to private or otherwise non-routable
@@ -2513,7 +2649,7 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
-        @WithDefault("floci/floci-ui:latest")
+        @WithDefault("floci/floci-ui:0.7.0")
         String image();
 
         @WithDefault("floci-ui")
@@ -2690,11 +2826,25 @@ public interface EmulatorConfig {
         @WithDefault("public.ecr.aws") // partition-literal: configurable; ECR Public exists only in the commercial partition
         String ecrBaseUri();
 
+        /** Full image references for individual runtimes, keyed by Lambda runtime identifier. */
+        Map<String, String> runtimeImages();
+
         @WithDefault("128")
         int defaultMemoryMb();
 
         @WithDefault("3")
         int defaultTimeoutSeconds();
+
+        /**
+         * Run the background sweep that fires durable execution timers. These are waits, step
+         * retries, execution timeouts and retention expiry. When off, timers are recorded but never fire.
+         */
+        @WithDefault("true")
+        boolean durableSweepEnabled();
+
+        /** How often the durable sweep runs. Waits are whole seconds, so 1s bounds their lateness. */
+        @WithDefault("1")
+        long durableSweepIntervalSeconds();
 
         Optional<String> dockerHostOverride();
 
@@ -2756,6 +2906,32 @@ public interface EmulatorConfig {
         @WithDefault("300")
         int containerIdleTimeoutSeconds();
 
+        /**
+         * Maximum idle (warm) containers kept per function. A container released when the
+         * function already holds this many idle ones is stopped instead of pooled.
+         *
+         * <p>Unset derives {@code max(4, availableProcessors())}. Values below 1 are ignored
+         * with a warning.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_PER_FUNCTION
+         */
+        Optional<Integer> warmPoolMaxPerFunction();
+
+        /**
+         * Maximum idle (warm) containers kept across all functions. When a release would push
+         * the total past this, the least-recently-used idle container of any function is
+         * stopped first, so the container that just ran (the most likely to run again) stays
+         * warm. {@code 0} disables the bound; a negative value is ignored with a warning and
+         * also leaves it unbounded. This bounds idle containers only, emulator-wide. Busy
+         * containers are not counted: their ceiling is {@code region-concurrency-limit}, which
+         * applies independently in each region, so peak container count is this cap plus the
+         * in-flight invocations across every active region.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_TOTAL
+         */
+        @WithDefault("0")
+        int warmPoolMaxTotal();
+
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
 
@@ -2811,7 +2987,7 @@ public interface EmulatorConfig {
          * ARN AWS would refuse. The content is never fetched either way, so a function whose
          * behaviour depends on the layer will not run correctly here.
          *
-         * <p>A layer ARN outside the {@code aws} partition is rejected regardless: partitions
+         * <p>A layer ARN outside the request's partition is rejected regardless: partitions
          * are isolated, so no resource policy can make one readable.
          *
          * Env var: FLOCI_SERVICES_LAMBDA_ACCEPT_EXTERNAL_LAYER_ARNS
@@ -3234,12 +3410,24 @@ public interface EmulatorConfig {
          * --disable-kube-proxy} instead of its bundled networking stack. k3s's default flannel CNI
          * and kube-proxy run embedded in the k3s server process itself (not separate, killable
          * DaemonSets), so a real CNI (e.g. Cilium) can only cleanly take over if k3s never starts
-         * its own in the first place — there is no way to evict them after the fact. CoreDNS,
+         * its own in the first place: there is no way to evict them after the fact. CoreDNS,
          * local-path-provisioner, and metrics-server are unaffected; they don't depend on which CNI
          * is in place.
          */
         @WithDefault("false")
         boolean disableCni();
+
+        /**
+         * When false (default), starts k3s with {@code --disable=local-storage} so clusters match
+         * AWS EKS by starting with no default StorageClass and no host-path provisioner. When true,
+         * retains k3s's bundled local-path provisioner and default StorageClass for local workloads
+         * that rely on automatic volume binding without installing a CSI driver.
+         *
+         * <p>Like {@link #disableCni()}, k3s's local-path-provisioner runs embedded in the k3s server
+         * process itself, so this flag must be set at startup rather than applied afterwards.
+         */
+        @WithDefault("false")
+        boolean defaultStorageClass();
 
         /**
          * When true, exposes an IMDS link-local proxy (169.254.169.254:80) inside the cluster container's
@@ -3346,6 +3534,15 @@ public interface EmulatorConfig {
     }
 
     interface InitHooksConfig {
+        /**
+         * Root of the Floci-native hook directories ({@code boot.d}, {@code start.d}, {@code ready.d},
+         * {@code stop.d}, {@code shutdown.d}). The image mounts them under the default; a binary on
+         * the host points this at a directory of its own. The LocalStack-compat tree under
+         * {@code /etc/localstack/init} is always read as well.
+         */
+        @WithDefault("/etc/floci/init")
+        String dir();
+
         @WithDefault("/bin/sh")
         String shellExecutable();
 
@@ -3427,10 +3624,10 @@ public interface EmulatorConfig {
         /**
          * Size of the connection pool behind the shared Docker client. Every Docker call leases a
          * connection from it, and some hold one for as long as a container runs: a Lambda
-         * container holds two (its followed log stream and its exit watcher) plus one per
-         * extension, and other container-backed services hold one for their log stream. Once
-         * those fill the pool, create, start, stop and remove wait for a free connection,
-         * including the calls that would release one, so the emulator stalls.
+         * container holds one (its exit watcher) plus one per extension. Log-follow streams
+         * live in the separate streaming pool. Once the long-lived connections fill this pool,
+         * create, start, stop and remove wait for a free connection, including the calls that
+         * would release one, so the emulator stalls.
          *
          * <p>1024 rather than the former hard-coded 100, which capped live Lambda containers at
          * about 50: a tenth of the 500 that the runtime API port range
@@ -3439,6 +3636,36 @@ public interface EmulatorConfig {
          */
         @WithDefault("1024")
         int maxConnections();
+
+        /**
+         * Connection pool size for the {@code @StreamingDocker} DockerClient, sized for the
+         * long-lived container log-follow streams that occupy a slot for a container's entire
+         * lifetime. Exec-output and container-wait streams stay on the main pool. Total live
+         * containers is unbounded across distinct functions (each {@code WarmPool} caps only
+         * per-function), so this pool is sized generously rather than tied to any single
+         * function's warm-pool cap.
+         */
+        @WithDefault("512")
+        int streamingMaxConnections();
+
+        /**
+         * How long a Docker call waits for a free pooled connection before it fails with
+         * {@code ConnectionRequestTimeoutException}, in seconds, for both pools. A full pool means
+         * the emulator is saturated, so failing sooner beats httpclient5's default three-minute wait;
+         * the transport retry never replays a lease timeout.
+         */
+        @WithDefault("30")
+        int connectionRequestTimeoutSeconds();
+
+        /**
+         * How long a Docker call waits for the daemon's response before it fails, in seconds, for
+         * both pools. The limit is per attempt: a control-plane request that is safe to repeat is
+         * tried up to six times. Requests that hold a stream open for as long as a container runs (container
+         * waits, exec and attach output, followed logs, streamed stats, events, image pulls and
+         * builds) are exempt, since they can stay silent while healthy.
+         */
+        @WithDefault("300")
+        int apiTimeoutSeconds();
 
         /**
          * Optional namespace inserted into Floci-managed child container and volume names.

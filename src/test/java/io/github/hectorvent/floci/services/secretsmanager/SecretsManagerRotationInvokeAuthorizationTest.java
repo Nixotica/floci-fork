@@ -50,7 +50,7 @@ class SecretsManagerRotationInvokeAuthorizationTest {
     void setUp() {
         store = new InMemoryStorage<>();
         lambda = mock(LambdaService.class);
-        when(lambda.getFunction(anyString(), anyString())).thenReturn(new LambdaFunction());
+        when(lambda.getFunctionByArn(anyString())).thenReturn(new LambdaFunction());
         when(lambda.invoke(anyString(), anyString(), any(byte[].class), any())).thenReturn(new InvokeResult());
         service = new SecretsManagerService(store, 30, new RegionResolver(REGION, ACCOUNT), lambda, new ObjectMapper());
         service.createSecret("my-secret", "v1", null, null, null, null, REGION);
@@ -99,6 +99,35 @@ class SecretsManagerRotationInvokeAuthorizationTest {
     }
 
     @Test
+    void functionInAnotherRegionIsRejectedBeforeTheCheck() {
+        Secret secret = service.describeSecret("my-secret", REGION);
+        secret.setRotationLambdaArn(FUNCTION_ARN);
+        store.put(REGION + "::my-secret", secret);
+        List<String> checked = new ArrayList<>();
+
+        AwsException e = assertThrows(AwsException.class, () -> service.rotateSecret("my-secret", TOKEN,
+                "arn:aws:lambda:us-west-2:000000000000:function:rotator", null, false, REGION, checked::add));
+
+        assertEquals("InvalidParameterException", e.getErrorCode());
+        assertEquals(400, e.getHttpStatus());
+        assertEquals(List.of(), checked);
+        assertEquals(FUNCTION_ARN, service.describeSecret("my-secret", REGION).getRotationLambdaArn());
+    }
+
+    @Test
+    void lambdaRefusingTheReferenceAtTheLookupIsAnInvalidParameter() {
+        when(lambda.getFunctionByArn(anyString()))
+                .thenThrow(new AwsException("ValidationException", "refused by Lambda", 400));
+
+        AwsException e = assertThrows(AwsException.class, () ->
+                service.rotateSecret("my-secret", TOKEN, FUNCTION_ARN, null, true, REGION, functionArn -> { }));
+
+        assertEquals("InvalidParameterException", e.getErrorCode());
+        assertEquals(400, e.getHttpStatus());
+        assertNull(service.describeSecret("my-secret", REGION).getRotationLambdaArn());
+    }
+
+    @Test
     void refusedCallerLeavesTheSecretUntouchedAndNothingRuns() {
         Consumer<String> refuse = functionArn -> {
             throw new AwsException("AccessDeniedException", "refused by the caller check", 400);
@@ -120,7 +149,7 @@ class SecretsManagerRotationInvokeAuthorizationTest {
 
     @Test
     void refusalComesBeforeTheExistenceCheck() {
-        when(lambda.getFunction(anyString(), anyString()))
+        when(lambda.getFunctionByArn(anyString()))
                 .thenThrow(new AwsException("ResourceNotFoundException", "Function not found", 404));
         Consumer<String> refuse = functionArn -> {
             throw new AwsException("AccessDeniedException", "refused by the caller check", 400);
@@ -134,7 +163,7 @@ class SecretsManagerRotationInvokeAuthorizationTest {
 
     @Test
     void missingFunctionIsReportedAsSecretsManagerReportsIt() {
-        when(lambda.getFunction(anyString(), anyString()))
+        when(lambda.getFunctionByArn(anyString()))
                 .thenThrow(new AwsException("ResourceNotFoundException", "Function not found", 404));
 
         AwsException e = assertThrows(AwsException.class, () ->
@@ -152,7 +181,7 @@ class SecretsManagerRotationInvokeAuthorizationTest {
         Secret secret = service.describeSecret("my-secret", REGION);
         secret.setRotationLambdaArn(FUNCTION_ARN);
         store.put(REGION + "::my-secret", secret);
-        when(lambda.getFunction(anyString(), anyString()))
+        when(lambda.getFunctionByArn(anyString()))
                 .thenThrow(new AwsException("ResourceNotFoundException", "Function not found", 404));
 
         assertThrows(AwsException.class, () -> service.rotateSecret("my-secret", TOKEN,

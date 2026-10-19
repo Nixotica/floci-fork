@@ -8,10 +8,10 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.startsWith;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.startsWith;
 
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -247,6 +247,28 @@ class LambdaMicrovmsIntegrationTest {
                 .statusCode(200)
                 .body("State", equalTo("ACTIVE"))
                 .body("Name", equalTo("microvm-it-connector"));
+
+        // UpdateNetworkConnector changes the operator role and protocol as well as the subnets.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {
+                          "OperatorRole": "arn:aws:iam::000000000000:role/microvm-connector-operator-v2",
+                          "Configuration": { "VpcEgressConfiguration": { "NetworkProtocol": "DUAL_STACK" } }
+                        }
+                        """)
+                .when()
+                .put(CORE + "/network-connectors/" + connectorId)
+                .then()
+                .statusCode(202);
+        given()
+                .when()
+                .get(CORE + "/network-connectors/" + connectorId)
+                .then()
+                .statusCode(200)
+                .body("OperatorRole", equalTo("arn:aws:iam::000000000000:role/microvm-connector-operator-v2"))
+                .body("Configuration.VpcEgressConfiguration.NetworkProtocol", equalTo("DUAL_STACK"))
+                .body("Configuration.VpcEgressConfiguration.SubnetIds[0]", equalTo("subnet-0000000000000it01"));
 
         given()
                 .when()

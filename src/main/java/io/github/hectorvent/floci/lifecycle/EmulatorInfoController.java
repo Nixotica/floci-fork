@@ -3,23 +3,23 @@ package io.github.hectorvent.floci.lifecycle;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
+import io.github.hectorvent.floci.config.FlociVersion;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServiceRegistry;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHook;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbBackendSelector;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
-
-import io.github.hectorvent.floci.core.storage.StorageFactory;
-import io.github.hectorvent.floci.core.common.Resettable;
-import jakarta.enterprise.inject.Instance;
-import jakarta.ws.rs.POST;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -64,7 +64,7 @@ public class EmulatorInfoController {
         this.certificateAuthority = certificateAuthority;
         this.config = config;
         this.dynamoDbBackendSelector = dynamoDbBackendSelector;
-        this.version = resolveVersion();
+        this.version = FlociVersion.current();
     }
 
     @GET
@@ -207,13 +207,5 @@ public class EmulatorInfoController {
         if (failure != null) {
             throw failure;
         }
-    }
-
-    static String resolveVersion() {
-        String env = System.getenv("FLOCI_VERSION");
-        if (env != null && !env.isBlank()) {
-            return env;
-        }
-        return "dev";
     }
 }

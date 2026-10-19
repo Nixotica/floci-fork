@@ -6,10 +6,12 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
-import java.nio.file.StandardCopyOption;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
+import java.util.stream.Stream;
 
 /**
  * Manages on-disk locations of extracted Lambda function code.
@@ -101,7 +103,7 @@ public class CodeStore {
         }
         Path target = getVersionCodePath(accountId, region, functionName, version);
         deleteDirectory(target, functionName);
-        try (var walk = Files.walk(source)) {
+        try (Stream<Path> walk = Files.walk(source)) {
             for (Path from : walk.toList()) {
                 Path to = target.resolve(source.relativize(from).toString());
                 if (Files.isDirectory(from)) {
@@ -111,6 +113,12 @@ public class CodeStore {
                     Files.copy(from, to, StandardCopyOption.REPLACE_EXISTING);
                 }
             }
+        } catch (UncheckedIOException e) {
+            deleteDirectory(target, functionName);
+            throw e.getCause();
+        } catch (IOException e) {
+            deleteDirectory(target, functionName);
+            throw e;
         }
         return target;
     }
@@ -148,7 +156,7 @@ public class CodeStore {
         if (!Files.exists(path)) {
             return;
         }
-        try (var walk = Files.walk(path)) {
+        try (Stream<Path> walk = Files.walk(path)) {
             walk.sorted(Comparator.reverseOrder())
                     .forEach(p -> {
                         try {
@@ -158,7 +166,7 @@ public class CodeStore {
                         }
                     });
             LOG.debugv("Deleted code for function: {0}", functionName);
-        } catch (IOException e) {
+        } catch (IOException | UncheckedIOException e) {
             LOG.warnv("Failed to delete code directory for {0}: {1}", functionName, e.getMessage());
         }
     }
@@ -168,7 +176,7 @@ public class CodeStore {
         if (!Files.exists(codePath)) {
             return false;
         }
-        try (var listing = Files.list(codePath)) {
+        try (Stream<Path> listing = Files.list(codePath)) {
             return listing.findAny().isPresent();
         } catch (IOException e) {
             return false;

@@ -1,5 +1,14 @@
 package io.github.hectorvent.floci.services.rds.container;
 
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
+import com.github.dockerjava.api.command.LogContainerCmd;
+import com.github.dockerjava.api.command.PauseContainerCmd;
+import com.github.dockerjava.api.command.UnpauseContainerCmd;
+import com.github.dockerjava.api.model.Bind;
+import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
@@ -10,12 +19,21 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
+import org.mockito.Mockito;
 
+import java.io.Closeable;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -24,15 +42,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
-import com.github.dockerjava.api.command.PauseContainerCmd;
-import com.github.dockerjava.api.command.UnpauseContainerCmd;
-import com.github.dockerjava.api.model.Bind;
-import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -40,12 +51,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -54,6 +65,12 @@ class RdsContainerManagerTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    void quotePostgresIdentifierDoublesEmbeddedQuotes() {
+        assertEquals("\"appdb\"", RdsContainerManager.quotePostgresIdentifier("appdb"));
+        assertEquals("\"app\"\"db\"", RdsContainerManager.quotePostgresIdentifier("app\"db"));
+    }
 
     @Test
     void mysql84UsesSupportedNativePasswordOptions() {
@@ -231,6 +248,40 @@ class RdsContainerManagerTest {
     }
 
     @Test
+    void aLogReadThatTimesOutFailsAndClosesTheStream() throws Exception {
+        EmulatorConfig config = config(tempDir.resolve("host-root"));
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        DockerClient dockerClient = mock(DockerClient.class);
+        when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+        LogContainerCmd logCmd = mock(LogContainerCmd.class);
+        when(dockerClient.logContainerCmd("slow")).thenReturn(logCmd);
+        when(logCmd.withStdOut(true)).thenReturn(logCmd);
+        when(logCmd.withStdErr(true)).thenReturn(logCmd);
+        when(logCmd.withTimestamps(true)).thenReturn(logCmd);
+        when(logCmd.withTail(RdsContainerManager.MAX_LOG_LINES)).thenReturn(logCmd);
+        Closeable stream = mock(Closeable.class);
+        // Docker starts the stream and sends one frame, then never completes.
+        when(logCmd.exec(any())).thenAnswer(invocation -> {
+            ResultCallback.Adapter<Frame> callback = invocation.getArgument(0);
+            callback.onStart(stream);
+            callback.onNext(new Frame(StreamType.STDOUT,
+                    "2026-10-15T10:00:00Z partial\n".getBytes(StandardCharsets.UTF_8)));
+            return callback;
+        });
+
+        RdsContainerManager manager = new RdsContainerManager(
+                new ContainerBuilder(config, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class)),
+                lifecycleManager, mock(ContainerLogStreamer.class), mock(ContainerDetector.class), config,
+                new RegionResolver("us-east-1", "000000000000"),
+                mock(ServiceConfigAccess.class));
+
+        IllegalStateException timedOut = assertThrows(IllegalStateException.class,
+                () -> manager.readLog("slow", Duration.ofMillis(50)));
+        assertTrue(timedOut.getMessage().contains("Timed out"), timedOut.getMessage());
+        verify(stream).close();
+    }
+
+    @Test
     void mysqlNonRootMasterStartInstallsGrantInitScriptBeforeStart() throws Exception {
         EmulatorConfig config = config(tempDir.resolve("host-root"));
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
@@ -254,17 +305,17 @@ class RdsContainerManagerTest {
         manager.start("db1", "vol1", DatabaseEngine.MYSQL, "mysql:8.0", "admin", "password", "db");
 
         verify(copyCmd).withRemotePath("/docker-entrypoint-initdb.d");
-        var tarCaptor = org.mockito.ArgumentCaptor.forClass(java.io.InputStream.class);
+        ArgumentCaptor<InputStream> tarCaptor = ArgumentCaptor.forClass(InputStream.class);
         verify(copyCmd).withTarInputStream(tarCaptor.capture());
-        try (var tar = new org.apache.commons.compress.archivers.tar.TarArchiveInputStream(tarCaptor.getValue())) {
-            var entry = tar.getNextEntry();
+        try (TarArchiveInputStream tar = new TarArchiveInputStream(tarCaptor.getValue())) {
+            TarArchiveEntry entry = tar.getNextEntry();
             assertEquals("floci-master-grants.sql", entry.getName());
             assertEquals(RdsContainerManager.mysqlMasterGrantSql("admin"),
                     new String(tar.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
         }
         // The script lands on the created container before it starts, so the entrypoint's
         // one-time init phase is the thing that runs it.
-        var order = org.mockito.Mockito.inOrder(dockerClient, lifecycleManager);
+        InOrder order = Mockito.inOrder(dockerClient, lifecycleManager);
         order.verify(dockerClient).copyArchiveToContainerCmd("container-id");
         order.verify(lifecycleManager).startCreated(org.mockito.ArgumentMatchers.eq("container-id"), any());
     }
@@ -320,7 +371,7 @@ class RdsContainerManagerTest {
         manager.start("db1", "vol1", DatabaseEngine.MYSQL, "mysql:8.0", "root", "password", "db");
 
         assertFalse(Files.exists(dbPath));
-        var spec = org.mockito.ArgumentCaptor.forClass(ContainerSpec.class);
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
         verify(lifecycleManager).create(spec.capture());
         Bind bind = spec.getValue().binds().getFirst();
         assertEquals(dbPath.toString(), bind.getPath());
@@ -353,7 +404,7 @@ class RdsContainerManagerTest {
         manager.start(runtimeId, "db1", null,
                 DatabaseEngine.MYSQL, "mysql:8.0", "root", "password", "db");
 
-        var spec = org.mockito.ArgumentCaptor.forClass(ContainerSpec.class);
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
         verify(lifecycleManager).create(spec.capture());
         assertEquals(dbPath.toString(), spec.getValue().binds().getFirst().getPath());
         assertEquals("floci-aws-rds-db1", spec.getValue().name());
@@ -382,7 +433,7 @@ class RdsContainerManagerTest {
         manager.start("arn:aws:rds:us-west-2:222222222222:db:db1", "db1", null,
                 DatabaseEngine.MYSQL, "mysql:8.0", "root", "password", "db");
 
-        var spec = org.mockito.ArgumentCaptor.forClass(ContainerSpec.class);
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
         verify(lifecycleManager).create(spec.capture());
         assertEquals(
                 Map.of("io.floci", "aws",
@@ -412,7 +463,7 @@ class RdsContainerManagerTest {
 
         manager.start("db1", "vol1", DatabaseEngine.MYSQL, "mysql:8.0", "root", "password", "db");
 
-        var spec = org.mockito.ArgumentCaptor.forClass(ContainerSpec.class);
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
         verify(lifecycleManager).create(spec.capture());
         assertEquals(
                 Map.of("io.floci", "aws",
@@ -1092,7 +1143,7 @@ class RdsContainerManagerTest {
 
         manager.start("db1", "volume-a", DatabaseEngine.MYSQL, "mysql:8.0", "root", "password", "db");
 
-        var spec = org.mockito.ArgumentCaptor.forClass(ContainerSpec.class);
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
         verify(lifecycleManager).removeIfExistsStrict("floci-rds-volume-a");
         verify(lifecycleManager).create(spec.capture());
         assertEquals("floci-aws-rds-volume-a", spec.getValue().name());
@@ -1123,7 +1174,7 @@ class RdsContainerManagerTest {
         manager.start(null, "db1", "db1", "floci-rds-db1",
                 DatabaseEngine.MYSQL, "mysql:8.0", "root", "password", "db");
 
-        var spec = org.mockito.ArgumentCaptor.forClass(ContainerSpec.class);
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
         verify(lifecycleManager).create(spec.capture());
         assertEquals("floci-aws-rds-db1", spec.getValue().name(),
                 "the container is renamed to the current prefix");
@@ -1158,7 +1209,7 @@ class RdsContainerManagerTest {
                 null, "db1", null, DatabaseEngine.MYSQL,
                 "mysql:8.0", "root", "password", "db");
 
-        var spec = org.mockito.ArgumentCaptor.forClass(ContainerSpec.class);
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
         verify(lifecycleManager).removeIfExistsStrict("floci-rds-db1");
         verify(lifecycleManager).create(spec.capture());
         assertEquals("floci-aws-rds-db1", spec.getValue().name());
@@ -1224,6 +1275,7 @@ class RdsContainerManagerTest {
         assertTrue(manager.pauseIfIdle(runtimeId));
         verify(pause).exec();
 
+        assertThrows(RdsBackendGate.ResumingException.class, () -> manager.enter("db1", 3306, false));
         manager.enter("db1", 3306).close();
         verify(unpause).exec();
 

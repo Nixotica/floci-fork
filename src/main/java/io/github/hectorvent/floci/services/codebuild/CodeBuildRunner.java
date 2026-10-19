@@ -5,14 +5,15 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.codebuild.BuildspecParser.ParsedArtifacts;
@@ -41,6 +42,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.PathMatcher;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -51,6 +53,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -71,6 +74,7 @@ public class CodeBuildRunner implements ContainerTeardown {
     private final EmulatorConfig config;
     private final ContainerDetector containerDetector;
     private final RegionResolver regionResolver;
+    private final ContainerReachableEndpoint containerEndpoint;
 
     private final ConcurrentHashMap<String, String> runningContainers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicBoolean> stopFlags = new ConcurrentHashMap<>();
@@ -85,7 +89,8 @@ public class CodeBuildRunner implements ContainerTeardown {
                            SecretsManagerService secretsManagerService,
                            EmulatorConfig config,
                            ContainerDetector containerDetector,
-                           RegionResolver regionResolver) {
+                           RegionResolver regionResolver,
+                           ContainerReachableEndpoint containerEndpoint) {
         this.dockerClient = dockerClient;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -96,6 +101,7 @@ public class CodeBuildRunner implements ContainerTeardown {
         this.config = config;
         this.containerDetector = containerDetector;
         this.regionResolver = regionResolver;
+        this.containerEndpoint = containerEndpoint;
     }
 
     /**
@@ -483,12 +489,12 @@ public class CodeBuildRunner implements ContainerTeardown {
         return result;
     }
 
-    private String resolveEndpointUrl() {
+    String resolveEndpointUrl() {
         if (containerDetector.isRunningInContainer()) {
             String suffix = config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
-            return "http://" + suffix + ":" + config.port();
+            return "http://" + suffix + ":" + containerEndpoint.port();
         } else {
-            return "http://host.docker.internal:" + config.port();
+            return "http://host.docker.internal:" + containerEndpoint.port();
         }
     }
 
@@ -498,7 +504,7 @@ public class CodeBuildRunner implements ContainerTeardown {
         try {
             if (!Files.exists(sourceDir)) return;
             boolean hasFiles;
-            try (var ls = Files.list(sourceDir)) {
+            try (Stream<Path> ls = Files.list(sourceDir)) {
                 hasFiles = ls.findAny().isPresent();
             }
             if (!hasFiles) return;
@@ -560,7 +566,7 @@ public class CodeBuildRunner implements ContainerTeardown {
 
     private void createTarFromDir(Path dir, ByteArrayOutputStream out) throws IOException {
         try (TarArchiveOutputStream tar = newTarStream(out);
-             var stream = Files.walk(dir)) {
+             Stream<Path> stream = Files.walk(dir)) {
             for (Path path : (Iterable<Path>) stream::iterator) {
                 if (path.equals(dir)) continue;
                 String entryName = dir.relativize(path).toString();
@@ -573,7 +579,7 @@ public class CodeBuildRunner implements ContainerTeardown {
                     entry.setSize(Files.size(path));
                     entry.setMode(0644);
                     tar.putArchiveEntry(entry);
-                    try (var fis = Files.newInputStream(path)) {
+                    try (InputStream fis = Files.newInputStream(path)) {
                         fis.transferTo(tar);
                     }
                     tar.closeArchiveEntry();
@@ -730,7 +736,7 @@ public class CodeBuildRunner implements ContainerTeardown {
         }
         for (String pattern : patterns) {
             if ("**/*".equals(pattern) || "**".equals(pattern)) {
-                try (var stream = Files.walk(baseDir)) {
+                try (Stream<Path> stream = Files.walk(baseDir)) {
                     stream.filter(Files::isRegularFile).forEach(result::add);
                 }
             } else if (!pattern.contains("*") && !pattern.contains("?")
@@ -743,8 +749,8 @@ public class CodeBuildRunner implements ContainerTeardown {
                     LOG.warnv("Artifact file not found: {0}", direct);
                 }
             } else {
-                var matcher = baseDir.getFileSystem().getPathMatcher("glob:" + pattern);
-                try (var stream = Files.walk(baseDir)) {
+                PathMatcher matcher = baseDir.getFileSystem().getPathMatcher("glob:" + pattern);
+                try (Stream<Path> stream = Files.walk(baseDir)) {
                     stream.filter(Files::isRegularFile)
                             .filter(p -> matcher.matches(baseDir.relativize(p)))
                             .forEach(result::add);

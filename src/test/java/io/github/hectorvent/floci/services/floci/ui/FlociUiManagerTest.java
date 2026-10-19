@@ -1,28 +1,29 @@
 package io.github.hectorvent.floci.services.floci.ui;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.sun.net.httpserver.HttpServer;
-import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.services.iam.model.SessionCreds;
-import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
-import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
-import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
-import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerPresence;
-import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
-import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
-import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
-import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
-import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
-import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
-import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
-import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import com.github.dockerjava.api.exception.DockerClientException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
+import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerPresence;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
+import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.services.iam.model.SessionCreds;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -36,8 +37,8 @@ import java.util.concurrent.TimeUnit;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -514,7 +515,7 @@ class FlociUiManagerTest {
         when(lifecycleManager.findByName("floci-ui")).thenReturn(Optional.of(existing));
         when(lifecycleManager.containerEnv("abc123")).thenReturn(Optional.empty());
         EndpointInfo endpoint = new EndpointInfo("localhost", 4500);
-        when(lifecycleManager.adopt("abc123", List.of(4500)))
+        when(lifecycleManager.adopt("abc123", List.of(4500), Optional.empty()))
                 .thenReturn(new ContainerLifecycleManager.ContainerInfo("abc123", Map.of(4500, endpoint)));
         // Running when it is first adopted, gone by the time status() checks on it.
         when(lifecycleManager.presenceOf("abc123"))
@@ -534,7 +535,7 @@ class FlociUiManagerTest {
 
         manager.ensureStartedAsync();
         await().atMost(2, TimeUnit.SECONDS)
-                .untilAsserted(() -> verify(lifecycleManager, times(1)).adopt("abc123", List.of(4500)));
+                .untilAsserted(() -> verify(lifecycleManager, times(1)).adopt("abc123", List.of(4500), Optional.empty()));
 
         // The sidecar is gone (ABSENT) and unreachable (nothing listens on localhost:4500), so
         // status() must trigger a second async restart. That restart no longer re-adopts the dead
@@ -1032,13 +1033,15 @@ class FlociUiManagerTest {
 
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         when(containerBuilder.resolveImage(image)).thenReturn(image);
+        when(containerBuilder.resolveDockerNetwork(any())).thenAnswer(inv -> inv.<Optional<String>>getArgument(0).map(n -> "resolved:" + n));
+        when(ui.dockerNetwork()).thenReturn(Optional.of("ui-net"));
 
         Container existing = mock(Container.class);
         when(existing.getId()).thenReturn("ui-container");
         when(lifecycleManager.findByName("floci-ui")).thenReturn(Optional.of(existing));
         when(lifecycleManager.containerEnv("ui-container"))
                 .thenReturn(Optional.of(List.of("AWS_ENDPOINT_URL=http://custom:4566")));
-        when(lifecycleManager.adopt("ui-container", List.of(4500))).thenReturn(
+        when(lifecycleManager.adopt("ui-container", List.of(4500), Optional.of("resolved:ui-net"))).thenReturn(
                 new ContainerInfo("ui-container", Map.of(4500, new EndpointInfo("127.0.0.1", port))));
 
         FlociUiManager manager = newManager(containerBuilder);
@@ -1056,7 +1059,7 @@ class FlociUiManagerTest {
         server.createContext(path, exchange -> {
             exchange.getResponseHeaders().set("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, body.length);
-            try (var output = exchange.getResponseBody()) {
+            try (OutputStream output = exchange.getResponseBody()) {
                 output.write(body);
             }
         });

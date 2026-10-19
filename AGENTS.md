@@ -15,7 +15,7 @@ Floci acts as an open-source alternative to LocalStack Community.
 - Port: 4566
 - Stack:
   - Java 25
-  - Quarkus 3.39.2
+  - Quarkus 3.40.1
   - JUnit 5
   - RestAssured
   - Jackson
@@ -122,8 +122,8 @@ Floci serves every AWS partition, not only the commercial one, so a literal that
 `aws` into a code path is a bug in a GovCloud, China, ISO or EUSC deployment even when it
 prints correctly in `us-east-1`. `make partition-check` (CI: Partition Literals) inventories
 `src/main/java` for `arn:aws:` prefixes, `amazonaws.com` hosts, Route 53 hosted-zone ids,
-hand-rolled `arn:aws[a-z-]*:` regexes and `Arn.of(...)` calls with a blank region against
-`tools/partition/baseline.tsv`, per file. The baseline is empty, so any new one fails.
+hand-rolled `arn:aws[a-z-]*:` regexes, `Arn.of(...)` calls with a blank region and comparisons
+with the literal `"aws"` against `tools/partition/baseline.tsv`, per file. The baseline is empty, so any new one fails.
 A literal in a new file fails, growth in an existing file fails, and a drop fails until you
 run `make partition-baseline` and commit the smaller baseline.
 
@@ -134,6 +134,12 @@ run `make partition-baseline` and commit the smaller baseline.
   `Arn.of(service, "", ...)`, which silently means `aws`: use `RegionResolver.buildGlobalArn`
   for the request's partition, or `Arn.global(partition, ...)` with the resource's own
   (`AwsRegions.partitionFor(region)` for a bucket or a stack's region).
+- Never compare a partition with a literal: `"aws".equals(arn.partition())` is commercial-only
+  logic that fails silently in every other partition. Compare with the partition the resource
+  belongs to, `AwsRegions.partitionFor(region)` for a regional resource or the stored ARN's own
+  partition for a global one, and accept any published partition with `AwsPartitions.find(...)`
+  when only the shape matters. `"aws"` as an account (managed policies) or a command name is not
+  a partition: end that line with `// partition-literal: <reason>`.
 - A service principal is `ServicePrincipals.of("<service>")`, never a literal: it is
   `<service>.amazonaws.com` in every partition, and `ServicePrincipals.canonical` folds the
   legacy per-partition forms a policy may still use before matching.
@@ -303,11 +309,15 @@ When adding functionality:
    value, while strict SDKs (Go, Java) reject the whole response. `javap -c` on the SDK
    model class shows the traits on each `SdkField`
 9. Add `<Svc>ServiceTest` and `<Svc>IntegrationTest`
-10. Document it: `docs/services/<svc>.md`, a `mkdocs.yml` nav entry, a Service Matrix row in
+10. If the service mints ARNs or AWS hosts (`buildArn`, `Arn.of`, `new AwsArnUtils.Arn`, `dnsSuffixFor`, `AwsEndpoints`),
+   add a case to `PartitionCrossServiceSmokeIntegrationTest` and its `COVERED_PACKAGES`, or a row
+   with a reason to `src/test/resources/partition/smoke-exemptions.tsv`;
+   `PartitionSmokeInventoryTest` fails until one of the two exists
+11. Document it: `docs/services/<svc>.md`, a `mkdocs.yml` nav entry, a Service Matrix row in
    `docs/services/index.md`, and a row in the README category table
-11. Register the handler in `tools/docs/services.yaml`, then run `make docs-sync` and
+12. Register the handler in `tools/docs/services.yaml`, then run `make docs-sync` and
     `make docs-check`
-12. Add a `TestFixtures` client factory and a `<Svc>Test` in `compatibility-tests/sdk-test-java`
+13. Add a `TestFixtures` client factory and a `<Svc>Test` in `compatibility-tests/sdk-test-java`
 
 ---
 
@@ -423,21 +433,19 @@ Floci-side rules:
   (`case Node(var left, var right) ->`), where naming the component types is pure
   noise.
 - **Import the classes you use. Do not write fully-qualified names inline.**
-  `new ArrayList<>()`, never `new java.util.ArrayList<>()`. The only reason to
-  qualify inline is a genuine name collision inside one file: import the type used
-  more often, qualify the other, and leave a short comment naming the clash.
-  Real examples in this repo are `apigateway` versus `apigatewayv2` model types,
-  CDI `jakarta.enterprise.inject.Instance` versus the EC2 model `Instance`,
-  `jakarta.inject.Provider` versus `jakarta.ws.rs.ext.Provider`, and a service's
-  own `Record` model versus `java.lang.Record`.
+  `new ArrayList<>()`, never `new java.util.ArrayList<>()`. Qualify inline only for
+  a genuine name clash inside one file: import the type used more often, qualify the
+  other, and leave a short comment naming the clash. Checkstyle (`NoFqcn`) enforces
+  this except in the files listed in `tools/checkstyle/suppressions.xml`.
 
 ### Imports
 
 - No wildcard imports in `src/main`. Static wildcards stay fine in tests, where
   `Assertions.*`, `Mockito.*` and `Matchers.*` are the established idiom.
-- Import order: non-`java`/`javax` imports alphabetically, then `java.*` and
-  `javax.*` last. This is the IntelliJ default layout and what most of the tree
-  already uses.
+- Import order: non-`java`/`javax` imports, then `javax.*`, then `java.*`, then
+  static imports. Alphabetize each group. Separate the non-JDK, JDK, and static
+  sections with a blank line; no blank line is needed between `javax` and `java`.
+  This follows IntelliJ's default layout and is enforced by Checkstyle.
 
 ### Conventions the codebase already follows
 

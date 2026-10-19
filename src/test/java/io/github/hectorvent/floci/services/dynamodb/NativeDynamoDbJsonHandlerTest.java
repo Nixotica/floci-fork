@@ -631,14 +631,14 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     private AwsException expectValidationException(String action, JsonNode request) {
-        var ex = assertThrows(AwsException.class, () -> handler.handle(action, request, "eu-west-1"));
+        AwsException ex = assertThrows(AwsException.class, () -> handler.handle(action, request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         return ex;
     }
 
     @Test
     void createTableRejectsProvisionedThroughputWithPayPerRequest() {
-        var ex = expectValidationException("CreateTable", json("""
+        AwsException ex = expectValidationException("CreateTable", json("""
                 {
                     "TableName": "PprTable",
                     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -653,7 +653,7 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void createTableRejectsGsiIncludeProjectionWithoutNonKeyAttributes() {
-        var ex = expectValidationException("CreateTable", json("""
+        AwsException ex = expectValidationException("CreateTable", json("""
                 {
                     "TableName": "GsiIncTable",
                     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -675,7 +675,7 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void createTableRejectsLsiIncludeProjectionWithoutNonKeyAttributes() {
-        var ex = expectValidationException("CreateTable", json("""
+        AwsException ex = expectValidationException("CreateTable", json("""
                 {
                     "TableName": "LsiIncTable",
                     "KeySchema": [
@@ -704,7 +704,7 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void createTableRejectsKeysOnlyProjectionCarryingNonKeyAttributes() {
-        var ex = expectValidationException("CreateTable", json("""
+        AwsException ex = expectValidationException("CreateTable", json("""
                 {
                     "TableName": "KeysOnlyTable",
                     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -727,7 +727,7 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateTableRejectsGsiIncludeProjectionWithoutNonKeyAttributes() {
         createUsersTable("eu-west-1");
-        var ex = expectValidationException("UpdateTable", json("""
+        AwsException ex = expectValidationException("UpdateTable", json("""
                 {
                     "TableName": "Users",
                     "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
@@ -746,7 +746,7 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateTableRejectsAllProjectionCarryingNonKeyAttributes() {
         createUsersTable("eu-west-1");
-        var ex = expectValidationException("UpdateTable", json("""
+        AwsException ex = expectValidationException("UpdateTable", json("""
                 {
                     "TableName": "Users",
                     "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
@@ -905,7 +905,7 @@ class NativeDynamoDbJsonHandlerTest {
     // Checked against real DynamoDB: the projection is validated before the table lookup.
     @Test
     void updateTableValidatesGsiProjectionBeforeTableLookup() {
-        var ex = expectValidationException("UpdateTable", json("""
+        AwsException ex = expectValidationException("UpdateTable", json("""
                 {
                     "TableName": "NoSuchTable",
                     "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
@@ -923,7 +923,7 @@ class NativeDynamoDbJsonHandlerTest {
     // The empty-list, null, and index-position cases below were checked against real DynamoDB.
     @Test
     void createTableRejectsEmptyGsiNonKeyAttributesWithItsPosition() {
-        var ex = expectValidationException("CreateTable", json("""
+        AwsException ex = expectValidationException("CreateTable", json("""
                 {
                     "TableName": "EmptyGsiNonKey",
                     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -953,7 +953,7 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void createTableRejectsEmptyLsiNonKeyAttributes() {
-        var ex = expectValidationException("CreateTable", json("""
+        AwsException ex = expectValidationException("CreateTable", json("""
                 {
                     "TableName": "EmptyLsiNonKey",
                     "KeySchema": [
@@ -984,7 +984,7 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateTableRejectsEmptyGsiNonKeyAttributesBeforeProjectionTypeCheck() {
         createUsersTable("eu-west-1");
-        var ex = expectValidationException("UpdateTable", json("""
+        AwsException ex = expectValidationException("UpdateTable", json("""
                 {
                     "TableName": "Users",
                     "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
@@ -1019,13 +1019,13 @@ class NativeDynamoDbJsonHandlerTest {
                 }
                 """), "eu-west-1");
         assertEquals(200, response.getStatus());
-        var gsi = service.describeTable("NullNonKey", "eu-west-1").findGsi("gsi1").orElseThrow();
+        GlobalSecondaryIndex gsi = service.describeTable("NullNonKey", "eu-west-1").findGsi("gsi1").orElseThrow();
         assertEquals("KEYS_ONLY", gsi.getProjectionType());
     }
 
     @Test
     void createTableRejectsStreamViewTypeWithStreamEnabledFalse() {
-        var ex = expectValidationException("CreateTable", json("""
+        AwsException ex = expectValidationException("CreateTable", json("""
                 {
                     "TableName": "StreamFalseTable",
                     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -1040,17 +1040,17 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void scanRejectsTotalSegmentsAboveTheMaximum() {
-        var ex = expectValidationException("Scan", json("""
+        AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Segment": 0, "TotalSegments": 1000001}
                 """));
-        assertEquals("1 validation error detected: Value '1000001' at 'totalSegments' failed to "
+        assertEquals("1 validation error detected: Value at 'TotalSegments' failed to "
                 + "satisfy constraint: Member must have value less than or equal to 1000000", ex.getMessage());
     }
 
     @Test
     void updateItemRejectsExpressionAttributeNamesWithNoExpression() {
         createUsersTable("eu-west-1");
-        var ex = expectValidationException("UpdateItem", json("""
+        AwsException ex = expectValidationException("UpdateItem", json("""
                 {
                     "TableName": "Users",
                     "Key": {"userId": {"S": "u1"}},
@@ -1063,39 +1063,267 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void scanRejectsANegativeSegment() {
-        var ex = expectValidationException("Scan", json("""
+        AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Segment": -1, "TotalSegments": 4}
                 """));
-        assertEquals("1 validation error detected: Value '-1' at 'segment' failed to satisfy constraint: "
+        assertEquals("1 validation error detected: Value at 'Segment' failed to satisfy constraint: "
                 + "Member must have value greater than or equal to 0", ex.getMessage());
     }
 
     @Test
     void scanRejectsTotalSegmentsBelowOne() {
-        var ex = expectValidationException("Scan", json("""
+        AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Segment": 0, "TotalSegments": 0}
                 """));
-        assertEquals("1 validation error detected: Value '0' at 'totalSegments' failed to satisfy constraint: "
+        assertEquals("1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: "
                 + "Member must have value greater than or equal to 1", ex.getMessage());
     }
 
     @Test
-    void scanReportsTotalSegmentsBeforeSegmentWhenBothAreOutOfRange() {
-        var ex = expectValidationException("Scan", json("""
+    void scanReportsSegmentBeforeTotalSegmentsWhenBothAreOutOfRange() {
+        AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Segment": -1, "TotalSegments": 0}
                 """));
         assertEquals("2 validation errors detected: "
-                + "Value '0' at 'totalSegments' failed to satisfy constraint: "
+                + "Value at 'Segment' failed to satisfy constraint: "
+                + "Member must have value greater than or equal to 0; "
+                + "Value at 'TotalSegments' failed to satisfy constraint: "
+                + "Member must have value greater than or equal to 1", ex.getMessage());
+    }
+
+    @Test
+    void scanReportsLimitAndSegmentTogetherBeforeTheTableLookup() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Missing", "Limit": 0, "Segment": -1, "TotalSegments": 2}
+                """));
+        assertEquals("2 validation errors detected: "
+                + "Value at 'Limit' failed to satisfy constraint: "
                 + "Member must have value greater than or equal to 1; "
-                + "Value '-1' at 'segment' failed to satisfy constraint: "
+                + "Value at 'Segment' failed to satisfy constraint: "
                 + "Member must have value greater than or equal to 0", ex.getMessage());
+    }
+
+    @Test
+    void scanRejectsASegmentNotBelowTotalSegments() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Segment": 5, "TotalSegments": 5}
+                """));
+        assertEquals("The Segment parameter is zero-based and must be less than parameter TotalSegments",
+                ex.getMessage());
+    }
+
+    @Test
+    void scanPrefixesTheMissingProjectionForSpecificAttributes() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "SPECIFIC_ATTRIBUTES"}
+                """));
+        assertEquals("1 validation error detected: Must specify the AttributesToGet or ProjectionExpression "
+                + "when choosing to get SPECIFIC_ATTRIBUTES", ex.getMessage());
+    }
+
+    @Test
+    void scanPrefixesTheSelectConflicts() {
+        createUsersTable("eu-west-1");
+
+        AwsException count = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "COUNT", "ProjectionExpression": "userId"}
+                """));
+        assertEquals("1 validation error detected: Cannot specify the ProjectionExpression "
+                + "when choosing to get only the Count", count.getMessage());
+
+        AwsException allProjected = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "ALL_PROJECTED_ATTRIBUTES"}
+                """));
+        assertEquals("1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only "
+                + "when Querying using an IndexName", allProjected.getMessage());
+    }
+
+    @Test
+    void queryPrefixesTheSelectConflicts() {
+        createUsersTable("eu-west-1");
+
+        AwsException allAttributes = expectValidationException("Query", json("""
+                {"TableName": "Users", "KeyConditionExpression": "userId = :u",
+                 "ExpressionAttributeValues": {":u": {"S": "a"}},
+                 "Select": "ALL_ATTRIBUTES", "ProjectionExpression": "userId"}
+                """));
+        assertEquals("1 validation error detected: Cannot specify the ProjectionExpression "
+                + "when choosing to get ALL_ATTRIBUTES", allAttributes.getMessage());
+
+        AwsException allProjected = expectValidationException("Query", json("""
+                {"TableName": "Users", "KeyConditionExpression": "userId = :u",
+                 "ExpressionAttributeValues": {":u": {"S": "a"}},
+                 "Select": "ALL_PROJECTED_ATTRIBUTES"}
+                """));
+        assertEquals("1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only "
+                + "when Querying using an IndexName", allProjected.getMessage());
+    }
+
+    @Test
+    void scanNamesTheSelectWhenRejectingAttributesToGet() {
+        createUsersTable("eu-west-1");
+
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "COUNT", "AttributesToGet": ["userId"]}
+                """));
+        assertEquals("1 validation error detected: Cannot specify the AttributesToGet "
+                + "when choosing to get only the Count", ex.getMessage());
+    }
+
+    @Test
+    void queryReportsTheAttributesToGetConflictBeforeTheMissingIndex() {
+        createUsersTable("eu-west-1");
+
+        AwsException ex = expectValidationException("Query", json("""
+                {"TableName": "Users",
+                 "KeyConditions": {"userId": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}},
+                 "Select": "ALL_PROJECTED_ATTRIBUTES", "AttributesToGet": ["userId"]}
+                """));
+        assertEquals("1 validation error detected: Cannot specify the AttributesToGet "
+                + "when choosing to get ALL_PROJECTED_ATTRIBUTES", ex.getMessage());
+    }
+
+    @Test
+    void queryListsEveryMixedParameter() {
+        AwsException ex = expectValidationException("Query", json("""
+                {"TableName": "Users", "KeyConditionExpression": "userId = :u",
+                 "ExpressionAttributeValues": {":u": {"S": "a"}},
+                 "KeyConditions": {"userId": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}},
+                 "FilterExpression": "attribute_exists(x)", "ProjectionExpression": "userId",
+                 "AttributesToGet": ["userId"], "ConditionalOperator": "AND",
+                 "QueryFilter": {"x": {"ComparisonOperator": "NOT_NULL"}}}
+                """));
+        assertEquals("Can not use both expression and non-expression parameters in the same request: "
+                + "Non-expression parameters: {AttributesToGet, QueryFilter, ConditionalOperator, KeyConditions} "
+                + "Expression parameters: {ProjectionExpression, FilterExpression, KeyConditionExpression}",
+                ex.getMessage());
+    }
+
+    @Test
+    void queryAllowsAFilterExpressionWithKeyConditions() throws Exception {
+        createUsersTable("eu-west-1");
+
+        Response response = handler.handle("Query", json("""
+                {"TableName": "Users",
+                 "KeyConditions": {"userId": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}},
+                 "FilterExpression": "attribute_exists(x)"}
+                """), "eu-west-1");
+        assertEquals(200, response.getStatus());
+    }
+
+    @Test
+    void scanListsEveryMixedParameter() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "FilterExpression": "attribute_exists(x)",
+                 "ProjectionExpression": "userId", "AttributesToGet": ["userId"],
+                 "ConditionalOperator": "AND", "ScanFilter": {"x": {"ComparisonOperator": "NOT_NULL"}}}
+                """));
+        assertEquals("Can not use both expression and non-expression parameters in the same request: "
+                + "Non-expression parameters: {AttributesToGet, ScanFilter, ConditionalOperator} "
+                + "Expression parameters: {ProjectionExpression, FilterExpression}", ex.getMessage());
+    }
+
+    @Test
+    void scanReportsTheLimitBeforeMixedParameters() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Limit": 0, "FilterExpression": "attribute_exists(x)",
+                 "ScanFilter": {"x": {"ComparisonOperator": "NOT_NULL"}}}
+                """));
+        assertEquals("1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+                + "Member must have value greater than or equal to 1", ex.getMessage());
+    }
+
+    @Test
+    void scanRejectsAnUnknownReturnConsumedCapacityBeforeTheTableLookup() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Missing", "ReturnConsumedCapacity": "BOGUS", "Select": "BOGUS"}
+                """));
+        assertEquals("1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' "
+                + "failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+                ex.getMessage());
+    }
+
+    @Test
+    void nullReturnConsumedCapacityIsTreatedAsAbsent() throws Exception {
+        createUsersTable("eu-west-1");
+        String key = "{\"userId\": {\"S\": \"a\"}}";
+        String select = "\"SELECT * FROM \\\"Users\\\" WHERE userId = 'a'\"";
+        Map<String, String> requests = Map.ofEntries(
+                Map.entry("PutItem", "{\"TableName\": \"Users\", \"Item\": " + key),
+                Map.entry("GetItem", "{\"TableName\": \"Users\", \"Key\": " + key),
+                Map.entry("DeleteItem", "{\"TableName\": \"Users\", \"Key\": " + key),
+                Map.entry("UpdateItem", "{\"TableName\": \"Users\", \"Key\": " + key),
+                Map.entry("Query", "{\"TableName\": \"Users\", \"KeyConditionExpression\": \"userId = :u\", "
+                        + "\"ExpressionAttributeValues\": {\":u\": {\"S\": \"a\"}}"),
+                Map.entry("Scan", "{\"TableName\": \"Users\""),
+                Map.entry("BatchGetItem", "{\"RequestItems\": {\"Users\": {\"Keys\": [" + key + "]}}"),
+                Map.entry("BatchWriteItem", "{\"RequestItems\": {\"Users\": [{\"PutRequest\": {\"Item\": " + key + "}}]}"),
+                Map.entry("TransactGetItems", "{\"TransactItems\": [{\"Get\": {\"TableName\": \"Users\", \"Key\": " + key + "}}]"),
+                Map.entry("TransactWriteItems", "{\"TransactItems\": [{\"Put\": {\"TableName\": \"Users\", \"Item\": " + key + "}}]"),
+                Map.entry("ExecuteStatement", "{\"Statement\": " + select),
+                Map.entry("BatchExecuteStatement", "{\"Statements\": [{\"Statement\": " + select + "}]"),
+                Map.entry("ExecuteTransaction", "{\"TransactStatements\": [{\"Statement\": " + select + "}]"));
+
+        for (Map.Entry<String, String> request : requests.entrySet()) {
+            Response response = handler.handle(request.getKey(),
+                    json(request.getValue() + ", \"ReturnConsumedCapacity\": null}"), "eu-west-1");
+            assertEquals(200, response.getStatus(), request.getKey());
+            JsonNode body = mapper.convertValue(response.getEntity(), JsonNode.class);
+            assertFalse(body.has("ConsumedCapacity"), request.getKey());
+        }
+    }
+
+    @Test
+    void scanReportsTheLimitBeforeReturnConsumedCapacity() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Limit": 0, "ReturnConsumedCapacity": "BOGUS"}
+                """));
+        assertEquals("1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+                + "Member must have value greater than or equal to 1", ex.getMessage());
+    }
+
+    @Test
+    void scanReportsTheMissingProjectionBeforeTheSegmentPairing() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "SPECIFIC_ATTRIBUTES", "Segment": 5, "TotalSegments": 5}
+                """));
+        assertEquals("1 validation error detected: Must specify the AttributesToGet or ProjectionExpression "
+                + "when choosing to get SPECIFIC_ATTRIBUTES", ex.getMessage());
+    }
+
+    @Test
+    void scanReportsAnUnknownSelectBeforeAMissingTotalSegments() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "BOGUS", "Segment": 1}
+                """));
+        assertEquals("1 validation error detected: Value 'BOGUS' at 'select' failed to satisfy constraint: "
+                + "Member must satisfy enum value set: "
+                + "[SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]", ex.getMessage());
+    }
+
+    @Test
+    void scanReportsACountProjectionBeforeTheSegmentPairingOnAMissingTable() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Missing", "Select": "COUNT", "ProjectionExpression": "a", "Segment": 1}
+                """));
+        assertEquals("1 validation error detected: "
+                + "Cannot specify the ProjectionExpression when choosing to get only the Count", ex.getMessage());
+    }
+
+    @Test
+    void scanReportsAllProjectedWithoutAnIndexBeforeAMissingSegment() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Missing", "Select": "ALL_PROJECTED_ATTRIBUTES", "TotalSegments": 2}
+                """));
+        assertEquals("1 validation error detected: "
+                + "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName", ex.getMessage());
     }
 
     @Test
     void scanAcceptsSegmentsAtTheBounds() throws Exception {
         createUsersTable("eu-west-1");
 
-        var response = handler.handle("Scan", json("""
+        Response response = handler.handle("Scan", json("""
                 {"TableName": "Users", "Segment": 0, "TotalSegments": 1000000}
                 """), "eu-west-1");
         assertEquals(200, response.getStatus());
@@ -1113,16 +1341,16 @@ class NativeDynamoDbJsonHandlerTest {
         int totalSegments = 10;
         int totalDeleted = 0;
         for (int segment = 0; segment < totalSegments; segment++) {
-            var scanReq = mapper.createObjectNode();
+            ObjectNode scanReq = mapper.createObjectNode();
             scanReq.put("TableName", "Users");
             scanReq.put("Segment", segment);
             scanReq.put("TotalSegments", totalSegments);
 
-            var response = handler.handle("Scan", scanReq, region);
+            Response response = handler.handle("Scan", scanReq, region);
             assertEquals(200, response.getStatus());
-            var entity = mapper.readTree(response.getEntity().toString());
-            var items = entity.get("Items");
-            for (var item : items) {
+            JsonNode entity = mapper.readTree(response.getEntity().toString());
+            JsonNode items = entity.get("Items");
+            for (JsonNode item : items) {
                 totalDeleted++;
                 String key = item.get("userId").get("S").asText();
                 service.deleteItem("Users", item("userId", key), region);
@@ -1131,10 +1359,10 @@ class NativeDynamoDbJsonHandlerTest {
 
         assertEquals(10, totalDeleted, "All 10 items should have been returned and deleted across segments");
 
-        var checkResponse = handler.handle("Scan", json("""
+        Response checkResponse = handler.handle("Scan", json("""
                 {"TableName": "Users", "Select": "COUNT"}
                 """), region);
-        var checkEntity = mapper.readTree(checkResponse.getEntity().toString());
+        JsonNode checkEntity = mapper.readTree(checkResponse.getEntity().toString());
         assertEquals(0, checkEntity.get("Count").asInt(), "No remaining items should be in the table");
     }
 
@@ -1152,7 +1380,7 @@ class NativeDynamoDbJsonHandlerTest {
         for (int segment = 0; segment < totalSegments; segment++) {
             JsonNode exclusiveStartKey = null;
             do {
-                var scanReq = mapper.createObjectNode();
+                ObjectNode scanReq = mapper.createObjectNode();
                 scanReq.put("TableName", "Users");
                 scanReq.put("Segment", segment);
                 scanReq.put("TotalSegments", totalSegments);
@@ -1161,12 +1389,12 @@ class NativeDynamoDbJsonHandlerTest {
                     scanReq.set("ExclusiveStartKey", exclusiveStartKey);
                 }
 
-                var response = handler.handle("Scan", scanReq, region);
+                Response response = handler.handle("Scan", scanReq, region);
                 assertEquals(200, response.getStatus());
-                var entity = mapper.readTree(response.getEntity().toString());
-                var items = entity.get("Items");
+                JsonNode entity = mapper.readTree(response.getEntity().toString());
+                JsonNode items = entity.get("Items");
                 assertTrue(items.size() <= 2, "Page size must not exceed limit");
-                for (var item : items) {
+                for (JsonNode item : items) {
                     String key = item.get("userId").get("S").asText();
                     assertTrue(collectedKeys.add(key), "Item must not be returned multiple times: " + key);
                 }
@@ -1190,15 +1418,15 @@ class NativeDynamoDbJsonHandlerTest {
         int sumCount = 0;
         int sumScannedCount = 0;
         for (int segment = 0; segment < totalSegments; segment++) {
-            var scanReq = mapper.createObjectNode();
+            ObjectNode scanReq = mapper.createObjectNode();
             scanReq.put("TableName", "Users");
             scanReq.put("Segment", segment);
             scanReq.put("TotalSegments", totalSegments);
             scanReq.put("Select", "COUNT");
 
-            var response = handler.handle("Scan", scanReq, region);
+            Response response = handler.handle("Scan", scanReq, region);
             assertEquals(200, response.getStatus());
-            var entity = mapper.readTree(response.getEntity().toString());
+            JsonNode entity = mapper.readTree(response.getEntity().toString());
             sumCount += entity.get("Count").asInt();
             sumScannedCount += entity.get("ScannedCount").asInt();
         }
@@ -1230,16 +1458,16 @@ class NativeDynamoDbJsonHandlerTest {
         userSegments.put("bob", new HashSet<>());
 
         for (int segment = 0; segment < totalSegments; segment++) {
-            var scanReq = mapper.createObjectNode();
+            ObjectNode scanReq = mapper.createObjectNode();
             scanReq.put("TableName", "Orders");
             scanReq.put("Segment", segment);
             scanReq.put("TotalSegments", totalSegments);
 
-            var response = handler.handle("Scan", scanReq, region);
+            Response response = handler.handle("Scan", scanReq, region);
             assertEquals(200, response.getStatus());
-            var entity = mapper.readTree(response.getEntity().toString());
-            var items = entity.get("Items");
-            for (var item : items) {
+            JsonNode entity = mapper.readTree(response.getEntity().toString());
+            JsonNode items = entity.get("Items");
+            for (JsonNode item : items) {
                 String userId = item.get("userId").get("S").asText();
                 userSegments.get(userId).add(segment);
             }
@@ -1250,7 +1478,7 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     private ObjectNode updateUserRequest() {
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("TableName", "Users");
         request.set("Key", mapper.createObjectNode().set("userId", attributeValue("S", "u1")));
         return request;
@@ -1259,26 +1487,26 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateItemUpdatedNewReturnsOnlyTheChangedMapFragment() throws Exception {
         createUsersTable("eu-west-1");
-        var parent = mapper.createObjectNode();
+        ObjectNode parent = mapper.createObjectNode();
         parent.set("keep", attributeValue("S", "k"));
         parent.set("child", attributeValue("S", "old"));
-        var putRequest = mapper.createObjectNode();
+        ObjectNode putRequest = mapper.createObjectNode();
         putRequest.put("TableName", "Users");
-        var item = mapper.createObjectNode();
+        ObjectNode item = mapper.createObjectNode();
         item.set("userId", attributeValue("S", "u1"));
         item.set("parent", mapper.createObjectNode().set("M", parent));
         putRequest.set("Item", item);
         handler.handle("PutItem", putRequest, "eu-west-1");
 
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("UpdateExpression", "SET parent.child = :v");
         request.set("ExpressionAttributeValues",
                 mapper.createObjectNode().set(":v", attributeValue("S", "new")));
         request.put("ReturnValues", "UPDATED_NEW");
 
-        var response = handler.handle("UpdateItem", request, "eu-west-1");
-        var body = mapper.convertValue(response.getEntity(), JsonNode.class);
-        var attributes = body.get("Attributes");
+        Response response = handler.handle("UpdateItem", request, "eu-west-1");
+        JsonNode body = mapper.convertValue(response.getEntity(), JsonNode.class);
+        JsonNode attributes = body.get("Attributes");
         assertEquals("new", attributes.get("parent").get("M").get("child").get("S").asText());
         assertFalse(attributes.get("parent").get("M").has("keep"));
     }
@@ -1286,31 +1514,31 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateItemRemoveWithUpdatedNewOmitsAttributes() throws Exception {
         createUsersTable("eu-west-1");
-        var putRequest = mapper.createObjectNode();
+        ObjectNode putRequest = mapper.createObjectNode();
         putRequest.put("TableName", "Users");
-        var item = mapper.createObjectNode();
+        ObjectNode item = mapper.createObjectNode();
         item.set("userId", attributeValue("S", "u1"));
         item.set("y", attributeValue("S", "drop"));
         putRequest.set("Item", item);
         handler.handle("PutItem", putRequest, "eu-west-1");
 
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("UpdateExpression", "REMOVE y");
         request.put("ReturnValues", "UPDATED_NEW");
 
-        var response = handler.handle("UpdateItem", request, "eu-west-1");
-        var body = mapper.convertValue(response.getEntity(), JsonNode.class);
+        Response response = handler.handle("UpdateItem", request, "eu-west-1");
+        JsonNode body = mapper.convertValue(response.getEntity(), JsonNode.class);
         assertFalse(body.has("Attributes"));
     }
 
     @Test
     void updateItemReportsOnlyTheFirstInvalidEnum() {
         createUsersTable("eu-west-1");
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("ReturnValues", "INVALID");
         request.put("ReturnConsumedCapacity", "INVALID");
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("UpdateItem", request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         assertTrue(ex.getMessage().startsWith("1 validation error detected:"), ex.getMessage());
@@ -1327,12 +1555,12 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void updateItemRejectsAnUpdateExpressionOver4096BytesBeforeTheTableLookup() {
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("TableName", "Missing");
         request.put("UpdateExpression", "SET " + nameOfBytes(4088) + " = :v");
         request.set("ExpressionAttributeValues", singleValue(":v"));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("UpdateItem", request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         assertEquals("1 validation error detected: Invalid UpdateExpression: "
@@ -1340,13 +1568,37 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
+    void updateItemRejectsAnUnclosedCallAtTheEndBeforeTheTableLookup() {
+        Map<String, String> nearByExpression = Map.of(
+                "SET a = list_append(l, :v", ":v",
+                "SET a = if_not_exists(a,:v", ":v",
+                "SET a = list_append(l, :v ", ":v ",
+                "SET a = list_append(if_not_exists(l, :v, :v)", ")",
+                "SET a = if_not_exists(a.b[1], c[0]", "]",
+                "SET a = list_append(", "(",
+                "SET a = :v, b = if_not_exists(b, :v", ":v",
+                "SET a = :v + (:v", ":v");
+        nearByExpression.forEach((expression, near) -> {
+            ObjectNode request = updateUserRequest();
+            request.put("TableName", "Missing");
+            request.put("UpdateExpression", expression);
+
+            AwsException ex = assertThrows(AwsException.class,
+                    () -> handler.handle("UpdateItem", request, "eu-west-1"), expression);
+            assertEquals("ValidationException", ex.getErrorCode());
+            assertEquals("1 validation error detected: Invalid UpdateExpression: Syntax error; "
+                    + "token: \"<EOF>\", near: \"" + near + "\"", ex.getMessage());
+        });
+    }
+
+    @Test
     void updateItemAcceptsAnUpdateExpressionOfExactly4096Bytes() throws Exception {
         createUsersTable("eu-west-1");
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("UpdateExpression", "SET " + nameOfBytes(4087) + " = :v");
         request.set("ExpressionAttributeValues", singleValue(":v"));
 
-        var response = handler.handle("UpdateItem", request, "eu-west-1");
+        Response response = handler.handle("UpdateItem", request, "eu-west-1");
         assertEquals(200, response.getStatus());
     }
 
@@ -1370,12 +1622,12 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void putItemRejectsAConditionExpressionOver4096Bytes() {
         createUsersTable("eu-west-1");
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("TableName", "Users");
         request.set("Item", item("userId", "u1"));
         request.put("ConditionExpression", "attribute_not_exists(" + nameOfBytes(4075) + ")");
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("PutItem", request, "eu-west-1"));
         assertEquals("1 validation error detected: Invalid ConditionExpression: "
                 + "Expression size has exceeded the maximum allowed size;", ex.getMessage());
@@ -1384,15 +1636,15 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void queryRejectsAFilterExpressionOver4096Bytes() {
         createUsersTable("eu-west-1");
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("TableName", "Users");
         request.put("KeyConditionExpression", "userId = :pk");
         request.put("FilterExpression", nameOfBytes(4092) + " = :v");
-        var values = singleValue(":pk");
+        ObjectNode values = singleValue(":pk");
         values.set(":v", attributeValue("S", "x"));
         request.set("ExpressionAttributeValues", values);
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("Query", request, "eu-west-1"));
         assertEquals("Invalid FilterExpression: Expression size has exceeded the maximum allowed size;",
                 ex.getMessage());
@@ -1401,12 +1653,12 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void scanRejectsAFilterExpressionOver4096BytesAndReportsTheSize() {
         createUsersTable("eu-west-1");
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("TableName", "Users");
         request.put("FilterExpression", nameOfBytes(4092) + " = :v");
         request.set("ExpressionAttributeValues", singleValue(":v"));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("Scan", request, "eu-west-1"));
         assertEquals("Invalid FilterExpression: Expression size has exceeded the maximum allowed size; "
                 + "expression size: 4097", ex.getMessage());
@@ -1415,10 +1667,10 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void getItemRejectsAProjectionExpressionOver4096Bytes() {
         createUsersTable("eu-west-1");
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("ProjectionExpression", nameOfBytes(4097));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("GetItem", request, "eu-west-1"));
         assertEquals("Invalid ProjectionExpression: Expression size has exceeded the maximum allowed size;",
                 ex.getMessage());
@@ -1426,8 +1678,8 @@ class NativeDynamoDbJsonHandlerTest {
 
     private ObjectNode nestedMaps(int levels) {
         ObjectNode value = attributeValue("S", "leaf");
-        for (var i = 0; i < levels; i++) {
-            var map = mapper.createObjectNode();
+        for (int i = 0; i < levels; i++) {
+            ObjectNode map = mapper.createObjectNode();
             map.set("n", value);
             value = mapper.createObjectNode();
             value.set("M", map);
@@ -1436,9 +1688,9 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     private ObjectNode putRequest(JsonNode value) {
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("TableName", "Users");
-        var item = item("userId", "u1");
+        ObjectNode item = item("userId", "u1");
         item.set("data", value);
         request.set("Item", item);
         return request;
@@ -1451,16 +1703,16 @@ class NativeDynamoDbJsonHandlerTest {
     void putItemAcceptsAnAttributeWithALeafAtLevel32() throws Exception {
         createUsersTable("eu-west-1");
 
-        var response = handler.handle("PutItem", putRequest(nestedMaps(31)), "eu-west-1");
+        Response response = handler.handle("PutItem", putRequest(nestedMaps(31)), "eu-west-1");
         assertEquals(200, response.getStatus());
     }
 
     @Test
     void putItemRejectsAnAttributeWithALeafAtLevel33BeforeTheTableLookup() {
-        var request = putRequest(nestedMaps(32));
+        ObjectNode request = putRequest(nestedMaps(32));
         request.put("TableName", "Missing");
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("PutItem", request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         assertEquals(NESTING_MESSAGE, ex.getMessage());
@@ -1469,15 +1721,15 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateItemRejectsAnExpressionAttributeValueWithALeafAtLevel33() {
         createUsersTable("eu-west-1");
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("UpdateExpression", "SET touched = :t");
         request.put("ConditionExpression", "#d = :deep");
         request.set("ExpressionAttributeNames", mapper.createObjectNode().put("#d", "data"));
-        var values = singleValue(":t");
+        ObjectNode values = singleValue(":t");
         values.set(":deep", nestedMaps(32));
         request.set("ExpressionAttributeValues", values);
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("UpdateItem", request, "eu-west-1"));
         assertEquals(NESTING_MESSAGE, ex.getMessage());
     }
@@ -1502,22 +1754,22 @@ class NativeDynamoDbJsonHandlerTest {
 
     private ObjectNode transactWrite(String action, ObjectNode op) {
         op.put("TableName", "Users");
-        var member = mapper.createObjectNode();
+        ObjectNode member = mapper.createObjectNode();
         member.set(action, op);
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.set("TransactItems", mapper.createArrayNode().add(member));
         return request;
     }
 
     @Test
     void transactWriteItemsRejectsAConditionExpressionOver4096BytesWithTheSizeBeforeTheTableLookup() {
-        var put = mapper.createObjectNode();
+        ObjectNode put = mapper.createObjectNode();
         put.set("Item", item("userId", "u1"));
         put.put("ConditionExpression", "attribute_not_exists(" + nameOfBytes(4075) + ")");
-        var request = transactWrite("Put", put);
+        ObjectNode request = transactWrite("Put", put);
         ((ObjectNode) request.get("TransactItems").get(0).get("Put")).put("TableName", "Missing");
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("TransactWriteItems", request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         assertEquals("Invalid ConditionExpression: Expression size has exceeded the maximum allowed size; "
@@ -1540,26 +1792,40 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void transactWriteItemsRejectsAnUpdateExpressionOver4096Bytes() {
         createUsersTable("eu-west-1");
-        var update = mapper.createObjectNode();
+        ObjectNode update = mapper.createObjectNode();
         update.set("Key", item("userId", "u1"));
         update.put("UpdateExpression", "SET " + nameOfBytes(4088) + " = :v");
         update.set("ExpressionAttributeValues", singleValue(":v"));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("TransactWriteItems", transactWrite("Update", update), "eu-west-1"));
         assertEquals("Invalid UpdateExpression: Expression size has exceeded the maximum allowed size;",
                 ex.getMessage());
     }
 
     @Test
+    void transactWriteItemsRejectsAnUnclosedCallAtTheEnd() {
+        createUsersTable("eu-west-1");
+        ObjectNode update = mapper.createObjectNode();
+        update.set("Key", item("userId", "u1"));
+        update.put("UpdateExpression", "SET a = list_append(l, :v");
+        update.set("ExpressionAttributeValues", singleValue(":v"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWrite("Update", update), "eu-west-1"));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \":v\"", ex.getMessage());
+    }
+
+    @Test
     void transactWriteItemsRejectsAPutItemWithALeafAtLevel33() {
         createUsersTable("eu-west-1");
-        var put = mapper.createObjectNode();
-        var item = item("userId", "u1");
+        ObjectNode put = mapper.createObjectNode();
+        ObjectNode item = item("userId", "u1");
         item.set("data", nestedMaps(32));
         put.set("Item", item);
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("TransactWriteItems", transactWrite("Put", put), "eu-west-1"));
         assertEquals("Nesting Levels have exceeded supported limits: "
                 + "Attributes in the item have nested levels beyond supported limit", ex.getMessage());
@@ -1567,14 +1833,14 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void batchWriteItemRejectsAPutItemWithALeafAtLevel33BeforeTheTableLookup() {
-        var item = item("userId", "u1");
+        ObjectNode item = item("userId", "u1");
         item.set("data", nestedMaps(32));
-        var putRequest = mapper.createObjectNode();
+        ObjectNode putRequest = mapper.createObjectNode();
         putRequest.set("PutRequest", mapper.createObjectNode().set("Item", item));
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.set("RequestItems", mapper.createObjectNode().set("Missing", mapper.createArrayNode().add(putRequest)));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("BatchWriteItem", request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         assertEquals("Nesting Levels have exceeded supported limits: "
@@ -1582,51 +1848,79 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
-    void transactWriteItemsCancelsOnAnUpdateValueWithALeafAtLevel33() throws Exception {
+    void transactWriteItemsRejectsAnUpdateValueWithALeafAtLevel33() {
         createUsersTable("eu-west-1");
-        var update = mapper.createObjectNode();
+        ObjectNode update = mapper.createObjectNode();
         update.set("Key", item("userId", "u1"));
         update.put("UpdateExpression", "SET deep = :deep");
         update.set("ExpressionAttributeValues", mapper.createObjectNode().set(":deep", nestedMaps(32)));
 
-        var response = handler.handle("TransactWriteItems", transactWrite("Update", update), "eu-west-1");
-        assertEquals(400, response.getStatus());
-        var body = mapper.convertValue(response.getEntity(), JsonNode.class);
-        assertEquals("TransactionCanceledException", body.get("__type").asText());
-        var reason = body.get("CancellationReasons").get(0);
-        assertEquals("ValidationError", reason.get("Code").asText());
-        assertEquals("Nesting Levels have exceeded supported limits", reason.get("Message").asText());
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWrite("Update", update), "eu-west-1"));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Nesting Levels have exceeded supported limits: "
+                + "Attributes in the item have nested levels beyond supported limit", ex.getMessage());
         assertNull(service.getItem("Users", item("userId", "u1"), "eu-west-1"));
     }
 
     @Test
-    void transactWriteItemsDoesNotCheckTheDepthOfAConditionCheckValue() throws Exception {
-        createUsersTable("eu-west-1");
-        var putRequest = mapper.createObjectNode();
-        putRequest.put("TableName", "Users");
-        putRequest.set("Item", item("userId", "u1", "marker", "x"));
-        handler.handle("PutItem", putRequest, "eu-west-1");
-        var check = mapper.createObjectNode();
+    void transactWriteItemsRejectsAConditionCheckValueWithALeafAtLevel33BeforeTheTableLookup() {
+        ObjectNode check = mapper.createObjectNode();
         check.set("Key", item("userId", "u1"));
         check.put("ConditionExpression", "#d = :deep");
         check.set("ExpressionAttributeNames", mapper.createObjectNode().put("#d", "data"));
         check.set("ExpressionAttributeValues", mapper.createObjectNode().set(":deep", nestedMaps(32)));
 
-        var response = handler.handle("TransactWriteItems", transactWrite("ConditionCheck", check), "eu-west-1");
-        assertEquals(400, response.getStatus());
-        var reason = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons").get(0);
-        assertEquals("ConditionalCheckFailed", reason.get("Code").asText());
-        assertEquals("The conditional request failed", reason.get("Message").asText());
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWrite("ConditionCheck", check), "eu-west-1"));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Nesting Levels have exceeded supported limits: "
+                + "Attributes in the item have nested levels beyond supported limit", ex.getMessage());
+    }
+
+    @Test
+    void transactWriteItemsRejectsAnUnusedValueWithALeafAtLevel33() {
+        createUsersTable("eu-west-1");
+        ObjectNode delete = mapper.createObjectNode();
+        delete.set("Key", item("userId", "u1"));
+        delete.set("ExpressionAttributeValues", mapper.createObjectNode().set(":deep", nestedMaps(32)));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWrite("Delete", delete), "eu-west-1"));
+        assertEquals("Nesting Levels have exceeded supported limits: "
+                + "Attributes in the item have nested levels beyond supported limit", ex.getMessage());
+    }
+
+    @Test
+    void transactWriteItemsChecksDepthBeforeTheExpressionsOfLaterMembersOnly() {
+        createUsersTable("eu-west-1");
+        ObjectNode deep = transactMember("ConditionCheck", "Users", "Key", item("userId", "u1"));
+        ObjectNode deepCheck = (ObjectNode) deep.get("ConditionCheck");
+        deepCheck.put("ConditionExpression", "#d = :deep");
+        deepCheck.set("ExpressionAttributeNames", mapper.createObjectNode().put("#d", "data"));
+        deepCheck.set("ExpressionAttributeValues", mapper.createObjectNode().set(":deep", nestedMaps(32)));
+        ObjectNode broken = transactMember("ConditionCheck", "Users", "Key", item("userId", "u2"));
+        ((ObjectNode) broken.get("ConditionCheck")).put("ConditionExpression", "attribute_exists(");
+
+        AwsException deepEx = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWriteOf(deep, broken), "eu-west-1"));
+        assertEquals("Nesting Levels have exceeded supported limits: "
+                + "Attributes in the item have nested levels beyond supported limit", deepEx.getMessage());
+
+        AwsException syntaxEx = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWriteOf(broken, deep), "eu-west-1"));
+        assertTrue(syntaxEx.getMessage().startsWith("Invalid ConditionExpression: Syntax error"),
+                syntaxEx.getMessage());
     }
 
     @Test
     void updateItemRejectsAnOutOfRangeAddOperandBeforeTheTableLookup() {
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("TableName", "Missing");
         request.put("UpdateExpression", "ADD n :a");
         request.set("ExpressionAttributeValues", mapper.createObjectNode().set(":a", attributeValue("N", "1e126")));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("UpdateItem", request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         assertEquals("1 validation error detected: Number overflow. "
@@ -1636,11 +1930,11 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateItemRejectsATooSmallExpressionAttributeValue() {
         createUsersTable("eu-west-1");
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("UpdateExpression", "SET x = :a");
         request.set("ExpressionAttributeValues", mapper.createObjectNode().set(":a", attributeValue("N", "1e-131")));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("UpdateItem", request, "eu-west-1"));
         assertEquals("1 validation error detected: Number underflow. "
                 + "Attempting to store a number with magnitude smaller than supported range", ex.getMessage());
@@ -1649,13 +1943,13 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateItemRejectsAnAttributeUpdatesValueWithTooManyDigits() {
         createUsersTable("eu-west-1");
-        var request = updateUserRequest();
-        var update = mapper.createObjectNode();
+        ObjectNode request = updateUserRequest();
+        ObjectNode update = mapper.createObjectNode();
         update.put("Action", "ADD");
         update.set("Value", attributeValue("N", "123456789012345678901234567890123456789"));
         request.set("AttributeUpdates", mapper.createObjectNode().set("n", update));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("UpdateItem", request, "eu-west-1"));
         assertEquals("1 validation error detected: Attempting to store more than 38 significant digits in a Number",
                 ex.getMessage());
@@ -1664,15 +1958,15 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void queryRejectsAnOutOfRangeExpressionAttributeValueWithoutTheEnvelope() {
         createUsersTable("eu-west-1");
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("TableName", "Users");
         request.put("KeyConditionExpression", "userId = :p");
         request.put("FilterExpression", "n = :a");
-        var values = singleValue(":p");
+        ObjectNode values = singleValue(":p");
         values.set(":a", attributeValue("N", "1e126"));
         request.set("ExpressionAttributeValues", values);
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("Query", request, "eu-west-1"));
         assertEquals("Number overflow. Attempting to store a number with magnitude larger than supported range",
                 ex.getMessage());
@@ -1680,14 +1974,14 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void updateItemRejectsAnAttributeUpdatesValueWithALeafAtLevel33BeforeTheTableLookup() {
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("TableName", "Missing");
-        var update = mapper.createObjectNode();
+        ObjectNode update = mapper.createObjectNode();
         update.put("Action", "PUT");
         update.set("Value", nestedMaps(32));
         request.set("AttributeUpdates", mapper.createObjectNode().set("data", update));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("UpdateItem", request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         assertEquals(NESTING_MESSAGE, ex.getMessage());
@@ -1696,11 +1990,11 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void putItemRejectsAnExpectedValueWithALeafAtLevel33() {
         createUsersTable("eu-west-1");
-        var request = putRequest(attributeValue("S", "x"));
+        ObjectNode request = putRequest(attributeValue("S", "x"));
         request.set("Expected", mapper.createObjectNode().set("data",
                 mapper.createObjectNode().set("Value", nestedMaps(32))));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("PutItem", request, "eu-west-1"));
         assertEquals(NESTING_MESSAGE, ex.getMessage());
     }
@@ -1708,18 +2002,18 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void queryRejectsAQueryFilterValueWithALeafAtLevel33WithoutTheEnvelope() {
         createUsersTable("eu-west-1");
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("TableName", "Users");
-        var keyCondition = mapper.createObjectNode();
+        ObjectNode keyCondition = mapper.createObjectNode();
         keyCondition.put("ComparisonOperator", "EQ");
         keyCondition.set("AttributeValueList", mapper.createArrayNode().add(attributeValue("S", "u1")));
         request.set("KeyConditions", mapper.createObjectNode().set("userId", keyCondition));
-        var filter = mapper.createObjectNode();
+        ObjectNode filter = mapper.createObjectNode();
         filter.put("ComparisonOperator", "EQ");
         filter.set("AttributeValueList", mapper.createArrayNode().add(nestedMaps(32)));
         request.set("QueryFilter", mapper.createObjectNode().set("data", filter));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("Query", request, "eu-west-1"));
         assertEquals("Nesting Levels have exceeded supported limits: "
                 + "Attributes in the item have nested levels beyond supported limit", ex.getMessage());
@@ -1727,41 +2021,41 @@ class NativeDynamoDbJsonHandlerTest {
 
     private void seedUpdateReturnValuesItem() throws Exception {
         createUsersTable("eu-west-1");
-        var parent = mapper.createObjectNode();
+        ObjectNode parent = mapper.createObjectNode();
         parent.set("keep", attributeValue("S", "k"));
         parent.set("child", attributeValue("S", "old"));
-        var list = mapper.createArrayNode()
+        ArrayNode list = mapper.createArrayNode()
                 .add(attributeValue("S", "l0")).add(attributeValue("S", "l1")).add(attributeValue("S", "l2"));
-        var item = item("userId", "u1");
+        ObjectNode item = item("userId", "u1");
         item.set("parent", mapper.createObjectNode().set("M", parent));
         item.set("l", mapper.createObjectNode().set("L", list));
-        var putRequest = mapper.createObjectNode();
+        ObjectNode putRequest = mapper.createObjectNode();
         putRequest.put("TableName", "Users");
         putRequest.set("Item", item);
         handler.handle("PutItem", putRequest, "eu-west-1");
     }
 
     private JsonNode updateAttributes(String expression, ObjectNode values, String returnValues) throws Exception {
-        var request = updateUserRequest();
+        ObjectNode request = updateUserRequest();
         request.put("UpdateExpression", expression);
         if (values != null) {
             request.set("ExpressionAttributeValues", values);
         }
         request.put("ReturnValues", returnValues);
-        var body = mapper.convertValue(handler.handle("UpdateItem", request, "eu-west-1").getEntity(), JsonNode.class);
+        JsonNode body = mapper.convertValue(handler.handle("UpdateItem", request, "eu-west-1").getEntity(), JsonNode.class);
         return body.get("Attributes");
     }
 
     @Test
     void updateItemUpdatedNewReturnsTheWholeMapWhenTheMapItselfIsSet() throws Exception {
         seedUpdateReturnValuesItem();
-        var parent = mapper.createObjectNode();
+        ObjectNode parent = mapper.createObjectNode();
         parent.set("keep", attributeValue("S", "k"));
         parent.set("child", attributeValue("S", "new"));
-        var values = mapper.createObjectNode();
+        ObjectNode values = mapper.createObjectNode();
         values.set(":v", mapper.createObjectNode().set("M", parent));
 
-        var attributes = updateAttributes("SET parent = :v", values, "UPDATED_NEW");
+        JsonNode attributes = updateAttributes("SET parent = :v", values, "UPDATED_NEW");
         assertEquals("k", attributes.get("parent").get("M").get("keep").get("S").asText());
         assertEquals("new", attributes.get("parent").get("M").get("child").get("S").asText());
     }
@@ -1769,10 +2063,10 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateItemUpdatedOldReturnsTheWholeOldMapWhenTheMapItselfIsSet() throws Exception {
         seedUpdateReturnValuesItem();
-        var values = mapper.createObjectNode();
+        ObjectNode values = mapper.createObjectNode();
         values.set(":v", mapper.createObjectNode().set("M", mapper.createObjectNode().set("child", attributeValue("S", "new"))));
 
-        var attributes = updateAttributes("SET parent = :v", values, "UPDATED_OLD");
+        JsonNode attributes = updateAttributes("SET parent = :v", values, "UPDATED_OLD");
         assertEquals("k", attributes.get("parent").get("M").get("keep").get("S").asText());
         assertEquals("old", attributes.get("parent").get("M").get("child").get("S").asText());
     }
@@ -1781,7 +2075,7 @@ class NativeDynamoDbJsonHandlerTest {
     void updateItemUpdatedNewReturnsANestedSetEvenWhenTheValueDidNotChange() throws Exception {
         seedUpdateReturnValuesItem();
 
-        var attributes = updateAttributes("SET parent.child = :v", singleValueOf("old"), "UPDATED_NEW");
+        JsonNode attributes = updateAttributes("SET parent.child = :v", singleValueOf("old"), "UPDATED_NEW");
         assertEquals("old", attributes.get("parent").get("M").get("child").get("S").asText());
         assertFalse(attributes.get("parent").get("M").has("keep"));
     }
@@ -1789,12 +2083,12 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void updateItemUpdatedNewPacksTouchedListElementsInIndexOrder() throws Exception {
         seedUpdateReturnValuesItem();
-        var values = mapper.createObjectNode();
+        ObjectNode values = mapper.createObjectNode();
         values.set(":v", attributeValue("S", "L2"));
         values.set(":w", attributeValue("S", "L0"));
 
-        var attributes = updateAttributes("SET l[2] = :v, l[0] = :w", values, "UPDATED_NEW");
-        var packed = attributes.get("l").get("L");
+        JsonNode attributes = updateAttributes("SET l[2] = :v, l[0] = :w", values, "UPDATED_NEW");
+        JsonNode packed = attributes.get("l").get("L");
         assertEquals(2, packed.size());
         assertEquals("L0", packed.get(0).get("S").asText());
         assertEquals("L2", packed.get(1).get("S").asText());
@@ -1804,7 +2098,7 @@ class NativeDynamoDbJsonHandlerTest {
     void updateItemUpdatedNewAfterRemovingAListElementReturnsTheElementNowAtThatIndex() throws Exception {
         seedUpdateReturnValuesItem();
 
-        var attributes = updateAttributes("REMOVE l[1]", null, "UPDATED_NEW");
+        JsonNode attributes = updateAttributes("REMOVE l[1]", null, "UPDATED_NEW");
         assertEquals(1, attributes.get("l").get("L").size());
         assertEquals("l2", attributes.get("l").get("L").get(0).get("S").asText());
     }
@@ -1822,14 +2116,14 @@ class NativeDynamoDbJsonHandlerTest {
 
     @Test
     void transactGetItemsRejectsAnOversizedProjectionBeforeTheTableLookup() {
-        var get = mapper.createObjectNode();
+        ObjectNode get = mapper.createObjectNode();
         get.put("TableName", "Missing");
         get.set("Key", item("userId", "u1"));
         get.put("ProjectionExpression", nameOfBytes(4097));
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.set("TransactItems", mapper.createArrayNode().add(mapper.createObjectNode().set("Get", get)));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("TransactGetItems", request, "eu-west-1"));
         assertEquals("Invalid ProjectionExpression: Expression size has exceeded the maximum allowed size;",
                 ex.getMessage());
@@ -1899,11 +2193,11 @@ class NativeDynamoDbJsonHandlerTest {
     @Test
     void executeStatementRejectsATooDeepParameter() {
         createUsersTable("eu-west-1");
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("Statement", "UPDATE \"Users\" SET deep=? WHERE userId=?");
         request.set("Parameters", mapper.createArrayNode().add(nestedMaps(33)).add(attributeValue("S", "u1")));
 
-        var ex = assertThrows(AwsException.class,
+        AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("ExecuteStatement", request, "eu-west-1"));
         assertEquals("ValidationException", ex.getErrorCode());
         assertEquals("Nesting Levels have exceeded supported limits: "
@@ -1922,23 +2216,108 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
+    void executeTransactionEvaluatesAConditionOnAParameterWithALeafAtLevel33() throws Exception {
+        createUsersTable("eu-west-1");
+        service.putItem("Users", item("userId", "u1"), "eu-west-1");
+        ObjectNode statement = mapper.createObjectNode();
+        statement.put("Statement", "UPDATE \"Users\" SET touched=? WHERE userId=? AND deep=?");
+        statement.set("Parameters", mapper.createArrayNode()
+                .add(attributeValue("S", "y")).add(attributeValue("S", "u1")).add(nestedMaps(32)));
+        ObjectNode request = mapper.createObjectNode();
+        request.set("TransactStatements", mapper.createArrayNode().add(statement));
+
+        Response response = handler.handle("ExecuteTransaction", request, "eu-west-1");
+        assertEquals(400, response.getStatus());
+        JsonNode reason = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons").get(0);
+        assertEquals("ConditionalCheckFailed", reason.get("Code").asText());
+    }
+
+    @Test
+    void executeTransactionReportsAFailedConditionBeforeATooDeepSetParameter() throws Exception {
+        createUsersTable("eu-west-1");
+        service.putItem("Users", item("userId", "u1"), "eu-west-1");
+        ObjectNode statement = mapper.createObjectNode();
+        statement.put("Statement", "UPDATE \"Users\" SET deep=? WHERE userId=? AND marker=?");
+        statement.set("Parameters", mapper.createArrayNode()
+                .add(nestedMaps(32)).add(attributeValue("S", "u1")).add(attributeValue("S", "x")));
+        ObjectNode request = mapper.createObjectNode();
+        request.set("TransactStatements", mapper.createArrayNode().add(statement));
+
+        Response response = handler.handle("ExecuteTransaction", request, "eu-west-1");
+        JsonNode reasons = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons");
+        assertEquals(1, reasons.size());
+        assertEquals("ConditionalCheckFailed", reasons.get(0).get("Code").asText());
+    }
+
+    @Test
+    void executeTransactionReportsATooDeepResultAlongsideAnotherStatementsFailedCondition() throws Exception {
+        createUsersTable("eu-west-1");
+        service.putItem("Users", item("userId", "u1"), "eu-west-1");
+        service.putItem("Users", item("userId", "u2"), "eu-west-1");
+        ObjectNode failing = mapper.createObjectNode();
+        failing.put("Statement", "UPDATE \"Users\" SET touched=? WHERE userId=? AND marker=?");
+        failing.set("Parameters", mapper.createArrayNode()
+                .add(attributeValue("S", "y")).add(attributeValue("S", "u1")).add(attributeValue("S", "x")));
+        ObjectNode deep = mapper.createObjectNode();
+        deep.put("Statement", "UPDATE \"Users\" SET deep=? WHERE userId=?");
+        deep.set("Parameters", mapper.createArrayNode().add(nestedMaps(32)).add(attributeValue("S", "u2")));
+        ObjectNode request = mapper.createObjectNode();
+        request.set("TransactStatements", mapper.createArrayNode().add(failing).add(deep));
+
+        Response response = handler.handle("ExecuteTransaction", request, "eu-west-1");
+        JsonNode reasons = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons");
+        assertEquals("ConditionalCheckFailed", reasons.get(0).get("Code").asText());
+        assertEquals("ValidationError", reasons.get(1).get("Code").asText());
+        assertEquals("Nesting Levels have exceeded supported limits", reasons.get(1).get("Message").asText());
+    }
+
+    @Test
+    void transactWriteItemsReportsATooDeepResultOnEveryMember() throws Exception {
+        createUsersTable("eu-west-1");
+        service.putItem("Users", item("userId", "u1"), "eu-west-1");
+        for (String userId : List.of("u2", "u3")) {
+            ObjectNode stored = item("userId", userId);
+            stored.set("a", nestedMaps(30));
+            service.putItem("Users", stored, "eu-west-1");
+        }
+        ObjectNode failing = transactMember("ConditionCheck", "Users", "Key", item("userId", "u1"));
+        ((ObjectNode) failing.get("ConditionCheck")).put("ConditionExpression", "attribute_exists(marker)");
+
+        Response response = handler.handle("TransactWriteItems",
+                transactWriteOf(deepeningUpdate("u2"), failing, deepeningUpdate("u3")), "eu-west-1");
+        assertEquals(400, response.getStatus());
+        JsonNode reasons = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons");
+        assertEquals("ValidationError", reasons.get(0).get("Code").asText());
+        assertEquals("ConditionalCheckFailed", reasons.get(1).get("Code").asText());
+        assertEquals("ValidationError", reasons.get(2).get("Code").asText());
+    }
+
+    private ObjectNode deepeningUpdate(String userId) {
+        ObjectNode member = transactMember("Update", "Users", "Key", item("userId", userId));
+        ObjectNode update = (ObjectNode) member.get("Update");
+        update.put("UpdateExpression", "SET a" + ".n".repeat(30) + " = :v");
+        update.set("ExpressionAttributeValues", mapper.createObjectNode().set(":v", nestedMaps(2)));
+        return member;
+    }
+
+    @Test
     void executeTransactionCancelsOnAnItemLeftTooDeepWithThatStatementsReason() throws Exception {
         createUsersTable("eu-west-1");
         service.putItem("Users", item("userId", "u1"), "eu-west-1");
-        var fine = mapper.createObjectNode();
+        ObjectNode fine = mapper.createObjectNode();
         fine.put("Statement", "UPDATE \"Users\" SET x=? WHERE userId=?");
         fine.set("Parameters", mapper.createArrayNode().add(attributeValue("S", "x")).add(attributeValue("S", "u1")));
-        var deep = mapper.createObjectNode();
+        ObjectNode deep = mapper.createObjectNode();
         deep.put("Statement", "INSERT INTO \"Users\" VALUE {'userId': ?, 'deep': ?}");
         deep.set("Parameters", mapper.createArrayNode().add(attributeValue("S", "u2")).add(nestedMaps(32)));
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.set("TransactStatements", mapper.createArrayNode().add(fine).add(deep));
 
-        var response = handler.handle("ExecuteTransaction", request, "eu-west-1");
+        Response response = handler.handle("ExecuteTransaction", request, "eu-west-1");
         assertEquals(400, response.getStatus());
-        var body = mapper.convertValue(response.getEntity(), JsonNode.class);
+        JsonNode body = mapper.convertValue(response.getEntity(), JsonNode.class);
         assertEquals("TransactionCanceledException", body.get("__type").asText());
-        var reasons = body.get("CancellationReasons");
+        JsonNode reasons = body.get("CancellationReasons");
         assertEquals("None", reasons.get(0).get("Code").asText());
         assertEquals("ValidationError", reasons.get(1).get("Code").asText());
         assertEquals("Nesting Levels have exceeded supported limits", reasons.get(1).get("Message").asText());

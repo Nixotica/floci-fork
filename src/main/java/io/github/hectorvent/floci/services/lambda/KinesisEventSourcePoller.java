@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
@@ -200,7 +201,7 @@ public class KinesisEventSourcePoller implements Resettable {
 
     private String buildKinesisEvent(List<KinesisRecord> records, EventSourceMapping esm, String shardId) {
         try {
-            var recordsArray = objectMapper.createArrayNode();
+            ArrayNode recordsArray = objectMapper.createArrayNode();
             for (KinesisRecord rec : records) {
                 ObjectNode kinesisNode = objectMapper.createObjectNode();
                 kinesisNode.put("kinesisSchemaVersion", "1.0");
@@ -324,7 +325,19 @@ public class KinesisEventSourcePoller implements Resettable {
         esmStore.saveForAccount(esm.getAccountId(), esm);
     }
 
-    private static String streamNameFromArn(String arn) {
-        return arn.substring(arn.lastIndexOf("/") + 1);
+    /**
+     * The stream name from a stream ARN ({@code .../stream/S}) or a stream-consumer ARN
+     * ({@code .../stream/S/consumer/C:123}): the segment right after {@code stream/}. Only a
+     * {@code /consumer/} suffix is dropped; any other suffix stays part of the name, so a
+     * malformed ARN names no stream rather than a real one.
+     */
+    static String streamNameFromArn(String arn) {
+        int streamIdx = arn.indexOf(":stream/");
+        if (streamIdx < 0) {
+            return arn.substring(arn.lastIndexOf("/") + 1);
+        }
+        String after = arn.substring(streamIdx + ":stream/".length());
+        int consumer = after.indexOf("/consumer/");
+        return consumer >= 0 ? after.substring(0, consumer) : after;
     }
 }

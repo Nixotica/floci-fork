@@ -7,6 +7,8 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.route53.model.AliasTarget;
+import io.github.hectorvent.floci.services.route53.model.HealthCheck;
+import io.github.hectorvent.floci.services.route53.model.HealthCheckConfig;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecordSet;
 import io.github.hectorvent.floci.services.route53.model.VpcAssociation;
@@ -31,10 +33,16 @@ class Route53ServiceTest {
 
     private static final String ACCOUNT = "000000000000";
 
+    private final Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
+
     private Route53Service newService() {
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
         Mockito.when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
-                .thenAnswer(invocation -> AccountAwareStorageBackend.inMemory(ACCOUNT));
+                .thenAnswer(invocation -> {
+                    AccountAwareStorageBackend<Object> store = AccountAwareStorageBackend.inMemory(ACCOUNT);
+                    stores.put(invocation.getArgument(1), store);
+                    return store;
+                });
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
@@ -250,6 +258,66 @@ class Route53ServiceTest {
     }
 
     @Test
+    void aNameWithOrWithoutTheTrailingDotAndABlankSetIdentifierAreTheSameRecord() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "ref-fqdn", null, null).zone().getId();
+        // How an earlier CloudFormation provisioner stored a record: the template's undotted Name and
+        // empty SetIdentifier, as written.
+        ResourceRecordSet legacy = aRecord("www.example.com", 300, "1.2.3.4");
+        legacy.setSetIdentifier("");
+        service.changeResourceRecordSets(zoneId, List.of(change("CREATE", legacy)), null);
+
+        AwsException e = assertThrows(AwsException.class, () -> service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", aRecord("www.example.com.", 300, "5.6.7.8"))), null));
+        assertEquals("InvalidChangeBatch", e.getErrorCode());
+
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("UPSERT", aRecord("www.example.com.", 300, "5.6.7.8"))), null);
+        List<ResourceRecordSet> records = typeARecords(service, zoneId);
+        assertThat(records, hasSize(1));
+        assertEquals("www.example.com.", records.get(0).getName());
+        assertEquals("5.6.7.8", records.get(0).getRecords().get(0).getValue());
+
+        ResourceRecordSet undotted = aRecord("www.example.com", 300, "5.6.7.8");
+        undotted.setSetIdentifier("");
+        service.changeResourceRecordSets(zoneId, List.of(change("DELETE", undotted)), null);
+        assertThat(typeARecords(service, zoneId), empty());
+    }
+
+    @Test
+    void aDeleteRemovesOneRecordWhenAnEarlierVersionLeftItStoredBothWays() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "ref-twins", null, null).zone().getId();
+        // An earlier version compared names literally, so a stack's undotted record and an API caller's
+        // dotted one could both be stored, with the same values.
+        ResourceRecordSet legacy = aRecord("www.example.com", 300, "1.2.3.4");
+        legacy.setSetIdentifier("");
+        @SuppressWarnings("unchecked")
+        AccountAwareStorageBackend<List<ResourceRecordSet>> recordStore =
+                (AccountAwareStorageBackend<List<ResourceRecordSet>>) stores.get("route53-records.json");
+        List<ResourceRecordSet> seeded = new ArrayList<>(recordStore.get(zoneId).orElseThrow());
+        seeded.add(legacy);
+        seeded.add(aRecord("www.example.com.", 300, "1.2.3.4"));
+        recordStore.put(zoneId, seeded);
+
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("DELETE", aRecord("www.example.com.", 300, "1.2.3.4"))), null);
+        List<ResourceRecordSet> records = typeARecords(service, zoneId);
+        assertThat(records, hasSize(1));
+        assertEquals("www.example.com", records.get(0).getName());
+
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("DELETE", aRecord("www.example.com.", 300, "1.2.3.4"))), null);
+        assertThat(typeARecords(service, zoneId), empty());
+    }
+
+    private static List<ResourceRecordSet> typeARecords(Route53Service service, String zoneId) {
+        return service.listResourceRecordSets(zoneId, null, null, 0).stream()
+                .filter(rrs -> "A".equals(rrs.getType()))
+                .toList();
+    }
+
+    @Test
     void deleteThenCreateOfSameNameAndTypeInOneBatchSucceeds() {
         Route53Service service = newService();
         String zoneId = service.createHostedZone("example.com.", "ref-replace", null, null).zone().getId();
@@ -298,5 +366,41 @@ class Route53ServiceTest {
         assertFalse(service.isCoveredByPrivateZone("public.com"));
         assertFalse(service.isCoveredByPrivateZone("othercorp.internal"));
         assertFalse(service.isCoveredByPrivateZone("example.org"));
+    }
+
+    private static HealthCheckConfig httpsCheck(String path) {
+        HealthCheckConfig cfg = new HealthCheckConfig();
+        cfg.setType("HTTPS");
+        cfg.setFullyQualifiedDomainName("example.com");
+        cfg.setPort(443);
+        cfg.setResourcePath(path);
+        cfg.setRequestInterval(30);
+        cfg.setFailureThreshold(3);
+        return cfg;
+    }
+
+    // Catches: an SDK retry of CreateHealthCheck (same caller reference, same settings) refused with
+    // HealthCheckAlreadyExists, which fails a Terraform or OpenTofu apply.
+    @Test
+    void createHealthCheck_retryWithSameReferenceAndSettings_returnsTheExistingHealthCheck() {
+        Route53Service service = newService();
+        HealthCheck first = service.createHealthCheck("tf-ref-1", httpsCheck("/health"), "ResourcePath=/health");
+
+        HealthCheck retried = service.createHealthCheck("tf-ref-1", httpsCheck("/health"), "ResourcePath=/health");
+
+        assertEquals(first.getId(), retried.getId());
+        assertThat(service.listHealthChecks(null, 0), hasSize(1));
+    }
+
+    @Test
+    void createHealthCheck_sameReferenceWithDifferentSettings_isHealthCheckAlreadyExists() {
+        Route53Service service = newService();
+        service.createHealthCheck("tf-ref-2", httpsCheck("/health"), "ResourcePath=/health");
+
+        AwsException e = assertThrows(AwsException.class,
+                () -> service.createHealthCheck("tf-ref-2", httpsCheck("/other"), "ResourcePath=/other"));
+
+        assertEquals("HealthCheckAlreadyExists", e.getErrorCode());
+        assertEquals(409, e.getHttpStatus());
     }
 }

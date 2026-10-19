@@ -10,6 +10,8 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.util.Optional;
+
 /**
  * JSON 1.1 handler for Route 53 Resolver operations.
  * Dispatches {@code X-Amz-Target: Route53Resolver.*} actions to {@link Route53ResolverService}.
@@ -48,6 +50,8 @@ public class Route53ResolverJsonHandler {
                 case "GetResolverEndpoint" -> resolverEndpointResponse(
                         service.getResolverEndpoint(text(request, "ResolverEndpointId")));
                 case "ListResolverEndpoints" -> handleListResolverEndpoints();
+                case "ListResolverEndpointIpAddresses" -> handleListResolverEndpointIpAddresses(
+                        text(request, "ResolverEndpointId"));
                 case "UpdateResolverEndpoint" -> resolverEndpointResponse(
                         service.updateResolverEndpoint(text(request, "ResolverEndpointId"), request));
 
@@ -106,7 +110,7 @@ public class Route53ResolverJsonHandler {
 
     private Response handleGetFirewallDomainList(JsonNode request, String region) {
         String id = text(request, "FirewallDomainListId");
-        var custom = service.getCustomFirewallDomainList(id);
+        Optional<ObjectNode> custom = service.getCustomFirewallDomainList(id);
         if (custom.isPresent()) {
             return firewallDomainListResponse(custom.get());
         }
@@ -139,6 +143,12 @@ public class Route53ResolverJsonHandler {
         for (ObjectNode endpoint : service.listResolverEndpoints()) {
             endpoints.add(endpoint);
         }
+        return Response.ok(result).build();
+    }
+
+    private Response handleListResolverEndpointIpAddresses(String endpointId) {
+        ObjectNode result = objectMapper.createObjectNode();
+        result.putArray("IpAddresses").addAll(service.listResolverEndpointIpAddresses(endpointId));
         return Response.ok(result).build();
     }
 

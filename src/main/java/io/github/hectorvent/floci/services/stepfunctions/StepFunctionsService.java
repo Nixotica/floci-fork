@@ -1,20 +1,22 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
@@ -25,7 +27,6 @@ import io.github.hectorvent.floci.services.stepfunctions.model.RoutingConfigurat
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachineAlias;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachineVersion;
-import io.github.hectorvent.floci.core.common.Resettable;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -41,9 +42,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.IntConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.function.IntConsumer;
 
 @ApplicationScoped
 public class StepFunctionsService implements Resettable, ResourceProvider {
@@ -70,6 +71,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private final AslExecutor aslExecutor;
     private final ObjectMapper objectMapper;
     private final SfnMockLoader mockLoader;
+    private final StepFunctionsEventPublisher eventPublisher;
 
     // Fields that are valid only in JSONPath mode. Validated against real AWS:
     // creating a JSONata state machine with any of these fields returns SCHEMA_VALIDATION_FAILED.
@@ -122,7 +124,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     @Inject
     public StepFunctionsService(StorageFactory storageFactory, RegionResolver regionResolver,
                                 AslExecutor aslExecutor, ObjectMapper objectMapper,
-                                SfnMockLoader mockLoader) {
+                                SfnMockLoader mockLoader, StepFunctionsEventPublisher eventPublisher) {
         this.stateMachineStore = storageFactory.create("stepfunctions", "sfn-state-machines.json",
                 new TypeReference<Map<String, StateMachine>>() {});
         this.executionStore = storageFactory.create("stepfunctions", "sfn-executions.json",
@@ -140,6 +142,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         this.aslExecutor = aslExecutor;
         this.objectMapper = objectMapper;
         this.mockLoader = mockLoader;
+        this.eventPublisher = eventPublisher;
     }
 
     public void clear() {
@@ -720,17 +723,17 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     // ──────────────────────────── Executions ────────────────────────────
 
     public Execution startExecution(String stateMachineArn, String name, String input, String region) {
-        var selection = splitTestCaseSuffix(stateMachineArn);
-        var resolved = resolveStateMachineForExecution(selection.stateMachineArn());
-        var sm = resolved.stateMachine();
-        var mockedTestCase = resolveMockedTestCase(sm, selection);
-        var execName = (name != null && !name.isBlank()) ? name : UUID.randomUUID().toString();
+        TestCaseSelection selection = splitTestCaseSuffix(stateMachineArn);
+        ResolvedStateMachine resolved = resolveStateMachineForExecution(selection.stateMachineArn());
+        StateMachine sm = resolved.stateMachine();
+        MockedTestCase mockedTestCase = resolveMockedTestCase(sm, selection);
+        String execName = (name != null && !name.isBlank()) ? name : UUID.randomUUID().toString();
         boolean express = "EXPRESS".equals(sm.getType());
         // An EXPRESS name is not unique on AWS: every start is its own execution that runs alongside
         // the others, so the ARN (which is also the execution-store key) carries a per-start id after
         // the name, under the express: namespace startSyncExecution already uses. A STANDARD execution
         // keeps the name-derived ARN whose uniqueness AWS enforces.
-        var arn = express
+        String arn = express
                 ? regionResolver.buildArn("states", region,
                         "express:" + sm.getName() + ":" + execName + ":" + UUID.randomUUID())
                 : regionResolver.buildArn("states", region, "execution:" + sm.getName() + ":" + execName);
@@ -766,7 +769,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                     executionStore.put(arn, exec);
                 }
             });
-            var startEvent = new HistoryEvent();
+            HistoryEvent startEvent = new HistoryEvent();
             startEvent.setId(1L);
             startEvent.setPreviousEventId(0L);
             startEvent.setType("ExecutionStarted");
@@ -780,19 +783,26 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         }
 
         LOG.infov("Started execution: {0}", arn);
+        if (!express) {
+            eventPublisher.emitStatusChange(exec);
+        }
 
         // The executor appends to this same history, so the cache entry put above is already the
-        // finished history by the time this runs.
+        // finished history by the time this runs. The worker also lands here after StopExecution
+        // aborted it; that ABORTED event is StopExecution's to emit, so it is not emitted twice.
         aslExecutor.executeAsync(sm, exec, history, mockedTestCase, (updatedExec, updatedHistory) -> {
             executionStore.put(updatedExec.getExecutionArn(), updatedExec);
             LOG.infov("Execution {0} completed with status {1}", updatedExec.getExecutionArn(), updatedExec.getStatus());
+            if (!express && !"ABORTED".equals(updatedExec.getStatus())) {
+                eventPublisher.emitStatusChange(updatedExec);
+            }
         });
 
         return exec;
     }
 
     public Execution startSyncExecution(String stateMachineArn, String name, String input, String region) {
-        var selection = splitTestCaseSuffix(stateMachineArn);
+        TestCaseSelection selection = splitTestCaseSuffix(stateMachineArn);
         if (selection.testCaseName() != null) {
             // Matches Step Functions Local, which rejects a test case suffix here.
             throw new AwsException("UnsupportedOperation",
@@ -801,8 +811,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         }
         // A bare trailing '#' is not stripped on this operation: Step Functions Local looks up
         // the raw ARN and fails with StateMachineDoesNotExist, so Floci does the same.
-        var resolved = resolveStateMachineForExecution(stateMachineArn);
-        var sm = resolved.stateMachine();
+        ResolvedStateMachine resolved = resolveStateMachineForExecution(stateMachineArn);
+        StateMachine sm = resolved.stateMachine();
         if (!"EXPRESS".equals(sm.getType())) {
             throw new AwsException("StateMachineTypeNotSupported",
                     "StartSyncExecution is only supported for EXPRESS state machines", 400);
@@ -817,7 +827,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         String arn = regionResolver.buildArn("states", region,
                 "express:" + sm.getName() + ":" + startDate + ":" + execName);
 
-        var exec = new Execution();
+        Execution exec = new Execution();
         exec.setExecutionArn(arn);
         exec.setStateMachineArn(resolved.baseArn());
         exec.setStateMachineVersionArn(resolved.versionArn());
@@ -826,8 +836,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         exec.setInput(input);
         exec.setStatus("RUNNING");
 
-        var history = new ArrayList<HistoryEvent>();
-        var startEvent = new HistoryEvent();
+        ArrayList<HistoryEvent> history = new ArrayList<>();
+        HistoryEvent startEvent = new HistoryEvent();
         startEvent.setId(1L);
         startEvent.setPreviousEventId(0L);
         startEvent.setType("ExecutionStarted");
@@ -887,11 +897,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
      * no test case and the execution runs unmocked, matching Step Functions Local.
      */
     private static TestCaseSelection splitTestCaseSuffix(String stateMachineArn) {
-        var separator = stateMachineArn != null ? stateMachineArn.indexOf('#') : -1;
+        int separator = stateMachineArn != null ? stateMachineArn.indexOf('#') : -1;
         if (separator < 0) {
             return new TestCaseSelection(stateMachineArn, null);
         }
-        var testCaseName = stateMachineArn.substring(separator + 1);
+        String testCaseName = stateMachineArn.substring(separator + 1);
         return new TestCaseSelection(stateMachineArn.substring(0, separator),
                 testCaseName.isBlank() ? null : testCaseName);
     }
@@ -900,16 +910,16 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         if (selection.testCaseName() == null) {
             return null;
         }
-        var mockedTestCase = mockLoader.requireTestCase(sm.getName(), selection.testCaseName());
+        MockedTestCase mockedTestCase = mockLoader.requireTestCase(sm.getName(), selection.testCaseName());
         warnOnMockedStatesMissingFromDefinition(sm, mockedTestCase);
         return mockedTestCase;
     }
 
     private void warnOnMockedStatesMissingFromDefinition(StateMachine sm, MockedTestCase testCase) {
         try {
-            var stateNames = new HashSet<String>();
+            HashSet<String> stateNames = new HashSet<>();
             collectStateNames(objectMapper.readTree(sm.getDefinition()), stateNames);
-            for (var stateName : testCase.stateResponses().keySet()) {
+            for (String stateName : testCase.stateResponses().keySet()) {
                 if (!stateNames.contains(stateName)) {
                     LOG.warnv("Mock test case {0} references state {1} which does not exist in state machine {2}",
                             testCase.testCaseName(), stateName, sm.getName());
@@ -922,7 +932,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
 
     private static void collectStateNames(JsonNode node, Set<String> names) {
         if (node.isObject()) {
-            var states = node.get("States");
+            JsonNode states = node.get("States");
             if (states != null && states.isObject()) {
                 states.fieldNames().forEachRemaining(names::add);
             }
@@ -961,6 +971,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             return;
         }
         executionStore.put(arn, exec);
+        if (StepFunctionsEventPublisher.isStandard(exec)) {
+            eventPublisher.emitStatusChange(exec);
+        }
     }
 
     /**
@@ -1628,7 +1641,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     private JsonNode defaultLoggingConfiguration() {
-        var configuration = objectMapper.createObjectNode();
+        ObjectNode configuration = objectMapper.createObjectNode();
         configuration.put("level", "OFF");
         configuration.put("includeExecutionData", false);
         configuration.putArray("destinations");
@@ -2146,9 +2159,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         Set<String> topLevelStateNames = new HashSet<>();
         states.fieldNames().forEachRemaining(topLevelStateNames::add);
 
-        var fields = states.fields();
+        Iterator<Map.Entry<String, JsonNode>> fields = states.fields();
         while (fields.hasNext()) {
-            var entry = fields.next();
+            Map.Entry<String, JsonNode> entry = fields.next();
             validateState("/States/" + entry.getKey(), entry.getValue(), topLevelJsonata,
                     topLevelStateNames, errors);
         }

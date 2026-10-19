@@ -1,9 +1,9 @@
 package io.github.hectorvent.floci.core.storage;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -117,7 +117,7 @@ public class StorageFactory {
                 yield wal;
             }
             case "hybrid" -> {
-                var hybrid = new HybridStorage<>(filePath, typeReference, flushInterval);
+                HybridStorage<String, V> hybrid = new HybridStorage<>(filePath, typeReference, flushInterval);
                 hybridBackends.add(hybrid);
                 yield hybrid;
             }
@@ -125,7 +125,7 @@ public class StorageFactory {
                 Path snapshotPath = basePath.resolve(fileName.replace(".json", "-snapshot.json"));
                 Path walFilePath = basePath.resolve(fileName.replace(".json", ".wal"));
                 long compactionInterval = config.storage().wal().compactionIntervalMs();
-                var wal = new WalStorage<>(snapshotPath, walFilePath, typeReference, compactionInterval);
+                WalStorage<String, V> wal = new WalStorage<>(snapshotPath, walFilePath, typeReference, compactionInterval);
                 walBackends.add(wal);
                 yield wal;
             }

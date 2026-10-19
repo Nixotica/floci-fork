@@ -5,6 +5,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
@@ -23,14 +24,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
+import java.time.Instant;
+import java.util.Arrays;
 import java.util.Base64;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -53,6 +55,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @QuarkusTest
 @TestProfile(EksRegistryHostsDockerIntegrationTest.Profile.class)
+// Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
+@Timeout(value = 6, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
     private static final Logger LOG = Logger.getLogger(EksRegistryHostsDockerIntegrationTest.class);
@@ -192,6 +196,7 @@ class EksRegistryHostsDockerIntegrationTest {
 
         // Verify hosts.toml survives container restart
         dockerClient.restartContainerCmd(containerId).exec();
+        Instant restartCompletedAt = Instant.now();
         waitUntilReady(cluster);
         String hostsTomlAfterRestart = null;
         long restartDeadline = System.currentTimeMillis() + 30000;
@@ -209,17 +214,27 @@ class EksRegistryHostsDockerIntegrationTest {
                 "the configured header must survive container restart");
 
         long saDeadline = System.currentTimeMillis() + 30000;
-        boolean saReady = false;
+        boolean ready = false;
         while (System.currentTimeMillis() < saDeadline) {
             ExecResult saResult = execInContainerWithExitCode(containerId,
-                    new String[]{"kubectl", "get", "serviceaccount", "default"});
-            if (saResult.exitCode() == 0) {
-                saReady = true;
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "serviceaccount", "default"});
+            ExecResult nodeReady = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "wait",
+                            "--for=condition=Ready", "nodes", "--all", "--timeout=1s"});
+            ExecResult leases = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "leases", "-n", "kube-node-lease",
+                            "-o", "jsonpath={.items[*].spec.renewTime}"});
+            String renewals = leases.stdout().trim();
+            boolean freshHeartbeat = leases.exitCode() == 0 && !renewals.isEmpty()
+                    && Arrays.stream(renewals.split("\\s+"))
+                            .allMatch(renewal -> Instant.parse(renewal).isAfter(restartCompletedAt));
+            if (saResult.exitCode() == 0 && nodeReady.exitCode() == 0 && freshHeartbeat) {
+                ready = true;
                 break;
             }
             Thread.sleep(1000);
         }
-        assertTrue(saReady, "default serviceaccount must be created within 30 seconds");
+        assertTrue(ready, "serviceaccount and Ready nodes with renewed Leases must be available within 30 seconds");
 
         String podYaml = """
                 apiVersion: v1
@@ -286,13 +301,13 @@ class EksRegistryHostsDockerIntegrationTest {
             gzip.write(tarBytes);
         }
         byte[] layerBytes = gzOut.toByteArray();
-        String diffId = "sha256:" + sha256Hex(tarBytes);
-        String layerDigest = "sha256:" + sha256Hex(layerBytes);
+        String diffId = "sha256:" + Digests.sha256Hex(tarBytes);
+        String layerDigest = "sha256:" + Digests.sha256Hex(layerBytes);
 
         byte[] configBytes = ("{\"architecture\":\"" + arch + "\",\"os\":\"linux\",\"config\":{},"
                 + "\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[\"" + diffId + "\"]}}")
                 .getBytes(StandardCharsets.UTF_8);
-        String configDigest = "sha256:" + sha256Hex(configBytes);
+        String configDigest = "sha256:" + Digests.sha256Hex(configBytes);
 
         uploadBlob(host, repo, layerDigest, layerBytes);
         uploadBlob(host, repo, configDigest, configBytes);
@@ -400,10 +415,6 @@ class EksRegistryHostsDockerIntegrationTest {
                 .body(content)
                 .when().put(location + separator + "digest=" + digest)
                 .then().statusCode(201);
-    }
-
-    private static String sha256Hex(byte[] data) throws Exception {
-        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(data));
     }
 
     private boolean isDockerAvailable() {

@@ -1,12 +1,12 @@
 package io.github.hectorvent.floci.core.common.docker;
 
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.LogContainerCmd;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -28,8 +28,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
@@ -47,8 +47,12 @@ public class ContainerLogStreamer {
     private final DockerClient dockerClient;
     private final CloudWatchLogsService cloudWatchLogsService;
 
+    // Log-follow attaches hold their connection open for the whole container lifetime, so
+    // this class is the primary consumer of the streaming pool: sharing the control-plane
+    // pool is what starved short create/start/stop calls during an LZA Logging fan-out
+    // (see DockerClientProducer / StreamingDocker).
     @Inject
-    public ContainerLogStreamer(DockerClient dockerClient, CloudWatchLogsService cloudWatchLogsService) {
+    public ContainerLogStreamer(@StreamingDocker DockerClient dockerClient, CloudWatchLogsService cloudWatchLogsService) {
         this.dockerClient = dockerClient;
         this.cloudWatchLogsService = cloudWatchLogsService;
     }
@@ -286,7 +290,7 @@ public class ContainerLogStreamer {
         private static final ScheduledExecutorService CLOSE_DRAIN_SCHEDULER = closeDrainScheduler();
 
         private static ScheduledExecutorService closeDrainScheduler() {
-            var scheduler = new ScheduledThreadPoolExecutor(1, runnable -> {
+            ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, runnable -> {
                 Thread thread = new Thread(runnable, "floci-container-log-close");
                 thread.setDaemon(true);
                 return thread;

@@ -3,29 +3,20 @@ package io.github.hectorvent.floci.services.stepfunctions;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
-import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
-import io.github.hectorvent.floci.services.ecs.EcsService;
-import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
-import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
-import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
-import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import io.quarkus.logging.Log;
 import io.quarkus.test.junit.QuarkusTest;
-
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.json.JsonObject;
 import io.vertx.mutiny.core.MultiMap;
 import io.vertx.mutiny.core.Vertx;
 import io.vertx.mutiny.core.buffer.Buffer;
 import io.vertx.mutiny.core.http.HttpServer;
+import io.vertx.mutiny.core.http.HttpServerRequest;
 import io.vertx.mutiny.ext.web.Router;
 import io.vertx.mutiny.ext.web.RoutingContext;
-import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -43,7 +34,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.Mockito.mock;
 
 @QuarkusTest
 class AslExecutorHttpInvokeTest {
@@ -89,7 +79,7 @@ class AslExecutorHttpInvokeTest {
     void setUp() {
         server = vertx.createHttpServer();
 
-        var router = Router.router(vertx);
+        Router router = Router.router(vertx);
         router.get("/json")
             .handler(ctx -> {
                 ctx.request().body()
@@ -159,31 +149,17 @@ class AslExecutorHttpInvokeTest {
             .listenAndAwait(0);
         baseUrl = "http://127.0.0.1:" + server.actualPort();
 
-        executor = new AslExecutor(
-            mock(LambdaExecutorService.class),
-            mock(LambdaFunctionStore.class),
-            mock(DynamoDbFacade.class),
-            mock(DynamoDbJsonHandler.class),
-            mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
-            mock(io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler.class),
-            mock(io.github.hectorvent.floci.services.ec2.Ec2Service.class),
-            mock(io.github.hectorvent.floci.services.s3.S3Service.class),
-            mock(EcsService.class),
-            mock(EcsJsonHandler.class),
-            mock(io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler.class),
-            mock(io.github.hectorvent.floci.services.scheduler.SchedulerService.class),
-            mock(io.github.hectorvent.floci.services.scheduler.SchedulerController.class),
-            objectMapper,
-            new JsonataEvaluator(objectMapper),
-            mock(Instance.class),
-            emulatorConfig,
-            vertx,
-            null);
+        executor = AslExecutorFixture.builder()
+                .objectMapper(objectMapper)
+                .config(emulatorConfig)
+                .vertx(vertx)
+                .customResourceLiveness(null)
+                .build();
     }
 
     private void recordRequest(final RoutingContext ctx, String body) {
-        var request = ctx.request();
-        var requestRecord = new RecordedRequest(
+        HttpServerRequest request = ctx.request();
+        RecordedRequest requestRecord = new RecordedRequest(
             request.method().name(),
             request.uri(),
             request.query(),

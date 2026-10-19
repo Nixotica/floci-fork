@@ -1,53 +1,5 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.AwsErrorResponse;
-import io.github.hectorvent.floci.core.common.AwsPartition;
-import io.github.hectorvent.floci.core.common.AwsPartitions;
-import io.github.hectorvent.floci.core.common.CsvParser;
-import io.github.hectorvent.floci.core.common.CustomResourceLiveness;
-import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.common.RequestContext;
-import io.github.hectorvent.floci.core.common.RequestScopes;
-import io.github.hectorvent.floci.core.common.XmlParser;
-import io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
-import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbItemAccess;
-import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Scope;
-import io.github.hectorvent.floci.services.ec2.Ec2Service;
-import io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler;
-import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
-import io.github.hectorvent.floci.services.ecs.EcsService;
-import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
-import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
-import io.github.hectorvent.floci.services.ecs.model.EcsTask;
-import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
-import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
-import io.github.hectorvent.floci.services.ecs.model.LaunchType;
-import io.github.hectorvent.floci.services.s3.S3Service;
-import io.github.hectorvent.floci.services.scheduler.SchedulerController;
-import io.github.hectorvent.floci.services.scheduler.SchedulerService;
-import io.github.hectorvent.floci.services.scheduler.model.Schedule;
-import io.github.hectorvent.floci.services.scheduler.model.ScheduleRequest;
-import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
-import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
-import io.github.hectorvent.floci.services.lambda.LambdaTargetResolver;
-import io.github.hectorvent.floci.services.lambda.model.InvocationType;
-import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
-import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
-import io.github.hectorvent.floci.services.rdsdata.RdsDataService;
-import io.github.hectorvent.floci.services.s3.model.S3Object;
-import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
-import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
-import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
-import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
-import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
-import io.github.hectorvent.floci.services.stepfunctions.model.MockedResponseStep;
-import io.github.hectorvent.floci.services.stepfunctions.model.MockedTestCase;
-import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -62,12 +14,62 @@ import com.jayway.jsonpath.JsonPath;
 import com.jayway.jsonpath.PathNotFoundException;
 import com.jayway.jsonpath.spi.json.JacksonJsonNodeJsonProvider;
 import com.jayway.jsonpath.spi.mapper.JacksonMappingProvider;
-
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.CsvParser;
+import io.github.hectorvent.floci.core.common.CustomResourceLiveness;
+import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.ServiceRegistry;
+import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbItemAccess;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Scope;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
+import io.github.hectorvent.floci.services.ecs.EcsService;
+import io.github.hectorvent.floci.services.ecs.model.Container;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
+import io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler;
+import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
+import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
+import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
+import io.github.hectorvent.floci.services.lambda.LambdaTargetResolver;
+import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.rdsdata.RdsDataService;
+import io.github.hectorvent.floci.services.redshiftdata.RedshiftDataJsonHandler;
+import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.model.S3Object;
+import io.github.hectorvent.floci.services.scheduler.SchedulerController;
+import io.github.hectorvent.floci.services.scheduler.SchedulerService;
+import io.github.hectorvent.floci.services.scheduler.model.Schedule;
+import io.github.hectorvent.floci.services.scheduler.model.ScheduleRequest;
+import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
+import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
+import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
+import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
+import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
+import io.github.hectorvent.floci.services.stepfunctions.model.MockedResponseStep;
+import io.github.hectorvent.floci.services.stepfunctions.model.MockedTestCase;
+import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.impl.NoStackTraceTimeoutException;
 import io.vertx.mutiny.core.MultiMap;
-import io.vertx.mutiny.core.buffer.Buffer;
 import io.vertx.mutiny.core.Vertx;
+import io.vertx.mutiny.core.buffer.Buffer;
 import io.vertx.mutiny.ext.web.client.HttpRequest;
 import io.vertx.mutiny.ext.web.client.HttpResponse;
 import io.vertx.mutiny.ext.web.client.WebClient;
@@ -102,6 +104,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
@@ -121,6 +124,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
@@ -159,6 +163,9 @@ public class AslExecutor {
     // How long a Task waits for its token, or for a .sync job to end, when the state declares no
     // TimeoutSeconds. AWS lets it run for a year; the emulator would rather free the worker thread.
     private static final int DEFAULT_TASK_TIMEOUT_SECONDS = 300;
+    // AWS's hard quota on an Express execution, synchronous or not.
+    private static final Duration EXPRESS_MAX_EXECUTION_TIME = Duration.ofMinutes(5);
+    private static final Set<String> TERMINAL_STATUSES = Set.of("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED");
 
     /**
      * AWS ends an execution once its history reaches this many events. The count is neither reset
@@ -251,6 +258,9 @@ public class AslExecutor {
     private final SchedulerService schedulerService;
     private final SchedulerController schedulerController;
     private final RdsDataService rdsDataService;
+    private final RedshiftDataJsonHandler redshiftDataHandler;
+    private final ServiceRegistry serviceRegistry;
+    private final LambdaTaskAuthorizer lambdaTaskAuthorizer;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
     private final JsonataEvaluator jsonataEvaluator;
@@ -262,6 +272,9 @@ public class AslExecutor {
     private final Sleeper sleeper;
     // Null in production, where the ceiling comes from the Step Functions config. Tests pin it.
     private final Integer maxWaitSecondsOverride;
+    private final Duration expressMaxExecutionTime;
+    // The monotonic clock every execution and task deadline is measured on. Tests move it forward.
+    private final LongSupplier nanoTime;
     private final Map<String, ActiveMockExecution> activeMocks = new ConcurrentHashMap<>();
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "sfn-executor");
@@ -280,13 +293,15 @@ public class AslExecutor {
                        SchedulerController schedulerController, RdsDataService rdsDataService,
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
-                       CustomResourceLiveness customResourceLiveness) {
+                       CustomResourceLiveness customResourceLiveness, RedshiftDataJsonHandler redshiftDataHandler,
+                       ServiceRegistry serviceRegistry, LambdaTaskAuthorizer lambdaTaskAuthorizer) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
+                lambdaTaskAuthorizer, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -300,8 +315,14 @@ public class AslExecutor {
                 ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                 Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                 CustomResourceLiveness customResourceLiveness,
-                Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride) {
+                Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride,
+                RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry,
+                LambdaTaskAuthorizer lambdaTaskAuthorizer, Duration expressMaxExecutionTimeOverride,
+                LongSupplier nanoTimeOverride) {
+        this.serviceRegistry = serviceRegistry;
+        this.lambdaTaskAuthorizer = lambdaTaskAuthorizer;
         this.customResourceLiveness = customResourceLiveness;
+        this.redshiftDataHandler = redshiftDataHandler;
         this.lambdaExecutor = lambdaExecutor;
         this.targetResolver = targetResolver;
         this.dynamoDb = dynamoDb;
@@ -330,6 +351,10 @@ public class AslExecutor {
         this.clock = clock;
         this.sleeper = sleeper;
         this.maxWaitSecondsOverride = maxWaitSecondsOverride;
+        this.nanoTime = nanoTimeOverride != null ? nanoTimeOverride : System::nanoTime;
+        this.expressMaxExecutionTime = expressMaxExecutionTimeOverride != null
+                ? expressMaxExecutionTimeOverride
+                : EXPRESS_MAX_EXECUTION_TIME;
         if (vertx != null) {
             // This can be optimized further
             // TODO Set WebclientOptions useragent to Amazon|StepFunctions|HttpInvoke|{{{{region}}}}
@@ -337,6 +362,47 @@ public class AslExecutor {
         } else {
             webClient = null;
         }
+    }
+
+    // Kept for tests that do not exercise the Redshift Data API integration.
+    AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
+                DynamoDbFacade dynamoDb, DynamoDbJsonHandler dynamoDbJsonHandler,
+                SqsJsonHandler sqsJsonHandler, SnsJsonHandler snsJsonHandler,
+                CloudFormationQueryHandler cloudFormationHandler,
+                Ec2Service ec2Service, S3Service s3Service,
+                EcsService ecsService, EcsJsonHandler ecsJsonHandler,
+                EventBridgeHandler eventBridgeHandler, SchedulerService schedulerService,
+                SchedulerController schedulerController, RdsDataService rdsDataService,
+                ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
+                Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
+                CustomResourceLiveness customResourceLiveness) {
+        this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
+                sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
+                ec2Service, s3Service, ecsService, ecsJsonHandler,
+                eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
+                objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null);
+    }
+
+    // Kept for tests that do not exercise the Redshift Data API integration.
+    AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
+                DynamoDbFacade dynamoDb, DynamoDbJsonHandler dynamoDbJsonHandler,
+                SqsJsonHandler sqsJsonHandler, SnsJsonHandler snsJsonHandler,
+                CloudFormationQueryHandler cloudFormationHandler,
+                Ec2Service ec2Service, S3Service s3Service,
+                EcsService ecsService, EcsJsonHandler ecsJsonHandler,
+                EventBridgeHandler eventBridgeHandler, SchedulerService schedulerService,
+                SchedulerController schedulerController, RdsDataService rdsDataService,
+                ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
+                Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
+                CustomResourceLiveness customResourceLiveness,
+                Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride) {
+        this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
+                sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
+                ec2Service, s3Service, ecsService, ecsJsonHandler,
+                eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
+                objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
+                clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -404,9 +470,15 @@ public class AslExecutor {
                              MockedTestCase mockedTestCase,
                              BiConsumer<Execution, List<HistoryEvent>> onUpdate) {
         registerMocks(exec, mockedTestCase);
+        // An Express execution has the same maximum execution time however it was started; a
+        // Standard one is allowed a year, which the emulator does not enforce.
+        long maxExecutionDeadlineNanos = "EXPRESS".equals(sm.getType())
+                ? nanoTime.getAsLong() + expressMaxExecutionTime.toNanos()
+                : Long.MAX_VALUE;
         executor.submit(() -> {
             try {
-                runUnderExecutionAccount(sm, () -> doExecute(sm, exec, history, onUpdate));
+                runUnderExecutionAccount(sm,
+                        () -> doExecute(sm, exec, history, onUpdate, maxExecutionDeadlineNanos));
             } catch (RuntimeException | Error e) {
                 // submit() parks whatever the task throws in a Future nobody reads, so without this
                 // the worker dies silently. doExecute has already published the terminal status by
@@ -432,17 +504,35 @@ public class AslExecutor {
                             MockedTestCase mockedTestCase,
                             BiConsumer<Execution, List<HistoryEvent>> onUpdate) {
         registerMocks(exec, mockedTestCase);
+        // The execution itself ends at this deadline, as it does at its TimeoutSeconds, so it runs
+        // no further state once the caller has been answered TIMED_OUT.
+        long maxExecutionDeadlineNanos = nanoTime.getAsLong() + expressMaxExecutionTime.toNanos();
         try {
-            Future<?> f = executor.submit(() ->
-                    runUnderExecutionAccount(sm, () -> doExecute(sm, exec, history, onUpdate)));
-            f.get(300, TimeUnit.SECONDS);
+            Future<?> f = executor.submit(() -> runUnderExecutionAccount(sm,
+                    () -> doExecute(sm, exec, history, onUpdate, maxExecutionDeadlineNanos)));
+            f.get(maxExecutionDeadlineNanos - nanoTime.getAsLong(), TimeUnit.NANOSECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
-            exec.setStopDate(System.currentTimeMillis() / 1000.0);
-            exec.setStatus("TIMED_OUT");
-            onUpdate.accept(exec, history);
+            answerTimedOutUnlessEnded(exec, history, onUpdate);
         } catch (Exception e) {
             LOG.warnv("Sync execution wait failed for {0}: {1}", exec.getExecutionArn(), e.getMessage());
         }
+    }
+
+    /**
+     * Answers a synchronous caller whose wait ran out. The worker ends itself at the same deadline;
+     * this publishes TIMED_OUT when it has not yet, and never replaces an outcome the worker already
+     * published.
+     */
+    void answerTimedOutUnlessEnded(Execution exec, List<HistoryEvent> history,
+                                   BiConsumer<Execution, List<HistoryEvent>> onUpdate) {
+        synchronized (exec) {
+            if (hasEnded(exec)) {
+                return;
+            }
+            exec.setStopDate(System.currentTimeMillis() / 1000.0);
+            exec.setStatus("TIMED_OUT");
+        }
+        onUpdate.accept(exec, history);
     }
 
     /**
@@ -487,8 +577,9 @@ public class AslExecutor {
     }
 
     private void doExecute(StateMachine sm, Execution exec, List<HistoryEvent> history,
-                           BiConsumer<Execution, List<HistoryEvent>> onUpdate) {
-        var chain = HistoryChain.of(history);
+                           BiConsumer<Execution, List<HistoryEvent>> onUpdate, long maxExecutionDeadlineNanos) {
+        HistoryChain chain = HistoryChain.of(history);
+        long executionDeadlineNanos = maxExecutionDeadlineNanos;
         try {
             JsonNode definition = objectMapper.readTree(sm.getDefinition());
             JsonNode states = definition.path("States");
@@ -496,11 +587,13 @@ public class AslExecutor {
             String topLevelQueryLanguage = definition.path("QueryLanguage").asText("JSONPath");
             JsonNode currentInput = parseInput(exec.getInput());
             // The state machine's total budget, computed once so every state measures against the
-            // same instant. Long.MAX_VALUE stands for a definition with no TimeoutSeconds.
+            // same instant: the earlier of its TimeoutSeconds and the maximum execution time its
+            // workflow type allows. Long.MAX_VALUE stands for neither.
             int timeoutSeconds = definition.path("TimeoutSeconds").asInt(0);
-            long executionDeadlineNanos = timeoutSeconds > 0
-                    ? System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds)
-                    : Long.MAX_VALUE;
+            if (timeoutSeconds > 0) {
+                executionDeadlineNanos = Math.min(
+                        nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(timeoutSeconds), maxExecutionDeadlineNanos);
+            }
             JsonNode execContext = buildContext(exec, sm);
             // Execution-scoped JSONata variables (the Assign field). Mutated in place as states
             // assign, so later states observe earlier assignments.
@@ -508,7 +601,7 @@ public class AslExecutor {
 
             String currentStateName = startAt;
             while (currentStateName != null && !abortedByCaller(exec)) {
-                if (System.nanoTime() >= executionDeadlineNanos) {
+                if (nanoTime.getAsLong() >= executionDeadlineNanos) {
                     throw new ExecutionTimedOutException();
                 }
                 JsonNode stateDef = states.path(currentStateName);
@@ -521,12 +614,22 @@ public class AslExecutor {
                     stateResult = runState(chain, currentStateName, stateDef, currentInput, sm,
                             topLevelQueryLanguage, execContext, variables, executionDeadlineNanos);
                 } catch (FailStateException e) {
+                    // A failure that came back after the deadline, like a late success, ends the
+                    // execution as timed out.
+                    if (nanoTime.getAsLong() >= executionDeadlineNanos) {
+                        throw new ExecutionTimedOutException();
+                    }
                     failExecution(exec, chain, e);
                     onUpdate.accept(exec, history);
                     return;
                 }
                 currentInput = stateResult.output();
                 currentStateName = stateResult.nextState();
+            }
+            // A last state that outran the deadline, such as an integration call that does not
+            // watch it, ends the execution as timed out rather than succeeded.
+            if (nanoTime.getAsLong() >= executionDeadlineNanos) {
+                throw new ExecutionTimedOutException();
             }
 
             succeedExecution(exec, chain, currentInput);
@@ -539,6 +642,12 @@ public class AslExecutor {
             // StopExecution already wrote ABORTED and sealed the history; the worker only stops.
             onUpdate.accept(exec, history);
         } catch (Exception e) {
+            if (nanoTime.getAsLong() >= executionDeadlineNanos) {
+                // Past the deadline the execution has timed out, whatever broke on the way there.
+                timeOutExecution(exec, chain);
+                onUpdate.accept(exec, history);
+                return;
+            }
             LOG.warnv("ASL execution failed for {0}: {1}", exec.getExecutionArn(), e.getMessage());
             // This path previously set only the status, leaving error and cause null forever on an
             // execution DescribeExecution reports as FAILED.
@@ -563,7 +672,7 @@ public class AslExecutor {
     private StateResult runState(HistoryChain chain, String name, JsonNode stateDef, JsonNode input,
                                  StateMachine sm, String topLevelQueryLanguage, JsonNode context,
                                  ObjectNode variables, long executionDeadlineNanos) throws Exception {
-        var type = stateDef.path("Type").asText();
+        String type = stateDef.path("Type").asText();
         long enteredEventId = chain.publishStateEntered(type, stateEnteredEventType(type),
                 Map.of("name", name, "input", input.toString(), "inputDetails", Map.of("truncated", false)));
         try {
@@ -580,7 +689,7 @@ public class AslExecutor {
                                         String topLevelQueryLanguage, JsonNode context, ObjectNode variables,
                                         long executionDeadlineNanos) throws Exception {
         updateStateContext(context, name);
-        var jsonata = isJsonata(stateDef, topLevelQueryLanguage);
+        boolean jsonata = isJsonata(stateDef, topLevelQueryLanguage);
         StateResult result;
         try {
             result = executeStateWithRetry(name, enteredEventId, type, stateDef, input, chain, sm, jsonata,
@@ -589,14 +698,14 @@ public class AslExecutor {
                 result = new StateResult(result.output(), null);
             }
         } catch (FailStateException failure) {
-            var beforeFailed = chain.lastEventId();
+            long beforeFailed = chain.lastEventId();
             publishStateFailedEvent(chain, type, failure);
             try {
                 result = handleCatch(stateDef, input, failure, jsonata, context, variables);
             } catch (FailStateException catchClauseFailure) {
                 // AWS reports a failure inside the Catch clause itself, and no later clause catches
                 // it. The clause's EvaluationFailed is recorded from before the state's Failed event.
-                var clauseFailure = catchClauseFailure.attributedTo(name, enteredEventId);
+                FailStateException clauseFailure = catchClauseFailure.attributedTo(name, enteredEventId);
                 chain.continueFrom(beforeFailed);
                 publishEvaluationFailedEvent(chain, name, clauseFailure);
                 publishStateFailedEvent(chain, type, clauseFailure);
@@ -628,7 +737,7 @@ public class AslExecutor {
         if (!"States.QueryEvaluationError".equals(failure.error)) {
             return;
         }
-        var details = failureDetails(failure);
+        Map<String, Object> details = failureDetails(failure);
         if (failure.location != null) {
             details.put("location", failure.location);
         }
@@ -653,24 +762,24 @@ public class AslExecutor {
                                               String topLevelQueryLanguage, JsonNode context,
                                               ObjectNode variables, long executionDeadlineNanos)
             throws Exception {
-        var retriers = stateDef.path("Retry");
-        var attemptsPerRetrier = new HashMap<Integer, Integer>();
-        var attempt = 0;
+        JsonNode retriers = stateDef.path("Retry");
+        HashMap<Integer, Integer> attemptsPerRetrier = new HashMap<>();
+        int attempt = 0;
         while (true) {
             try {
                 return executeState(name, type, stateDef, input, chain, sm, jsonata,
                         topLevelQueryLanguage, context, variables, executionDeadlineNanos);
             } catch (FailStateException raised) {
-                var e = raised.attributedTo(name, enteredEventId);
+                FailStateException e = raised.attributedTo(name, enteredEventId);
                 if (!raised.hasFinalCause()) {
                     publishEvaluationFailedEvent(chain, name, e);
                 }
-                var retrierIndex = findMatchingRetrier(retriers, e);
+                int retrierIndex = findMatchingRetrier(retriers, e);
                 if (retrierIndex < 0) {
                     throw e;
                 }
-                var retrier = retriers.get(retrierIndex);
-                var attemptsUsed = attemptsPerRetrier.merge(retrierIndex, 1, Integer::sum);
+                JsonNode retrier = retriers.get(retrierIndex);
+                Integer attemptsUsed = attemptsPerRetrier.merge(retrierIndex, 1, Integer::sum);
                 if (attemptsUsed > retrier.path("MaxAttempts").asInt(3)) {
                     throw e;
                 }
@@ -685,7 +794,7 @@ public class AslExecutor {
         if (!retriers.isArray()) {
             return -1;
         }
-        for (var i = 0; i < retriers.size(); i++) {
+        for (int i = 0; i < retriers.size(); i++) {
             if (catchMatches(retriers.get(i), failure)) {
                 return i;
             }
@@ -713,9 +822,9 @@ public class AslExecutor {
      * zero and the computed delay. Jitter applies after the caps, matching AWS.
      */
     static double retryDelaySeconds(JsonNode retrier, int attemptsUsed, double random, int maxWaitSeconds) {
-        var interval = retrier.path("IntervalSeconds").asDouble(1.0);
-        var backoffRate = retrier.path("BackoffRate").asDouble(2.0);
-        var delaySeconds = interval * Math.pow(backoffRate, attemptsUsed - 1.0);
+        double interval = retrier.path("IntervalSeconds").asDouble(1.0);
+        double backoffRate = retrier.path("BackoffRate").asDouble(2.0);
+        double delaySeconds = interval * Math.pow(backoffRate, attemptsUsed - 1.0);
         double maxDelay = retrier.path("MaxDelaySeconds").asDouble(maxWaitSeconds);
         // Like the Wait state, cap the delay at the configured ceiling to keep emulated runs fast.
         delaySeconds = Math.min(delaySeconds, Math.min(maxDelay, maxWaitSeconds));
@@ -780,16 +889,16 @@ public class AslExecutor {
                                          HistoryChain chain, StateMachine sm, boolean jsonata,
                                          JsonNode context, ObjectNode variables,
                                          long executionDeadlineNanos) throws Exception {
-        var resource = stateDef.path("Resource").asText();
-        var isWaitForToken = resource.endsWith(".waitForTaskToken");
-        var effectiveResource = isWaitForToken
+        String resource = stateDef.path("Resource").asText();
+        boolean isWaitForToken = resource.endsWith(".waitForTaskToken");
+        String effectiveResource = isWaitForToken
                 ? resource.substring(0, resource.length() - ".waitForTaskToken".length())
                 : resource;
-        var isActivity = isActivityArn(effectiveResource);
-        var mockedInvocation = findMockedInvocation(context, stateName);
+        boolean isActivity = isActivityArn(effectiveResource);
+        MockedTaskInvocation mockedInvocation = findMockedInvocation(context, stateName);
         // A mocked task never calls the integrated service, so it neither registers a task token
         // nor waits for one; the mocked response stands in for the whole interaction.
-        var needsToken = mockedInvocation == null && (isWaitForToken || isActivity);
+        boolean needsToken = mockedInvocation == null && (isWaitForToken || isActivity);
 
         String taskToken = null;
         if (needsToken) {
@@ -798,23 +907,35 @@ public class AslExecutor {
         }
 
         JsonNode effectiveInput;
+        // The role a task's Credentials name is read the way its Parameters or Arguments are, and
+        // only under IAM enforcement, the one place it is used.
+        JsonNode credentials = null;
+        boolean readCredentials = stateDef.has("Credentials") && iamEnforcementEnabled();
         if (jsonata) {
             effectiveInput = input;
             if (stateDef.has("Arguments")) {
-                var statesVar = buildStatesVar(input, null, context);
+                JsonNode statesVar = buildStatesVar(input, null, context);
                 effectiveInput = jsonataEvaluator.resolveTemplate(
                         stateDef.get("Arguments"), "Arguments", statesVar, variables);
             }
+            if (readCredentials) {
+                credentials = jsonataEvaluator.resolveTemplate(stateDef.get("Credentials"), "Credentials",
+                        buildStatesVar(input, null, context), variables);
+            }
         } else {
             effectiveInput = applyInputPath(stateDef, input, context);
+            if (readCredentials) {
+                credentials = resolveParameters(stateDef.get("Credentials"), effectiveInput, context);
+            }
             if (stateDef.has("Parameters")) {
                 effectiveInput = resolveParameters(stateDef.get("Parameters"), effectiveInput, context);
             }
         }
+        String credentialsRoleArn = credentials == null ? null : credentials.path("RoleArn").asText(null);
 
         // Registered after the input template resolved, so a template failure leaves no token behind.
-        var tokenFuture = needsToken ? sfnService.get().registerPendingToken(taskToken) : null;
-        var profile = taskEventProfile(resource, isActivity);
+        CompletableFuture<JsonNode> tokenFuture = needsToken ? sfnService.get().registerPendingToken(taskToken) : null;
+        TaskEventProfile profile = taskEventProfile(resource, isActivity);
         JsonNode taskResult;
         // Read before the scheduled event is built, so a large input or a slow history callback
         // does not extend the Task's own TimeoutSeconds.
@@ -828,7 +949,7 @@ public class AslExecutor {
                         : invokeResource(effectiveResource, effectiveInput, sm, taskToken,
                                 context.path("Execution").path("Id").asText(null),
                                 executionDeadlineNanos, taskDeadlineNanos,
-                                jsonata ? null : stateDef.path("Parameters"),
+                                jsonata ? null : stateDef.path("Parameters"), credentialsRoleArn,
                                 jobResponse -> addTaskSubmittedEvent(chain, profile, jobResponse));
                 if (tokenFuture != null) {
                     taskResult = awaitToken(tokenFuture, stateDef, taskToken, executionDeadlineNanos,
@@ -852,7 +973,7 @@ public class AslExecutor {
                 // that cut it records its TaskStateAborted.
                 throw e;
             } catch (Exception e) {
-                var failure = e instanceof FailStateException f ? f : null;
+                FailStateException failure = e instanceof FailStateException f ? f : null;
                 addTaskFailedEvent(chain, profile,
                         failure != null && failure.error != null ? failure.error : "States.Runtime",
                         failure != null ? failure.cause : e.getMessage());
@@ -889,22 +1010,22 @@ public class AslExecutor {
         if (activeMocks.isEmpty()) {
             return null;
         }
-        var executionArn = context.path("Execution").path("Id").asText(null);
+        String executionArn = context.path("Execution").path("Id").asText(null);
         if (executionArn == null) {
             return null;
         }
-        var activeMock = activeMocks.get(executionArn);
+        ActiveMockExecution activeMock = activeMocks.get(executionArn);
         if (activeMock == null) {
             return null;
         }
-        var steps = activeMock.testCase().stateResponses().get(stateName);
+        List<MockedResponseStep> steps = activeMock.testCase().stateResponses().get(stateName);
         return steps != null
                 ? new MockedTaskInvocation(steps, activeMock.nextResponseIndex(stateName))
                 : null;
     }
 
     private JsonNode mockedTaskResult(List<MockedResponseStep> steps, String stateName, int responseIndex) {
-        for (var step : steps) {
+        for (MockedResponseStep step : steps) {
             if (step.covers(responseIndex)) {
                 if (step.isThrow()) {
                     // The mocked Error and Cause must reach Retry/Catch unchanged; routing them
@@ -938,22 +1059,22 @@ public class AslExecutor {
                 long wakeAtNanos = Math.min(executionDeadlineNanos, Math.min(timeoutDeadlineNanos,
                         heartbeatDeadlineNanos(taskToken, heartbeatSeconds)));
                 try {
-                    return future.get(wakeAtNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+                    return future.get(wakeAtNanos - nanoTime.getAsLong(), TimeUnit.NANOSECONDS);
                 } catch (java.util.concurrent.TimeoutException e) {
                     // The execution's budget is read first: when it is the clock that ran out, the
                     // execution ends as TIMED_OUT and the task's own timeout never applies.
-                    if (System.nanoTime() >= executionDeadlineNanos) {
+                    if (nanoTime.getAsLong() >= executionDeadlineNanos) {
                         future.cancel(true);
                         throw new ExecutionTimedOutException();
                     }
-                    if (System.nanoTime() >= timeoutDeadlineNanos) {
+                    if (nanoTime.getAsLong() >= timeoutDeadlineNanos) {
                         future.cancel(true);
                         throw new TaskTimedOutException("States.Timeout");
                     }
                     // Read the gap again rather than trusting the one this thread parked on: a
                     // heartbeat that landed meanwhile has already moved it past now, and the task
                     // goes back to waiting on the later deadline.
-                    if (System.nanoTime() >= heartbeatDeadlineNanos(taskToken, heartbeatSeconds)) {
+                    if (nanoTime.getAsLong() >= heartbeatDeadlineNanos(taskToken, heartbeatSeconds)) {
                         future.cancel(true);
                         throw new TaskTimedOutException("States.HeartbeatTimeout");
                     }
@@ -981,7 +1102,7 @@ public class AslExecutor {
         if (timeoutSeconds <= 0) {
             timeoutSeconds = DEFAULT_TASK_TIMEOUT_SECONDS;
         }
-        return System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        return nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
     }
 
     /**
@@ -1028,9 +1149,17 @@ public class AslExecutor {
         return colon >= 0 ? fn.substring(colon + 1) : null;
     }
 
-    private LambdaFunction resolveLambdaFunction(String region, String name, String qualifier) {
+    private boolean iamEnforcementEnabled() {
+        return config != null && config.services() != null && config.services().iam() != null
+                && config.services().iam().enforcementEnabled();
+    }
+
+    /** {@code accountId} is null for the state machine's own account, the account the execution runs in. */
+    private LambdaFunction resolveLambdaFunction(String accountId, String region, String name, String qualifier) {
         try {
-            return targetResolver.resolveInvokeTarget(region, name, qualifier);
+            return accountId == null
+                    ? targetResolver.resolveInvokeTarget(region, name, qualifier)
+                    : targetResolver.resolveInvokeTargetForAccount(accountId, region, name, qualifier);
         } catch (AwsException e) {
             if ("ResourceNotFoundException".equals(e.getErrorCode())) {
                 return null;
@@ -1080,12 +1209,15 @@ public class AslExecutor {
     }
 
     /**
+     * @param credentialsRoleArn the role the task's {@code Credentials} name, read only under IAM
+     *                           enforcement, or null when the task runs as the execution role
      * @param jobSubmitted called with the response of the call that started a {@code .sync} job,
      *                     once it has returned and before the job is waited on
      */
     private JsonNode invokeResource(String resource, JsonNode input, StateMachine sm, String taskToken,
                                     String executionArn, long executionDeadlineNanos, long taskDeadlineNanos,
-                                    JsonNode rawParameters, Consumer<JsonNode> jobSubmitted) throws Exception {
+                                    JsonNode rawParameters, String credentialsRoleArn,
+                                    Consumer<JsonNode> jobSubmitted) throws Exception {
         // Support Lambda resources: direct ARN or optimized integration
         String functionName = null;
         String functionRef = null;
@@ -1112,9 +1244,46 @@ public class AslExecutor {
         }
 
         if (functionName != null) {
-            // Extract region from the state machine ARN: arn:<partition>:states:REGION:...
-            String region = extractRegionFromArn(sm.getStateMachineArn());
-            LambdaFunction fn = resolveLambdaFunction(region, functionName, extractLambdaQualifier(functionRef));
+            AwsArnUtils.Arn stateMachineArn = AwsArnUtils.parse(sm.getStateMachineArn());
+            LambdaArnUtils.ResolvedFunctionRef ref;
+            try {
+                ref = LambdaArnUtils.resolve(functionRef);
+            } catch (AwsException e) {
+                throw new FailStateException("Lambda." + e.getErrorCode(), e.getMessage());
+            }
+            // The optimized integration calls Lambda's Invoke in the state machine's region, which
+            // refuses a function ARN from another region. A function ARN otherwise names its own
+            // account and region, never a same-named function of the state machine's.
+            if (optimizedLambdaInvoke && ref.region() != null && !ref.region().equals(stateMachineArn.region())) {
+                throw new FailStateException("Lambda.InvalidParameterValueException",
+                        "Region '" + ref.region() + "' in ARN does not match request region '"
+                                + stateMachineArn.region() + "'");
+            }
+            String region = ref.region() != null ? ref.region() : stateMachineArn.region();
+            String accountId = ref.account() == null || ref.account().equals(stateMachineArn.accountId())
+                    ? null : ref.account();
+            // The task invokes the function as its role: the execution role, or the role its
+            // Credentials name once the execution role has assumed it. The role's policies or the
+            // function's have to allow the call, and both when the function is in another account.
+            if (iamEnforcementEnabled()) {
+                String invokingRoleArn = sm.getRoleArn();
+                if (credentialsRoleArn != null) {
+                    Optional<String> assumeRefusal = lambdaTaskAuthorizer.assumeRefusal(sm.getRoleArn(),
+                            credentialsRoleArn, sm.getStateMachineArn());
+                    if (assumeRefusal.isPresent()) {
+                        throw new FailStateException("States.Permissions", assumeRefusal.get());
+                    }
+                    invokingRoleArn = credentialsRoleArn;
+                }
+                String functionArn = LambdaArnUtils.functionArn(functionRef, stateMachineArn.partition(), region,
+                        stateMachineArn.accountId());
+                Optional<String> refusal = lambdaTaskAuthorizer.refusal(invokingRoleArn, functionArn);
+                if (refusal.isPresent()) {
+                    throw new FailStateException("Lambda.AccessDeniedException", refusal.get());
+                }
+            }
+            LambdaFunction fn = resolveLambdaFunction(accountId, region, functionName,
+                    extractLambdaQualifier(functionRef));
             if (fn == null) {
                 // A missing function is a task failure on AWS, so it must stay reachable for
                 // Retry and Catch instead of surfacing as States.Runtime.
@@ -1124,7 +1293,12 @@ public class AslExecutor {
 
             byte[] payloadBytes = objectMapper.writeValueAsString(lambdaPayload).getBytes();
             reportCustomResourceLiveness(payloadBytes);
-            InvokeResult result = lambdaExecutor.invoke(fn, payloadBytes, InvocationType.RequestResponse);
+            InvokeResult result;
+            try {
+                result = lambdaExecutor.invoke(fn, payloadBytes, InvocationType.RequestResponse);
+            } catch (AwsException e) {
+                throw new FailStateException("Lambda." + e.getErrorCode(), e.getMessage());
+            }
 
             if (result.getFunctionError() != null) {
                 throw lambdaFunctionFailure(functionName, result);
@@ -1167,6 +1341,12 @@ public class AslExecutor {
             String camelCaseAction = integration.api();
             String region = extractRegionFromArn(sm.getStateMachineArn());
             return invokeAwsSdkDynamoDb(camelCaseAction, input, region);
+        }
+
+        // AWS SDK service integrations: Redshift Data API (provisioned clusters and Serverless workgroups)
+        if (integration.isSdkService("redshiftdata") && integration.suffix().isEmpty()) {
+            String region = extractRegionFromArn(sm.getStateMachineArn());
+            return invokeAwsSdkRedshiftData(integration, input, region);
         }
 
         // AWS SDK service integration: RDS Data API ExecuteStatement
@@ -1214,7 +1394,7 @@ public class AslExecutor {
 
         // AWS SDK service integration: EC2 DescribeRegions
         if (integration.isSdk("ec2", "describeRegions")) {
-            return invokeAwsSdkEc2DescribeRegions();
+            return invokeAwsSdkEc2DescribeRegions(sm.getStateMachineArn());
         }
 
         // S3 PutObject — optimized and aws-sdk integrations
@@ -1321,11 +1501,17 @@ public class AslExecutor {
         }
     }
 
-    private JsonNode invokeAwsSdkEc2DescribeRegions() {
+    /**
+     * The regions of the partition the state machine lives in. The partition is read from its ARN,
+     * so a state machine in a region no partition publishes (allowed by
+     * {@code floci.partitions.allow-unknown-regions}) lists the regions of the partition its ARN
+     * was minted in.
+     */
+    private JsonNode invokeAwsSdkEc2DescribeRegions(String stateMachineArn) {
         ObjectNode result = objectMapper.createObjectNode();
         ArrayNode regions = objectMapper.createArrayNode();
-        AwsPartition partition = AwsPartitions.byId(
-                RegionResolver.effectivePartition(config.defaultRegion(), config.partitions().id()));
+        AwsPartition partition = AwsPartitions.find(AwsArnUtils.parse(stateMachineArn).partition())
+                .orElseGet(() -> AwsPartitions.forRegionOrCommercial(extractRegionFromArn(stateMachineArn)));
         for (AwsPartition.Region name : ec2Service.describeRegions(partition, false)) {
             ObjectNode region = objectMapper.createObjectNode();
             region.put("RegionName", name.id());
@@ -1353,7 +1539,7 @@ public class AslExecutor {
             data = body.toString().getBytes(StandardCharsets.UTF_8);
         }
         try {
-            var stored = s3Service.putObject(bucket, key, data, "application/octet-stream", new HashMap<>());
+            S3Object stored = s3Service.putObject(bucket, key, data, "application/octet-stream", new HashMap<>());
             ObjectNode result = objectMapper.createObjectNode();
             if (stored != null && stored.getETag() != null) {
                 result.put("ETag", stored.getETag());
@@ -2019,7 +2205,7 @@ public class AslExecutor {
         Integer nonZeroExit = null;
         boolean hasNullExitCode = false;
         if (ranAContainer) {
-            for (var c : task.getContainers()) {
+            for (Container c : task.getContainers()) {
                 // Only essential containers decide the task outcome, like real Step Functions; a
                 // non-essential sidecar (log shipper, metrics agent) exiting non-zero is ignored.
                 // Anything not explicitly marked non-essential defaults to essential.
@@ -2244,6 +2430,49 @@ public class AslExecutor {
             return jsonNode;
         }
         return objectMapper.createObjectNode();
+    }
+
+    /**
+     * The Data API is a JSON 1.1 service, so the Task input is already the PascalCase wire request and
+     * the response needs no re-casing. Only the timestamps differ: the wire carries epoch seconds where
+     * the {@code aws-sdk:} integration renders the SDK's ISO-8601 {@code Instant}.
+     */
+    private JsonNode invokeAwsSdkRedshiftData(StatesIntegration integration, JsonNode input, String region) {
+        if (!serviceRegistry.isServiceEnabled("redshift-data")) {
+            throw new FailStateException(sdkExceptionName("RedshiftData", "ServiceNotAvailableException"),
+                    "Service redshift-data is not enabled.");
+        }
+        if (input != null && !input.isObject()) {
+            throw new FailStateException(sdkExceptionName("RedshiftData", "ValidationException"),
+                    "The task input must be a JSON object.");
+        }
+        JsonNode request = input != null ? input : objectMapper.createObjectNode();
+        Response response;
+        try {
+            response = redshiftDataHandler.handle(capitalizeFirst(integration.api()), request, region);
+        } catch (AwsException e) {
+            throw new FailStateException(sdkExceptionName("RedshiftData", e.getErrorCode()), e.getMessage());
+        }
+        if (!(response.getEntity() instanceof JsonNode body)) {
+            return objectMapper.createObjectNode();
+        }
+        JsonNode rendered = body.deepCopy();
+        renderRedshiftDataTimestamps(rendered);
+        return rendered;
+    }
+
+    private static void renderRedshiftDataTimestamps(JsonNode node) {
+        if (node instanceof ObjectNode object) {
+            for (String field : List.of("CreatedAt", "UpdatedAt")) {
+                JsonNode value = object.get(field);
+                if (value != null && value.isNumber()) {
+                    object.put(field, sdkTimestamp(value.asDouble()));
+                }
+            }
+            object.elements().forEachRemaining(AslExecutor::renderRedshiftDataTimestamps);
+        } else if (node instanceof ArrayNode array) {
+            array.elements().forEachRemaining(AslExecutor::renderRedshiftDataTimestamps);
+        }
     }
 
     private JsonNode invokeAwsSdkRdsData(StatesIntegration integration, JsonNode input, String region) {
@@ -2552,7 +2781,7 @@ public class AslExecutor {
      */
     private void sleepOrTimeOutTask(long pauseNanos, long executionDeadlineNanos, long taskDeadlineNanos)
             throws InterruptedException {
-        long remainingNanos = Math.min(executionDeadlineNanos, taskDeadlineNanos) - System.nanoTime();
+        long remainingNanos = Math.min(executionDeadlineNanos, taskDeadlineNanos) - nanoTime.getAsLong();
         if (pauseNanos < remainingNanos) {
             sleeper.sleep(pauseNanos);
             return;
@@ -2560,7 +2789,7 @@ public class AslExecutor {
         sleeper.sleep(Math.max(remainingNanos, 0));
         // The execution's budget wins when it is the clock that was parked on, and also when a late
         // wake finds it spent: the execution ends TIMED_OUT and the Task's own timeout never applies.
-        if (executionDeadlineNanos <= taskDeadlineNanos || System.nanoTime() >= executionDeadlineNanos) {
+        if (executionDeadlineNanos <= taskDeadlineNanos || nanoTime.getAsLong() >= executionDeadlineNanos) {
             throw new ExecutionTimedOutException();
         }
         throw new TaskTimedOutException("States.Timeout");
@@ -2625,7 +2854,7 @@ public class AslExecutor {
         JsonNode effectiveInput = jsonata ? input : applyInputPath(stateDef, input, context);
         JsonNode branches = stateDef.path("Branches");
         chain.publish("ParallelStateStarted", null);
-        var branchChains = new ArrayList<HistoryChain>();
+        ArrayList<HistoryChain> branchChains = new ArrayList<>();
         // The branches are joined in the order they complete, not the order they are declared, so
         // a failure in any branch ends the Parallel while the others are still running, as on AWS
         // (measured: the Parallel fails within about 0.1 s of the failing branch, whichever branch
@@ -2642,8 +2871,8 @@ public class AslExecutor {
             ObjectNode branchVariables = variables.deepCopy();
             // Each branch also gets its own copy of the context object so State.RetryCount and
             // Task.Token writes cannot race across concurrent branches.
-            var branchContext = ((ObjectNode) context).deepCopy();
-            var branchChain = chain.fork();
+            ObjectNode branchContext = ((ObjectNode) context).deepCopy();
+            HistoryChain branchChain = chain.fork();
             branchChains.add(branchChain);
 
             // Run each branch on its own worker thread under the execution's account: the request
@@ -2659,7 +2888,7 @@ public class AslExecutor {
 
         int timeoutSeconds = stateDef.path("TimeoutSeconds").asInt(0);
         long stateDeadlineNanos = timeoutSeconds > 0
-                ? System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds)
+                ? nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(timeoutSeconds)
                 : Long.MAX_VALUE;
         // Two clocks can end this wait, and the join stops at whichever comes first: the state's
         // own TimeoutSeconds, and the state machine's budget for the whole execution.
@@ -2671,7 +2900,7 @@ public class AslExecutor {
         int current = -1;
         try {
             for (int joined = 0; joined < futures.size(); joined++) {
-                long remainingNanos = joinDeadlineNanos - System.nanoTime();
+                long remainingNanos = joinDeadlineNanos - nanoTime.getAsLong();
                 if (remainingNanos <= 0) {
                     throw parallelJoinExpired(stateDeadlineNanos, timeoutSeconds);
                 }
@@ -2766,7 +2995,7 @@ public class AslExecutor {
      * execution and no Catch sees it.
      */
     private RuntimeException parallelJoinExpired(long stateDeadlineNanos, int timeoutSeconds) {
-        if (System.nanoTime() < stateDeadlineNanos) {
+        if (nanoTime.getAsLong() < stateDeadlineNanos) {
             return new ExecutionTimedOutException();
         }
         return new FailStateException("States.Timeout",
@@ -2840,19 +3069,19 @@ public class AslExecutor {
             mapRunRecord.setToleratedFailurePercentage(tolerated.declaredPercentage());
             chain.publish("MapRunStarted", Map.of("mapRunArn", mapRun.arn()));
         }
-        var succeededItems = new AtomicInteger();
-        var failedItems = new AtomicInteger();
+        AtomicInteger succeededItems = new AtomicInteger();
+        AtomicInteger failedItems = new AtomicInteger();
         AtomicInteger succeededExecutions = new AtomicInteger();
         AtomicInteger failedExecutions = new AtomicInteger();
         List<Integer> succeededChildren = new ArrayList<>(childCount);
         FailedChild[] failedByIndex = hasResultWriter ? new FailedChild[childCount] : null;
-        var iterationChains = new ArrayList<HistoryChain>(childCount);
-        for (var i = 0; i < childCount; i++) {
+        ArrayList<HistoryChain> iterationChains = new ArrayList<>(childCount);
+        for (int i = 0; i < childCount; i++) {
             iterationChains.add(distributed ? HistoryChain.ofChildExecution() : chain.fork());
         }
 
         java.util.function.IntFunction<Callable<JsonNode>> makeTask = (i) -> () -> {
-            var iterationChain = iterationChains.get(i);
+            HistoryChain iterationChain = iterationChains.get(i);
             boolean batchedChild = batches != null;
             JsonNode item = batchedChild ? batches.get(i) : items.get(i);
             int itemsInChild = batchedChild ? item.path("Items").size() : 1;
@@ -3082,7 +3311,7 @@ public class AslExecutor {
      */
     private static MapRun newMapRun(MapRunIdentity identity, JsonNode context, int itemCount,
                                     int executionCount, int requestedConcurrency) {
-        var mapRun = new MapRun();
+        MapRun mapRun = new MapRun();
         mapRun.setMapRunArn(identity.arn());
         mapRun.setExecutionArn(context.path("Execution").path("Id").asText(null));
         mapRun.setStartDate(System.currentTimeMillis() / 1000.0);
@@ -3285,14 +3514,14 @@ public class AslExecutor {
     }
 
     private MapRunIdentity newMapRunIdentity(JsonNode stateDef, StateMachine sm, JsonNode context) {
-        var region = extractRegionFromArn(sm.getStateMachineArn());
-        var account = AwsArnUtils.accountOrDefault(sm.getStateMachineArn(), null);
-        var smName = context.path("StateMachine").path("Name").asText(sm.getName());
-        var label = stateDef.path("Label").asText(null);
+        String region = extractRegionFromArn(sm.getStateMachineArn());
+        String account = AwsArnUtils.accountOrDefault(sm.getStateMachineArn(), null);
+        String smName = context.path("StateMachine").path("Name").asText(sm.getName());
+        String label = stateDef.path("Label").asText(null);
         if (label == null || label.isBlank()) {
             label = UUID.randomUUID().toString();
         }
-        var id = UUID.randomUUID().toString();
+        String id = UUID.randomUUID().toString();
         return new MapRunIdentity(label, id, AwsArnUtils.Arn.of("states", region, account,
                 "mapRun:" + smName + "/" + label + ":" + id).toString());
     }
@@ -3375,8 +3604,8 @@ public class AslExecutor {
             }
 
             // The run id alone keys the exported result set under the user-supplied S3 prefix.
-            var mapRunId = mapRun.id();
-            var mapRunArn = mapRun.arn();
+            String mapRunId = mapRun.id();
+            String mapRunArn = mapRun.arn();
             String base = prefix.isEmpty()
                     ? mapRunId + "/"
                     : prefix + (prefix.endsWith("/") ? "" : "/") + mapRunId + "/";
@@ -3824,7 +4053,7 @@ public class AslExecutor {
             // A Parallel or Map branch runs on its own thread and is not cut mid-state by the
             // execution's TimeoutSeconds: the state loop that resumes once the branch returns
             // is where the budget is enforced.
-            var result = runState(chain, currentState, stateDef, currentInput, sm, topLevelQueryLanguage,
+            StateResult result = runState(chain, currentState, stateDef, currentInput, sm, topLevelQueryLanguage,
                     context, variables, Long.MAX_VALUE);
             currentInput = result.output();
             currentState = result.nextState();
@@ -4533,20 +4762,20 @@ public class AslExecutor {
      * TODO: Add HTTP Task coverage for unsupported binary/media response content types.
      */
     private JsonNode invokeHttp(JsonNode input, String region) {
-        var rawUri = input.path("ApiEndpoint").asText(null);
-        var method = input.path("Method").asText(null);
-        var timeoutMillis = input.path("TimeoutSeconds").asLong(60) * 1_000;
-        var headers = input.path("Headers");
-        var queryParameters = input.path("QueryParameters");
-        var requestBody = input.path("RequestBody");
-        var requestBodyEncoding = input.path("Transform").path("RequestBodyEncoding").asText("NONE");
+        String rawUri = input.path("ApiEndpoint").asText(null);
+        String method = input.path("Method").asText(null);
+        long timeoutMillis = input.path("TimeoutSeconds").asLong(60) * 1_000;
+        JsonNode headers = input.path("Headers");
+        JsonNode queryParameters = input.path("QueryParameters");
+        JsonNode requestBody = input.path("RequestBody");
+        String requestBodyEncoding = input.path("Transform").path("RequestBodyEncoding").asText("NONE");
 
         if (rawUri == null || rawUri.isBlank()) {
             throw new FailStateException("States.Runtime", "ApiEndpoint is required for HTTP task");
         }
-        var uri = URI.create(rawUri);
-        var isHttps = "https".equalsIgnoreCase(uri.getScheme());
-        var allowPlainHttp = config.services().stepfunctions().allowPlaintextHttp();
+        URI uri = URI.create(rawUri);
+        boolean isHttps = "https".equalsIgnoreCase(uri.getScheme());
+        boolean allowPlainHttp = config.services().stepfunctions().allowPlaintextHttp();
         if (!allowPlainHttp && !isHttps) {
             throw new FailStateException("States.Runtime", "The value for the 'ApiEndpoint' field must have the scheme 'https'. " +
                                                            "You can enable plaintext http via 'floci.services.stepfunctions.allow-plaintext-http=true'.");
@@ -4556,18 +4785,18 @@ public class AslExecutor {
         validateConnectionArn(input);
         validateHttpHeaders(headers);
 
-        var requestPayload = requestPayload(requestBody, requestBodyEncoding);
-        var requestHeaders = requestHeaders(headers, requestPayload.contentType());
-        var requestQueryParameters = queryParameters(queryParameters);
+        HttpRequestPayload requestPayload = requestPayload(requestBody, requestBodyEncoding);
+        MultiMap requestHeaders = requestHeaders(headers, requestPayload.contentType());
+        MultiMap requestQueryParameters = queryParameters(queryParameters);
 
         try {
-            var request = webClient.requestAbs(HttpMethod.valueOf(method), rawUri)
+            HttpRequest<Buffer> request = webClient.requestAbs(HttpMethod.valueOf(method), rawUri)
                 .timeout(timeoutMillis)
                 .putHeaders(requestHeaders);
             request.queryParams().addAll(requestQueryParameters);
 
             LOG.infov("Step Functions HTTP task sending request: method={0}, uri={1}", method, uri);
-            var response = sendHttpRequest(request, requestPayload);
+            HttpResponse<Buffer> response = sendHttpRequest(request, requestPayload);
             validateHttpStatus(response);
             validateHttpResponse(response);
             return httpResultJson(response);
@@ -4625,7 +4854,7 @@ public class AslExecutor {
     }
 
     private JsonNode httpResultJson(HttpResponse<Buffer> response) {
-       var stepHttpResponse = new HttpTaskResponse(
+       HttpTaskResponse stepHttpResponse = new HttpTaskResponse(
             response.statusCode(),
             response.statusMessage(),
             httpResponseHeaders(response),
@@ -4960,7 +5189,7 @@ public class AslExecutor {
                             "States.JsonMerge supports only shallow merge (third argument must be false)");
                 }
                 // Shallow merge: second object's top-level fields override the first's.
-                var merged = objectMapper.createObjectNode();
+                ObjectNode merged = objectMapper.createObjectNode();
                 a.fields().forEachRemaining(e -> merged.set(e.getKey(), e.getValue()));
                 b.fields().forEachRemaining(e -> merged.set(e.getKey(), e.getValue()));
                 yield merged;
@@ -5389,7 +5618,7 @@ public class AslExecutor {
      */
     private JsonNode resolveIntrinsicReference(String path, JsonNode searchRoot, JsonNode context,
                                                JsonNode input) {
-        var value = resolvePathNode(path, searchRoot, context);
+        JsonNode value = resolvePathNode(path, searchRoot, context);
         if (value.isMissingNode()) {
             throw new MissingIntrinsicArgumentException(path, input);
         }
@@ -5487,7 +5716,7 @@ public class AslExecutor {
 
     private void addTaskScheduledEvent(HistoryChain chain, TaskEventProfile profile, JsonNode stateDef,
                                        JsonNode effectiveInput, StateMachine sm) {
-        var details = new LinkedHashMap<String, Object>();
+        LinkedHashMap<String, Object> details = new LinkedHashMap<>();
         if (profile.resourceType() != null) {
             details.put("resourceType", profile.resourceType());
         }
@@ -5532,7 +5761,7 @@ public class AslExecutor {
     }
 
     private void addTaskSucceededEvent(HistoryChain chain, TaskEventProfile profile, JsonNode taskResult) {
-        var output = taskResult.toString();
+        String output = taskResult.toString();
         if ("Task".equals(profile.prefix())) {
             chain.publish(profile.prefix() + "Succeeded",
                     Map.of("resourceType", profile.resourceType(), "resource", profile.resource(),
@@ -5544,7 +5773,7 @@ public class AslExecutor {
     }
 
     private void addTaskFailedEvent(HistoryChain chain, TaskEventProfile profile, String error, String cause) {
-        var details = new LinkedHashMap<String, Object>();
+        LinkedHashMap<String, Object> details = new LinkedHashMap<>();
         if ("Task".equals(profile.prefix())) {
             details.put("resourceType", profile.resourceType());
             details.put("resource", profile.resource());
@@ -5563,7 +5792,7 @@ public class AslExecutor {
      * both {@code TimeoutSeconds} and {@code HeartbeatSeconds}, and carries no cause.
      */
     private void addTaskTimedOutEvent(HistoryChain chain, TaskEventProfile profile) {
-        var details = new LinkedHashMap<String, Object>();
+        LinkedHashMap<String, Object> details = new LinkedHashMap<>();
         if ("Task".equals(profile.prefix())) {
             details.put("resourceType", profile.resourceType());
             details.put("resource", profile.resource());
@@ -5587,7 +5816,7 @@ public class AslExecutor {
      */
     private void failExecution(Execution exec, HistoryChain chain, String error, String cause) {
         synchronized (exec) {
-            if (abortedByCaller(exec)) {
+            if (hasEnded(exec)) {
                 return;
             }
             exec.setError(error);
@@ -5609,7 +5838,7 @@ public class AslExecutor {
     }
 
     private static Map<String, Object> failureDetails(String error, String cause) {
-        var details = new LinkedHashMap<String, Object>();
+        LinkedHashMap<String, Object> details = new LinkedHashMap<>();
         details.put("error", error);
         if (cause != null) {
             details.put("cause", cause);
@@ -5626,11 +5855,15 @@ public class AslExecutor {
      */
     private void timeOutExecution(Execution exec, HistoryChain chain) {
         synchronized (exec) {
-            if (abortedByCaller(exec)) {
-                return;
+            // A synchronous caller may have published the timeout already; the event still ends
+            // the history. Any other outcome already published stands.
+            if (!"TIMED_OUT".equals(exec.getStatus())) {
+                if (hasEnded(exec)) {
+                    return;
+                }
+                exec.setStopDate(System.currentTimeMillis() / 1000.0);
+                exec.setStatus("TIMED_OUT");
             }
-            exec.setStopDate(System.currentTimeMillis() / 1000.0);
-            exec.setStatus("TIMED_OUT");
         }
         chain.end("ExecutionTimedOut", 0L, Map.of("error", "States.Timeout"));
     }
@@ -5644,7 +5877,7 @@ public class AslExecutor {
      */
     private void succeedExecution(Execution exec, HistoryChain chain, JsonNode output) {
         synchronized (exec) {
-            if (abortedByCaller(exec)) {
+            if (hasEnded(exec)) {
                 return;
             }
             exec.setOutput(output.toString());
@@ -5657,13 +5890,23 @@ public class AslExecutor {
 
     /**
      * True once StopExecution published ABORTED on this execution. The state loop reads it between
-     * states and every terminal write here reads it before publishing, so the worker's own status
-     * loses the race against a stop that arrived while it was still stepping: what a caller has
-     * already read back from DescribeExecution is what stands.
+     * states, so the worker stops stepping once a caller has stopped it.
      */
     private static boolean abortedByCaller(Execution exec) {
         synchronized (exec) {
             return "ABORTED".equals(exec.getStatus());
+        }
+    }
+
+    /**
+     * True once any outcome has been published on this execution: a stop from StopExecution, a
+     * synchronous caller answered with TIMED_OUT, or the worker's own. Every terminal write reads
+     * it before publishing, so the first outcome stands: what a caller has already read back from
+     * DescribeExecution or StartSyncExecution is never replaced.
+     */
+    private static boolean hasEnded(Execution exec) {
+        synchronized (exec) {
+            return TERMINAL_STATUSES.contains(exec.getStatus());
         }
     }
 
@@ -5720,18 +5963,18 @@ public class AslExecutor {
     }
 
     private boolean catchMatches(JsonNode catcher, FailStateException failure) {
-        var errors = catcher.path("ErrorEquals");
+        JsonNode errors = catcher.path("ErrorEquals");
         if (!errors.isArray()) {
             return false;
         }
-        var error = failure.error != null ? failure.error : "States.Runtime";
+        String error = failure.error != null ? failure.error : "States.Runtime";
         // States.Runtime is never retried or caught, even when named explicitly in
         // ErrorEquals. Verified against real AWS: the execution fails immediately.
         if ("States.Runtime".equals(error)) {
             return false;
         }
         for (JsonNode candidate : errors) {
-            var expected = candidate.asText();
+            String expected = candidate.asText();
             if (failure.isNamedBy(expected)) {
                 return true;
             }

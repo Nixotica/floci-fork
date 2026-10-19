@@ -5,54 +5,54 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.glue.model.AuthenticationConfiguration;
 import io.github.hectorvent.floci.services.glue.model.Classifier;
 import io.github.hectorvent.floci.services.glue.model.Column;
-import io.github.hectorvent.floci.services.glue.model.Database;
 import io.github.hectorvent.floci.services.glue.model.Connection;
 import io.github.hectorvent.floci.services.glue.model.ConnectionInput;
 import io.github.hectorvent.floci.services.glue.model.ConnectionPasswordEncryption;
+import io.github.hectorvent.floci.services.glue.model.Crawler;
+import io.github.hectorvent.floci.services.glue.model.CrawlerTargets;
 import io.github.hectorvent.floci.services.glue.model.DataCatalogEncryptionSettings;
+import io.github.hectorvent.floci.services.glue.model.Database;
 import io.github.hectorvent.floci.services.glue.model.EncryptionAtRest;
 import io.github.hectorvent.floci.services.glue.model.GluePolicy;
-import io.github.hectorvent.floci.services.glue.model.Crawler;
-import io.github.hectorvent.floci.services.glue.model.AuthenticationConfiguration;
-import io.github.hectorvent.floci.services.glue.model.PhysicalConnectionRequirements;
-import io.github.hectorvent.floci.services.glue.model.CrawlerTargets;
 import io.github.hectorvent.floci.services.glue.model.Job;
 import io.github.hectorvent.floci.services.glue.model.JobCommand;
 import io.github.hectorvent.floci.services.glue.model.JobUpdate;
 import io.github.hectorvent.floci.services.glue.model.Partition;
 import io.github.hectorvent.floci.services.glue.model.PartitionIndex;
 import io.github.hectorvent.floci.services.glue.model.PartitionIndexDescriptor;
+import io.github.hectorvent.floci.services.glue.model.PhysicalConnectionRequirements;
 import io.github.hectorvent.floci.services.glue.model.S3Target;
 import io.github.hectorvent.floci.services.glue.model.SchemaReference;
 import io.github.hectorvent.floci.services.glue.model.SecurityConfiguration;
-import io.github.hectorvent.floci.services.glue.model.Trigger;
-import io.github.hectorvent.floci.services.glue.model.Workflow;
 import io.github.hectorvent.floci.services.glue.model.StorageDescriptor;
 import io.github.hectorvent.floci.services.glue.model.Table;
+import io.github.hectorvent.floci.services.glue.model.Trigger;
 import io.github.hectorvent.floci.services.glue.model.UserDefinedFunction;
+import io.github.hectorvent.floci.services.glue.model.Workflow;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
-import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.RegistryId;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.SchemaId;
+import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.time.Instant;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
-import java.util.concurrent.CountDownLatch;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -319,7 +319,7 @@ class GlueServiceTest {
         plain.setStorageDescriptor(sd);
         glueService.createTable("db1", plain);
 
-        var tables = glueService.getTables("db1");
+        List<Table> tables = glueService.getTables("db1");
 
         assertEquals(2, tables.size());
         for (Table t : tables) {
@@ -607,6 +607,62 @@ class GlueServiceTest {
 
         assertEquals("EntityNotFoundException", ex.getErrorCode());
         assertEquals("Cannot find partition.", ex.getMessage());
+    }
+
+    @Test
+    void stringStatisticsWithoutAverageLengthReadBackWithZero() {
+        Table table = new Table();
+        table.setName("nulls");
+        glueService.createTable("db1", table);
+        Map<String, Object> statistics = Map.of(
+                "ColumnName", "a",
+                "ColumnType", "string",
+                "AnalyzedTime", Instant.EPOCH,
+                "StatisticsData", Map.of(
+                        "Type", "STRING",
+                        "StringColumnStatisticsData", Map.of("NumberOfNulls", 1, "NumberOfDistinctValues", 0)));
+
+        glueService.updateColumnStatisticsForTable("db1", "nulls", List.of(statistics));
+        Map<String, Object> stored = glueService.getColumnStatisticsForTable("db1", "nulls", List.of("a"))
+                .columnStatisticsList().get(0);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = (Map<String, Object>) ((Map<String, Object>) stored.get("StatisticsData"))
+                .get("StringColumnStatisticsData");
+        assertEquals(0, data.get("AverageLength"));
+        assertEquals(0, data.get("MaximumLength"));
+        assertEquals(1, data.get("NumberOfNulls"));
+        Map<String, Object> raw = columnStatisticsStore.scan(key -> true).get(0);
+        assertFalse(((Map<?, ?>) ((Map<?, ?>) raw.get("StatisticsData")).get("StringColumnStatisticsData"))
+                .containsKey("AverageLength"));
+    }
+
+    @Test
+    void partitionBinaryStatisticsWithoutLengthsReadBackWithZero() {
+        Table table = new Table();
+        table.setName("blobs");
+        glueService.createTable("db1", table);
+        Partition partition = new Partition();
+        partition.setValues(List.of("1"));
+        glueService.createPartition("db1", "blobs", partition);
+        Map<String, Object> statistics = Map.of(
+                "ColumnName", "payload",
+                "ColumnType", "binary",
+                "AnalyzedTime", Instant.EPOCH,
+                "StatisticsData", Map.of(
+                        "Type", "BINARY",
+                        "BinaryColumnStatisticsData", Map.of("NumberOfNulls", 2)));
+
+        glueService.updateColumnStatisticsForPartition("db1", "blobs", List.of("1"), List.of(statistics));
+        Map<String, Object> stored = glueService.getColumnStatisticsForPartition(
+                "db1", "blobs", List.of("1"), List.of("payload")).columnStatisticsList().get(0);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = (Map<String, Object>) ((Map<String, Object>) stored.get("StatisticsData"))
+                .get("BinaryColumnStatisticsData");
+        assertEquals(0, data.get("MaximumLength"));
+        assertEquals(0, data.get("AverageLength"));
+        assertEquals(2, data.get("NumberOfNulls"));
     }
 
     @Test

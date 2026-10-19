@@ -9,9 +9,9 @@ Status: complete for the local emulator slice.
 Supported MVP 1 behavior:
 
 - Thing CRUD with idempotent identical `CreateThing`, duplicate-conflict semantics, `UpdateThing.expectedVersion`, and list pagination.
-- Certificate basics: `CreateKeysAndCertificate`, `CreateCertificateFromCsr`, `DescribeCertificate`, `ListCertificates`, `UpdateCertificate`, and `DeleteCertificate` with active/attached delete constraints. `CreateKeysAndCertificate` returns a real X.509 client certificate issued by Floci's local CA (`GET /_floci/ca.pem`) with a fresh RSA 2048 key pair, valid until 2049-12-31T23:59:59Z as on AWS, and `certificateId` is the SHA-256 of the certificate's DER encoding as on AWS. `DescribeCertificate` reports `validity` and `certificateMode`. `CreateCertificateFromCsr` signs the request's public key (RSA of at least 2048 bits, or EC on P-256, P-384 or P-521) with the same CA and, as on AWS, returns no private key.
+- Certificate basics: `CreateKeysAndCertificate`, `CreateCertificateFromCsr`, `DescribeCertificate`, `ListCertificates`, `UpdateCertificate`, and `DeleteCertificate` with active/attached delete constraints. `CreateKeysAndCertificate` returns a real X.509 client certificate issued by Floci's local CA (`GET /_floci/ca.pem`) with a fresh RSA 2048 key pair, valid until 2049-12-31T23:59:59Z as on AWS, and `certificateId` is the SHA-256 of the certificate's DER encoding as on AWS. `DescribeCertificate` reports `validity` and `certificateMode`. `CreateCertificateFromCsr` signs the request's public key (RSA of at least 2048 bits, or EC on P-256, P-384 or P-521) with the same CA and, as on AWS, returns no private key. `RegisterCertificateWithoutCA` registers a certificate from any issuer, as on AWS: no CA is checked, the status defaults to `INACTIVE`, `DescribeCertificate` reports `certificateMode` `SNI_ONLY`, a certificate already registered is `ResourceAlreadyExistsException`, and a PEM that does not parse is `CertificateValidationException`.
 - Policy basics: `CreatePolicy`, `GetPolicy`, `ListPolicies`, `DeletePolicy`, policy version lifecycle, `AttachPolicy`, `DetachPolicy`, `ListAttachedPolicies`, and `ListTargetsForPolicy`.
-- Thing principal basics: `AttachThingPrincipal`, `DetachThingPrincipal`, `ListThingPrincipals`, and `ListPrincipalThings`.
+- Thing principal basics: `AttachThingPrincipal`, `DetachThingPrincipal`, `ListThingPrincipals`, `ListPrincipalThings`, and the paginated `ListThingPrincipalsV2` and `ListPrincipalThingsV2`. Exclusive attachment is not modelled, so the V2 lists report every attachment as `NON_EXCLUSIVE_THING`, and a `thingPrincipalType` filter of `EXCLUSIVE_THING` returns none.
 - Tags for things, certificates, policies, and topic rules.
 - IoT Data retained messages: retained `Publish`, `GetRetainedMessage`, and paginated `ListRetainedMessages`.
 - Shadow null-delete and version-conflict behavior for HTTP and shared service paths.
@@ -45,7 +45,7 @@ Current MVP 2 limitations:
 - `SendDirectMessage` publishes to the requested MQTT topic through the embedded broker. Unlike AWS IoT Core, it does not yet bypass subscription matching to deliver to a client that is not subscribed to that topic.
 - `GetConnection` and `ListSubscriptions` report live in-memory broker state only; offline persistent session subscription reporting is not modeled yet.
 - Jobs reserved MQTT topics remain follow-up scope; Jobs Data HTTP APIs are implemented first.
-- Dynamic thing groups, fleet indexing, job rollouts, cancellations, documents from S3, and advanced job scheduling are not yet modeled.
+- Dynamic thing groups, job rollouts, cancellations, documents from S3, and advanced job scheduling are not yet modeled. Fleet indexing has its configuration and a bounded `SearchIndex` subset, see [Fleet Indexing](#fleet-indexing).
 
 ## Domain Configurations
 
@@ -67,6 +67,100 @@ Current limitations:
 - A custom domain does not change where the broker listens or what `DescribeEndpoint` returns (see [Endpoint address](#endpoint-address)), and pointing DNS at the emulator is outside its scope.
 - Server certificate ARNs are stored as given and reported `VALID`; they are not checked against ACM.
 
+## Authorizers
+
+Status: control plane, `TestInvokeAuthorizer` and MQTT `CONNECT` enforcement.
+
+`CreateAuthorizer`, `DescribeAuthorizer`, `UpdateAuthorizer`, `DeleteAuthorizer`, `ListAuthorizers`, `SetDefaultAuthorizer`, `DescribeDefaultAuthorizer`, `ClearDefaultAuthorizer` and `TestInvokeAuthorizer` are served on the REST-JSON paths the AWS SDKs use, with the shapes, error codes and messages measured against AWS:
+
+- A new authorizer is `INACTIVE` with HTTP caching off unless the request says otherwise. Unless `signingDisabled` is `true`, it needs a `tokenKeyName` and one or two RSA-2048 public keys in PEM form; a signing-disabled authorizer takes no keys. The function ARN is checked for ARN syntax only; the function is resolved when it is invoked.
+- `DescribeAuthorizer` returns every member; an unset token key name or key map is JSON `null`, and tags are not shown.
+- `UpdateAuthorizer` changes only the members sent and merges signing keys by key name, refusing a third key. Any member sent moves `lastModifiedDate`; an empty body does not.
+- `DeleteAuthorizer` refuses an `ACTIVE` authorizer (`InvalidRequestException`) and the default authorizer (`DeleteConflictException`).
+- `ListAuthorizers` returns the newest authorizer first (`isAscendingOrder=true` reverses it), filters by `status` and pages with `marker` and `pageSize` (1 to 250).
+- Setting the authorizer that already is the default fails with `ResourceAlreadyExistsException`; setting another one replaces it.
+- Tags work through `TagResource`, `UntagResource` and `ListTagsForResource` on the authorizer ARN.
+- CloudFormation provisions `AWS::IoT::Authorizer`: `Ref` is the name and `Fn::GetAtt Arn` the ARN.
+
+The function is invoked synchronously with the event AWS IoT sends (`protocolData`, `protocols`, `token` for a signed authorizer, `signatureVerified`, `connectionMetadata`), and its answer is checked as AWS checks it: `isAuthenticated`, a `principalId` of 1 to 128 letters and digits, at most 10 `policyDocuments` of at most 2048 characters each that parse as JSON objects, and TTLs from 300 to 86400 seconds. Omitted TTLs become 300 (`refreshAfterInSeconds`) and 86400 (`disconnectAfterInSeconds`), and a policy returned as a JSON object becomes one compact string. A signed authorizer verifies the token's SHA256withRSA signature against each of its keys before the function is invoked.
+
+- `TestInvokeAuthorizer` works on `ACTIVE` and `INACTIVE` authorizers. It returns the request errors (`InvalidRequestException`) and answer errors (`InvalidResponseException`) with AWS's messages, and passes the contexts on as given: header case is kept and `queryString` keeps its leading `?`.
+- An MQTT `CONNECT` on the plaintext listener or on [MQTT over WebSocket](#mqtt-over-websocket) that names an authorizer, in the username (`<clientId>?x-amz-customauthorizer-name=<name>`), the WebSocket URL query or the `x-amz-customauthorizer-name` upgrade header, is admitted only when the authorizer exists and is `ACTIVE`, the signature verifies for a signed authorizer, the answer is valid, `isAuthenticated` is `true`, and the returned policies allow `iot:Connect` on `arn:aws:iot:<region>:<account>:client/<clientId>`. The event carries the username with its query, the password in base64, and for WebSocket the lower-cased upgrade headers, the query string without `?` and, over TLS, the server name.
+- A refused MQTT 3.1.1 client is disconnected without a `CONNACK`; an MQTT 5 client gets `CONNACK` reason code `0x87` with the reason string AWS sends, then the connection closes. A `CONNECT` that names no authorizer is handled as before.
+
+Current limitations:
+
+- The default authorizer is not used: a `CONNECT` that names no authorizer is not authenticated.
+- HTTPS publish does not invoke authorizers, and `enableCachingForHttp` has no effect.
+- `refreshAfterInSeconds` and `disconnectAfterInSeconds` are returned but do not schedule a re-invocation or a disconnect.
+- The returned policies decide `iot:Connect` only; publish, subscribe and receive are not checked against them.
+- The function's resource policy is not checked, so `AddPermission` for `iot.amazonaws.com` is not required.
+- A WebSocket upgrade without the `mqtt` subprotocol is not answered with AWS's 426.
+- A refused WebSocket client sees a close frame with status `1000`. AWS sends an empty close frame to an MQTT 3.1.1 client and closes the connection without a close frame after the MQTT 5 `CONNACK`.
+- An accepting MQTT 5 `CONNACK` carries no properties.
+- The MQTT over TLS listener (8883) authenticates by device certificate only.
+- On a connection, the authorizer is looked up in Floci's default account and region.
+- The MQTT password reaches the function as the broker decodes it, as UTF-8 text, so password bytes that are not valid UTF-8 arrive altered. The broker library, Vert.x MQTT, exposes the password only as a string.
+
+## Fleet Indexing
+
+Status: configuration and a bounded SearchIndex subset.
+
+`UpdateIndexingConfiguration` and `GetIndexingConfiguration` (`/indexing/config`) and `DescribeIndex` (`/indices/{indexName}`) are served on the REST-JSON paths the AWS SDKs use, with the AWS shapes, error codes and validation messages:
+
+- There is one configuration per account and region. Before the first update both indexes are `OFF`.
+- An update may carry the thing configuration, the thing group configuration, or both; the one it leaves out keeps its value. Turning `thingIndexingMode` to `OFF` clears the whole thing configuration, as on AWS.
+- `managedFields` in `GetIndexingConfiguration` are derived from the modes, as AWS derives them. Managed fields sent in an update are only checked: every entry must be a field AWS manages, with its type, or the update fails with `InvalidRequestException`. A custom shadow path such as `shadow.name.<shadow>.reported.<field>` is rejected this way on AWS too. The thing group's managed fields are checked the same way, also while `thingGroupIndexingMode` is `OFF`.
+- The thing configuration's `customFields` and `filter` (named shadow names, geolocations, socket information) are stored and returned as sent, except that a geolocation without an `order` gets `LatLon`. A thing custom field without a name or a type, or named after a managed field, fails with `InvalidRequestException`.
+- A member of the wrong JSON type, or content after the JSON body, fails with `SerializationException`.
+- `DescribeIndex` reports `AWS_Things` and `AWS_ThingGroups` with the schema the modes select. The index is `ACTIVE` as soon as it is enabled: Floci has no `BUILDING` or `REBUILDING` window. A disabled index is `ResourceNotFoundException`, any other index name `InvalidRequestException`.
+
+### SearchIndex
+
+`SearchIndex` (`POST /indices/search`) searches the things of the caller's account and region in the `AWS_Things` index, the default index name. Floci evaluates this part of the query language:
+
+- `field:value`. Values match case-insensitively, field names exactly: `attributes.Site:north` matches nothing when the attribute is named `site`.
+- `*` (any run of characters) and `?` (one character) inside a value, and `\` to escape one character. A quoted value such as `thingName:"x"` matches literally.
+- `field:*` matches the things that have the field. A bare `*` matches every thing.
+- `AND`, `OR` and `NOT` in upper case, their forms `&&`, `||` and `!`, a leading `-` for negation, and parentheses.
+- Precedence as measured on AWS: `NOT` binds tightest, then `AND`, then `OR`. Whitespace is an `AND` that binds looser than `OR`, so `a OR b c` means `(a OR b) AND c`.
+
+The fields are `thingName`, `thingId`, `thingTypeName`, `thingGroupNames` (direct memberships) and `attributes.<name>`.
+
+Errors follow AWS, with AWS's messages. The body and member types are checked first, then the member constraints, then the index, then the query, then `nextToken`:
+
+- `InvalidRequestException` for a missing or empty `queryString`, a `queryString` longer than 1000 characters, a `maxResults` below 1 (AWS truncates it toward zero and caps it at the 32-bit integer range), an empty `indexName`, a `queryVersion` other than `2017-09-30`, an unknown index name, a `nextToken` that is empty, was not issued by `SearchIndex`, or was edited or truncated (`Invalid nextToken`), and a `nextToken` issued for a different `queryString`, `indexName` or `queryVersion` (`nextToken was from a request with different parameters`).
+- `ResourceNotFoundException` for an index that is not enabled.
+- `InvalidQueryException` for invalid syntax, an invalid field name (including a `shadow.name.<shadow>.<field>` whose shadow is not in the named shadow filter), more than 12 terms, more than two `*` wildcards in a value, a value starting with `?`, the `+` operator, and fuzzy, regular expression and boost queries.
+- `InvalidRequestException` for a `connectivity.*`, `shadow.*` or `deviceDefender.*` field while that indexing is off. A classic `shadow.*` field needs `REGISTRY_AND_SHADOW`; a `shadow.name.*` field is also served by named shadow indexing.
+- `SerializationException` for a body that is not a JSON object, malformed JSON or content after it, a `queryString`, `indexName`, `queryVersion` or `nextToken` that is not a string, and a `maxResults` that is not a number.
+
+Within the query, invalid syntax is reported before more than 12 terms, and more than 12 terms before any other query error, including a `connectivity.*`, `shadow.*` or `deviceDefender.*` field while that indexing is off and the constructs Floci refuses below. Each value of a field group counts as a term, the field before it does not. The field of a group is checked like any other field, before the group is refused. A range is one term: two bounds, separated by spaces and optionally by `TO`, in `[` or `{` and `]` or `}`. An unclosed or otherwise malformed range, and an unescaped `[`, `]`, `{` or `}` outside a range, is invalid syntax, as on AWS.
+
+Syntax AWS accepts but Floci does not evaluate is refused with `InvalidQueryException` and the message `Floci does not support <construct> in fleet index queries, query string: <query>`. It never answers with an empty result. This covers:
+
+- range queries (`field:[a TO b]`, `field:{a TO b}`)
+- comparisons (`>`, `<`, `>=`, `<=`)
+- free text terms without a field, including lower case `and`, `or` and `not`
+- field grouping (`field:(a OR b)`)
+- every `connectivity.*`, `shadow.*` and `deviceDefender.*` field once its indexing is on. While that indexing is off the answer is AWS's `InvalidRequestException` above.
+
+Searching `AWS_ThingGroups` is refused with `InvalidRequestException` and `Floci does not support searching AWS_ThingGroups` while that index is enabled. While it is disabled the answer is AWS's `ResourceNotFoundException`.
+
+Results:
+
+- A thing has `thingName` and `thingId`, and `thingTypeName`, `thingGroupNames` and `attributes` only when it has them. `shadow` and `deviceDefender` are never returned: Floci keeps no indexed shadow document.
+- `connectivity` is never returned either. AWS adds it while `thingConnectivityIndexingMode` is `STATUS`, where a thing that never connected shows `connected` `false` and `timestamp` `0`.
+- Things come in thing name order. AWS does not specify an order.
+- `maxResults` and `nextToken` page the results. Without `maxResults` every match comes in one page. The token marks the last thing returned, so the next page continues after it even when things before it were deleted, as on AWS. A token continues only the request that issued it: the same `queryString`, and `indexName` and `queryVersion` sent the same way, since an omitted member differs from its explicit default. `maxResults` may change between pages.
+- An index answers at once: a thing is searchable as soon as it is created, where AWS takes a few seconds.
+
+Current limitations:
+
+- `ListIndices` and the statistics and aggregation APIs (`GetStatistics`, `GetCardinality`, `GetPercentiles`, `GetBucketsAggregation`) are not modeled yet.
+- `customFields` types are not applied to search: attribute values are matched as strings.
+- `managedFields` and `customFields` sent in the thing group configuration are checked (the custom fields for their types only) but not stored: `GetIndexingConfiguration` reports the managed fields the mode selects and no custom fields.
+
 ## MQTT Broker
 
 Status: complete.
@@ -80,7 +174,7 @@ Broker scope:
 - Support QoS 0 and QoS 1 publish/subscribe behavior for the local AWS IoT slice.
 - Accept PUBLISH payloads up to 128 KB on 1883, 8883 and `/mqtt`, the AWS IoT Core quota (packets up to 146 KB including the variable header). A larger publish disconnects the client without acknowledgement, delivery or rule evaluation, as on AWS.
 - Serve MQTT over TLS on 8883 next to plaintext 1883 when TLS is enabled, and verify the device certificate and its `iot:Connect` permission there.
-- Keep the plaintext listener permissive; topic-level authorization (`Publish`, `Subscribe`, `Receive`) is follow-up scope.
+- Keep the plaintext listener permissive except for a `CONNECT` that names a [custom authorizer](#authorizers); topic-level authorization (`Publish`, `Subscribe`, `Receive`) is follow-up scope.
 - Keep MQTT broker logging minimal.
 - Validate the relevant IoT compatibility tests against the native binary before considering the phase complete.
 
@@ -105,11 +199,11 @@ mosquitto_sub -h localhost -p 8883 --cafile ca.pem --cert device.crt --key devic
 
 The connection is admitted when all of these hold, otherwise the broker answers `CONNACK` not authorized (return code `5`, reason code `0x87` on MQTT 5) and closes the connection:
 
-1. A certificate was presented and the SHA-256 of its DER encoding is a registered `certificateId` (`CreateKeysAndCertificate` or `CreateCertificateFromCsr`), in any account and region. Who signed it does not matter, registration does, as on AWS.
+1. A certificate was presented and the SHA-256 of its DER encoding is a registered `certificateId` (`CreateKeysAndCertificate`, `CreateCertificateFromCsr` or `RegisterCertificateWithoutCA`), in any account and region. Who signed it does not matter, registration does, as on AWS. AWS selects the account from the server name, which Floci does not yet do, so a certificate registered in more than one account is refused. Within one account, the registration in the alphabetically first region is used.
 2. The certificate is `ACTIVE` and inside its validity dates.
 3. The default versions of the policies attached to the certificate (`AttachPolicy` with the certificate ARN as target, in the certificate's own account and region) allow `iot:Connect` on `arn:aws:iot:<region>:<account>:client/<clientId>`. No attached policy means deny, and an explicit `Deny` wins.
 
-Policy variables are substituted and are also available as condition keys: `iot:ClientId`, `aws:SourceIp`, `iot:DomainName` (the server name the client sent in the TLS handshake, absent when it dialled an IP address), `iot:Connection.Thing.IsAttached` and, only when the client id names a thing attached to the certificate with `AttachThingPrincipal`, `iot:Connection.Thing.ThingName`, `iot:Connection.Thing.ThingTypeName` and `iot:Connection.Thing.Attributes[name]`. A statement that uses a variable Floci cannot resolve, such as the certificate variables `iot:Certificate.*`, matches nothing.
+The connection carries these condition keys: `iot:ClientId`, `aws:SourceIp`, `iot:DomainName` (the server name the client sent in the TLS handshake, absent when it dialled an IP address), `iot:Connection.Thing.IsAttached` and, only when the client id names a thing attached to the certificate with `AttachThingPrincipal`, `iot:Connection.Thing.ThingName`, `iot:Connection.Thing.ThingTypeName` and `iot:Connection.Thing.Attributes[name]`. They are also what the policy's own `${...}` resolves against, in the `Resource` and `Condition` elements and nowhere else, read by the same resolver as an IAM policy's variables: key names are case-insensitive, `${*}`, `${?}` and `${$}` stand for those three characters, and a variable with no value, the certificate variables `iot:Certificate.*` among them, leaves a `Resource` pattern matching no resource and a `Condition` value null. A document that does not declare `"Version": "2012-10-17"` has no variables at all, `${iot:ClientId}` there being the literal text it looks like.
 
 Differences from AWS: AWS rejects an unregistered, inactive or expired certificate during the TLS handshake and closes an MQTT 3.1.1 connection it does not authorize without a `CONNACK`; Floci completes the handshake and always answers with the return code, so the reason is visible to the client. Deactivating the certificate or detaching the policy takes effect on the next connect; established sessions are not dropped. Policies attached to thing groups are not consulted, and exclusive thing attachment (`thingPrincipalType`) is not modelled: the thing is always the one named by the client id.
 
@@ -149,8 +243,10 @@ request to `/mqtt` gets the usual 404.
 
 No client certificate is requested on this path. On AWS it authenticates by SigV4 (signed query
 string on the upgrade URL) or by a custom authorizer (`<clientId>?x-amz-customauthorizer-name=<name>`
-as the MQTT username with a token as the password); Floci accepts such a CONNECT as is and does
-not evaluate the signature or the authorizer yet.
+as the MQTT username with a token as the password). Floci enforces a custom authorizer named in the
+username, the URL query or the `x-amz-customauthorizer-name` upgrade header, see
+[Authorizers](#authorizers); it does not verify a SigV4 signature, and a CONNECT that names no
+authorizer is accepted as is.
 
 ## Reserved Topics
 
@@ -164,6 +260,23 @@ Required phase 7 reserved-topic behavior:
 - Basic Ingest and Jobs topic families are desired follow-up scope, but should not block restoring the broker unless explicitly pulled into the implementation phase.
 
 Reserved request topics are handled by Floci before normal MQTT fan-out. The original `$aws/...` request publish is not routed as an application message; generated accepted, rejected, documents, and delta responses are published back through `IotMqttBrokerService.publish(...)` so matching MQTT subscribers receive broker-native messages.
+
+### Shadow Events
+
+A successful classic or named shadow change reaches MQTT subscribers and the topic rules on the AWS response topics, whether it came from an MQTT request or from the REST `UpdateThingShadow` and `DeleteThingShadow` APIs. A rule such as `SELECT * FROM '$aws/things/+/shadow/name/building/update/accepted'` therefore fires for both. As on AWS, a rule whose filter starts with a wildcard, such as `'#'` or `'+/things/+/shadow/#'`, receives them too. The events are published in the order accepted, documents, delta, and carry one timestamp (epoch seconds) per operation:
+
+- `update/accepted`, which is also the `UpdateThingShadow` response: `state` exactly as sent, null leaves kept, `metadata` mirroring it with `{"timestamp": ...}` per leaf (an array gets one entry per element), the new `version`, `timestamp`, and `clientToken` when the request had one.
+- `update/documents`: `previous` (JSON `null` on the first update) and `current`, each `{state, metadata, version}` as stored, plus `timestamp` and `clientToken`.
+- `update/delta`, only when desired differs from reported: `version`, `timestamp`, `state` with the desired values whose reported value is missing or different, compared key by key through nested objects and whole for arrays, the stored desired `metadata` of exactly those values, and `clientToken`.
+- `get/accepted`, for an MQTT get only (`GetThingShadow` publishes nothing): `state` with `desired`, `reported` and, when non-empty, `delta`, the stored `metadata`, `version`, the current `timestamp`, and `clientToken`.
+- `delete/accepted`: the deleted `version`, `timestamp`, and `clientToken`. `DeleteThingShadow` returns `version` and `timestamp`.
+- `rejected`, for an MQTT request only: `code` (the HTTP status as a number), `message`, and `clientToken` once the request parsed. A version conflict is `409` with `Version conflict`, a payload that is not JSON is `400` with `Invalid JSON`.
+
+An empty `name` is the classic shadow. A name that is not 1 to 64 of `$`, `a-z`, `A-Z`, `0-9`, `:`, `_` and `-` fails with `InvalidRequestException` (`Bad Request`), and an MQTT request on such a named topic, empty name included, is ignored as on AWS, with no `rejected`. A name containing `$` other than the reserved `$package` fails with `InvalidRequestException` (`Invalid shadow name : <name>`), which an MQTT request receives as a `400` `rejected`. `$package` is served as an ordinary named shadow: AWS's reserved document schema, and its omission of `metadata`, are not emulated.
+
+Shadow events are evaluated only against the rules of the shadow's region. A REST change belongs to the region of its SigV4 credential, and MQTT shadows live in the default region (`FLOCI_DEFAULT_REGION`). `clientid()` is `N/A` for every shadow event, as on AWS. The MQTT broker itself has no region or account, so its subscribers receive the shadow events of every region and account, as they receive a republish.
+
+Shadow responses are produced only by the shadow service in reaction to a request, and each one is fanned out once, recorded once and rule-evaluated once. Response topics are never parsed as requests. A `republish` action stays record plus fan-out, with no rule re-evaluation and no shadow processing, even when it targets a shadow request topic. Broker publish and fan-out are not recursive.
 
 Implementation notes:
 
@@ -180,6 +293,10 @@ Current accepted limitation:
 - Persistent offline sessions are not modeled yet.
 - QoS 2 and advanced MQTT 5 property semantics remain follow-up scope.
 - At most 1,000 MQTT publishes are pending rule evaluation, running or waiting. While that many are pending, further publishes are still delivered to subscribers but their topic rules are skipped, with one warning logged until the backlog drains.
+- Shadow state is merged shallowly: a nested object in `desired` or `reported` replaces the stored value of its top-level key instead of being merged into it.
+- REST shadow errors are not published to `rejected`.
+- MQTT shadow request topics are not themselves delivered to rules or subscribers.
+- An IoT Data `Publish` to a shadow request topic does not update the shadow, and a `republish` that targets a shadow request topic is not processed as a shadow request.
 
 ## Implementation Shape
 
@@ -189,6 +306,7 @@ The MQTT integration should keep service behavior separated from broker mechanic
 - The broker publish handler detects AWS IoT reserved topics.
 - IoT reserved-topic handling lives in IoT service code or a focused reserved-topic handler, not in packet parsing code.
 - AWS-generated shadow responses are published back through `IotMqttBrokerService.publish(...)` so regular MQTT subscribers receive broker-native messages.
+- MQTT and REST shadow changes share one `IotService` path that fans each response out once, records it once and hands its rule evaluation to the caller's rule runner: the JAX-RS request thread for REST, so the rules run before the response returns, and the broker's rule worker for MQTT.
 
 ## Phase 7 Completion Criteria
 
@@ -217,6 +335,7 @@ Supported rule behavior:
 - IoT Data `Publish` and MQTT publishes use the same rule dispatch path. An IoT Data `Publish` evaluates its rules before it returns. An MQTT publish evaluates them on the broker's rule worker, so neither its PUBACK nor its fan-out waits for rule actions, and a republished message can reach subscribers before or after the source message's other deliveries; AWS gives no ordering guarantee there either.
 - Rule matching is region-scoped: an IoT Data `Publish` evaluates the rules of the region named by its SigV4 credential, and a rule's actions target the rule's own region.
 - Publishes that carry no region (MQTT, or an IoT Data `Publish` whose `Authorization` header is absent or not SigV4) are evaluated against every region's rules.
+- Device shadow events on the `$aws/things/...` response topics reach rules as well, evaluated only against the rules of the shadow's region; see [Shadow Events](#shadow-events).
 - Actions receive the projected document, which is the payload itself for a statement that selects only `*`.
 - `republish` action republishes to another MQTT topic through `IotMqttBrokerService`.
 - `sqs` action sends to an SQS queue through Floci's SQS service boundary.
@@ -254,8 +373,8 @@ Semantics:
 
 - Keywords and function names are case insensitive, field names are case sensitive.
 - `topic()` is the full MQTT topic, `topic(n)` is its nth segment counting from 1.
-- `clientid()` is the MQTT client that published the message, or `n/a` for an IoT Data `Publish`
-  over HTTP, as on AWS. `accountid()` is the account that owns the rule. `timestamp()` is the
+- `clientid()` is the MQTT client that published the message, or `N/A` for an IoT Data `Publish`
+  over HTTP and for a device shadow event, as on AWS. `accountid()` is the account that owns the rule. `timestamp()` is the
   current time in milliseconds since the epoch. `newuuid()` is a fresh random UUID.
 - `isNull(x)` is true only for a JSON `null`, `isUndefined(x)` only for a missing field or an
   undefined expression. Neither is ever undefined itself.

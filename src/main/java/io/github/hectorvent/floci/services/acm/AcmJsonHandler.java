@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.acm.model.Certificate;
 import io.github.hectorvent.floci.services.acm.model.CertificateOptions;
 import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
@@ -100,7 +101,13 @@ public class AcmJsonHandler {
                     "Value null at 'domainName' failed to satisfy constraint: Member must not be null"))
                 .build();
         }
-        List<String> sans = parseStringList(request.path("SubjectAlternativeNames"));
+        JsonNode sanNode = request.path("SubjectAlternativeNames");
+        if (sanNode.isArray() && sanNode.isEmpty()) {
+            throw SmithyValidationErrors.validationException(
+                "Value '[]' at 'subjectAlternativeNames' failed to satisfy "
+                    + "constraint: Member must have length greater than or equal to 1");
+        }
+        List<String> sans = parseStringList(sanNode);
         ValidationMethod validationMethod = parseValidationMethod(request.path("ValidationMethod").asText(null));
         String idempotencyToken = request.path("IdempotencyToken").asText(null);
         KeyAlgorithm keyAlgorithm = KeyAlgorithm.fromAwsName(request.path("KeyAlgorithm").asText(null));

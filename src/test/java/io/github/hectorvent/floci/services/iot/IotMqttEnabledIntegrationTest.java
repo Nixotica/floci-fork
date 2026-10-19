@@ -2,9 +2,12 @@ package io.github.hectorvent.floci.services.iot;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.testing.IotMqttTlsProfile;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
 import org.eclipse.paho.client.mqttv3.MqttCallback;
@@ -15,12 +18,15 @@ import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
@@ -36,16 +42,20 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
-@TestProfile(IotMqttEnabledIntegrationTest.EnabledMqttProfile.class)
+@TestProfile(IotMqttTlsProfile.class)
 class IotMqttEnabledIntegrationTest {
 
     static final int AWS_MAX_PAYLOAD = 128 * 1024;
-    private static final int PORT = 18831;
-    private static final String BROKER_URI = "tcp://127.0.0.1:" + PORT;
+    private static final String BROKER_URI = "tcp://127.0.0.1:" + IotMqttTlsProfile.PLAIN_PORT;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final String BUILDING_RULE_SQL = "SELECT *, topic() AS topic, clientid() AS cid "
+            + "FROM '$aws/things/+/shadow/name/building/update/accepted' WHERE endswith(clientToken, 'inbound')";
 
     @Inject
     IotPublishEventRecorder eventRecorder;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
 
     @BeforeEach
     void clearEvents() {
@@ -260,6 +270,7 @@ class IotMqttEnabledIntegrationTest {
             try (MqttTestClient publisher = connectMqtt("phase7-update-pub")) {
                 publisher.publish("$aws/things/phase7Thing/shadow/update",
                         json("{\"state\":{\"desired\":{\"color\":\"blue\"}},\"clientToken\":\"token-1\"}"));
+                removeShadowAfterTheTest("phase7Thing");
             }
 
             MqttPublish accepted = subscriber.takePublish();
@@ -278,6 +289,7 @@ class IotMqttEnabledIntegrationTest {
             try (Mqtt5TestClient publisher = connectMqtt5("phase7-mqtt5-update-pub")) {
                 publisher.publish("$aws/things/phase7Mqtt5Thing/shadow/update",
                         json("{\"state\":{\"desired\":{\"color\":\"purple\"}},\"clientToken\":\"mqtt5-token\"}"));
+                removeShadowAfterTheTest("phase7Mqtt5Thing");
             }
 
             MqttPublish accepted = subscriber.takePublish();
@@ -301,8 +313,9 @@ class IotMqttEnabledIntegrationTest {
             MqttPublish rejected = subscriber.takePublish();
             JsonNode payload = readJson(rejected.payload());
             assertEquals("$aws/things/phase7Thing/shadow/update/rejected", rejected.topic());
-            assertEquals("InvalidRequestException", payload.path("code").asText());
-            assertTrue(payload.path("message").asText().length() > 0);
+            assertEquals(400, payload.path("code").asInt());
+            assertTrue(payload.path("code").isInt(), payload.toString());
+            assertEquals("Invalid JSON", payload.path("message").asText());
         }
     }
 
@@ -326,8 +339,10 @@ class IotMqttEnabledIntegrationTest {
                 MqttPublish deleteAccepted = subscriber.takePublish();
                 JsonNode deletePayload = readJson(deleteAccepted.payload());
                 assertEquals("$aws/things/phase7GetDelete/shadow/delete/accepted", deleteAccepted.topic());
-                assertTrue(deletePayload.path("state").path("reported").path("online").asBoolean());
+                assertEquals(getPayload.path("version").asLong(), deletePayload.path("version").asLong());
+                assertTrue(deletePayload.path("timestamp").isNumber(), deletePayload.toString());
                 assertEquals("delete-token", deletePayload.path("clientToken").asText());
+                assertTrue(deletePayload.path("state").isMissingNode(), deletePayload.toString());
             }
         }
     }
@@ -341,6 +356,7 @@ class IotMqttEnabledIntegrationTest {
             try (MqttTestClient publisher = connectMqtt("phase7-docs-delta-pub")) {
                 publisher.publish("$aws/things/phase7Documents/shadow/update",
                         json("{\"state\":{\"reported\":{\"color\":\"red\"}}}"));
+                removeShadowAfterTheTest("phase7Documents");
                 subscriber.takePublish();
 
                 publisher.publish("$aws/things/phase7Documents/shadow/update",
@@ -377,6 +393,8 @@ class IotMqttEnabledIntegrationTest {
             try (MqttTestClient publisher = connectMqtt("phase7-named-pub")) {
                 publisher.publish(updateTopic,
                         json("{\"state\":{\"desired\":{\"mode\":\"auto\"}},\"clientToken\":\"named-update\"}"));
+                cleanup.register(() -> given().queryParam("name", "settings")
+                        .when().delete("/things/" + thingName + "/shadow").then().statusCode(200));
                 MqttPublish updateAccepted = subscriber.takePublish();
                 JsonNode updatePayload = readJson(updateAccepted.payload());
                 assertEquals(updateTopic + "/accepted", updateAccepted.topic());
@@ -416,6 +434,7 @@ class IotMqttEnabledIntegrationTest {
             .put("/rules/phase8MqttRepublishRule")
         .then()
             .statusCode(200);
+        cleanup.register(() -> given().when().delete("/rules/phase8MqttRepublishRule").then().statusCode(200));
 
         try (MqttTestClient subscriber = connectMqtt("phase8-republish-sub")) {
             subscriber.subscribe("devices/phase8/mqtt/target");
@@ -453,6 +472,7 @@ class IotMqttEnabledIntegrationTest {
             .put("/rules/phase8MqttClientIdRule")
         .then()
             .statusCode(200);
+        cleanup.register(() -> given().when().delete("/rules/phase8MqttClientIdRule").then().statusCode(200));
 
         try (MqttTestClient subscriber = connectMqtt("phase8-clientid-sub")) {
             subscriber.subscribe("devices/phase8/mqtt/clientid-target");
@@ -466,6 +486,197 @@ class IotMqttEnabledIntegrationTest {
             assertEquals("{\"client\":\"" + publisherId + "\",\"topic\":\"devices/phase8/mqtt/clientid\"}",
                     new String(republished.payload(), StandardCharsets.UTF_8));
         }
+    }
+
+    @Test
+    void restNamedShadowUpdateReachesARuleOnItsAcceptedTopic() throws Exception {
+        String thing = "shadowRuleRest" + System.nanoTime();
+        String queueUrl = createQueue("shadow-rule-rest-" + System.nanoTime());
+        String rule = "shadowRuleRest" + System.nanoTime();
+        createSqsRule(rule, BUILDING_RULE_SQL, queueUrl);
+        try {
+            updateShadow(thing, "building", "{\"state\":{\"desired\":{\"temp\":21}},\"clientToken\":\"x:inbound\"}");
+
+            List<String> bodies = receiveMessages(queueUrl);
+            assertEquals(1, bodies.size(), "one message per matching update: " + bodies);
+            JsonNode message = OBJECT_MAPPER.readTree(bodies.get(0));
+            assertEquals("$aws/things/" + thing + "/shadow/name/building/update/accepted", message.path("topic").asText());
+            assertEquals("N/A", message.path("cid").asText());
+            assertEquals("x:inbound", message.path("clientToken").asText());
+            assertEquals(21, message.at("/state/desired/temp").asInt());
+            assertTrue(message.at("/metadata/desired/temp/timestamp").isNumber(), message.toString());
+            assertEquals(1, message.path("version").asInt());
+            assertTrue(message.path("timestamp").isNumber(), message.toString());
+
+            updateShadow(thing, "building", "{\"state\":{\"desired\":{\"temp\":22}},\"clientToken\":\"x:outbound\"}");
+
+            assertEquals(List.of(), receiveMessages(queueUrl), "a nonmatching clientToken reaches no rule");
+        } finally {
+            deleteRule(rule);
+        }
+    }
+
+    @Test
+    void mqttNamedShadowUpdateReachesARuleOnItsAcceptedTopic() throws Exception {
+        String thing = "shadowRuleMqtt" + System.nanoTime();
+        String queueUrl = createQueue("shadow-rule-mqtt-" + System.nanoTime());
+        String rule = "shadowRuleMqtt" + System.nanoTime();
+        createSqsRule(rule, BUILDING_RULE_SQL, queueUrl);
+        try {
+            try (MqttTestClient publisher = connectMqtt("shadow-rule-pub")) {
+                String update = "$aws/things/" + thing + "/shadow/name/building/update";
+                publisher.publish(update, json("{\"state\":{\"desired\":{\"temp\":20}},\"clientToken\":\"x:outbound\"}"));
+                publisher.publish(update, json("{\"state\":{\"desired\":{\"temp\":21}},\"clientToken\":\"x:inbound\"}"));
+            }
+
+            // One worker runs the rules in publish order, so the outbound update was evaluated before the inbound one.
+            List<String> bodies = awaitMessages(queueUrl);
+            assertEquals(1, bodies.size(), "one message per matching update: " + bodies);
+            JsonNode message = OBJECT_MAPPER.readTree(bodies.get(0));
+            assertEquals("$aws/things/" + thing + "/shadow/name/building/update/accepted", message.path("topic").asText());
+            assertEquals("N/A", message.path("cid").asText());
+            assertEquals("x:inbound", message.path("clientToken").asText());
+            assertEquals(21, message.at("/state/desired/temp").asInt());
+            assertEquals(2, message.path("version").asInt());
+            assertEquals(List.of(), receiveMessages(queueUrl), "a nonmatching clientToken reaches no rule");
+        } finally {
+            deleteRule(rule);
+        }
+    }
+
+    @Test
+    void restClassicShadowUpdateAndDeleteReachRulesOnTheirAcceptedTopics() throws Exception {
+        String thing = "shadowRuleClassic" + System.nanoTime();
+        String queueUrl = createQueue("shadow-rule-classic-" + System.nanoTime());
+        String updateRule = "shadowClassicUpdate" + System.nanoTime();
+        String deleteRule = "shadowClassicDelete" + System.nanoTime();
+        createSqsRule(updateRule, "SELECT *, topic() AS topic FROM '$aws/things/+/shadow/update/accepted' "
+                + "WHERE topic(3) = '" + thing + "'", queueUrl);
+        createSqsRule(deleteRule, "SELECT *, topic() AS topic FROM '$aws/things/+/shadow/delete/accepted' "
+                + "WHERE topic(3) = '" + thing + "'", queueUrl);
+        try {
+            updateShadow(thing, null, "{\"state\":{\"reported\":{\"online\":true}}}");
+            given()
+            .when()
+                .delete("/things/" + thing + "/shadow")
+            .then()
+                .statusCode(200)
+                .body("version", equalTo(1));
+
+            Map<String, JsonNode> byTopic = new HashMap<>();
+            for (String body : receiveMessages(queueUrl)) {
+                JsonNode message = OBJECT_MAPPER.readTree(body);
+                byTopic.put(message.path("topic").asText(), message);
+            }
+            JsonNode updated = byTopic.get("$aws/things/" + thing + "/shadow/update/accepted");
+            JsonNode deleted = byTopic.get("$aws/things/" + thing + "/shadow/delete/accepted");
+            assertEquals(2, byTopic.size(), byTopic.toString());
+            assertTrue(updated.at("/state/reported/online").asBoolean(), updated.toString());
+            assertEquals(1, updated.path("version").asInt());
+            assertEquals(1, deleted.path("version").asInt());
+            assertTrue(deleted.path("timestamp").isNumber(), deleted.toString());
+        } finally {
+            deleteRule(updateRule);
+            deleteRule(deleteRule);
+        }
+    }
+
+    @Test
+    void mqttSubscriberReceivesTheAcceptedEventOfARestShadowUpdate() throws Exception {
+        String thing = "shadowRestToMqtt" + System.nanoTime();
+        String accepted = "$aws/things/" + thing + "/shadow/name/building/update/accepted";
+
+        try (MqttTestClient subscriber = connectMqtt("shadow-rest-sub")) {
+            subscriber.subscribe(accepted);
+
+            updateShadow(thing, "building", "{\"state\":{\"desired\":{\"temp\":21}},\"clientToken\":\"rest-token\"}");
+
+            MqttPublish received = subscriber.takePublish();
+            JsonNode payload = readJson(received.payload());
+            assertEquals(accepted, received.topic());
+            assertEquals(21, payload.at("/state/desired/temp").asInt());
+            assertEquals("rest-token", payload.path("clientToken").asText());
+            assertEquals(1, payload.path("version").asInt());
+        }
+    }
+
+    private String createQueue(String queueName) {
+        return given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", queueName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+    }
+
+    private List<String> receiveMessages(String queueUrl) {
+        return given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ReceiveMessage")
+            .formParam("QueueUrl", queueUrl)
+            .formParam("MaxNumberOfMessages", "10")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getList("ReceiveMessageResponse.ReceiveMessageResult.Message.Body", String.class);
+    }
+
+    /** The first non-empty receive on the queue within two seconds. */
+    private List<String> awaitMessages(String queueUrl) throws InterruptedException {
+        Instant deadline = Instant.now().plus(Duration.ofSeconds(2));
+        while (Instant.now().isBefore(deadline)) {
+            List<String> received = receiveMessages(queueUrl);
+            if (!received.isEmpty()) {
+                return received;
+            }
+            Thread.sleep(25);
+        }
+        throw new AssertionError("No message arrived on " + queueUrl);
+    }
+
+    private void createSqsRule(String ruleName, String sql, String queueUrl) {
+        ObjectNode sqs = OBJECT_MAPPER.createObjectNode()
+                .put("roleArn", "arn:aws:iam::000000000000:role/iot-rule-role")
+                .put("queueUrl", queueUrl);
+        ObjectNode payload = OBJECT_MAPPER.createObjectNode()
+                .put("sql", sql)
+                .put("ruleDisabled", false);
+        payload.putArray("actions").addObject().set("sqs", sqs);
+        ObjectNode body = OBJECT_MAPPER.createObjectNode();
+        body.set("topicRulePayload", payload);
+        given()
+            .contentType("application/json")
+            .body(body.toString())
+        .when()
+            .put("/rules/" + ruleName)
+        .then()
+            .statusCode(200);
+    }
+
+    private void deleteRule(String ruleName) {
+        given()
+        .when()
+            .delete("/rules/" + ruleName)
+        .then()
+            .statusCode(200);
+    }
+
+    private void updateShadow(String thingName, String shadowName, String body) {
+        RequestSpecification request = given()
+            .contentType("application/json")
+            .body(body);
+        if (shadowName != null) {
+            request.queryParam("name", shadowName);
+        }
+        request
+        .when()
+            .post("/things/" + thingName + "/shadow")
+        .then()
+            .statusCode(200);
     }
 
     private MqttTestClient connectMqtt(String clientId) throws MqttException {
@@ -482,6 +693,10 @@ class IotMqttEnabledIntegrationTest {
 
     private Mqtt5TestClient connectMqtt5(String clientId) throws org.eclipse.paho.mqttv5.common.MqttException {
         return Mqtt5TestClient.connect(uniqueClientId(clientId));
+    }
+
+    private void removeShadowAfterTheTest(String thingName) {
+        cleanup.register(() -> given().when().delete("/things/" + thingName + "/shadow").then().statusCode(200));
     }
 
     static byte[] randomPayload(int size) {
@@ -682,18 +897,6 @@ class IotMqttEnabledIntegrationTest {
             options.setKeepAliveInterval(60);
             options.setAutomaticReconnect(false);
             return options;
-        }
-    }
-
-    public static final class EnabledMqttProfile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of(
-                    "floci.services.iot.mqtt.enabled", "true",
-                    "floci.services.iot.mqtt.auto-start", "true",
-                    "floci.services.iot.mqtt.host", "127.0.0.1",
-                    "floci.services.iot.mqtt.port", Integer.toString(PORT)
-            );
         }
     }
 }

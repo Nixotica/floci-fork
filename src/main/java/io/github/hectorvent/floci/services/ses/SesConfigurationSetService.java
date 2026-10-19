@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ses.model.ArchivingOptions;
@@ -12,9 +13,10 @@ import io.github.hectorvent.floci.services.ses.model.ConfigurationSet;
 import io.github.hectorvent.floci.services.ses.model.DeliveryOptions;
 import io.github.hectorvent.floci.services.ses.model.EventBridgeDestination;
 import io.github.hectorvent.floci.services.ses.model.EventDestination;
-import io.github.hectorvent.floci.services.ses.model.TrackingOptions;
+import io.github.hectorvent.floci.services.ses.model.MessageSecurityOptions;
 import io.github.hectorvent.floci.services.ses.model.SuppressionOptions;
 import io.github.hectorvent.floci.services.ses.model.Tag;
+import io.github.hectorvent.floci.services.ses.model.TrackingOptions;
 import io.github.hectorvent.floci.services.ses.model.VdmOptions;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -25,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -46,11 +49,12 @@ import java.util.regex.Pattern;
  * reasons) and the tenant delete-guard around {@link #remove}.
  */
 @ApplicationScoped
-public class SesConfigurationSetService {
+public class SesConfigurationSetService implements SesTaggable {
 
     private static final Logger LOG = Logger.getLogger(SesConfigurationSetService.class);
 
-    private static final Pattern CONFIG_SET_NAME = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
+    private static final Pattern CONFIG_SET_NAME = Pattern.compile("^[A-Za-z0-9_-]+$");
+    private static final int MAX_CONFIG_SET_NAME_LENGTH = 64;
     private static final Set<String> VDM_FEATURE_STATES = Set.of("ENABLED", "DISABLED");
 
     private static final Pattern EVENT_DESTINATION_NAME_CHARS = Pattern.compile("^[A-Za-z0-9_-]+$");
@@ -83,7 +87,7 @@ public class SesConfigurationSetService {
             throw new AwsException("InvalidParameterValue",
                     "ConfigurationSetName is required.", 400);
         }
-        validateConfigurationSetName(configSet.getName());
+        validateName(configSet.getName());
         SesTags.validate(configSet.getTags());
         if (configSet.getSuppressionOptions() != null
                 && configSet.getSuppressionOptions().getSuppressedReasons() != null) {
@@ -93,12 +97,11 @@ public class SesConfigurationSetService {
                             invalidSuppressionReasonMessage(null), 400);
                 }
                 if (!isValidSuppressionReason(reason)) {
-                    throw new AwsException("BadRequestException",
-                            "1 validation error detected: Value at "
+                    throw SmithyValidationErrors.badRequest(
+                            "Value at "
                                     + "'suppressionOptions.suppressedReasons' failed to satisfy "
                                     + "constraint: Member must satisfy constraint: "
-                                    + "[Member must satisfy enum value set: [BOUNCE, COMPLAINT]]",
-                            400);
+                                    + "[Member must satisfy enum value set: [BOUNCE, COMPLAINT]]");
                 }
             }
         }
@@ -140,6 +143,31 @@ public class SesConfigurationSetService {
         return configSetStore.scan(k -> k.startsWith(prefix)).stream()
                 .sorted(Comparator.comparing(ConfigurationSet::getName))
                 .toList();
+    }
+
+    /**
+     * ListConfigurationSets with a name filter, probed 2026-10-03: SES checks the page size, the
+     * name, then the token. The name is not trimmed and is found anywhere in a set's name without
+     * regard to case, and a token is bound to it. A null name lists every set.
+     */
+    public PaginatedResult<ConfigurationSet> listV2(String region, String nameContains, Integer pageSize,
+                                                    String nextToken) {
+        SesListPaging paging = SesListPaging.V2_LIST_CONFIGURATION_SETS;
+        if (nameContains == null) {
+            return list(region, paging, pageSize, nextToken);
+        }
+        // Validated here as well as in page() so the size error wins over the name's length.
+        paging.checkRequest(pageSize, nextToken);
+        int length = nameContains.codePointCount(0, nameContains.length());
+        if (length < 3 || length > 64) {
+            throw new AwsException("BadRequestException",
+                    "CONFIGURATION_SET_NAME_CONTAINS must be between 3 and 64 characters", 400);
+        }
+        String name = nameContains.toLowerCase(Locale.ROOT);
+        List<ConfigurationSet> matching = list(region).stream()
+                .filter(cs -> cs.getName().toLowerCase(Locale.ROOT).contains(name))
+                .toList();
+        return paging.page(region, name, matching, ConfigurationSet::getName, pageSize, nextToken);
     }
 
     /** The raw removal; existence and the tenant delete-guard are the facade's orchestration. */
@@ -202,9 +230,9 @@ public class SesConfigurationSetService {
                     "Domain <" + domain + "> is not verified under this account.", 400);
         }
         if (httpsPolicy != null && !HTTPS_POLICIES.contains(httpsPolicy)) {
-            throw new AwsException("BadRequestException",
-                    "1 validation error detected: Value at 'httpsPolicy' failed to satisfy constraint: "
-                            + "Member must satisfy enum value set: [OPTIONAL, REQUIRE, REQUIRE_OPEN_ONLY]", 400);
+            throw SmithyValidationErrors.badRequest(
+                    "Value at 'httpsPolicy' failed to satisfy constraint: "
+                            + "Member must satisfy enum value set: [OPTIONAL, REQUIRE, REQUIRE_OPEN_ONLY]");
         }
     }
 
@@ -214,9 +242,9 @@ public class SesConfigurationSetService {
             return;
         }
         if (options.getTlsPolicy() != null && !TLS_POLICIES.contains(options.getTlsPolicy())) {
-            throw new AwsException("BadRequestException",
-                    "1 validation error detected: Value at 'tlsPolicy' failed to satisfy constraint: "
-                            + "Member must satisfy enum value set: [OPTIONAL, REQUIRE]", 400);
+            throw SmithyValidationErrors.badRequest(
+                    "Value at 'tlsPolicy' failed to satisfy constraint: "
+                            + "Member must satisfy enum value set: [OPTIONAL, REQUIRE]");
         }
         // AWS rejects a blank SendingPoolName outright, and a non-existent
         // dedicated IP pool (both verified against real AWS 2026-06-17). The
@@ -236,14 +264,14 @@ public class SesConfigurationSetService {
         if (options.getMaxDeliverySeconds() != null) {
             long maxDeliverySeconds = options.getMaxDeliverySeconds();
             if (maxDeliverySeconds < 300) {
-                throw new AwsException("BadRequestException",
-                        "1 validation error detected: Value at 'maxDeliverySeconds' failed to satisfy constraint: "
-                                + "Member must have value greater than or equal to 300", 400);
+                throw SmithyValidationErrors.badRequest(
+                        "Value at 'maxDeliverySeconds' failed to satisfy constraint: "
+                                + "Member must have value greater than or equal to 300");
             }
             if (maxDeliverySeconds > 50400) {
-                throw new AwsException("BadRequestException",
-                        "1 validation error detected: Value at 'maxDeliverySeconds' failed to satisfy constraint: "
-                                + "Member must have value less than or equal to 50400", 400);
+                throw SmithyValidationErrors.badRequest(
+                        "Value at 'maxDeliverySeconds' failed to satisfy constraint: "
+                                + "Member must have value less than or equal to 50400");
             }
         }
     }
@@ -251,9 +279,9 @@ public class SesConfigurationSetService {
     void requireVerifiedRedirectDomain(String domain, Predicate<String> verifiedDomainIdentity) {
         Objects.requireNonNull(verifiedDomainIdentity, "verifiedDomainIdentity probe is required");
         if (domain == null) {
-            throw new AwsException("ValidationError",
-                    "1 validation error detected: Value at 'trackingOptions' failed to satisfy constraint: "
-                            + "Member must not be null", 400);
+            throw SmithyValidationErrors.validationError(
+                    "Value at 'trackingOptions' failed to satisfy constraint: "
+                            + "Member must not be null");
         }
         if (domain.isBlank()) {
             throw new AwsException("InvalidTrackingOptions",
@@ -316,10 +344,12 @@ public class SesConfigurationSetService {
     }
 
     /** The ARN-dispatched tag operations, sharing the store behind {@code CreateConfigurationSet.Tags}. */
+    @Override
     public List<Tag> listTags(String name, String region) {
         return new ArrayList<>(requireForTags(name, region).getTags());
     }
 
+    @Override
     public void tag(String name, String region, List<Tag> newTags) {
         ConfigurationSet cs = requireForTags(name, region);
         cs.setTags(SesTags.merge(cs.getTags(), newTags));
@@ -327,6 +357,7 @@ public class SesConfigurationSetService {
         LOG.infov("Tagged SES configuration set: {0} (region {1}, +{2} tags)", name, region, newTags.size());
     }
 
+    @Override
     public void untag(String name, String region, List<String> tagKeys) {
         ConfigurationSet cs = requireForTags(name, region);
         Set<String> toRemove = new HashSet<>(tagKeys);
@@ -357,7 +388,7 @@ public class SesConfigurationSetService {
 
     /** For guards that must not trip the key derivation's name validation (the tenant gate). */
     static boolean isValidName(String name) {
-        return name != null && CONFIG_SET_NAME.matcher(name).matches();
+        return name != null && name.length() <= MAX_CONFIG_SET_NAME_LENGTH && CONFIG_SET_NAME.matcher(name).matches();
     }
 
     // ──────────────────────── Domain-pure option setters ────────────────────────
@@ -396,6 +427,22 @@ public class SesConfigurationSetService {
         LOG.infov("Updated ArchivingOptions on configuration set {0} in region {1}", configSetName, region);
     }
 
+    /**
+     * UpdateConfigurationSet: a partial update, so a null {@code options} keeps the stored value
+     * while the set must still exist.
+     */
+    public void updateMessageSecurityOptions(String configSetName, MessageSecurityOptions options,
+                                             String region) {
+        ConfigurationSet cs = get(configSetName, region);
+        if (options == null) {
+            return;
+        }
+        cs.setMessageSecurityOptions(options);
+        configSetStore.put(configSetKey(region, configSetName), cs);
+        LOG.infov("Updated MessageSecurityOptions on configuration set {0} in region {1}",
+                configSetName, region);
+    }
+
     public void setVdmOptions(String configSetName, VdmOptions options, String region) {
         ConfigurationSet cs = get(configSetName, region);
         validateVdmOptions(options);
@@ -413,16 +460,16 @@ public class SesConfigurationSetService {
         if (options.getDashboardOptions() != null
                 && options.getDashboardOptions().getEngagementMetrics() != null
                 && !VDM_FEATURE_STATES.contains(options.getDashboardOptions().getEngagementMetrics())) {
-            throw new AwsException("BadRequestException",
-                    "1 validation error detected: Value at 'vdmOptions.dashboardOptions.engagementMetrics' "
-                            + "failed to satisfy constraint: Member must satisfy enum value set: [ENABLED, DISABLED]", 400);
+            throw SmithyValidationErrors.badRequest(
+                    "Value at 'vdmOptions.dashboardOptions.engagementMetrics' "
+                            + "failed to satisfy constraint: Member must satisfy enum value set: [ENABLED, DISABLED]");
         }
         if (options.getGuardianOptions() != null
                 && options.getGuardianOptions().getOptimizedSharedDelivery() != null
                 && !VDM_FEATURE_STATES.contains(options.getGuardianOptions().getOptimizedSharedDelivery())) {
-            throw new AwsException("BadRequestException",
-                    "1 validation error detected: Value at 'vdmOptions.guardianOptions.optimizedSharedDelivery' "
-                            + "failed to satisfy constraint: Member must satisfy enum value set: [ENABLED, DISABLED]", 400);
+            throw SmithyValidationErrors.badRequest(
+                    "Value at 'vdmOptions.guardianOptions.optimizedSharedDelivery' "
+                            + "failed to satisfy constraint: Member must satisfy enum value set: [ENABLED, DISABLED]");
         }
     }
 
@@ -680,20 +727,24 @@ public class SesConfigurationSetService {
         return count;
     }
 
-    private static void validateConfigurationSetName(String name) {
-        if (name == null || name.isBlank()) {
+    static void validateName(String name) {
+        if (name == null || name.isEmpty()) {
             throw new AwsException("InvalidParameterValue",
-                    "ConfigurationSetName is required.", 400);
+                    "The configuration set name must be specified.", 400);
+        }
+        if (name.length() > MAX_CONFIG_SET_NAME_LENGTH) {
+            throw new AwsException("InvalidParameterValue",
+                    "Configuration set name cannot exceed " + MAX_CONFIG_SET_NAME_LENGTH + " characters.", 400);
         }
         if (!CONFIG_SET_NAME.matcher(name).matches()) {
             throw new AwsException("InvalidParameterValue",
-                    "ConfigurationSetName must be 1-64 characters and may only contain "
-                            + "alphanumeric characters, underscores, and hyphens.", 400);
+                    "Invalid configuration set name <" + name + ">: only alphanumeric ASCII characters, "
+                            + "'_', and '-' are allowed.", 400);
         }
     }
 
     private static String configSetKey(String region, String name) {
-        validateConfigurationSetName(name);
+        validateName(name);
         return "configSet::" + region + "::" + name;
     }
 }

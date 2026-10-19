@@ -16,8 +16,8 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <aws.sdk.version>2.55.3</aws.sdk.version>
-        <awsjavasdk.version>2.55.3</awsjavasdk.version>
+        <aws.sdk.version>2.55.11</aws.sdk.version>
+        <awsjavasdk.version>2.55.11</awsjavasdk.version>
         <jackson.version>2.18.8</jackson.version>
         <kafka.clients.version>3.9.2</kafka.clients.version>
         <netty.version>4.1.135.Final</netty.version>
@@ -72,6 +72,10 @@
     </dependencyManagement>
 
     <dependencies>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>servicequotas</artifactId>
+        </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>acm</artifactId>
@@ -130,6 +134,10 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>lambdaweb</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>apigateway</artifactId>
         </dependency>
         <dependency>
@@ -163,6 +171,10 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>signin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>transfer</artifactId>
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -660,6 +672,20 @@
             <groupId>org.bouncycastle</groupId>
             <artifactId>bcpkix-jdk18on</artifactId>
             <version>1.84</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- MQTT 3.1.1 and MQTT 5 clients for the IoT custom-authorizer WebSocket tests,
+             the versions the emulator module itself tests with -->
+        <dependency>
+            <groupId>org.eclipse.paho</groupId>
+            <artifactId>org.eclipse.paho.client.mqttv3</artifactId>
+            <version>1.2.5</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.paho</groupId>
+            <artifactId>org.eclipse.paho.mqttv5.client</artifactId>
+            <version>1.2.5</version>
             <scope>test</scope>
         </dependency>
         <!-- Decodes the Snappy variants Firehose delivers to S3 (issue #2328).

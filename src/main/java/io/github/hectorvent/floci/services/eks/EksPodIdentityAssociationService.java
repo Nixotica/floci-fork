@@ -1,7 +1,10 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
@@ -37,17 +40,20 @@ public class EksPodIdentityAssociationService {
 
     private final StorageBackend<String, StoredAssociation> associations;
     private final IamService iam;
+    private final RegionResolver regionResolver;
     private final SecureRandom random = new SecureRandom();
 
     @Inject
-    public EksPodIdentityAssociationService(StorageFactory factory, IamService iam) {
+    public EksPodIdentityAssociationService(StorageFactory factory, IamService iam, RegionResolver regionResolver) {
         this(factory.create("eks", "eks-pod-identity-associations.json",
-                new TypeReference<Map<String, StoredAssociation>>() {}), iam);
+                new TypeReference<Map<String, StoredAssociation>>() {}), iam, regionResolver);
     }
 
-    EksPodIdentityAssociationService(StorageBackend<String, StoredAssociation> associations, IamService iam) {
+    EksPodIdentityAssociationService(StorageBackend<String, StoredAssociation> associations, IamService iam,
+                                     RegionResolver regionResolver) {
         this.associations = associations;
         this.iam = iam;
+        this.regionResolver = regionResolver;
     }
 
     @RegisterForReflection
@@ -79,10 +85,10 @@ public class EksPodIdentityAssociationService {
         if (roleArn == null || roleArn.isBlank()) {
             throw invalid("roleArn is required");
         }
-        validateRoleArn(cluster, roleArn, "roleArn");
+        validateRoleArn(roleArn, "roleArn");
 
         if (request.targetRoleArn() != null && !request.targetRoleArn().isBlank()) {
-            validateTargetRoleArn(cluster, request.targetRoleArn());
+            validateTargetRoleArn(request.targetRoleArn());
         }
 
         Map<String, String> tags = request.tags() == null ? Map.of() : request.tags();
@@ -118,19 +124,12 @@ public class EksPodIdentityAssociationService {
         }
 
         String associationId = generateAssociationId();
-        String partition = "aws";
-        String region = "us-east-1"; // partition-literal: fallback only when the record carries no region; no resolver in scope (follow-up)
-        String accountId = cluster.getAccountId() != null ? cluster.getAccountId() : "000000000000";
-        if (cluster.getArn() != null) {
-            String[] clusterArn = cluster.getArn().split(":", 6);
-            if (clusterArn.length == 6) {
-                partition = clusterArn[1];
-                region = clusterArn[3];
-                accountId = clusterArn[4];
-            }
-        }
-        String associationArn = "arn:" + partition + ":eks:" + region + ":"
-                + accountId + ":podidentityassociation/" + cluster.getName() + "/" + associationId;
+        // The association lives in the cluster's region and account, which its ARN names.
+        String region = AwsArnUtils.regionOrDefault(cluster.getArn(), regionResolver.getDefaultRegion());
+        String accountId = AwsArnUtils.accountOrDefault(cluster.getArn(),
+                cluster.getAccountId() != null ? cluster.getAccountId() : regionResolver.getDefaultAccountId());
+        String associationArn = AwsArnUtils.Arn.of("eks", region, accountId,
+                "podidentityassociation/" + cluster.getName() + "/" + associationId).toString();
         double now = Instant.now().toEpochMilli() / 1000.0;
         String externalId = UUID.randomUUID().toString();
 
@@ -196,12 +195,12 @@ public class EksPodIdentityAssociationService {
 
         String newRoleArn = current.roleArn();
         if (request.roleArn() != null) {
-            validateRoleArn(cluster, request.roleArn(), "roleArn");
+            validateRoleArn(request.roleArn(), "roleArn");
             newRoleArn = request.roleArn();
         }
         String newTargetRoleArn = current.targetRoleArn();
         if (request.targetRoleArn() != null) {
-            validateTargetRoleArn(cluster, request.targetRoleArn());
+            validateTargetRoleArn(request.targetRoleArn());
             newTargetRoleArn = request.targetRoleArn();
         }
         Boolean newDisableSessionTags = request.disableSessionTags() != null
@@ -274,8 +273,7 @@ public class EksPodIdentityAssociationService {
                 .toList();
 
         String token = remaining.size() > limit
-                ? Base64.getUrlEncoder().withoutPadding().encodeToString(
-                        (prefix + "\n" + page.getLast().associationId()).getBytes(StandardCharsets.UTF_8))
+                ? Base64Url.encode(prefix + "\n" + page.getLast().associationId())
                 : null;
 
         return new Page(page, token);
@@ -315,16 +313,14 @@ public class EksPodIdentityAssociationService {
         }
     }
 
-    private void validateRoleArn(Cluster cluster, String roleArn, String fieldName) {
+    /**
+     * The role must exist in the account the ARN names. Its partition only has to be well formed:
+     * an account keeps one IAM namespace whichever partition a request is for, and STS AssumeRole
+     * accepts the same role ARNs through {@link IamService#roleArnMatches}.
+     */
+    private void validateRoleArn(String roleArn, String fieldName) {
         String[] arn = roleArn.split(":", 6);
-        String expectedPartition = "aws";
-        if (cluster != null && cluster.getArn() != null) {
-            String[] clusterArn = cluster.getArn().split(":", 6);
-            if (clusterArn.length > 1) {
-                expectedPartition = clusterArn[1];
-            }
-        }
-        if (arn.length != 6 || !"arn".equals(arn[0]) || !arn[1].equals(expectedPartition)
+        if (arn.length != 6 || !"arn".equals(arn[0]) || !arn[1].matches(AwsArnUtils.PARTITION_REGEX)
                 || !"iam".equals(arn[2]) || !arn[3].isEmpty() || !arn[4].matches("[0-9]{12}")
                 || !arn[5].startsWith("role/") || arn[5].startsWith("role/aws-service-role/")
                 || roleArn.endsWith("/")) {
@@ -332,20 +328,13 @@ public class EksPodIdentityAssociationService {
         }
         String roleName = roleArn.substring(roleArn.lastIndexOf('/') + 1);
         iam.findRole(arn[4], roleName)
-                .filter(role -> roleArn.equals(role.getArn()))
+                .filter(role -> IamService.roleArnMatches(roleArn, role))
                 .orElseThrow(() -> invalid("IAM role does not exist"));
     }
 
-    private static void validateTargetRoleArn(Cluster cluster, String targetRoleArn) {
+    private static void validateTargetRoleArn(String targetRoleArn) {
         String[] arn = targetRoleArn.split(":", 6);
-        String expectedPartition = "aws";
-        if (cluster != null && cluster.getArn() != null) {
-            String[] clusterArn = cluster.getArn().split(":", 6);
-            if (clusterArn.length > 1) {
-                expectedPartition = clusterArn[1];
-            }
-        }
-        if (arn.length != 6 || !"arn".equals(arn[0]) || !arn[1].equals(expectedPartition)
+        if (arn.length != 6 || !"arn".equals(arn[0]) || !arn[1].matches(AwsArnUtils.PARTITION_REGEX)
                 || !"iam".equals(arn[2]) || !arn[3].isEmpty() || !arn[4].matches("[0-9]{12}")
                 || !arn[5].startsWith("role/") || targetRoleArn.endsWith("/")) {
             throw invalid("targetRoleArn must identify an IAM role");

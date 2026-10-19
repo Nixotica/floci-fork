@@ -8,28 +8,28 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
-import io.github.hectorvent.floci.services.ec2.model.ManagedPrefixList;
-import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
+import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
-import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
-import io.github.hectorvent.floci.services.ec2.model.Image;
-import io.github.hectorvent.floci.services.ec2.model.NetworkAcl;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.ec2.model.ManagedPrefixList;
 import io.github.hectorvent.floci.services.ec2.model.NatGateway;
+import io.github.hectorvent.floci.services.ec2.model.NetworkAcl;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.Snapshot;
+import io.github.hectorvent.floci.services.ec2.model.SpotInstanceRequest;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
-import io.github.hectorvent.floci.services.ec2.model.SpotInstanceRequest;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -63,6 +63,46 @@ class Ec2ServicePersistenceTest {
     private static final String REGION = "us-east-1";
 
     @Test
+    void elasticIpMetadataSurvivesRestart(@TempDir Path dir) {
+        String region = "us-west-2";
+        String pool = "ipv4pool-ec2-0123456789abcdef0";
+        String borderGroup = "us-west-2-lax-1";
+        Ec2Service first = newService(dir);
+        Address allocated = first.allocateAddress(region, pool, borderGroup);
+
+        Ec2Service restarted = newService(dir);
+        Address described = restarted.describeAddresses(
+                region, List.of(allocated.getAllocationId()), Map.of()).getFirst();
+
+        assertEquals(allocated.getAllocationId(), described.getAllocationId());
+        assertEquals(pool, described.getPublicIpv4Pool());
+        assertEquals(borderGroup, described.getNetworkBorderGroup());
+    }
+
+    @Test
+    void legacyElasticIpMetadataDefaultsToAmazonAndItsStoredRegion(@TempDir Path dir) throws IOException {
+        String region = "us-west-2";
+        String allocationId = "eipalloc-0123456789abcdef0";
+        String legacyJson = """
+                {
+                  "%s::%s": {
+                    "allocationId": "%s",
+                    "publicIp": "54.1.2.3",
+                    "domain": "vpc",
+                    "region": "%s"
+                  }
+                }
+                """.formatted(region, allocationId, allocationId, region);
+        Files.writeString(dir.resolve("ec2-addresses.json"), legacyJson);
+
+        Ec2Service restarted = newService(dir);
+        Address described = restarted.describeAddresses(region, List.of(allocationId), Map.of()).getFirst();
+
+        assertEquals("amazon", described.getPublicIpv4Pool());
+        assertEquals(region, described.getNetworkBorderGroup());
+    }
+
+    @Test
     void deletedVpcDefaultResourcesRemainAbsentAfterRestart(@TempDir Path dir) {
         Ec2Service first = newService(dir);
         Vpc vpc = first.createVpc(REGION, "10.77.0.0/16", false);
@@ -89,12 +129,12 @@ class Ec2ServicePersistenceTest {
     void emptyNetworkDiscoverySurvivesRestart(@TempDir Path dir) {
         Ec2Service first = newService(dir);
         assertTrue(first.describeVpnGatewayIds(List.of(), Map.of()).isEmpty());
-        assertTrue(first.describeEgressOnlyInternetGatewayIds(Map.of()).isEmpty());
+        assertTrue(first.describeEgressOnlyInternetGateways("us-east-1", List.of(), Map.of()).isEmpty());
 
         Ec2Service restarted = newService(dir);
         assertTrue(restarted.describeVpnGatewayIds(
                 List.of(), Map.of("attachment.vpc-id", List.of("vpc-0123456789abcdef0"))).isEmpty());
-        assertTrue(restarted.describeEgressOnlyInternetGatewayIds(Map.of("tag:Owner", List.of("TeamA"))).isEmpty());
+        assertTrue(restarted.describeEgressOnlyInternetGateways("us-east-1", List.of(), Map.of("tag:Owner", List.of("TeamA"))).isEmpty());
     }
 
     @Test
@@ -342,7 +382,7 @@ class Ec2ServicePersistenceTest {
                 .getFirst()
                 .getData();
         assertEquals("arn:aws:iam::000000000000:instance-profile/legacy-profile",
-                restarted.iamInstanceProfileArn(versioned),
+                versioned.getIamInstanceProfile().getArn(),
                 "IAM instance profile on a legacy versions-map entry must survive restart");
         assertEquals(List.of("legacy-versioned"),
                 versioned.getInstanceTags().stream().map(Tag::getValue).toList(),
@@ -353,7 +393,7 @@ class Ec2ServicePersistenceTest {
                 .getFirst()
                 .getData();
         assertEquals("arn:aws:iam::000000000000:instance-profile/legacy-profile",
-                restarted.iamInstanceProfileArn(noVersions),
+                noVersions.getIamInstanceProfile().getArn(),
                 "IAM instance profile on a legacy template with no versions map must survive restart");
         assertEquals(List.of("legacy-no-versions"),
                 noVersions.getInstanceTags().stream().map(Tag::getValue).toList(),

@@ -7,7 +7,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -64,14 +66,19 @@ final class ProjectionEvaluator {
     }
 
     static Set<String> topLevelAttributes(String projectionExpression, JsonNode exprAttrNames) {
-        var attributes = new java.util.HashSet<String>();
+        Set<String> attributes = new LinkedHashSet<>();
         for (String rawPath : splitProjectionPaths(projectionExpression)) {
             List<PathSegment> segments = resolvePath(rawPath.trim(), exprAttrNames);
-            if (!segments.isEmpty()) {
-                attributes.add(segments.getFirst().name());
+            if (segments.isEmpty()) {
+                continue;
             }
+            PathSegment root = segments.getFirst();
+            if (root.isIndex()) {
+                throw new IllegalArgumentException("Projection path starts with a list index: " + rawPath.trim());
+            }
+            attributes.add(root.name());
         }
-        return Set.copyOf(attributes);
+        return Collections.unmodifiableSet(attributes);
     }
 
     static void validateSyntax(String expression, String expressionType) {
@@ -222,11 +229,11 @@ final class ProjectionEvaluator {
         if (content.isEmpty()) {
             throw syntaxError("ProjectionExpression", "]", "[]");
         }
-        final var contentLength = content.length();
-        for (var i = 0; i < contentLength; i++) {
-            var c = content.charAt(i);
+        final int contentLength = content.length();
+        for (int i = 0; i < contentLength; i++) {
+            char c = content.charAt(i);
             if (c < '0' || '9' < c) {
-                var near = "[" + content + "]";
+                String near = "[" + content + "]";
                 throw syntaxError("ProjectionExpression", String.valueOf(c),
                         near.substring(0, Math.min(3, near.length())));
             }

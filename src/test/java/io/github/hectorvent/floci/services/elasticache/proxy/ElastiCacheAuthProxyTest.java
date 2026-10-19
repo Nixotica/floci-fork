@@ -3,12 +3,37 @@ package io.github.hectorvent.floci.services.elasticache.proxy;
 import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.atomic.AtomicReference;
+
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class ElastiCacheAuthProxyTest {
+
+    @Test
+    void authModeIsReadFromTheCacheOnEachConnection() {
+        AtomicReference<AuthMode> cacheAuthMode = new AtomicReference<>();
+        ElastiCacheAuthProxy.PasswordValidator passwordValidator = new ElastiCacheAuthProxy.PasswordValidator() {
+            @Override
+            public boolean validatePassword(String username, String password) {
+                return false;
+            }
+
+            @Override
+            public AuthMode authMode() {
+                return cacheAuthMode.get();
+            }
+        };
+        ElastiCacheAuthProxy proxy = new ElastiCacheAuthProxy("grp-live", AuthMode.IAM, "127.0.0.1", 6379,
+                passwordValidator, mock(SigV4Validator.class));
+
+        assertTrue(proxy.authRequired(), "the mode the proxy started with applies until the cache reports one");
+
+        cacheAuthMode.set(AuthMode.NO_AUTH);
+        assertFalse(proxy.authRequired(), "a cache whose last user group was removed has no access control");
+    }
 
     @Test
     void groupWithIamAuthModeAuthenticatesPasswordUserWhenAssociated() {
@@ -43,8 +68,8 @@ class ElastiCacheAuthProxyTest {
     @Test
     void groupWithPasswordAuthModeAuthenticatesIamUserWhenAssociated() {
         SigV4Validator sigV4Validator = mock(SigV4Validator.class);
-        when(sigV4Validator.validate("valid-sigv4", "grp-2", "iam-user")).thenReturn(true);
-        when(sigV4Validator.validate("bad-sigv4", "grp-2", "iam-user")).thenReturn(false);
+        when(sigV4Validator.validate("valid-sigv4", "grp-2", "iam-user", null)).thenReturn(true);
+        when(sigV4Validator.validate("bad-sigv4", "grp-2", "iam-user", null)).thenReturn(false);
 
         ElastiCacheAuthProxy.PasswordValidator passwordValidator = new ElastiCacheAuthProxy.PasswordValidator() {
             @Override
@@ -132,7 +157,7 @@ class ElastiCacheAuthProxyTest {
     @Test
     void groupWithMembersNormalizesEmptyUsernameToDefaultForIamValidation() {
         SigV4Validator sigV4Validator = mock(SigV4Validator.class);
-        when(sigV4Validator.validate("valid-sigv4", "grp-empty", "default")).thenReturn(true);
+        when(sigV4Validator.validate("valid-sigv4", "grp-empty", "default", null)).thenReturn(true);
 
         ElastiCacheAuthProxy.PasswordValidator passwordValidator = new ElastiCacheAuthProxy.PasswordValidator() {
             @Override
@@ -161,7 +186,7 @@ class ElastiCacheAuthProxyTest {
     @Test
     void groupWithNoMembersRequiresDefaultUserForSingleArgIamAuth() {
         SigV4Validator sigV4Validator = mock(SigV4Validator.class);
-        when(sigV4Validator.validate("valid-sigv4", "grp-legacy-iam", "default")).thenReturn(true);
+        when(sigV4Validator.validate("valid-sigv4", "grp-legacy-iam", "default", null)).thenReturn(true);
 
         ElastiCacheAuthProxy.PasswordValidator passwordValidator = new ElastiCacheAuthProxy.PasswordValidator() {
             @Override
@@ -185,7 +210,7 @@ class ElastiCacheAuthProxyTest {
     @Test
     void groupWithNoMembersPreservesLegacyIamAndAuthTokenBehaviour() {
         SigV4Validator sigV4Validator = mock(SigV4Validator.class);
-        when(sigV4Validator.validate("valid-sigv4", "grp-4", "anyone")).thenReturn(true);
+        when(sigV4Validator.validate("valid-sigv4", "grp-4", "anyone", null)).thenReturn(true);
 
         ElastiCacheAuthProxy.PasswordValidator passwordValidator = new ElastiCacheAuthProxy.PasswordValidator() {
             @Override
@@ -395,5 +420,56 @@ class ElastiCacheAuthProxyTest {
                 "AUTH \"\" <pass> must fail when default user is disabled");
         assertTrue(proxy.authenticate("app-user", "secret-123"),
                 "Configured password user must be able to authenticate");
+    }
+
+    @Test
+    void iamTokenIsCheckedAgainstTheAccountThatOwnsTheCache() {
+        SigV4Validator sigV4Validator = mock(SigV4Validator.class);
+        when(sigV4Validator.validate("valid-sigv4", "grp-owned", "iam-user", "111111111111")).thenReturn(true);
+        when(sigV4Validator.validate("valid-sigv4", "grp-owned", "default", "111111111111")).thenReturn(true);
+        ElastiCacheAuthProxy.PasswordValidator passwordValidator = new ElastiCacheAuthProxy.PasswordValidator() {
+            @Override
+            public boolean validatePassword(String username, String password) {
+                return false;
+            }
+
+            @Override
+            public boolean hasMembers() {
+                return true;
+            }
+
+            @Override
+            public AuthMode memberAuthMode(String username) {
+                return AuthMode.IAM;
+            }
+
+            @Override
+            public String ownerAccountId() {
+                return "111111111111";
+            }
+        };
+
+        ElastiCacheAuthProxy proxy = new ElastiCacheAuthProxy("grp-owned", AuthMode.IAM, "127.0.0.1", 6379,
+                passwordValidator, sigV4Validator);
+
+        assertTrue(proxy.authenticate("iam-user", "valid-sigv4"));
+        assertTrue(proxy.authenticate(null, "valid-sigv4"));
+
+        when(sigV4Validator.validate("valid-sigv4", "grp-owned", "anyone", "111111111111")).thenReturn(true);
+        ElastiCacheAuthProxy.PasswordValidator withoutMembers = new ElastiCacheAuthProxy.PasswordValidator() {
+            @Override
+            public boolean validatePassword(String username, String password) {
+                return false;
+            }
+
+            @Override
+            public String ownerAccountId() {
+                return "111111111111";
+            }
+        };
+        ElastiCacheAuthProxy legacyProxy = new ElastiCacheAuthProxy("grp-owned", AuthMode.IAM, "127.0.0.1", 6379,
+                withoutMembers, sigV4Validator);
+
+        assertTrue(legacyProxy.authenticate("anyone", "valid-sigv4"));
     }
 }

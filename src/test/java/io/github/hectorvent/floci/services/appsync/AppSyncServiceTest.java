@@ -14,6 +14,8 @@ import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizer
 import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizerResult;
 import io.github.hectorvent.floci.services.appsync.model.ApiKey;
 import io.github.hectorvent.floci.services.appsync.model.AuthenticationType;
+import io.github.hectorvent.floci.services.appsync.model.DomainName;
+import io.github.hectorvent.floci.services.appsync.model.FunctionConfiguration;
 import io.github.hectorvent.floci.services.appsync.model.GraphqlApi;
 import io.github.hectorvent.floci.services.appsync.model.SchemaCreationStatus;
 import jakarta.enterprise.inject.Instance;
@@ -28,10 +30,12 @@ import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
@@ -46,10 +50,50 @@ class AppSyncServiceTest {
     private static final Instant NOW = Instant.parse("2026-01-01T00:00:00Z");
     private AppSyncService service;
     private AccountAwareStorageBackend<ApiKey> apiKeyStoreOverride;
+    private String region = "us-east-1";
+    /** The deployment partition, or null to derive it from {@link #region}. */
+    private String partition;
 
     @BeforeEach
     void setUp() {
         service = newService(Clock.fixed(NOW, ZoneOffset.UTC));
+    }
+
+    /**
+     * AppSync fronts a custom domain with CloudFront, so a DNS alias to {@code appsyncDomainName}
+     * lives in the partition's CloudFront hosted zone, as the CDK's AppSyncTarget builds it. A
+     * random zone id made every such alias point nowhere. With no suffix configured the
+     * distribution name takes the partition's own.
+     */
+    @Test
+    void customDomainIsFrontedByTheCloudFrontZoneOfItsPartition() {
+        DomainName commercial = service.createDomainName(Map.of("domainName", "api.example.com"));
+        assertEquals("Z2FDTNDATAQYW2", commercial.getHostedZoneId());
+        assertTrue(commercial.getAppsyncDomainName().matches("d[0-9a-f]{13}\\.cloudfront\\.net"),
+                commercial.getAppsyncDomainName());
+
+        region = "cn-north-1";
+        DomainName china = newService(Clock.fixed(NOW, ZoneOffset.UTC))
+                .createDomainName(Map.of("domainName", "api.example.cn"));
+        assertEquals("Z3RFFRIM2A3IF5", china.getHostedZoneId());
+        assertTrue(china.getAppsyncDomainName().matches("d[0-9a-f]{13}\\.cloudfront\\.cn"),
+                china.getAppsyncDomainName());
+    }
+
+    /**
+     * A region no partition publishes, accepted under {@code allow-unknown-regions}, belongs to the
+     * deployment's partition, so a China deployment fronts the domain with China's CloudFront
+     * suffix and zone rather than the commercial ones.
+     */
+    @Test
+    void customDomainInAnUnpublishedRegionTakesTheDeploymentsPartition() {
+        region = "xx-test-1";
+        partition = "aws-cn";
+        DomainName domain = newService(Clock.fixed(NOW, ZoneOffset.UTC))
+                .createDomainName(Map.of("domainName", "api.example.cn"));
+
+        assertEquals("Z3RFFRIM2A3IF5", domain.getHostedZoneId());
+        assertTrue(domain.getAppsyncDomainName().endsWith(".cloudfront.cn"), domain.getAppsyncDomainName());
     }
 
     @Test
@@ -57,7 +101,7 @@ class AppSyncServiceTest {
         GraphqlApi api = service.createGraphqlApi(
                 Map.of("name", "rename", "authenticationType", "API_KEY"), "us-east-1");
         service.createDataSource(api.getApiId(), Map.of("name", "ds", "type", "NONE"), "us-east-1");
-        var created = service.createFunction(api.getApiId(),
+        FunctionConfiguration created = service.createFunction(api.getApiId(),
                 Map.of("name", "Query_getMessages_0", "dataSourceName", "ds"), "us-east-1");
 
         service.updateFunction(api.getApiId(), created.getFunctionId(),
@@ -382,12 +426,14 @@ class AppSyncServiceTest {
         Instance<RequestContext> requestContext = mock(Instance.class);
         schemaRegistry = mock(SchemaRegistry.class);
         lambdaAuthorizerCache = new LambdaAuthorizerCache();
-        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.effectiveBaseUrl()).thenReturn(baseUrl);
+        when(config.services().cloudfront().domainSuffix()).thenReturn(Optional.empty());
         return new AppSyncService(
                 storageFactory,
                 config,
-                new RegionResolver("us-east-1", "000000000000"),
+                partition == null ? new RegionResolver(region, "000000000000")
+                        : new RegionResolver(region, "000000000000", partition),
                 schemaRegistry,
                 mock(SchemaCreationWorker.class),
                 requestContext,

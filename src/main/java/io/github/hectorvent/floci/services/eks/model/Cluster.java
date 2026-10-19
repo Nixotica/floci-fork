@@ -8,8 +8,10 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -101,10 +103,50 @@ public class Cluster {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private String nodeInstanceType;
 
+    /**
+     * Caller-supplied k3s arguments passed at creation via reserved floci tags.
+     * Internal persisted metadata omitted from AWS API responses.
+     */
+    @JsonProperty("clusterArgs")
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private List<String> clusterArgs;
+
+    /**
+     * Internal setting indicating whether the cluster was started with k3s's bundled
+     * local-path provisioner and default StorageClass. Persisted to storage so restored
+     * clusters preserve their storage behavior across container recreations.
+     */
+    @JsonProperty("defaultStorageClass")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private Boolean defaultStorageClass;
+
+    // Internal persisted map of joined EC2 instance IDs to their region.
+    @JsonProperty("joinedInstanceIds")
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private Map<String, String> joinedInstanceIds;
+
     private AccessConfig accessConfig;
 
     public AccessConfig getAccessConfig() { return accessConfig; }
     public void setAccessConfig(AccessConfig accessConfig) { this.accessConfig = accessConfig; }
+
+    public Map<String, String> getJoinedInstanceIds() {
+        if (joinedInstanceIds != null && !(joinedInstanceIds instanceof ConcurrentHashMap)) {
+            joinedInstanceIds = new ConcurrentHashMap<>(joinedInstanceIds);
+        }
+        return joinedInstanceIds;
+    }
+
+    public void setJoinedInstanceIds(Map<String, String> joinedInstanceIds) {
+        this.joinedInstanceIds = joinedInstanceIds != null ? new ConcurrentHashMap<>(joinedInstanceIds) : null;
+    }
+
+    public synchronized void recordJoinedInstance(String instanceId, String region) {
+        if (joinedInstanceIds == null) {
+            joinedInstanceIds = new ConcurrentHashMap<>();
+        }
+        joinedInstanceIds.put(instanceId, region);
+    }
 
     public Cluster() {}
 
@@ -153,6 +195,9 @@ public class Cluster {
     public String getNodeInstanceType() { return nodeInstanceType; }
     public void setNodeInstanceType(String nodeInstanceType) { this.nodeInstanceType = nodeInstanceType; }
 
+    public List<String> getClusterArgs() { return clusterArgs; }
+    public void setClusterArgs(List<String> clusterArgs) { this.clusterArgs = clusterArgs; }
+
     public String getAccountId() { return accountId; }
     public void setAccountId(String accountId) { this.accountId = accountId; }
 
@@ -176,6 +221,9 @@ public class Cluster {
 
     public boolean isExplicitVersion() { return explicitVersion; }
     public void setExplicitVersion(boolean explicitVersion) { this.explicitVersion = explicitVersion; }
+
+    public Boolean getDefaultStorageClass() { return defaultStorageClass; }
+    public void setDefaultStorageClass(Boolean defaultStorageClass) { this.defaultStorageClass = defaultStorageClass; }
 
     public Cluster copy() {
         Cluster c = new Cluster();
@@ -202,6 +250,9 @@ public class Cluster {
         c.explicitVersion = this.explicitVersion;
         c.dockerName = this.dockerName;
         c.nodeInstanceType = this.nodeInstanceType;
+        c.clusterArgs = this.clusterArgs != null ? new ArrayList<>(this.clusterArgs) : null;
+        c.defaultStorageClass = this.defaultStorageClass;
+        c.joinedInstanceIds = this.joinedInstanceIds != null ? new ConcurrentHashMap<>(this.joinedInstanceIds) : null;
         c.accessConfig = this.accessConfig;
         return c;
     }

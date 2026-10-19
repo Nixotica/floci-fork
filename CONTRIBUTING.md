@@ -55,7 +55,7 @@ suites in Docker against it.
 
 ## Branching Model
 
-Floci uses a **tag-driven release model**. Merging a PR never publishes a release image. `main` is published once a day as the `nightly` channel, and a stable release is published only when a maintainer runs the "Release Cut" workflow (`.github/workflows/release-cut.yml`, `workflow_dispatch`). That workflow runs semantic-release, which bumps `pom.xml`, writes `CHANGELOG.md`, commits, and pushes the `X.Y.Z` tag. The tag then triggers `.github/workflows/release.yml`, which builds and publishes the release images to Docker Hub and public ECR.
+Floci uses a **tag-driven release model**. Merging a PR never publishes a release image. `main` is published once a day as the `nightly` channel, and a stable release is published only when the "Release Cut" workflow (`.github/workflows/release-cut.yml`) runs: on its schedule at 00:30 US Central time on the 15th and the last day of each month, or when a maintainer dispatches it. That workflow runs semantic-release, which bumps `pom.xml`, writes `CHANGELOG.md`, commits, and pushes the `X.Y.Z` tag. The tag then triggers `.github/workflows/release.yml`, which builds and publishes the release images to Docker Hub and public ECR.
 
 | Branch / tag | Purpose | Docker published? |
 |---|---|---|
@@ -155,6 +155,9 @@ before your first PR:
   `new ArrayList<>()`, never `new java.util.ArrayList<>()`. Qualify inline only for
   a genuine name collision in that file, and say in a comment what collides.
 - **No wildcard imports in `src/main`.** Static wildcards are fine in tests.
+- **Keep imports ordered.** Alphabetize non-JDK imports, then `javax`, then
+  `java`, then static imports. Use blank lines between sections, except between
+  `javax` and `java`, matching IntelliJ's default layout.
 - **Never leave a `catch` block empty.** If swallowing is correct, name the
   variable `ignored` or `expected` and say why in a comment.
 - **Always use braces in conditionals**, and use constructor injection.
@@ -257,28 +260,29 @@ update path.
 3. CI runs tests automatically. All checks must pass before merge.
 4. Keep PRs focused: one feature or fix per PR.
 5. Reference any related issues in the PR description.
-6. Keep at most **2 open, non-draft PRs** at a time: see [Pull Request Limits and Review Bandwidth](#pull-request-limits-and-review-bandwidth).
+6. Keep at most **4 open PRs**, drafts included, and at most **2 of them ready for review**: see [Pull Request Limits and Review Bandwidth](#pull-request-limits-and-review-bandwidth).
 
 Docker images are built on contributor PRs only for the compatibility suite (`.github/workflows/compatibility.yml`, on changes under `src/**` and the compat test trees) and are never published, so merging to `main` is always cheap.
 
 ### Pull Request Limits and Review Bandwidth
 
-To make sure every contribution gets a thorough, high-quality review in a reasonable time, we ask contributors to keep **no more than 2 open, non-draft pull requests** at any time in this repository.
+To make sure every contribution gets a thorough, high-quality review in a reasonable time, we ask contributors to keep **no more than 4 open pull requests**, drafts included, at any time in this repository, and **no more than 2 of them ready for review**.
 
 - **Why this policy exists:** maintainer review time is limited. Capping concurrent open PRs prevents review backlogs, reduces context switching, and keeps PR cycle times short for everyone.
 - **Dependent work:** if your work depends on a PR that has not been merged yet, build on that branch or note the dependency in the discussion instead of opening separate, uncoordinated PRs.
-- **Draft PRs:** drafts do not count against the limit. Mark a draft as ready for review only when you have review capacity available.
-- **How it is applied:** a bot labels your 3rd and later open pull requests `over-pr-limit` with a reminder. Starting **2026-10-08**, from your 5th open pull request onward, new ones are closed automatically. Your branch and commits are kept, and you can reopen the PR once one of your other PRs is merged or closed. Maintainers and dependency bots are not counted.
+- **Draft PRs:** drafts do not count against the limit of 2 ready pull requests, but they do count toward the total of 4. You can have, for example, 2 ready and 2 drafts, or 1 ready and 3 drafts. Use drafts for work in progress, not as a queue of finished changes waiting for a review slot, and mark a draft as ready for review only when you have review capacity available.
+- **How it is applied:** a bot turns a pull request back into a draft if it would be your 3rd ready for review, and closes a pull request opened while you already have 4 open, drafts included. Your branch and commits are always kept: mark the draft ready again once one of your ready pull requests is merged, closed or turned into a draft, and reopen a closed pull request once you have fewer than 4 open. Maintainers and dependency bots are not counted.
 
 Once your current pull requests are reviewed, merged, or closed, you are welcome to open new ones!
 
 ## Release Process (maintainers)
 
-Stable releases ship on the **1st and 3rd Tuesday of each month**. Merging to `main` does
-not cut a release: the change rides the next train, and reaches the `nightly` image on the
-next nightly build.
+Stable releases ship on the **15th and the last day of each month**. Merging to `main`
+does not cut a release: the change rides the next train, and reaches the `nightly` image on
+the next nightly build.
 
-Releases are cut from `main` with the **Release Cut** workflow
+Releases are cut from `main` by the **Release Cut** workflow, which runs on a schedule at
+00:30 US Central time (America/Chicago) on those days. Maintainers can also run it by hand
 (Actions → Release Cut → Run workflow). semantic-release analyzes the
 Conventional Commits since the last tag, bumps `pom.xml`, regenerates
 `CHANGELOG.md`, commits, tags, and publishes the GitHub Release; the tag
@@ -346,7 +350,31 @@ DNS suffix; a literal that really is partition-invariant goes in
 The partition catalog itself (`src/main/resources/aws/partitions.json`: ids, DNS suffixes,
 regions, opt-in flags, global endpoints) is generated from botocore's published data by
 `make aws-data-sync` and checked by `make aws-data-check` in CI; never hand-edit it. Bump
-`tools/aws/requirements.txt` when regenerating from a newer botocore.
+`tools/aws/requirements.txt` when regenerating from a newer botocore. The same target
+regenerates the IAM managed-policy catalog (`src/main/resources/iam/managed-polic*`) from the
+`local/aws/iam-dataset` checkout; without that checkout, as in CI, `make aws-data-check` only
+verifies the catalog's shape.
+
+### Botocore pin of record
+
+[tools/aws/requirements.txt](tools/aws/requirements.txt) is the botocore pin of record
+for AWS model audits and vendored AWS data. CI installs this file before running
+`make aws-data-check`. Use an isolated environment installed from this file when checking
+whether botocore models an operation, request member, endpoint, or partition.
+
+[compatibility-tests/sdk-test-python/requirements.txt](compatibility-tests/sdk-test-python/requirements.txt)
+pins the boto3 and botocore clients used by the Python compatibility suite. Those client
+versions can differ from the generator pin; they are not the model-audit reference.
+Updating a compatibility client alone does not change the vendored AWS data.
+
+Generators using `resolve_botocore_data`, including partitions and request shapes, prefer
+an explicit `--botocore-data` directory, then `local/aws/botocore/botocore/data`, then the
+installed botocore package. The region-facts generator instead requires its local sources
+(or explicit source paths); it does not fall back to the installed package, and `--check`
+only verifies shape when its sources are missing. When a local checkout or explicit
+directory is selected, ensure it matches the tools pin too: checking only the installed
+package version does not establish which data is being read.
+Keep a generator-pin change and its required regenerated data together, as described above.
 
 ## Reporting Security Issues
 

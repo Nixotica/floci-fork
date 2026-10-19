@@ -104,7 +104,7 @@ floci:
     spoof-aws-endpoints: false
 
   auth:
-    validate-signatures: false               # Set to true to verify S3 SigV4 signatures (header, presigned URL, presigned POST)
+    validate-signatures: false               # Set to true to verify SigV4 signatures for every service (S3: header, presigned URL, presigned POST; others: header)
     presign-secret: local-emulator-secret    # HMAC secret for S3 pre-signed URL verification
 
   tls:
@@ -120,7 +120,8 @@ floci:
     log-max-size: "10m"                      # Max size per container log file before rotation
     log-max-file: "3"                        # Number of rotated log files to retain
     docker-host: unix:///var/run/docker.sock # Docker daemon socket (shared by Lambda, RDS, ElastiCache)
-    max-connections: 1024                    # Docker client connection pool; each live Lambda container holds 2
+    max-connections: 1024                    # Docker client connection pool; each live Lambda container holds 1
+    streaming-max-connections: 512           # Separate pool for container log-follow streams
     docker-config-path: ""                   # Path to dir containing Docker's config.json (e.g. /root/.docker)
     registry-credentials: []                 # Per-registry explicit credentials for private registries
 
@@ -139,6 +140,8 @@ floci:
     s3:
       enabled: true
       default-presign-expiry-seconds: 3600
+      lifecycle-sweep-enabled: true            # Apply bucket lifecycle expiration rules in the background
+      lifecycle-sweep-interval-seconds: 60     # Seconds between lifecycle sweeps
 
     dynamodb:
       enabled: true
@@ -155,6 +158,8 @@ floci:
       ephemeral: false                        # true = remove container after each invocation
       docker-flags: ""                        # Extra Docker create flags for Lambda containers
       ecr-base-uri: public.ecr.aws            # Registry for Lambda runtime images (legacy: floci.ecr-base-uri / FLOCI_ECR_BASE_URI)
+      runtime-images:                         # Optional per-runtime image references
+        "python3.12": "registry.example/lambda-python:3.12"
       honour-architectures: false             # true = select the declared Lambda Docker architecture
       default-memory-mb: 128
       default-timeout-seconds: 3
@@ -165,6 +170,8 @@ floci:
       poll-interval-ms: 1000
       async-retry-delay-seconds: 60           # Wait before the first retry of a failed Event invocation; the second waits twice this
       container-idle-timeout-seconds: 300     # Remove idle containers after this
+      # warm-pool-max-per-function:           # Idle containers kept per function (default max(4, cpus))
+      warm-pool-max-total: 0                  # Idle containers kept across all functions; 0 = unbounded
       region-concurrency-limit: 1000          # Concurrent executions ceiling per region
       unreserved-concurrency-min: 100         # Minimum unreserved capacity PutFunctionConcurrency must leave
       hot-reload:
@@ -215,6 +222,7 @@ floci:
     rds-data:
       enabled: true
       transaction-ttl-seconds: 180
+      database-resuming-exception-enabled: false
 
     eventbridge:
       enabled: true
@@ -242,12 +250,18 @@ floci:
 
     cognito:
       enabled: true
+      enforce-token-validity-limits: true  # Reject app clients whose token validity is outside AWS's limits; false allows shorter tokens
 
     stepfunctions:
       enabled: true
 
     cloudformation:
       enabled: true
+
+    cloudcontrol:
+      enabled: true
+      create-worker-threads: 4                # Threads that run CreateResource provisioning
+      create-queue-capacity: 64               # Creates that may wait for a thread before ThrottlingException
 
     acm:
       enabled: true
@@ -326,6 +340,7 @@ All keys in this table are declared on `EmulatorConfig` and accept environment v
 | `FLOCI_DEFAULT_AVAILABILITY_ZONE`                  | `us-east-1a`     | Default AZ reported by EC2, RDS, and other AZ-aware services  |
 | `FLOCI_DEFAULT_ACCOUNT_ID`                         | `000000000000`   | Default AWS account ID used in ARNs                           |
 | `FLOCI_SERVICES_LAMBDA_ECR_BASE_URI`               | `public.ecr.aws` | Registry used when pulling Lambda runtime images (legacy: `FLOCI_ECR_BASE_URI`) |
+| `FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__PYTHON3_12__` | *(unset)* | Image reference for `python3.12`; double underscores quote the dotted runtime key |
 | `FLOCI_DNS_EXTRA_SUFFIXES`                         | *(unset)*        | Comma-separated extra hostname suffixes the embedded DNS server resolves to Floci's container IP. E.g. `localhost.localstack.cloud,localhost.example.internal` |
 | `FLOCI_SERVICES_SSM_MAX_PARAMETER_HISTORY`         | `5`              | Max parameter versions kept                                   |
 | `FLOCI_SERVICES_SQS_DEFAULT_VISIBILITY_TIMEOUT`    | `30`             | Default visibility timeout (seconds)                          |
@@ -336,11 +351,12 @@ All keys in this table are declared on `EmulatorConfig` and accept environment v
 | `FLOCI_SERVICES_DOCKER_NETWORK`                    | *(unset)*        | Shared Docker network for Lambda, RDS, ElastiCache containers |
 | `FLOCI_SERVICES_RDS_DATA_ENABLED`                  | `true`           | Enable the RDS Data API service                               |
 | `FLOCI_SERVICES_RDS_DATA_TRANSACTION_TTL_SECONDS`  | `180`            | Idle timeout, in seconds, before leaked RDS Data API transactions expire |
+| `FLOCI_SERVICES_RDS_DATA_DATABASE_RESUMING_EXCEPTION_ENABLED` | `false` | Return HTTP 400 `DatabaseResumingException` during Aurora resume instead of waiting |
 | `FLOCI_SERVICES_ECS_MOCK`                          | `false`          | Skip Docker; tasks go straight to RUNNING (useful for CI)     |
 | `FLOCI_SERVICES_ECS_DOCKER_NETWORK`                | *(unset)*        | Docker network for ECS task containers                        |
 | `FLOCI_SERVICES_ECS_DEFAULT_MEMORY_MB`             | `512`            | Default memory (MB) when task definition omits it             |
 | `FLOCI_SERVICES_ECS_DEFAULT_CPU_UNITS`             | `256`            | Default CPU units when task definition omits it               |
-| `FLOCI_SERVICES_ECS_HOST_VOLUME_ROOTS`             | *(unset)*        | Comma-separated allowlist of parent directories for host volume bind mounts; by default (unset, and `ALLOW_UNSAFE_HOST_VOLUMES=false`) every host volume `sourcePath` is rejected |
+| `FLOCI_SERVICES_ECS_HOST_VOLUME_ROOTS`             | *(unset)*        | Comma-separated allowlist of parent directories for host volume bind mounts and container devices; by default (unset, and `ALLOW_UNSAFE_HOST_VOLUMES=false`) every host volume `sourcePath` and device `hostPath` is rejected |
 | `FLOCI_SERVICES_ECS_ALLOW_UNSAFE_HOST_VOLUMES`     | `false`          | Allow any host path, bypassing the host-volume-roots allowlist (traversal, bare root, and the Docker socket or an ancestor directory of it are still always rejected) |
 | `FLOCI_SERVICES_ECS_RECONCILE_CONTAINERS_ON_STARTUP` | `true`         | Remove the ECS containers a previous run of this Floci left on the daemon before replacement tasks start |
 | `FLOCI_SERVICES_ECS_IMAGE_PULL_BEHAVIOR`           | `default`        | How task images are pulled at launch, as the ECS agent's `ECS_IMAGE_PULL_BEHAVIOR`: `default`, `always`, `once` or `prefer-cached` |

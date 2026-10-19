@@ -12,8 +12,18 @@
 | `ListTopics` | List all topics |
 | `GetTopicAttributes` | Get topic configuration |
 | `SetTopicAttributes` | Update topic configuration |
+| `AddPermission` | Add a labelled statement to a topic's access policy |
+| `RemovePermission` | Remove a labelled statement from a topic's access policy |
 | `GetSMSAttributes` | Read account SMS preferences in this region |
 | `SetSMSAttributes` | Set account SMS preferences in this region |
+| `GetSMSSandboxAccountStatus` | Report whether the account is in the SMS sandbox (always outside it) |
+| `CreateSMSSandboxPhoneNumber` | Add a sandbox destination number and text it a verification code |
+| `VerifySMSSandboxPhoneNumber` | Verify a sandbox number with the code it was sent |
+| `DeleteSMSSandboxPhoneNumber` | Remove a sandbox number |
+| `ListSMSSandboxPhoneNumbers` | List sandbox numbers and their verification status |
+| `CheckIfPhoneNumberIsOptedOut` | Check whether a number has opted out of SMS (never, in Floci) |
+| `ListPhoneNumbersOptedOut` | List numbers opted out of SMS (always empty) |
+| `OptInPhoneNumber` | Opt a number back in to SMS |
 | `Subscribe` | Subscribe an endpoint (SQS, HTTP, Lambda, email) |
 | `Unsubscribe` | Remove a subscription |
 | `ListSubscriptions` | List all subscriptions |
@@ -42,6 +52,41 @@ names; omitting the list returns all configured preferences. In Floci, setting a
 clears that preference. SMS delivery
 remains mocked, so these settings do not generate delivery
 reports or CloudWatch delivery logs.
+
+`AddPermission` and `RemovePermission` edit the topic's `Policy` attribute the way AWS does: the
+label becomes the statement's `Sid` and each account becomes its `root` principal. A topic with no
+policy set starts from the default one AWS gives a new topic, and `GetTopicAttributes` returns it.
+Under IAM enforcement the topic policy decides what AWS services may publish to the topic, such as
+[SES's event destinations and notifications](ses.md#iam-enforcement), and takes part in an IAM
+caller's request the way any [resource-based policy](iam.md#resource-based-policies) does when the
+request names the topic in a JSON-protocol body. A Query-protocol request carries the topic in its
+form body, which enforcement does not read yet, so the topic policy plays no part in it.
+
+## SMS sandbox and opt-out
+
+A new AWS account starts in the SMS sandbox, where it can only text verified numbers. Floci
+delivers SMS to any number, so `GetSMSSandboxAccountStatus` reports `IsInSandbox: false`, which
+is how it actually behaves. The sandbox number calls still work, per account and region, without
+the limits AWS lifts once an account leaves the sandbox (ten verified numbers, and no deleting a
+number until 24 hours after its last verification attempt). `CreateSMSSandboxPhoneNumber` texts a
+six-digit code the way every SMS is sent here, so a test reads it back from the inspection
+endpoint and passes it to `VerifySMSSandboxPhoneNumber`:
+
+```bash
+aws sns create-sms-sandbox-phone-number --phone-number +15555550100 --endpoint-url $AWS_ENDPOINT_URL
+curl -s "$AWS_ENDPOINT_URL/_aws/sns?phone=%2B15555550100"   # {"messages":[{"Message":"Your verification code is 123456", ...}]}
+aws sns verify-sms-sandbox-phone-number --phone-number +15555550100 --one-time-password 123456 \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+A wrong code fails with `VerificationException` and the number stays `Pending`. AWS requires the
+error's `Status` member but documents no values for it, so Floci picks one: the number's verification
+status, `Pending`. `Pending` and `Verified` are the only statuses SNS publishes for a sandbox number,
+and the developer guide reads a number left `Pending` as an unsuccessful verification.
+
+AWS opts a number out when its owner replies STOP. Nothing reaches Floci that way, so no number is
+ever opted out: `CheckIfPhoneNumberIsOptedOut` answers `false`, `ListPhoneNumbersOptedOut` is
+empty, and `OptInPhoneNumber` only checks that the number is in E.164 format.
 
 ## Configuration
 
@@ -124,6 +169,30 @@ resolve a hostname again**, so a hostname that passed `Subscribe` and later reso
 address is not screened at delivery: Floci's HTTP client resolves the name itself when it connects
 and cannot be given the result of an earlier check, so a lookup there could not decide where the
 request goes. Treat the `Subscribe` check as the boundary, not the delivery one.
+
+## Message signatures
+
+Floci signs deliveries the way AWS does, so a consumer can keep its standard SNS signature check
+switched on locally. Signed messages are HTTP/HTTPS notifications and `SubscriptionConfirmation`
+messages, Lambda records, and the JSON envelope SQS subscriptions receive without
+`RawMessageDelivery`.
+
+- `Signature` is the base64 RSA signature of the canonical string AWS documents: `Name\nValue\n`
+  for `Message`, `MessageId`, `Subject` (only when present), `Timestamp`, `TopicArn` and `Type` on a
+  notification, and `Message`, `MessageId`, `SubscribeURL`, `Timestamp`, `Token`, `TopicArn` and
+  `Type` on a confirmation.
+- `SignatureVersion` follows the topic attribute of the same name: `1` (default) is SHA1withRSA,
+  `2` is SHA256withRSA.
+- `SigningCertURL` (`SigningCertUrl` in Lambda records) points at a self-signed RSA 2048
+  certificate Floci serves itself:
+  `{base-url}/_aws/sns/SimpleNotificationService-<fingerprint>.pem`.
+
+The key is kept in SNS storage, so persistent storage keeps the same certificate across restarts
+and memory storage generates a new one per process. A state reset discards the key and the next
+delivery generates a new one. The fingerprint in the file name changes with
+the key, so a consumer that caches certificates by URL never verifies against a stale one. A
+consumer that also requires the certificate host to be an AWS SNS domain must relax that check
+locally.
 
 ## Message size
 

@@ -1,11 +1,7 @@
 package io.github.hectorvent.floci.services.iot;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import io.github.hectorvent.floci.config.CertificateMetadata;
-import io.github.hectorvent.floci.config.FlociCertificateAuthority;
-import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import io.github.hectorvent.floci.testing.IotMqttTlsProfile;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
@@ -19,8 +15,6 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.junit.jupiter.api.Test;
 
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManagerFactory;
-import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -29,12 +23,9 @@ import java.net.http.WebSocket;
 import java.net.http.WebSocketHandshakeException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.KeyStore;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -63,14 +54,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * like one on the plaintext TCP listener because that is where the frames end up.
  */
 @QuarkusTest
-@TestProfile(IotMqttWebSocketIntegrationTest.Profile.class)
+@TestProfile(IotMqttTlsProfile.class)
 public class IotMqttWebSocketIntegrationTest {
 
-    static final Path DATA_DIR = Path.of("target", "floci-iot-mqtt-ws-test").toAbsolutePath();
-    static final Path TLS_DIR = DATA_DIR.resolve("tls");
-    static final int PLAIN_PORT = 18836;
-    static final int TLS_PORT = 18837;
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final int PLAIN_PORT = IotMqttTlsProfile.PLAIN_PORT;
     private static final short CLOSE_UNSUPPORTED_DATA = 1003;
     private static final int CHURN_THREADS = 10;
 
@@ -127,12 +114,12 @@ public class IotMqttWebSocketIntegrationTest {
     }
 
     @Test
-    void customAuthorizerStyleConnectIsAccepted() throws Exception {
+    void connectNamingAnUnknownCustomAuthorizerIsRefused() {
         String clientId = "tunnel-" + System.nanoTime();
         String username = clientId + "?x-amz-customauthorizer-name=my-authorizer";
-        try (WsClient client = WsClient.connect(wss("/mqtt"), clientId, username, "token-" + System.nanoTime())) {
-            assertTrue(client.isConnected());
-        }
+        MqttException refused = assertThrows(MqttException.class,
+                () -> WsClient.connect(wss("/mqtt"), clientId, username, "token-" + System.nanoTime()));
+        assertEquals(MqttException.REASON_CODE_CONNECTION_LOST, refused.getReasonCode());
     }
 
     @Test
@@ -392,14 +379,7 @@ public class IotMqttWebSocketIntegrationTest {
     }
 
     public static SSLContext trustOnlyFlociCa() throws Exception {
-        KeyStore trust = KeyStore.getInstance(KeyStore.getDefaultType());
-        trust.load(null, null);
-        trust.setCertificateEntry("floci", FlociCertificateAuthority.loadOrCreate(TLS_DIR).certificate());
-        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-        tmf.init(trust);
-        SSLContext ctx = SSLContext.getInstance("TLS");
-        ctx.init(null, tmf.getTrustManagers(), null);
-        return ctx;
+        return IotDeviceIdentity.trustOnlySslContext(Path.of(IotMqttTlsProfile.TLS_DIR));
     }
 
     private static final class WsClient implements AutoCloseable {
@@ -441,7 +421,7 @@ public class IotMqttWebSocketIntegrationTest {
                 options.setUserName(username);
                 options.setPassword(password.toCharArray());
             }
-            client.connect(options);
+            PahoWebSocketConnect.connect(client, options);
             return wsClient;
         }
 
@@ -473,50 +453,6 @@ public class IotMqttWebSocketIntegrationTest {
                 client.disconnect();
             }
             client.close();
-        }
-    }
-
-    /**
-     * TLS on with a CA-issued leaf on disk, exactly what TlsConfigSource produces in production.
-     * TlsConfigSource reads system properties, not profile overrides, so the profile lays the files
-     * down and points the TLS registry at them. The broker's plaintext listener is the bridge's
-     * target.
-     */
-    public static final class Profile implements QuarkusTestProfile {
-
-        static {
-            try {
-                Files.createDirectories(TLS_DIR);
-                for (String name : List.of("floci-server.crt", "floci-server.key", "floci-server.metadata.json")) {
-                    Files.deleteIfExists(TLS_DIR.resolve(name));
-                }
-                FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(TLS_DIR);
-                List<String> sans = List.of("localhost", "127.0.0.1", "*.localhost.floci.io");
-                var leaf = ca.issueServerCertificate("localhost", sans, KeyAlgorithm.RSA_2048, null);
-                Files.writeString(TLS_DIR.resolve("floci-server.crt"), leaf.certificatePem());
-                Files.writeString(TLS_DIR.resolve("floci-server.key"), leaf.privateKeyPem());
-                Files.writeString(TLS_DIR.resolve("floci-server.metadata.json"),
-                        OBJECT_MAPPER.writeValueAsString(CertificateMetadata.create(sans, "dev")));
-            } catch (IOException e) {
-                throw new IllegalStateException("could not prepare the TLS fixtures", e);
-            }
-        }
-
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.ofEntries(
-                    Map.entry("floci.tls.enabled", "true"),
-                    Map.entry("floci.tls.self-signed", "true"),
-                    Map.entry("floci.tls.aws-https-port", "0"),
-                    Map.entry("floci.storage.persistent-path", DATA_DIR.toString()),
-                    Map.entry("quarkus.tls.key-store.pem.0.cert", TLS_DIR.resolve("floci-server.crt").toString()),
-                    Map.entry("quarkus.tls.key-store.pem.0.key", TLS_DIR.resolve("floci-server.key").toString()),
-                    Map.entry("quarkus.http.insecure-requests", "enabled"),
-                    Map.entry("floci.services.iot.mqtt.enabled", "true"),
-                    Map.entry("floci.services.iot.mqtt.auto-start", "true"),
-                    Map.entry("floci.services.iot.mqtt.host", "127.0.0.1"),
-                    Map.entry("floci.services.iot.mqtt.port", Integer.toString(PLAIN_PORT)),
-                    Map.entry("floci.services.iot.mqtt.tls-port", Integer.toString(TLS_PORT)));
         }
     }
 }

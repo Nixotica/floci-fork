@@ -3,8 +3,8 @@ package io.github.hectorvent.floci.services.ssm;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -419,7 +419,7 @@ class SsmSendCommandIntegrationTest {
                 eq("i-direct-container"),
                 eq("AWS-RunShellScript"),
                 any(),
-                eq(60)))
+                eq(3600)))
                 .thenReturn(Optional.of(new SsmDirectCommandExecutor.ExecutionResult(
                         "Success", "direct-output\n", "", 0, start, end)));
 

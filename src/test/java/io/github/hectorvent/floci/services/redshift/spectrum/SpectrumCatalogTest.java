@@ -9,8 +9,8 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -39,6 +39,19 @@ class SpectrumCatalogTest {
         catalog.createSchema(schema);
 
         assertEquals(java.util.Optional.of(schema), catalog.schema(ACCOUNT, "dev", "analytics"));
+    }
+
+    @Test
+    void legacySchemaLookupKeepsTheSchemaWhoseLocationCoversTheTablesOfThisDatabase() {
+        String roleA = "arn:aws:iam::000000000000:role/A";
+        String roleB = "arn:aws:iam::000000000000:role/B";
+        catalog.createSchema(new SpectrumExternalSchema(ACCOUNT, "glue_a", "analytics", "s3://other/root/", roleA));
+        SpectrumExternalSchema owning = new SpectrumExternalSchema(
+                ACCOUNT, "glue_b", "analytics", "s3://warehouse/events/", roleB);
+        catalog.createSchema(owning);
+        catalog.createTable(table("events"));
+
+        assertEquals(java.util.Optional.of(owning), catalog.findLegacySchema(ACCOUNT, "dev", "analytics"));
     }
 
     @Test

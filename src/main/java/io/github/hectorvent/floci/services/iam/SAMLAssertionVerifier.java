@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.iam.model.SAMLProvider;
+import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
@@ -13,7 +15,6 @@ import javax.xml.crypto.dsig.XMLSignatureFactory;
 import javax.xml.crypto.dsig.dom.DOMValidateContext;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
@@ -43,7 +44,7 @@ final class SAMLAssertionVerifier {
     static Verified verify(String encoded, SAMLProvider provider, Instant now) throws InvalidAssertionException {
         try {
             byte[] bytes = Base64.getDecoder().decode(encoded);
-            var document = SAMLXml.document(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+            Document document = SAMLXml.document(new String(bytes, StandardCharsets.UTF_8));
             Element assertion = document.getDocumentElement();
             if ("Response".equals(assertion.getLocalName())) {
                 assertion = first(assertion, SAML, "Assertion");
@@ -74,7 +75,7 @@ final class SAMLAssertionVerifier {
                 }
             }
             X509Certificate certificate = certificate(provider.getCertificate());
-            var context = new DOMValidateContext(certificate.getPublicKey(), signature);
+            DOMValidateContext context = new DOMValidateContext(certificate.getPublicKey(), signature);
             context.setProperty("org.jcp.xml.dsig.secureValidation", Boolean.TRUE);
             XMLSignature xmlSignature = XMLSignatureFactory.getInstance("DOM").unmarshalXMLSignature(context);
             if (xmlSignature.getSignedInfo().getReferences().size() != 1
@@ -166,8 +167,8 @@ final class SAMLAssertionVerifier {
             if (roles.isEmpty()) {
                 throw invalid("role pair missing");
             }
-            String nameQualifier = java.util.Base64.getEncoder().encodeToString(MessageDigest.getInstance("SHA-1")
-                    .digest((issuer + provider.getArn()).getBytes(StandardCharsets.UTF_8)));
+            String nameQualifier = java.util.Base64.getEncoder().encodeToString(
+                    Digests.sha1((issuer + provider.getArn()).getBytes(StandardCharsets.UTF_8)));
             return new Verified(issuer, name, subjectType, nameQualifier, notOnOrAfter, roles);
         } catch (InvalidAssertionException e) {
             throw e;

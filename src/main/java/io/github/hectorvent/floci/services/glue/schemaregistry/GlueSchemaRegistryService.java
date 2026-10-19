@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.glue.schemaregistry;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -16,13 +17,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -490,7 +487,7 @@ public class GlueSchemaRegistryService {
                     info.getOtherMetadataValueList() != null
                             ? new ArrayList<>(info.getOtherMetadataValueList())
                             : new ArrayList<>();
-            for (var item : history) {
+            for (MetadataInfo.OtherMetadataValueListItem item : history) {
                 if (value.equals(item.getMetadataValue())) {
                     throw new AwsException("AlreadyExistsException",
                             "Metadata key/value pair already exists: " + key + "=" + value, 400);
@@ -571,7 +568,7 @@ public class GlueSchemaRegistryService {
             return stored;
         }
         Map<String, MetadataInfo> filtered = new java.util.LinkedHashMap<>();
-        for (var f : metadataList) {
+        for (MetadataKeyValueFilter f : metadataList) {
             MetadataInfo info = stored.get(f.metadataKey());
             if (info == null) continue;
             if (f.metadataValue() == null || f.metadataValue().isBlank()) {
@@ -579,7 +576,7 @@ public class GlueSchemaRegistryService {
             } else if (f.metadataValue().equals(info.getMetadataValue())) {
                 filtered.put(f.metadataKey(), info);
             } else if (info.getOtherMetadataValueList() != null) {
-                for (var item : info.getOtherMetadataValueList()) {
+                for (MetadataInfo.OtherMetadataValueListItem item : info.getOtherMetadataValueList()) {
                     if (f.metadataValue().equals(item.getMetadataValue())) {
                         filtered.put(f.metadataKey(), info);
                         break;
@@ -984,16 +981,7 @@ public class GlueSchemaRegistryService {
         } catch (RuntimeException e) {
             canonical = definition;
         }
-        return sha256Hex(canonical);
-    }
-
-    private static String sha256Hex(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(md.digest(input.getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 not available", e);
-        }
+        return Digests.sha256Hex(canonical);
     }
 
     private Registry autoCreateDefaultRegistry(String region) {

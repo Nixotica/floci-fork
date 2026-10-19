@@ -1,7 +1,12 @@
 package io.github.hectorvent.floci.services.ecs;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.ecs.container.HostVolumePolicy;
 import io.github.hectorvent.floci.services.ecs.model.Attribute;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
@@ -15,16 +20,16 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
 import io.github.hectorvent.floci.services.ecs.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.ecs.model.CreateServiceRequest;
 import io.github.hectorvent.floci.services.ecs.model.CreateTaskSetRequest;
-import io.github.hectorvent.floci.services.ecs.model.RegisterContainerInstanceRequest;
-import io.github.hectorvent.floci.services.ecs.model.EnvironmentFile;
-import io.github.hectorvent.floci.services.ecs.model.Failure;
-import io.github.hectorvent.floci.services.ecs.model.EphemeralStorage;
-import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
-import io.github.hectorvent.floci.services.ecs.model.HealthCheck;
 import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
 import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
 import io.github.hectorvent.floci.services.ecs.model.EcsServiceModel;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.EfsVolumeConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.EnvironmentFile;
+import io.github.hectorvent.floci.services.ecs.model.EphemeralStorage;
+import io.github.hectorvent.floci.services.ecs.model.Failure;
+import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.HealthCheck;
 import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.ListTasksRequest;
@@ -34,27 +39,24 @@ import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import io.github.hectorvent.floci.services.ecs.model.PortMapping;
 import io.github.hectorvent.floci.services.ecs.model.ProtectedTask;
+import io.github.hectorvent.floci.services.ecs.model.RegisterContainerInstanceRequest;
 import io.github.hectorvent.floci.services.ecs.model.RegisterTaskDefinitionRequest;
 import io.github.hectorvent.floci.services.ecs.model.RunTaskRequest;
 import io.github.hectorvent.floci.services.ecs.model.RuntimePlatform;
+import io.github.hectorvent.floci.services.ecs.model.Secret;
 import io.github.hectorvent.floci.services.ecs.model.ServiceDeployment;
 import io.github.hectorvent.floci.services.ecs.model.ServiceRevision;
-import io.github.hectorvent.floci.services.ecs.model.Secret;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.ecs.model.TaskOverride;
 import io.github.hectorvent.floci.services.ecs.model.TaskSet;
-import io.github.hectorvent.floci.services.ecs.model.EfsVolumeConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.UpdateServiceRequest;
 import io.github.hectorvent.floci.services.ecs.model.Volume;
 import io.github.hectorvent.floci.services.ecs.model.VolumeFrom;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -87,6 +89,10 @@ public class EcsJsonHandler {
     }
 
     public Response handle(String action, JsonNode request, String region) {
+        return handle(action, request, region, null);
+    }
+
+    public Response handle(String action, JsonNode request, String region, URI requestBaseUri) {
         return switch (action) {
             // Clusters
             case "CreateCluster" -> handleCreateCluster(request, region);
@@ -111,7 +117,7 @@ public class EcsJsonHandler {
             case "ListTasks" -> handleListTasks(request, region);
             case "UpdateTaskProtection" -> handleUpdateTaskProtection(request, region);
             case "GetTaskProtection" -> handleGetTaskProtection(request, region);
-            case "ExecuteCommand" -> handleExecuteCommand(request, region);
+            case "ExecuteCommand" -> handleExecuteCommand(request, region, requestBaseUri);
 
             case "CreateService" -> handleCreateService(request, region);
             case "UpdateService" -> handleUpdateService(request, region);
@@ -332,7 +338,7 @@ public class EcsJsonHandler {
         Integer maxResults = req.hasNonNull("maxResults") ? req.path("maxResults").asInt() : null;
         String nextToken = req.hasNonNull("nextToken") ? req.path("nextToken").asText() : null;
 
-        EcsService.ListPage page = service.listTaskDefinitions(familyPrefix, status, sort,
+        EcsService.ListPage page = service.listTaskDefinitions(region, familyPrefix, status, sort,
                 maxResults, nextToken);
 
         ObjectNode resp = objectMapper.createObjectNode();
@@ -351,7 +357,7 @@ public class EcsJsonHandler {
         Integer maxResults = req.hasNonNull("maxResults") ? req.path("maxResults").asInt() : null;
         String nextToken = req.hasNonNull("nextToken") ? req.path("nextToken").asText() : null;
 
-        EcsService.ListPage page = service.listTaskDefinitionFamilies(familyPrefix, status,
+        EcsService.ListPage page = service.listTaskDefinitionFamilies(region, familyPrefix, status,
                 maxResults, nextToken);
 
         ObjectNode resp = objectMapper.createObjectNode();
@@ -515,7 +521,7 @@ public class EcsJsonHandler {
         return Response.ok(resp).build();
     }
 
-    private Response handleExecuteCommand(JsonNode req, String region) {
+    private Response handleExecuteCommand(JsonNode req, String region, URI requestBaseUri) {
         String cluster = req.has("cluster") ? req.path("cluster").asText() : null;
         String task = req.path("task").asText();
         String container = req.hasNonNull("container") ? req.path("container").asText() : null;
@@ -535,7 +541,7 @@ public class EcsJsonHandler {
         resp.put("interactive", interactive);
         ObjectNode session = resp.putObject("session");
         session.put("sessionId", result.session().sessionId());
-        session.put("streamUrl", service.execStreamUrl(result.session()));
+        session.put("streamUrl", service.execStreamUrl(result.session(), requestBaseUri));
         session.put("tokenValue", result.session().tokenValue());
         return Response.ok(resp).build();
     }
@@ -1455,18 +1461,16 @@ public class EcsJsonHandler {
             return null;
         }
         if (!node.hasNonNull("type")) {
-            throw new AwsException("ClientException",
-                    "1 validation error detected: Value null at 'containerDefinitions." + containerIndex
-                            + ".member.firelensConfiguration.type' failed to satisfy constraint: Member must not be null",
-                    400);
+            throw SmithyValidationErrors.exception("ClientException",
+                    "Value null at 'containerDefinitions." + containerIndex
+                            + ".member.firelensConfiguration.type' failed to satisfy constraint: Member must not be null");
         }
         String type = node.path("type").asText();
         if (!"fluentd".equals(type) && !"fluentbit".equals(type)) {
-            throw new AwsException("ClientException",
-                    "1 validation error detected: Value '" + type + "' at 'containerDefinitions." + containerIndex
+            throw SmithyValidationErrors.exception("ClientException",
+                    "Value '" + type + "' at 'containerDefinitions." + containerIndex
                             + ".member.firelensConfiguration.type' failed to satisfy constraint: "
-                            + "Member must satisfy enum value set: [fluentd, fluentbit]",
-                    400);
+                            + "Member must satisfy enum value set: [fluentd, fluentbit]");
         }
         Map<String, String> options = null;
         if (node.path("options").isObject()) {
@@ -1517,12 +1521,16 @@ public class EcsJsonHandler {
     private static final Set<String> VOLUME_CONSUMED = Set.of("name", "efsVolumeConfiguration");
 
     private EfsVolumeConfiguration parseEfsVolumeConfiguration(JsonNode node) {
-        if (node == null || !node.isObject()) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
             return null;
         }
+        if (!node.isObject()) {
+            throw new AwsException("InvalidParameterException", "EFS volume configuration must be an object.", 400);
+        }
         String fileSystemId = node.path("fileSystemId").asText(null);
-        if (fileSystemId == null) {
-            return null;
+        if (fileSystemId == null || fileSystemId.isBlank()) {
+            throw new AwsException("InvalidParameterException",
+                    "EFS volume configuration requires a fileSystemId.", 400);
         }
         Integer transitEncryptionPort = node.path("transitEncryptionPort").isNumber()
                 ? node.path("transitEncryptionPort").asInt() : null;

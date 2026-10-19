@@ -17,15 +17,11 @@ import static org.mockito.Mockito.verifyNoInteractions;
 
 /**
  * {@link VerdaccioSidecarManager#stopManagedContainers()} is a thin delegation to
- * {@link PerKeyContainerPool#stopAll()}, whose own behavior (stop every tracked container,
- * tolerate a failure in one, forget them all) is already covered by
- * {@code PerKeyContainerPoolTest}. What matters here, and what a Docker-gated integration test
- * cannot isolate from every other moving part, is the wiring: that the manager genuinely
- * implements {@link ContainerTeardown} (so {@code ContainerTeardowns.stopAll} finds it on
- * {@code /state/reset}, {@code /state/nuke}, and process shutdown) and that it hands the pool
- * container ids it actually started rather than something it invented. A container is seeded
- * directly into the pool's tracking map by reflection, the same way
- * {@code ReposiliteSidecarManagerTest} seeds a stale endpoint, so this needs no Docker daemon.
+ * {@link PerKeyContainerPool#stopAll()}, whose own behavior is covered by {@code PerKeyContainerPoolTest}.
+ * What matters here is the wiring: that the manager implements {@link ContainerTeardown} (so
+ * {@code ContainerTeardowns.stopAll} finds it on reset, nuke, and shutdown) and that it stops the
+ * containers it actually started. A container is seeded straight into the pool by reflection, so this
+ * needs no Docker daemon.
  */
 class VerdaccioSidecarManagerTest {
 
@@ -41,8 +37,8 @@ class VerdaccioSidecarManagerTest {
     @Test
     void stopManagedContainersStopsEveryContainerThePoolIsTracking() throws Exception {
         VerdaccioSidecarManager manager = manager();
-        seedPooledContainer(manager, "npm-repo-1", "tracked-verdaccio-1");
-        seedPooledContainer(manager, "npm-repo-2", "tracked-verdaccio-2");
+        seedPooledContainer(manager, "npm-repo-1", "tracked-verdaccio-1", "http://127.0.0.1:1");
+        seedPooledContainer(manager, "npm-repo-2", "tracked-verdaccio-2", "http://127.0.0.1:1");
 
         manager.stopManagedContainers();
 
@@ -52,9 +48,7 @@ class VerdaccioSidecarManagerTest {
 
     @Test
     void stopManagedContainersIsANoOpWhenNothingWasEverStarted() {
-        VerdaccioSidecarManager manager = manager();
-
-        manager.stopManagedContainers();
+        manager().stopManagedContainers();
 
         verifyNoInteractions(lifecycleManager);
     }
@@ -64,8 +58,8 @@ class VerdaccioSidecarManagerTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static void seedPooledContainer(VerdaccioSidecarManager manager, String key, String containerId)
-            throws Exception {
+    private static void seedPooledContainer(VerdaccioSidecarManager manager, String key, String containerId,
+                                              String url) throws Exception {
         Field poolField = VerdaccioSidecarManager.class.getDeclaredField("pool");
         poolField.setAccessible(true);
         PerKeyContainerPool pool = (PerKeyContainerPool) poolField.get(manager);
@@ -74,6 +68,6 @@ class VerdaccioSidecarManagerTest {
         containersField.setAccessible(true);
         ConcurrentHashMap<String, PerKeyContainerPool.StartedContainer> containers =
                 (ConcurrentHashMap<String, PerKeyContainerPool.StartedContainer>) containersField.get(pool);
-        containers.put(key, new PerKeyContainerPool.StartedContainer(containerId, "http://127.0.0.1:1"));
+        containers.put(key, new PerKeyContainerPool.StartedContainer(containerId, url));
     }
 }

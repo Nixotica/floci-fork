@@ -108,6 +108,7 @@ floci:
     allow-private-jwt-targets: true
 
   init-hooks:
+    dir: /etc/floci/init
     shell-executable: /bin/sh
     timeout-seconds: 5
     shutdown-grace-period-seconds: 2
@@ -138,6 +139,8 @@ floci:
       enforce-auth: false
       default-presign-expiry-seconds: 3600
       global-bucket-namespace: false
+      lifecycle-sweep-enabled: false   # tests run the sweep themselves, so no bucket's rules apply behind another test's back
+      lifecycle-sweep-interval-seconds: 60
     dynamodb:
       enabled: true
       vector-index-allocation-seconds: 0
@@ -151,6 +154,8 @@ floci:
       honour-architectures: false
       zip-max-entries: 100000
       async-retry-delay-seconds: 1
+      durable-sweep-enabled: true
+      durable-sweep-interval-seconds: 1
       # aws-config-path:
       hot-reload:
         enabled: true
@@ -202,6 +207,7 @@ floci:
       proxy-handshake-timeout-millis: 10000
       proxy-backend-connect-timeout-millis: 5000
       proxy-max-connections: 100
+      spectrum-max-rows: 1000000
     rds:
       enabled: true
       mock: false
@@ -216,9 +222,13 @@ floci:
     rds-data:
       enabled: true
       transaction-ttl-seconds: 180
+      database-resuming-exception-enabled: false
     redshift-data:
       enabled: true
       result-ttl-hours: 24
+      max-concurrent-statements: 10
+      queue-capacity: 100
+      shutdown-timeout-seconds: 10
     redshift-serverless:
       enabled: true
     neptune:
@@ -249,13 +259,15 @@ floci:
       list-shards-next-token-ttl-millis: 300000
     firehose:
       enabled: true
-      tick-interval-seconds: 10
+      tick-interval-seconds: 1
       flush-record-count: 0
       staging-bucket: floci-firehose-staging
     kms:
       enabled: true
     cognito:
       enabled: true
+      google-issuer: https://accounts.google.com
+      enforce-token-validity-limits: true
     stepfunctions:
       enabled: true
       allow-plaintext-http: true
@@ -338,6 +350,7 @@ floci:
       max-memory-mib: 0
       max-vcpus: 0
       ecr-registry-mirror: true
+      default-storage-class: false
       imds: false
       irsa-signing-key: true
       embedded-dns: true
@@ -529,6 +542,7 @@ floci:
       enabled: true
     servicequotas:
       enabled: true
+      standard-on-demand-vcpus: 5
     verifiedpermissions:
       enabled: true
     ram:

@@ -1,12 +1,13 @@
 package io.github.hectorvent.floci.services.msk;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -15,9 +16,9 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.msk.model.BrokerNodeGroupInfo;
 import io.github.hectorvent.floci.services.msk.model.ClusterState;
+import io.github.hectorvent.floci.services.msk.model.ConfigurationInfo;
 import io.github.hectorvent.floci.services.msk.model.ConfigurationRevision;
 import io.github.hectorvent.floci.services.msk.model.ConfigurationRevisionDetail;
-import io.github.hectorvent.floci.services.msk.model.ConfigurationInfo;
 import io.github.hectorvent.floci.services.msk.model.ConfigurationState;
 import io.github.hectorvent.floci.services.msk.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.msk.model.CreateClusterV2Request;
@@ -25,7 +26,6 @@ import io.github.hectorvent.floci.services.msk.model.EncryptionInTransit;
 import io.github.hectorvent.floci.services.msk.model.EncryptionInfo;
 import io.github.hectorvent.floci.services.msk.model.MskCluster;
 import io.github.hectorvent.floci.services.msk.model.MskConfiguration;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -167,16 +167,7 @@ public class MskService implements ResourceProvider {
             cluster.getCurrentBrokerSoftwareInfo().setConfigurationRevision(configurationInfo.getRevision());
         }
 
-        if (config.services().msk().mock()) {
-            cluster.setState(ClusterState.ACTIVE);
-            cluster.setBootstrapBrokers("localhost:9092");
-        } else if (!redpandaManager.tryStartContainer(cluster)) {
-            LOG.warnv("MSK cluster {0} created without a backing Kafka broker: no Docker daemon "
-                    + "is reachable. Metadata operations work; producing and consuming do not "
-                    + "until a daemon appears.", clusterName);
-            cluster.setState(ClusterState.ACTIVE);
-            cluster.setBootstrapBrokers("localhost:9092");
-        }
+        startBroker(cluster);
 
         storage.put(clusterArn, cluster);
         return cluster;
@@ -218,6 +209,19 @@ public class MskService implements ResourceProvider {
             merged.setRebalancing(request.getProvisioned().getRebalancing());
         }
         return createCluster(merged);
+    }
+
+    private void startBroker(MskCluster cluster) {
+        if (config.services().msk().mock()) {
+            cluster.setState(ClusterState.ACTIVE);
+            cluster.setBootstrapBrokers("localhost:9092");
+        } else if (!redpandaManager.tryStartContainer(cluster)) {
+            LOG.warnv("MSK cluster {0} created without a backing Kafka broker: no Docker daemon "
+                    + "is reachable. Metadata operations work; producing and consuming do not "
+                    + "until a daemon appears.", cluster.getClusterName());
+            cluster.setState(ClusterState.ACTIVE);
+            cluster.setBootstrapBrokers("localhost:9092");
+        }
     }
 
     /**
@@ -360,12 +364,7 @@ public class MskService implements ResourceProvider {
         cluster.setZookeeperConnectString(null);
         cluster.setCurrentBrokerSoftwareInfo(null);
 
-        if (config.services().msk().mock()) {
-            cluster.setState(ClusterState.ACTIVE);
-            cluster.setBootstrapBrokers("localhost:9092");
-        } else {
-            redpandaManager.startContainer(cluster);
-        }
+        startBroker(cluster);
 
         storage.put(clusterArn, cluster);
         return cluster;
@@ -435,12 +434,14 @@ public class MskService implements ResourceProvider {
         if (serverProperties == null) {
             throw new AwsException("BadRequestException", "serverProperties is required.", 400);
         }
-        if (configurationStorage.scan(k -> true).stream().anyMatch(c -> c.getName().equals(name))) {
+        if (configurationStorage.scan(k -> true).stream()
+                .filter(this::isCurrentRegion)
+                .anyMatch(c -> c.getName().equals(name))) {
             throw new AwsException("ConflictException", "Configuration already exists: " + name, 409);
         }
 
         String accountId = regionResolver.getAccountId();
-        String arn = AwsArnUtils.Arn.of("kafka", config.defaultRegion(), accountId,
+        String arn = AwsArnUtils.Arn.of("kafka", regionResolver.getRegion(), accountId,
                 "configuration/" + name + "/" + UUID.randomUUID()).toString();
 
         MskConfiguration configuration = new MskConfiguration(arn, name, description, kafkaVersions, serverProperties);
@@ -456,13 +457,13 @@ public class MskService implements ResourceProvider {
         // NotFoundException. The message prefix is a compatibility contract: terraform-provider-aws
         // (and the Pulumi provider bridging it) substring-matches "Configuration ARN does not exist"
         // to detect that a configuration is gone, so its post-delete waiter can complete.
-        return configurationStorage.get(arn)
+        return configurationStorage.get(arn).filter(this::isCurrentRegion)
                 .orElseThrow(() -> new AwsException("BadRequestException",
                         "Configuration ARN does not exist: " + arn, 400));
     }
 
     public PaginatedResult<MskConfiguration> listConfigurations(Integer maxResults, String nextToken) {
-        List<MskConfiguration> all = configurationStorage.scan(k -> true);
+        List<MskConfiguration> all = configurationStorage.scan(k -> true).stream().filter(this::isCurrentRegion).toList();
         return Pagination.paginate(all, MskConfiguration::getArn, maxResults, nextToken, MAX_PAGE, "BadRequestException");
     }
 
@@ -559,7 +560,7 @@ public class MskService implements ResourceProvider {
         if (cluster != null) {
             return cluster.getTags() != null ? cluster.getTags() : Map.of();
         }
-        MskConfiguration configuration = configurationStorage.get(arn).orElse(null);
+        MskConfiguration configuration = configurationStorage.get(arn).filter(this::isCurrentRegion).orElse(null);
         if (configuration != null) {
             return configuration.getTags() != null ? configuration.getTags() : Map.of();
         }
@@ -573,7 +574,7 @@ public class MskService implements ResourceProvider {
             storage.put(arn, cluster);
             return;
         }
-        MskConfiguration configuration = configurationStorage.get(arn).orElse(null);
+        MskConfiguration configuration = configurationStorage.get(arn).filter(this::isCurrentRegion).orElse(null);
         if (configuration != null) {
             configuration.setTags(merged(configuration.getTags(), tags));
             configurationStorage.put(arn, configuration);
@@ -589,7 +590,7 @@ public class MskService implements ResourceProvider {
             storage.put(arn, cluster);
             return;
         }
-        MskConfiguration configuration = configurationStorage.get(arn).orElse(null);
+        MskConfiguration configuration = configurationStorage.get(arn).filter(this::isCurrentRegion).orElse(null);
         if (configuration != null) {
             configuration.setTags(without(configuration.getTags(), tagKeys));
             configurationStorage.put(arn, configuration);
@@ -675,6 +676,14 @@ public class MskService implements ResourceProvider {
     @Override
     public Set<SupportedResourceType> getSupportedResourceTypes() {
         return Set.of(new SupportedResourceType("kafka:cluster", "kafka", true));
+    }
+
+    /**
+     * Configurations are regional like clusters. Their ARN has always carried the region they were
+     * created in, so it decides; there are no older records to keep visible.
+     */
+    private boolean isCurrentRegion(MskConfiguration configuration) {
+        return regionResolver.getRegion().equals(AwsArnUtils.regionOrDefault(configuration.getArn(), null));
     }
 
     private boolean isCurrentRegion(MskCluster cluster) {

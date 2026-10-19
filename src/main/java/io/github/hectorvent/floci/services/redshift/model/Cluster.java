@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.redshift.model;
 
 import io.quarkus.runtime.annotations.RegisterForReflection;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -71,6 +72,24 @@ public class Cluster {
     public void setLoggingS3TableKmsKeyId(String loggingS3TableKmsKeyId) { this.loggingS3TableKmsKeyId = loggingS3TableKmsKeyId; }
     public String getLoggingS3TableGranularity() { return loggingS3TableGranularity; }
     public void setLoggingS3TableGranularity(String loggingS3TableGranularity) { this.loggingS3TableGranularity = loggingS3TableGranularity; }
+
+    // Cross-region snapshot copy (EnableSnapshotCopy). Enabled exactly when the destination is set.
+    private String snapshotCopyDestinationRegion;
+    private Integer snapshotCopyRetentionPeriod;
+    private Integer snapshotCopyManualRetentionPeriod;
+    private String snapshotCopyGrantName;
+    private String snapshotScheduleIdentifier;
+
+    public String getSnapshotCopyDestinationRegion() { return snapshotCopyDestinationRegion; }
+    public void setSnapshotCopyDestinationRegion(String snapshotCopyDestinationRegion) { this.snapshotCopyDestinationRegion = snapshotCopyDestinationRegion; }
+    public Integer getSnapshotCopyRetentionPeriod() { return snapshotCopyRetentionPeriod; }
+    public void setSnapshotCopyRetentionPeriod(Integer snapshotCopyRetentionPeriod) { this.snapshotCopyRetentionPeriod = snapshotCopyRetentionPeriod; }
+    public Integer getSnapshotCopyManualRetentionPeriod() { return snapshotCopyManualRetentionPeriod; }
+    public void setSnapshotCopyManualRetentionPeriod(Integer snapshotCopyManualRetentionPeriod) { this.snapshotCopyManualRetentionPeriod = snapshotCopyManualRetentionPeriod; }
+    public String getSnapshotCopyGrantName() { return snapshotCopyGrantName; }
+    public void setSnapshotCopyGrantName(String snapshotCopyGrantName) { this.snapshotCopyGrantName = snapshotCopyGrantName; }
+    public String getSnapshotScheduleIdentifier() { return snapshotScheduleIdentifier; }
+    public void setSnapshotScheduleIdentifier(String snapshotScheduleIdentifier) { this.snapshotScheduleIdentifier = snapshotScheduleIdentifier; }
 
     private boolean multiAZ = false;
 

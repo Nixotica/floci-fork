@@ -18,6 +18,7 @@ class CfnCreateOnlyPropertiesTest {
         assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::SQS::Queue", "QueueName"));
         assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::SQS::Queue", "FifoQueue"));
         assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::S3::Bucket", "BucketName"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::IoT::Authorizer", "SigningDisabled"));
     }
 
     @Test
@@ -25,6 +26,40 @@ class CfnCreateOnlyPropertiesTest {
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::SQS::Queue", "VisibilityTimeout"));
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::Redshift::Cluster", "NumberOfNodes"));
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::S3::Bucket", "VersioningConfiguration"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::IoT::Authorizer", "Status"));
+    }
+
+    @Test
+    void isCreateOnly_vpcLinkReplacesOnlyForSubnetsAndSecurityGroups() {
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::ApiGatewayV2::VpcLink", "SubnetIds"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::ApiGatewayV2::VpcLink", "SecurityGroupIds"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::ApiGatewayV2::VpcLink", "Name"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::ApiGatewayV2::VpcLink", "Tags"));
+    }
+
+    @Test
+    void isCreateOnly_serverlessCacheReplacesOnItsSchemaProperties() {
+        String type = "AWS::ElastiCache::ServerlessCache";
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "ServerlessCacheName"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "SubnetIds"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "KmsKeyId"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "SnapshotArnsToRestore"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "ConnectionType"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "NetworkType"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "SecurityGroupIds"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "Description"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "Tags"));
+    }
+
+    @Test
+    void isCreateOnly_ipSetReplacesOnlyForNameAndScope() {
+        String type = "AWS::WAFv2::IPSet";
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "Name"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "Scope"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "Addresses"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "Description"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "IPAddressVersion"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "Tags"));
     }
 
     @Test

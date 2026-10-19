@@ -5,8 +5,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.FunctionEventInvokeConfig;
-import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.PendingInvocation;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
@@ -175,6 +175,25 @@ class LambdaExecutorServiceTest {
         String payload = new String(result.getPayload());
         assertTrue(payload.contains("Function.TimedOut"), "payload should contain error type");
         assertTrue(payload.contains("1 seconds"), "payload should contain timeout value");
+    }
+
+    @Test
+    void syncInvoke_clientContext_isPlacedOnTheEnqueuedInvocation() {
+        RuntimeApiServer rtas = mock(RuntimeApiServer.class);
+        ContainerHandle handle = new ContainerHandle("cid-ctx", "test-fn", rtas, ContainerState.WARM);
+        when(warmPool.acquire(any())).thenReturn(handle);
+        AtomicReference<String> seen = new AtomicReference<>();
+        doAnswer(inv -> {
+            PendingInvocation pi = inv.getArgument(0);
+            seen.set(pi.getClientContext());
+            pi.getResultFuture().complete(new InvokeResult(200, null, "{}".getBytes(), null, "req-ctx"));
+            return pi.getResultFuture();
+        }).when(rtas).enqueue(any(PendingInvocation.class));
+
+        String clientContext = "{\"custom\":{\"traceparent\":\"00-abc-def-01\"}}";
+        executor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse, 0, null, clientContext);
+
+        assertEquals(clientContext, seen.get());
     }
 
     @Test

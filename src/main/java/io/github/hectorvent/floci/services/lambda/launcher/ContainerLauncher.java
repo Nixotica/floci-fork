@@ -1,7 +1,11 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
@@ -9,44 +13,37 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
+import io.github.hectorvent.floci.services.lambda.LambdaLogDestinations;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.exception.NotFoundException;
-import com.github.dockerjava.api.model.WaitResponse;
-import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Typed;
 import jakarta.inject.Inject;
-import org.jboss.logging.Logger;
-
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.jboss.logging.Logger;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -55,6 +52,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 /**
  * Starts and stops Docker containers for Lambda function execution.
@@ -216,10 +214,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 resolveContainerNamePrefix(config), fn.getFunctionName() + "-" + shortId);
 
         // CloudWatch log coordinates — computed here so they can be injected as env vars
-        String cwLogGroup  = "/aws/lambda/" + fn.getFunctionName();
-        String cwLogStream = LOG_STREAM_DATE_FMT.format(LocalDate.now()) + "/[$LATEST]" + shortId;
+        String cwLogGroup  = LambdaLogDestinations.logGroup(fn);
+        String cwLogStream = LOG_STREAM_DATE_FMT.format(LocalDate.now()) + "/"
+                + LambdaLogDestinations.logStreamSuffix(fn, shortId);
         String lambdaRegion = extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion());
         String lambdaAccountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId());
+        LambdaDockerFlags dockerFlags = configuredDockerFlags();
 
         // Build env vars
         List<String> env = new ArrayList<>();
@@ -227,7 +227,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         env.add("AWS_LAMBDA_FUNCTION_NAME=" + fn.getFunctionName());
         env.add("AWS_LAMBDA_FUNCTION_MEMORY_SIZE=" + fn.getMemorySize());
         env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
-        env.add("AWS_LAMBDA_FUNCTION_VERSION=$LATEST");
         env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
         env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
         if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
@@ -243,7 +242,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
-                roleCredentials, lambdaAccountId));
+                awsEnv.flociEndpoint(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
         if (fn.getEnvironment() != null) {
             boolean hasExecutionRoleCredentials = roleCredentials.isPresent();
             boolean userDefinesFullCredentialTriad = definesFullCredentialTriad(fn.getEnvironment());
@@ -264,6 +263,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             });
         }
 
+        env.removeIf(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION="));
+        env.add("AWS_LAMBDA_FUNCTION_VERSION=" + fn.getVersion());
+
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
                 .withName(containerName)
                 .withEnv(env)
@@ -274,7 +276,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
 
-        LambdaDockerFlags dockerFlags = configuredDockerFlags();
         applyDockerFlags(specBuilder, dockerFlags);
 
         specBuilder.withEmbeddedDns();
@@ -314,7 +315,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
 
         if (fn.getFileSystemConfigs() != null && !fn.getFileSystemConfigs().isEmpty()) {
-            var efsCfg = config.storage().efs();
+            EmulatorConfig.EfsSharingConfig efsCfg = config.storage().efs();
             fn.getFileSystemConfigs().forEach(fileSystem -> {
                 String volumeName = efsVolumeName(fileSystem.getArn());
                 lifecycleManager.ensureSharedVolume(volumeName,
@@ -990,7 +991,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         } finally {
             if (helperId != null) {
                 try {
-                    lifecycleManager.stopAndRemove(helperId, null);
+                    // This helper only sleeps while the copy runs; it has no runtime to drain.
+                    lifecycleManager.stopAndRemove(helperId, null, 0);
                 } catch (Exception e) {
                     LOG.warnv("Could not remove code-volume helper {0}: {1}", helperId, e.getMessage());
                 }
@@ -1118,7 +1120,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     static boolean shouldUseCodeVolume(Path codeDir) {
         final long threshold = CODE_VOLUME_MIN_BYTES;
         final long[] total = {0L};
-        try (var stream = Files.walk(codeDir)) {
+        try (Stream<Path> stream = Files.walk(codeDir)) {
             for (Path path : (Iterable<Path>) stream::iterator) {
                 if (Files.isRegularFile(path)) {
                     total[0] += Files.size(path);
@@ -1166,7 +1168,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private static String namespaceDisambiguator(EmulatorConfig config) {
         String namespace = config.docker() == null || config.docker().resourceNamespace() == null
                 ? "" : config.docker().resourceNamespace().orElse("").trim();
-        return namespace.isEmpty() ? "" : "-" + sha256Hex(namespace).substring(0, 12);
+        return namespace.isEmpty() ? "" : "-" + Digests.sha256Hex(namespace).substring(0, 12);
     }
 
     /** Leading part shared by every code volume (and completion marker) this configuration names. */
@@ -1200,7 +1202,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (resourceId.isBlank()) {
             throw new IllegalArgumentException("File system access point ARN must include a resource id");
         }
-        return "efs-" + resourceId + "-" + sha256Hex(accessPointArn);
+        return "efs-" + resourceId + "-" + Digests.sha256Hex(accessPointArn);
     }
 
     /**
@@ -1219,29 +1221,18 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         return ContainerStorageHelper.dockerName(config, token);
     }
 
-    private static String sha256Hex(String value) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is required but not available", e);
-        }
-    }
-
-    /**
-     * Buffer for the tar-streaming pipe. The default {@link java.io.PipedInputStream} buffer is
-     * only 1KB, which forces a writer/reader thread hand-off (wait/notify) every 1KB. Streaming a
-     * ~90MB node_modules through that ran at ~0.5MB/s (≈3 min per cold start) — pure synchronization
-     * thrash, not I/O. A large buffer lets the tar writer stream ahead so throughput is bound by the
-     * Docker daemon, not the pipe.
-     */
-    private static final int TAR_PIPE_BUFFER_BYTES = 16 * 1024 * 1024;
-
     @FunctionalInterface
     interface DirectoryTarWriter {
         void write(Path sourceDir, OutputStream out) throws IOException;
     }
+
+    /**
+     * See {@link RetryingTarCopier}: these copies retry at the call site because the transport
+     * seam cannot replay a one-shot {@code InputStream} body. A failure throws so launch() cleans
+     * up the half-built container instead of leaking it.
+     */
+    static final int COPY_MAX_ATTEMPTS = 6;
+    static final long COPY_RETRY_BACKOFF_MS = 500L;
 
     private void copyDirToContainer(DockerClient dockerClient, String containerId,
                                     Path sourceDir, String remotePath, String functionName) {
@@ -1253,7 +1244,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                                    Path sourceDir, String remotePath, String functionName,
                                    DirectoryTarWriter tarWriter) {
         copyDirToContainer(dockerClient, containerId, sourceDir, remotePath, functionName,
-                tarWriter, false);
+                tarWriter, false, COPY_MAX_ATTEMPTS, COPY_RETRY_BACKOFF_MS);
+    }
+
+    void copyDirToContainer(DockerClient dockerClient, String containerId,
+                            Path sourceDir, String remotePath, String functionName,
+                            int maxAttempts, long backoffMillis) {
+        copyDirToContainer(dockerClient, containerId, sourceDir, remotePath, functionName,
+                ContainerLauncher::createTarFromDir, false, maxAttempts, backoffMillis);
     }
 
     private void copyDirToContainerStrict(DockerClient dockerClient, String containerId,
@@ -1266,93 +1264,79 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                                          Path sourceDir, String remotePath, String functionName,
                                          DirectoryTarWriter tarWriter) {
         copyDirToContainer(dockerClient, containerId, sourceDir, remotePath, functionName,
-                tarWriter, true);
+                tarWriter, true, COPY_MAX_ATTEMPTS, COPY_RETRY_BACKOFF_MS);
     }
 
     private static void copyDirToContainer(DockerClient dockerClient, String containerId,
                                            Path sourceDir, String remotePath, String functionName,
-                                           DirectoryTarWriter tarWriter, boolean failOnTarFailure) {
+                                           DirectoryTarWriter tarWriter, boolean failOnTarFailure,
+                                           int maxAttempts, long backoffMillis) {
         // No per-copy gating here: the heavy /var/task populate for large code already holds a
         // populateSemaphore permit; small-code direct copies and layer copies are light enough
         // to run unthrottled.
-        try (java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
-             java.io.PipedInputStream pis = new java.io.PipedInputStream(pos, TAR_PIPE_BUFFER_BYTES)) {
-
-            AtomicReference<IOException> tarFailure = new AtomicReference<>();
-            Thread tarStreamer = new Thread(() -> {
-                try (pos) {
-                    tarWriter.write(sourceDir, pos);
-                } catch (IOException e) {
-                    if (failOnTarFailure) {
-                        tarFailure.set(e);
-                    } else {
-                        LOG.errorv("Failed to stream directory tar for function {0}: {1}",
-                                functionName, e.getMessage());
-                    }
-                }
-            }, "tar-streamer-dir-" + functionName);
-            tarStreamer.start();
-
-            dockerClient.copyArchiveToContainerCmd(containerId)
-                    .withRemotePath(remotePath)
-                    .withTarInputStream(pis)
-                    .exec();
-            if (failOnTarFailure) {
-                waitForTarStreamer(tarStreamer, tarFailure, functionName, sourceDir);
+        AtomicReference<IOException> tarFailure = new AtomicReference<>();
+        try {
+            RetryingTarCopier.copyStreamed(dockerClient, containerId, remotePath,
+                    "dir-" + functionName, out -> {
+                        tarFailure.set(null);
+                        try {
+                            tarWriter.write(sourceDir, out);
+                        } catch (IOException e) {
+                            tarFailure.set(e);
+                            if (!failOnTarFailure) {
+                                LOG.errorv("Failed to stream directory tar for function {0}: {1}",
+                                        functionName, e.getMessage());
+                            }
+                            throw e;
+                        }
+                    },
+                    maxAttempts, backoffMillis);
+        } catch (RuntimeException e) {
+            // RetryingTarCopier always surfaces a tar-producer failure it captured (so a writer
+            // failure the daemon happened to accept doesn't masquerade as success), wrapped in its
+            // own generic message. A distinct docker-level failure (the daemon itself rejecting the
+            // stream, not our own writer) isn't ours to reinterpret and must propagate as-is.
+            IOException producerFailure = tarFailure.get();
+            if (!isCausedBy(e, producerFailure)) {
+                throw e;
             }
-            LOG.debugv("Copied directory {0} into container {1} at {2}", sourceDir, containerId, remotePath);
-        } catch (Exception e) {
-            // Fail loudly so launch() cleans up the half-built container instead of leaking it.
+            if (!failOnTarFailure) {
+                LOG.debugv("Ignoring tolerated tar-producer failure for function {0}", functionName);
+                return;
+            }
+            IOException cause = new IOException("Failed to stream tar for function " + functionName
+                    + " from " + sourceDir, producerFailure);
             throw new RuntimeException("Failed to copy directory " + sourceDir + " into container "
-                    + containerId + " for function " + functionName + ": " + e.getMessage(), e);
+                    + containerId + " for function " + functionName + ": " + cause.getMessage(), cause);
         }
+        LOG.debugv("Copied directory {0} into container {1} at {2}", sourceDir, containerId, remotePath);
+    }
+
+    /** True if {@code target} appears by reference in {@code thrown}'s cause chain. */
+    private static boolean isCausedBy(Throwable thrown, Throwable target) {
+        if (target == null) {
+            return false;
+        }
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            if (t == target) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void copyFileToContainer(DockerClient dockerClient, String containerId,
                                      Path sourceFile, String remotePath, String entryName, String functionName) {
-        try (java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
-             java.io.PipedInputStream pis = new java.io.PipedInputStream(pos, TAR_PIPE_BUFFER_BYTES)) {
-
-            new Thread(() -> {
-                try (TarArchiveOutputStream tar = newTarStream(pos)) {
-                    TarArchiveEntry entry = new TarArchiveEntry(entryName);
-                    entry.setSize(Files.size(sourceFile));
-                    entry.setMode(0755);
-                    tar.putArchiveEntry(entry);
-                    try (var fis = Files.newInputStream(sourceFile)) {
-                        fis.transferTo(tar);
-                    }
-                    tar.closeArchiveEntry();
-                } catch (IOException e) {
-                    LOG.errorv("Failed to stream file tar for function {0}: {1}", functionName, e.getMessage());
-                }
-            }, "tar-streamer-file-" + functionName).start();
-
-            dockerClient.copyArchiveToContainerCmd(containerId)
-                    .withRemotePath(remotePath)
-                    .withTarInputStream(pis)
-                    .exec();
-            LOG.debugv("Copied file {0} as {1} into container {2} at {3}", sourceFile, entryName, containerId, remotePath);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to copy file " + sourceFile + " into container "
-                    + containerId + " for function " + functionName + ": " + e.getMessage(), e);
-        }
+        copyFileToContainer(dockerClient, containerId, sourceFile, remotePath, entryName, functionName,
+                COPY_MAX_ATTEMPTS, COPY_RETRY_BACKOFF_MS);
     }
 
-    private static void waitForTarStreamer(Thread tarStreamer, AtomicReference<IOException> tarFailure,
-                                           String functionName, Path sourcePath) throws IOException {
-        try {
-            tarStreamer.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while streaming tar for function " + functionName
-                    + " from " + sourcePath, e);
-        }
-        IOException failure = tarFailure.get();
-        if (failure != null) {
-            throw new IOException("Failed to stream tar for function " + functionName
-                    + " from " + sourcePath, failure);
-        }
+    void copyFileToContainer(DockerClient dockerClient, String containerId,
+                             Path sourceFile, String remotePath, String entryName, String functionName,
+                             int maxAttempts, long backoffMillis) {
+        RetryingTarCopier.copyFile(dockerClient, containerId, remotePath, entryName, sourceFile,
+                0755, maxAttempts, backoffMillis);
+        LOG.debugv("Copied file {0} as {1} into container {2} at {3}", sourceFile, entryName, containerId, remotePath);
     }
 
     private static boolean isProvidedRuntime(String runtime) {
@@ -1394,26 +1378,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * invocation waiting out the full function timeout to be told {@code Function.TimedOut}
      * instead of the {@code Runtime.ExitError} AWS reports immediately.
      *
-     * <p>Fires exactly once per container, on whatever exit eventually happens - including an
-     * intentional {@code docker stop} during normal teardown. {@link RuntimeApiServer
-     * #handleRuntimeProcessExited} itself distinguishes a genuine crash from that case (its own
-     * {@code stopped}/{@code faulted} guard), so this method only needs to forward the event;
-     * it does not need to be un-armed on the teardown path.
+     * <p>Fires once per container exit, including an intentional {@code docker stop} during
+     * normal teardown. {@link RuntimeApiServer#handleRuntimeProcessExited} itself distinguishes
+     * a genuine crash from that case (its own {@code stopped}/{@code faulted} guard). The watch
+     * survives its stream timing out on a quiet container; see {@link LambdaExitWatcher}.
      */
     private void watchForUnexpectedExit(DockerClient dockerClient, String containerId,
                                         RuntimeApiServer runtimeApiServer) {
-        try {
-            dockerClient.waitContainerCmd(containerId).exec(new WaitContainerResultCallback() {
-                @Override
-                public void onNext(WaitResponse response) {
-                    super.onNext(response);
-                    Integer statusCode = response.getStatusCode();
-                    runtimeApiServer.handleRuntimeProcessExited(statusCode != null ? statusCode : -1);
-                }
-            });
-        } catch (RuntimeException e) {
-            LOG.debugv(e, "Could not arm exit watcher for container {0}", containerId);
-        }
+        LambdaExitWatcher.watch(dockerClient, containerId, runtimeApiServer::handleRuntimeProcessExited);
     }
 
     private void launchExtensions(DockerClient dockerClient, String containerId, String functionName,
@@ -1426,7 +1398,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         for (String name : extensionNames) {
             try {
                 String path = EXTENSIONS_DIR + "/" + name;
-                var create = dockerClient.execCreateCmd(containerId)
+                ExecCreateCmd create = dockerClient.execCreateCmd(containerId)
                         .withCmd(path)
                         .withAttachStdout(true)
                         .withAttachStderr(true);
@@ -1530,8 +1502,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * are preserved without truncation.
      */
     private static void createTarFromDir(Path sourceDir, OutputStream out) throws IOException {
-        try (TarArchiveOutputStream tar = newTarStream(out);
-             var stream = Files.walk(sourceDir)) {
+        try (TarArchiveOutputStream tar = RetryingTarCopier.newTarStream(out);
+             Stream<Path> stream = Files.walk(sourceDir)) {
             for (Path path : (Iterable<Path>) stream::iterator) {
                 if (Files.isDirectory(path)) {
                     continue;
@@ -1541,18 +1513,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 entry.setSize(Files.size(path));
                 entry.setMode(0755);
                 tar.putArchiveEntry(entry);
-                try (var fis = Files.newInputStream(path)) {
+                try (InputStream fis = Files.newInputStream(path)) {
                     fis.transferTo(tar);
                 }
                 tar.closeArchiveEntry();
             }
         }
-    }
-
-    private static TarArchiveOutputStream newTarStream(OutputStream out) {
-        TarArchiveOutputStream tar = new TarArchiveOutputStream(out);
-        tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU);
-        tar.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_STAR);
-        return tar;
     }
 }

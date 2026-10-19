@@ -1,11 +1,15 @@
 package io.github.hectorvent.floci.services.opensearch;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -16,8 +20,8 @@ import io.github.hectorvent.floci.services.opensearch.model.DomainEndpointOption
 import io.github.hectorvent.floci.services.opensearch.model.EbsOptions;
 import io.github.hectorvent.floci.services.opensearch.model.EncryptionAtRestOptions;
 import io.github.hectorvent.floci.services.opensearch.model.NodeToNodeEncryptionOptions;
+import io.github.hectorvent.floci.services.opensearch.model.VolumeOwnership;
 import io.github.hectorvent.floci.services.opensearch.model.VpcOptions;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -33,9 +37,6 @@ import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
-import io.github.hectorvent.floci.core.resource.ResourceProvider;
-import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 
 @ApplicationScoped
 public class OpenSearchService implements ResourceProvider {
@@ -136,6 +137,10 @@ public class OpenSearchService implements ResourceProvider {
         // recomputed later. Only records predating this field fall back to the legacy name.
         domain.setDockerVolumeName(ContainerStorageHelper.resourceName(
                 config, "opensearch", domain.getVolumeId(), domain.getDomainName()));
+        // The ownership marker travels with the name, so deletion removes what was persisted
+        // instead of recomputing ownership against whatever configuration holds at delete time.
+        // A configured data volume overwrites both when startDomain mounts operator storage.
+        domain.setVolumeOwnership(VolumeOwnership.FLOCI_MANAGED);
 
         if (clusterConfig != null) {
             domain.setClusterConfig(clusterConfig);

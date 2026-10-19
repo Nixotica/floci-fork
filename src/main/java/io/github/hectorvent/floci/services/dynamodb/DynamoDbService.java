@@ -1,26 +1,5 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.common.RequestScopes;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
-import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.core.storage.StorageFactory;
-import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
-import io.github.hectorvent.floci.services.dynamodb.model.ExportDescription;
-import io.github.hectorvent.floci.services.dynamodb.model.ExportSummary;
-import io.github.hectorvent.floci.services.dynamodb.model.GlobalSecondaryIndex;
-import io.github.hectorvent.floci.services.dynamodb.model.ImportSummary;
-import io.github.hectorvent.floci.services.dynamodb.model.ImportTableDescription;
-import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
-import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
-import io.github.hectorvent.floci.services.dynamodb.model.StreamDescription;
-import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
-import io.github.hectorvent.floci.services.dynamodb.model.VectorIndex;
-import io.github.hectorvent.floci.services.dynamodb.model.ConditionalCheckFailedException;
-import io.github.hectorvent.floci.services.s3.S3Service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -28,6 +7,30 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
+import io.github.hectorvent.floci.services.dynamodb.model.ConditionalCheckFailedException;
+import io.github.hectorvent.floci.services.dynamodb.model.ExportDescription;
+import io.github.hectorvent.floci.services.dynamodb.model.ExportSummary;
+import io.github.hectorvent.floci.services.dynamodb.model.GlobalSecondaryIndex;
+import io.github.hectorvent.floci.services.dynamodb.model.ImportSummary;
+import io.github.hectorvent.floci.services.dynamodb.model.ImportTableDescription;
+import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
+import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
+import io.github.hectorvent.floci.services.dynamodb.model.StreamDescription;
+import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
+import io.github.hectorvent.floci.services.dynamodb.model.VectorIndex;
+import io.github.hectorvent.floci.services.s3.S3Service;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -49,9 +52,9 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -70,7 +73,6 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
 
 @ApplicationScoped
 public class DynamoDbService {
@@ -357,10 +359,10 @@ public class DynamoDbService {
         for (int i = 0; i < keySchema.size(); i++) {
             String keyType = keySchema.get(i).getKeyType();
             if (!"HASH".equals(keyType) && !"RANGE".equals(keyType)) {
-                throw new AwsException("ValidationException",
-                        "1 validation error detected: Value '" + keyType
+                throw SmithyValidationErrors.validationException(
+                        "Value '" + keyType
                         + "' at 'keySchema." + (i + 1) + ".member.keyType' failed to satisfy constraint: "
-                        + "Member must satisfy enum value set: [HASH, RANGE]", 400);
+                        + "Member must satisfy enum value set: [HASH, RANGE]");
             }
         }
 
@@ -369,9 +371,9 @@ public class DynamoDbService {
             String repr = "[" + keySchema.stream()
                     .map(k -> "KeySchemaElement(attributeName=" + k.getAttributeName() + ", keyType=" + k.getKeyType() + ")")
                     .collect(Collectors.joining(", ")) + "]";
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + repr + "' at 'keySchema' failed to satisfy constraint: "
-                    + "Member must have length less than or equal to 2", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + repr + "' at 'keySchema' failed to satisfy constraint: "
+                    + "Member must have length less than or equal to 2");
         }
 
         // Validate no duplicate attribute names in keySchema
@@ -388,10 +390,10 @@ public class DynamoDbService {
             for (int i = 0; i < attributeDefinitions.size(); i++) {
                 String attrType = attributeDefinitions.get(i).getAttributeType();
                 if (!"B".equals(attrType) && !"N".equals(attrType) && !"S".equals(attrType)) {
-                    throw new AwsException("ValidationException",
-                            "1 validation error detected: Value '" + attrType
+                    throw SmithyValidationErrors.validationException(
+                            "Value '" + attrType
                             + "' at 'attributeDefinitions." + (i + 1) + ".member.attributeType' failed to satisfy constraint: "
-                            + "Member must satisfy enum value set: [B, N, S]", 400);
+                            + "Member must satisfy enum value set: [B, N, S]");
                 }
             }
         }
@@ -551,24 +553,24 @@ public class DynamoDbService {
             requireVectorIndexMember(index.getDistanceFunction(), memberPath + ".distanceFunction");
             String indexName = index.getIndexName();
             if (indexName == null || indexName.length() < MIN_VECTOR_INDEX_NAME_LENGTH) {
-                throw new AwsException("ValidationException",
-                        "1 validation error detected: Value '" + indexName + "' at '"
+                throw SmithyValidationErrors.validationException(
+                        "Value '" + indexName + "' at '"
                         + memberPath + ".indexName' failed to satisfy constraint: "
-                        + "Member must have length greater than or equal to " + MIN_VECTOR_INDEX_NAME_LENGTH, 400);
+                        + "Member must have length greater than or equal to " + MIN_VECTOR_INDEX_NAME_LENGTH);
             }
             String distanceFunction = index.getDistanceFunction();
             if (!VECTOR_DISTANCE_FUNCTIONS.contains(distanceFunction)) {
-                throw new AwsException("ValidationException",
-                        "1 validation error detected: Value '" + distanceFunction + "' at '"
+                throw SmithyValidationErrors.validationException(
+                        "Value '" + distanceFunction + "' at '"
                         + memberPath + ".distanceFunction' failed to satisfy constraint: "
-                        + "Member must satisfy enum value set: " + VECTOR_DISTANCE_FUNCTIONS, 400);
+                        + "Member must satisfy enum value set: " + VECTOR_DISTANCE_FUNCTIONS);
             }
             Long dimensions = index.getDimensions();
             if (dimensions < 1) {
-                throw new AwsException("ValidationException",
-                        "1 validation error detected: Value '" + dimensions + "' at '"
+                throw SmithyValidationErrors.validationException(
+                        "Value '" + dimensions + "' at '"
                         + memberPath + ".dimensions' failed to satisfy constraint: "
-                        + "Member must have value greater than or equal to 1", 400);
+                        + "Member must have value greater than or equal to 1");
             }
         }
     }
@@ -643,9 +645,9 @@ public class DynamoDbService {
 
     private static void requireVectorIndexMember(Object value, String memberPath) {
         if (value == null) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value null at '" + memberPath
-                    + "' failed to satisfy constraint: Member must not be null", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value null at '" + memberPath
+                    + "' failed to satisfy constraint: Member must not be null");
         }
     }
 
@@ -739,7 +741,7 @@ public class DynamoDbService {
     }
 
     /**
-     * Every live item of the table, expired ones dropped. SearchVectors reads the whole table:
+     * Every stored item of the table, including expired items pending TTL deletion. SearchVectors reads the whole table:
      * it has no page boundary and no cursor, so it cannot go through {@link #scan}, which stops
      * at the 1 MB response cap.
      */
@@ -749,9 +751,7 @@ public class DynamoDbService {
         if (items == null) {
             return List.of();
         }
-        return items.values().stream()
-                .filter(item -> !isExpired(item, table))
-                .toList();
+        return List.copyOf(items.values());
     }
 
     /**
@@ -996,10 +996,6 @@ public class DynamoDbService {
             return null;
         }
         JsonNode item = items.get(itemKey);
-        if (item != null && isExpired(item, table)) {
-            LOG.tracev("Got item from {0}: key={1} item=<expired>", canonicalTableName, itemKey);
-            return null;
-        }
         LOG.tracev("Got item from {0}: key={1} item={2}", canonicalTableName, itemKey, item);
         return item;
     }
@@ -1263,12 +1259,9 @@ public class DynamoDbService {
             // AWS validates index key values against the item the update produces.
             validateIndexKeyTypes(table, item, true);
 
-            if (sizeRule == UpdateSizeRule.UPDATE_ITEM) {
-                requireUpdateItemWithinSizeLimit(item,
-                        writtenAttributes(touchedPaths, updateExpression, expressionAttrNames),
-                        updateExpression != null
-                                ? DynamoDbItemSize.updateExpressionCost(updateExpression)
-                                : DynamoDbItemSize.attributeUpdatesCost(attributeUpdates));
+            if (sizeRule == UpdateSizeRule.UPDATE_ITEM && updateExpression != null) {
+                requireUpdateItemWithinSizeLimit(item, DynamoDbItemSize.updateStatementSize(updateExpression,
+                        path -> parsePath(path, expressionAttrNames), expressionAttrValues));
             } else {
                 requireUpdatedItemWithinSizeLimit(item);
             }
@@ -1310,18 +1303,6 @@ public class DynamoDbService {
 
     private List<Object> pathTokens(String path, String updateExpression, JsonNode expressionAttrNames) {
         return updateExpression != null ? parsePath(path, expressionAttrNames) : List.<Object>of(path);
-    }
-
-    private Set<String> writtenAttributes(List<String> touchedPaths, String updateExpression,
-                                           JsonNode expressionAttrNames) {
-        Set<String> names = new LinkedHashSet<>();
-        for (String path : touchedPaths) {
-            List<Object> tokens = pathTokens(path, updateExpression, expressionAttrNames);
-            if (!tokens.isEmpty() && tokens.get(0) instanceof String name) {
-                names.add(name);
-            }
-        }
-        return names;
     }
 
     public QueryResult query(String tableName, JsonNode keyConditions,
@@ -1383,9 +1364,6 @@ public class DynamoDbService {
                             key -> item.has(key) && hasNonNullAttribute(item, key)))
                     .toList();
         }
-
-        // Filter out TTL-expired items
-        results = results.stream().filter(item -> !isExpired(item, table)).toList();
 
         // Sort by the full (possibly composite) sort key, comparing each attribute in key-schema
         // order. Using only the first sort-key attribute would ignore the remaining components
@@ -1571,11 +1549,11 @@ public class DynamoDbService {
             totalScanned++;
             scannedItems.add(item);
             lastScanned = item;
-            if (!isExpired(item, table)) {
-                boolean matched = (filterExpression == null
-                        || matchesFilterExpression(item, filterExpression, expressionAttrNames, expressionAttrValues))
-                        && (scanFilter == null || matchesScanFilter(item, scanFilter));
-                if (matched) results.add(item);
+            boolean matched = (filterExpression == null
+                    || matchesFilterExpression(item, filterExpression, expressionAttrNames, expressionAttrValues))
+                    && (scanFilter == null || matchesScanFilter(item, scanFilter));
+            if (matched) {
+                results.add(item);
             }
             // Limit caps SCANNED items (those read), not matched items. DynamoDB does
             // not look ahead when it stops at the Limit boundary: it always surfaces a
@@ -1733,7 +1711,7 @@ public class DynamoDbService {
             return new TransactWriteResult(applyTransactWrite(transactItems, region).writeCapacity(), false);
         }
         String cacheKey = regionResolver.getAccountId() + "::" + region + "::" + clientRequestToken;
-        String requestHash = sha256(rawRequest.toString());
+        String requestHash = Digests.sha256Hex(rawRequest.toString());
         for (;;) {
             long nowNanos = System.nanoTime();
             IdempotencyEntry fresh = new IdempotencyEntry(requestHash, nowNanos, new CompletableFuture<>());
@@ -1821,9 +1799,10 @@ public class DynamoDbService {
             List<TransactionCanceledException.CancellationReason> cancellationReasons = new ArrayList<>();
             boolean hasFailed = false;
             for (JsonNode transactItem : transactItems) {
-                var failReason = transactUpdateValueTooDeep(transactItem);
+                TransactionCanceledException.CancellationReason failReason =
+                        evaluateTransactCondition(transactItem, region, staged);
                 if (failReason == null) {
-                    failReason = evaluateTransactCondition(transactItem, region, staged);
+                    failReason = transactItemValidationFailure(transactItem, region, staged);
                 }
                 if (failReason != null) {
                     hasFailed = true;
@@ -1834,15 +1813,6 @@ public class DynamoDbService {
             }
             if (hasFailed) {
                 throw new TransactionCanceledException(cancellationReasons);
-            }
-
-            for (int i = 0; i < transactItems.size(); i++) {
-                try {
-                    validateTransactItem(transactItems.get(i), region, staged);
-                } catch (KeySchemaMismatchException | ItemNestingExceededException
-                        | UpdatedItemTooLargeException e) {
-                    throw cancelledByMember(transactItems.size(), i, e.getMessage());
-                }
             }
             List<JsonNode> oldImages = stagedImages(memberParticipants, staged);
             for (JsonNode transactItem : transactItems) {
@@ -1974,17 +1944,6 @@ public class DynamoDbService {
         return new TransactParticipant(storageKey, itemKey, tableName);
     }
 
-    // AWS checks the depth of a transact Update's values as part of that member, so a too
-    // deep value cancels the transaction instead of failing the request up front.
-    private TransactionCanceledException.CancellationReason transactUpdateValueTooDeep(JsonNode transactItem) {
-        var values = transactItem.path("Update").get("ExpressionAttributeValues");
-        if (DynamoDbAttributeValueValidator.nestingWithinLimit(values)) {
-            return null;
-        }
-        return new TransactionCanceledException.CancellationReason("ValidationError", null,
-                "Nesting Levels have exceeded supported limits");
-    }
-
     // AWS checks every member's key against the table schema, in order, before it looks for
     // duplicate items or evaluates a condition. The first mismatch cancels with that member's
     // reason alone. An empty key value still fails the whole request.
@@ -2043,6 +2002,17 @@ public class DynamoDbService {
         return new TransactionCanceledException(reasons);
     }
 
+    private TransactionCanceledException.CancellationReason transactItemValidationFailure(
+            JsonNode transactItem, String region,
+            Map<String, ConcurrentSkipListMap<String, JsonNode>> staged) {
+        try {
+            validateTransactItem(transactItem, region, staged);
+            return null;
+        } catch (KeySchemaMismatchException | ItemNestingExceededException | UpdatedItemTooLargeException e) {
+            return new TransactionCanceledException.CancellationReason("ValidationError", null, e.getMessage());
+        }
+    }
+
     private TransactionCanceledException.CancellationReason evaluateTransactCondition(JsonNode transactItem, String region) {
         return evaluateTransactCondition(transactItem, region, null);
     }
@@ -2098,7 +2068,10 @@ public class DynamoDbService {
         String pkName = table.getPartitionKeyName();
         JsonNode origPk = key.get(pkName);
         JsonNode newPk = item.get(pkName);
-        if (origPk != null && newPk != null && !origPk.equals(newPk)) {
+        if (newPk != null) {
+            validateAttributeValueShape(newPk);
+        }
+        if (origPk != null && newPk != null && !attributeValuesEqual(origPk, newPk)) {
             throw new AwsException("ValidationException",
                     "One or more parameter values were invalid: Cannot update attribute " + pkName
                     + ". This attribute is part of the key", 400);
@@ -2107,7 +2080,10 @@ public class DynamoDbService {
         if (skName != null) {
             JsonNode origSk = key.get(skName);
             JsonNode newSk = item.get(skName);
-            if (origSk != null && newSk != null && !origSk.equals(newSk)) {
+            if (newSk != null) {
+                validateAttributeValueShape(newSk);
+            }
+            if (origSk != null && newSk != null && !attributeValuesEqual(origSk, newSk)) {
                 throw new AwsException("ValidationException",
                         "One or more parameter values were invalid: Cannot update attribute " + skName
                         + ". This attribute is part of the key", 400);
@@ -2178,9 +2154,8 @@ public class DynamoDbService {
         }
     }
 
-    private static void requireUpdateItemWithinSizeLimit(JsonNode item, Set<String> writtenAttributes,
-                                                          int actionCost) {
-        if (!DynamoDbItemSize.updateItemWithinLimit(item, writtenAttributes, actionCost)) {
+    private static void requireUpdateItemWithinSizeLimit(JsonNode item, int statementSize) {
+        if (!DynamoDbItemSize.updateItemWithinLimit(item, statementSize)) {
             throw new UpdatedItemTooLargeException();
         }
     }
@@ -2316,7 +2291,8 @@ public class DynamoDbService {
         if (newAttrDefs != null) {
             knownAttrDefs.addAll(newAttrDefs);
         }
-        validateVectorIndexUpdates(table, vectorIndexCreates, vectorIndexDeletes, knownAttrDefs,
+        validateVectorIndexUpdates(table, vectorIndexCreates, vectorIndexDeletes,
+                gsiCreates.size() + gsiDeletes.size(), knownAttrDefs,
                 billingMode != null ? billingMode : table.getBillingMode());
 
         if (readCapacity != null) {
@@ -2372,13 +2348,14 @@ public class DynamoDbService {
      * current lifecycle state.
      *
      * <p>AWS allows one online index operation per table at a time. That limit binds the table,
-     * not the request, so two creates in one request and a create issued while an earlier index
+     * not the request, and GSI creates and deletes count against it too, so two creates in one
+     * request and a create issued while an earlier index
      * still builds are refused the same way. Deleting an index that is still in its resource
      * allocation phase is refused with a different error, and the same delete is accepted once
      * the index reaches backfilling.
      */
     private void validateVectorIndexUpdates(TableDefinition table, List<VectorIndexCreate> creates,
-                                            List<String> deletes,
+                                            List<String> deletes, int gsiOperations,
                                             List<AttributeDefinition> attributeDefinitions,
                                             String billingMode) {
         validateVectorIndexMembers(creates);
@@ -2389,7 +2366,7 @@ public class DynamoDbService {
                     "One or more parameter values were invalid: Vector indexes are only supported "
                     + "for PAY_PER_REQUEST tables", 400);
         }
-        if (creates.isEmpty() && deletes.isEmpty()) {
+        if (creates.isEmpty() && deletes.isEmpty() && gsiOperations == 0) {
             return;
         }
         for (VectorIndexCreate create : creates) {
@@ -2421,7 +2398,8 @@ public class DynamoDbService {
                 .count();
         // Deleting an index that is still backfilling takes over the slot that index already
         // holds, so it does not need one of its own.
-        long onlineOperations = building + creates.size() + deletes.size() - deletesOfBuildingIndexes;
+        long onlineOperations = building + creates.size() + deletes.size() + gsiOperations
+                - deletesOfBuildingIndexes;
         if (onlineOperations > 1) {
             throw new AwsException("LimitExceededException",
                     "Subscriber limit exceeded: Only 1 online index can be created or deleted "
@@ -2775,12 +2753,13 @@ public class DynamoDbService {
                 }
                 deletedForTable++;
                 if (streamService != null) {
-                    streamService.captureEvent("REMOVE", removed, null, scan.table(), scan.region());
+                    streamService.captureEvent("REMOVE", removed, null, scan.table(), scan.region(), true);
                 }
                 if (kinesisForwarder != null) {
                     // Out of request scope here: pass the table owner's account explicitly so the CDC
                     // record lands in the owner's stream, not the default account's same-named stream.
-                    kinesisForwarder.forward("REMOVE", removed, null, scan.table(), scan.region(), scan.accountId());
+                    kinesisForwarder.forward("REMOVE", removed, null, scan.table(), scan.region(), scan.accountId(),
+                            true);
                 }
             }
             if (deletedForTable > 0) {
@@ -2934,6 +2913,7 @@ public class DynamoDbService {
             throw new AwsException("ValidationException",
                     "Invalid UpdateExpression: The expression can not be empty;", 400);
         }
+        requireClosedParentheses(expression, "");
         // AWS tokenizes UpdateExpression whitespace-insensitively, so collapse runs of
         // whitespace (newlines, tabs, multiple spaces) so clause-keyword dispatch and the
         // comma-separated action parsing below work regardless of formatting. Normalize
@@ -3137,7 +3117,7 @@ public class DynamoDbService {
      * unwrapped form. Rejects forms like "(a) - (b)" where the outer parens do
      * not actually enclose the whole expression.
      */
-    private static String stripOuterParens(String expr) {
+    static String stripOuterParens(String expr) {
         String s = expr.trim();
         while (s.length() >= 2 && s.charAt(0) == '(' && s.charAt(s.length() - 1) == ')') {
             int depth = 0;
@@ -3518,13 +3498,11 @@ public class DynamoDbService {
                     }
 
                     if (index < 0 || index > MAX_DYNAMODB_LIST_INDEX) {
-                        throw new AwsException(
-                                "ValidationException",
-                                "1 validation error detected: Invalid UpdateExpression: "
+                        throw SmithyValidationErrors.validationException(
+                                "Invalid UpdateExpression: "
                                         + "List index is not within the allowable range; index: ["
                                         + indexText
-                                        + "]. The maximum allowed index is 4294967294",
-                                400);
+                                        + "]. The maximum allowed index is 4294967294");
                     }
 
                     tokens.add(index);
@@ -3799,6 +3777,41 @@ public class DynamoDbService {
         }
     }
 
+    // DynamoDB reads an unclosed call or group to the end of the expression and reports the
+    // raw text from its last token on, trailing whitespace included. UpdateItem wraps the
+    // error in the validation envelope, TransactWriteItems does not.
+    static void requireClosedParentheses(String expression, String envelope) {
+        int depth = 0;
+        int lastToken = 0;
+        for (int i = 0; i < expression.length(); i++) {
+            char c = expression.charAt(i);
+            if (Character.isWhitespace(c)) {
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+                if (depth < 0) {
+                    return;
+                }
+            }
+            if (i == 0 || isUpdatePunctuation(c) || isUpdatePunctuation(expression.charAt(i - 1))
+                    || Character.isWhitespace(expression.charAt(i - 1))) {
+                lastToken = i;
+            }
+        }
+        if (depth > 0) {
+            throw new AwsException("ValidationException",
+                    envelope + "Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \""
+                            + expression.substring(lastToken) + "\"", 400);
+        }
+    }
+
+    private static boolean isUpdatePunctuation(char c) {
+        return "()[],.=+-".indexOf(c) >= 0;
+    }
+
     static int findNextComma(String s) {
         // Find next comma that is not inside a function call
         int depth = 0;
@@ -3881,7 +3894,7 @@ public class DynamoDbService {
      * Finds the index of an arithmetic operator (+ or -) that is outside
      * function parentheses. Returns -1 if none found.
      */
-    private int findArithmeticOperator(String expr) {
+    static int findArithmeticOperator(String expr) {
         int depth = 0;
         for (int i = 0; i < expr.length(); i++) {
             char c = expr.charAt(i);
@@ -3906,7 +3919,7 @@ public class DynamoDbService {
      * spaced form (e.g. PynamoDB always generates {@code "list_append (x, y)"}), which a plain
      * {@code startsWith(functionName + "(")} rejects.
      */
-    private static boolean startsWithFunctionCall(String value, String functionName) {
+    static boolean startsWithFunctionCall(String value, String functionName) {
         return value.startsWith(functionName)
                 && value.substring(functionName.length()).stripLeading().startsWith("(");
     }
@@ -4101,16 +4114,10 @@ public class DynamoDbService {
             throw new KeySchemaMismatchException("The provided key element does not match the schema");
         }
         if (attr.has("S") && attr.get("S").asText().isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "One or more parameter values are not valid. "
-                    + "The AttributeValue for a key attribute cannot contain an empty string value. Key: "
-                    + keyName, 400);
+            throw DynamoDbKeyValueErrors.emptyKeyValue("S", keyName);
         }
         if (attr.has("B") && attr.get("B").asText().isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "One or more parameter values are not valid. "
-                    + "The AttributeValue for a key attribute cannot contain an empty binary value. Key: "
-                    + keyName, 400);
+            throw DynamoDbKeyValueErrors.emptyKeyValue("B", keyName);
         }
     }
 
@@ -4205,33 +4212,29 @@ public class DynamoDbService {
             validateAttributeValueShape(attr);
             String expectedType = keyAttributeType(table, attrName);
             if (expectedType != null && !attr.has(expectedType)) {
-                throw new KeySchemaMismatchException(
-                        "One or more parameter values were invalid: Type mismatch for Index Key " + attrName
-                        + " Expected: " + expectedType + " Actual: " + attr.fieldNames().next()
-                        + " IndexName: " + indexName);
+                throw DynamoDbKeyValueErrors.indexKeyTypeMismatch(attrName, expectedType,
+                        attr.fieldNames().next(), indexName);
             }
             if (attr.has("S") && attr.get("S").asText().isEmpty()) {
-                throw emptyIndexKeyValue("empty string value", indexName, attrName, isUpdate);
+                throw emptyIndexKeyValue("S", indexName, attrName, isUpdate);
             }
             if (attr.has("B") && attr.get("B").asText().isEmpty()) {
-                throw emptyIndexKeyValue("empty binary value", indexName, attrName, isUpdate);
+                throw emptyIndexKeyValue("B", indexName, attrName, isUpdate);
             }
         }
     }
 
     // AWS uses different wording for UpdateItem than for writes of a whole item.
-    private static AwsException emptyIndexKeyValue(String what, String indexName, String attrName,
+    private static AwsException emptyIndexKeyValue(String type, String indexName, String attrName,
                                                    boolean isUpdate) {
         if (isUpdate) {
             return new AwsException("ValidationException",
                     "One or more parameter values are not valid. The update expression attempted to "
                     + "update a secondary index key to a value that is not supported. "
-                    + "The AttributeValue for a key attribute cannot contain an " + what + ".", 400);
+                    + "The AttributeValue for a key attribute cannot contain an "
+                    + DynamoDbKeyValueErrors.emptyValueKind(type) + ".", 400);
         }
-        return new AwsException("ValidationException",
-                "One or more parameter values are not valid. A value specified for a secondary "
-                + "index key is not supported. The AttributeValue for a key attribute cannot "
-                + "contain an " + what + ". IndexName: " + indexName + ", IndexKey: " + attrName, 400);
+        return DynamoDbKeyValueErrors.emptyIndexKeyValue(type, indexName, attrName);
     }
 
     private String buildItemKeyFromNode(JsonNode item, String pkName, String skName) {
@@ -4428,7 +4431,7 @@ public class DynamoDbService {
         if (exclusiveStartKey == null || exclusiveStartKey.isNull()) {
             return;
         }
-        DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath, false);
+        DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath);
 
         boolean withinBounds = keyConditionExpression != null
                 ? ExpressionEvaluator.matches(keyConditionExpression, exclusiveStartKey,
@@ -4666,23 +4669,6 @@ public class DynamoDbService {
         }
     }
 
-    /**
-     * SHA-256 hex digest of a string, used by ClientRequestToken idempotency to compare
-     * request bodies. SHA-256 is required (not MD5) for the dedup contract because a
-     * collision would allow a request with different parameters to be silently treated
-     * as a replay; SHA-256 is supported on every JVM via {@link MessageDigest}.
-     */
-    private static String sha256(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            // SHA-256 is mandated by the JLS to be available on every JVM; this should never trigger.
-            throw new IllegalStateException("SHA-256 is required but not available on this JVM", e);
-        }
-    }
-
     private String buildManifestSummary(ExportDescription desc, String exportId,
                                          String dataKey, long itemCount, long billedSize,
                                          String md5, String etag, String manifestSummaryKey) {
@@ -4725,8 +4711,17 @@ public class DynamoDbService {
                     "Export not found: " + exportArn, 400);
         }
         return exportStore.get(exportArn)
+                .filter(d -> inRequestRegion(d.getExportArn()))
                 .orElseThrow(() -> new AwsException("ExportNotFoundException",
                         "Export not found: " + exportArn, 400));
+    }
+
+    /** Export and import jobs are stored by ARN for every region; a request sees only its own region's. */
+    private boolean inRequestRegion(String jobArn) {
+        if (jobArn == null || !AwsArnUtils.isArn(jobArn)) {
+            return true;
+        }
+        return AwsArnUtils.parse(jobArn).region().equals(regionResolver.getRegion());
     }
 
     public record ListExportsResult(List<ExportSummary> exportSummaries, String nextToken) {}
@@ -4736,6 +4731,7 @@ public class DynamoDbService {
             return new ListExportsResult(List.of(), null);
         }
         var all = exportStore.scan(k -> true).stream()
+                .filter(d -> inRequestRegion(d.getExportArn()))
                 .filter(d -> tableArn == null || tableArn.equals(d.getTableArn()))
                 .toList();
         requirePageSize(maxResults, "maxResults");
@@ -4752,15 +4748,15 @@ public class DynamoDbService {
             return;
         }
         if (pageSize < 1) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + pageSize + "' at '" + field
-                    + "' failed to satisfy constraint: Member must have value greater than or equal to 1", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + pageSize + "' at '" + field
+                    + "' failed to satisfy constraint: Member must have value greater than or equal to 1");
         }
         if (MAX_JOB_PAGE_SIZE < pageSize) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + pageSize + "' at '" + field
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + pageSize + "' at '" + field
                     + "' failed to satisfy constraint: Member must have value less than or equal to "
-                    + MAX_JOB_PAGE_SIZE, 400);
+                    + MAX_JOB_PAGE_SIZE);
         }
     }
 
@@ -4795,10 +4791,10 @@ public class DynamoDbService {
     static void validateBillingMode(JsonNode request, String memberPrefix) {
         JsonNode billingMode = request.path("BillingMode");
         if (billingMode.isTextual() && !VALID_BILLING_MODES.contains(billingMode.asText())) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + billingMode.asText() + "' at '" + memberPrefix
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + billingMode.asText() + "' at '" + memberPrefix
                     + "billingMode' failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]", 400);
+                    + "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]");
         }
     }
 
@@ -4817,31 +4813,32 @@ public class DynamoDbService {
             case "" -> throw new AwsException("ValidationException", "InputFormat is required", 400);
             case "CSV", "ION" -> throw new AwsException("ValidationException",
                     "Unsupported InputFormat: " + inputFormat + ". Floci imports DYNAMODB_JSON only", 400);
-            default -> throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + inputFormat
-                    + "' at 'inputFormat' failed to satisfy constraint: Member must satisfy enum value set: [ION, CSV, DYNAMODB_JSON]", 400);
+            default -> throw SmithyValidationErrors.validationException(
+                    "Value '" + inputFormat
+                    + "' at 'inputFormat' failed to satisfy constraint: Member must satisfy enum value set: [ION, CSV, DYNAMODB_JSON]");
         }
         var compression = request.path("InputCompressionType").asText("NONE");
         switch (compression) {
             case "NONE", "GZIP" -> { }
             case "ZSTD" -> throw new AwsException("ValidationException",
                     "Unsupported InputCompressionType: ZSTD. Floci accepts NONE or GZIP", 400);
-            default -> throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + compression
-                    + "' at 'inputCompressionType' failed to satisfy constraint: Member must satisfy enum value set: [GZIP, ZSTD, NONE]", 400);
+            default -> throw SmithyValidationErrors.validationException(
+                    "Value '" + compression
+                    + "' at 'inputCompressionType' failed to satisfy constraint: Member must satisfy enum value set: [GZIP, ZSTD, NONE]");
         }
         DynamoDbTableNames.requireShortName(request.path("TableCreationParameters").path("TableName").asText(null));
         validateBillingMode(request.path("TableCreationParameters"), "tableCreationParameters.");
         var clientToken = request.path("ClientToken").asText(null);
         if (clientToken != null && clientToken.isBlank()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + clientToken
-                    + "' at 'clientToken' failed to satisfy constraint: Member must have length greater than or equal to 1", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + clientToken
+                    + "' at 'clientToken' failed to satisfy constraint: Member must have length greater than or equal to 1");
         }
         if (clientToken == null || importStore == null) {
             return null;
         }
         var existing = importStore.scan(k -> true).stream()
+                .filter(d -> inRequestRegion(d.getImportArn()))
                 .filter(d -> clientToken.equals(d.getClientToken()))
                 .findFirst()
                 .orElse(null);
@@ -5042,6 +5039,7 @@ public class DynamoDbService {
     public ImportTableDescription describeImport(String importArn) {
         return Optional.ofNullable(importStore)
                 .flatMap(store -> store.get(importArn))
+                .filter(d -> inRequestRegion(d.getImportArn()))
                 .orElseThrow(() -> new AwsException("ImportNotFoundException",
                         "The specified import was not found.", 400));
     }
@@ -5053,6 +5051,7 @@ public class DynamoDbService {
             return new ListImportsResult(List.of(), null);
         }
         var all = importStore.scan(k -> true).stream()
+                .filter(d -> inRequestRegion(d.getImportArn()))
                 .filter(d -> tableArn == null || tableArn.equals(d.getTableArn()))
                 .toList();
         requirePageSize(pageSize, "pageSize");

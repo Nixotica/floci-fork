@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.apigatewayv2;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
@@ -9,12 +10,13 @@ import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.storage.StorageOperations;
 import io.github.hectorvent.floci.services.apigatewayv2.model.*;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -218,19 +220,15 @@ public class ApiGatewayV2Service {
         // Cascade-delete every child resource keyed under region::apiId::*.
         // VpcLink is region-scoped (region::vpcLinkId, shared across APIs) and excluded.
         String prefix = region + "::" + apiId + "::";
-        deleteByPrefix(routeStore, prefix);
-        deleteByPrefix(integrationStore, prefix);
-        deleteByPrefix(authorizerStore, prefix);
-        deleteByPrefix(deploymentStore, prefix);
-        deleteByPrefix(stageStore, prefix);
-        deleteByPrefix(modelStore, prefix);
-        deleteByPrefix(routeResponseStore, prefix);
-        deleteByPrefix(integrationResponseStore, prefix);
+        StorageOperations.deleteByPrefix(routeStore, prefix);
+        StorageOperations.deleteByPrefix(integrationStore, prefix);
+        StorageOperations.deleteByPrefix(authorizerStore, prefix);
+        StorageOperations.deleteByPrefix(deploymentStore, prefix);
+        StorageOperations.deleteByPrefix(stageStore, prefix);
+        StorageOperations.deleteByPrefix(modelStore, prefix);
+        StorageOperations.deleteByPrefix(routeResponseStore, prefix);
+        StorageOperations.deleteByPrefix(integrationResponseStore, prefix);
         LOG.infov("Deleted HTTP API: {0} in {1}", apiId, region);
-    }
-
-    private static void deleteByPrefix(StorageBackend<String, ?> store, String prefix) {
-        store.keys().stream().filter(k -> k.startsWith(prefix)).forEach(store::delete);
     }
 
     public Api updateApi(String region, String apiId, Map<String, Object> request) {
@@ -782,6 +780,19 @@ public class ApiGatewayV2Service {
         return integration;
     }
 
+    /**
+     * Sets the connection type and id exactly as given, null included. UpdateIntegration keeps a
+     * field the request leaves out, so it cannot remove a connection that CloudFormation dropped.
+     */
+    public Integration replaceIntegrationConnection(String region, String apiId, String integrationId,
+                                                    String connectionType, String connectionId) {
+        Integration integration = getIntegration(region, apiId, integrationId);
+        integration.setConnectionType(connectionType);
+        integration.setConnectionId(connectionId);
+        integrationStore.put(integrationKey(region, apiId, integrationId), integration);
+        return integration;
+    }
+
     // ──────────────────────────── Stage CRUD ────────────────────────────
 
     public Stage createStage(String region, String apiId, Map<String, Object> request) {
@@ -816,6 +827,12 @@ public class ApiGatewayV2Service {
     public Stage getStage(String region, String apiId, String stageName) {
         return stageStore.get(stageKey(region, apiId, stageName))
                 .orElseThrow(() -> new AwsException("NotFoundException", "Stage not found", 404));
+    }
+
+    public Map<String, String> getStageVariables(String region, String apiId, String stageName) {
+        return stageStore.get(stageKey(region, apiId, stageName))
+                .map(Stage::getStageVariables)
+                .orElse(Map.of());
     }
 
     public List<Stage> getStages(String region, String apiId) {
@@ -1143,6 +1160,16 @@ public class ApiGatewayV2Service {
         return vpcLinkStore.scan(k -> k.startsWith(prefix));
     }
 
+    /** UpdateVpcLink: only the name can change, as in the API model. */
+    public VpcLink updateVpcLink(String region, String vpcLinkId, Map<String, Object> request) {
+        VpcLink link = getVpcLink(region, vpcLinkId);
+        if (request.get("name") instanceof String name) {
+            link.setName(name);
+        }
+        vpcLinkStore.put(vpcLinkKey(region, vpcLinkId), link);
+        return link;
+    }
+
     public void deleteVpcLink(String region, String vpcLinkId) {
         getVpcLink(region, vpcLinkId);
         vpcLinkStore.delete(vpcLinkKey(region, vpcLinkId));
@@ -1150,18 +1177,23 @@ public class ApiGatewayV2Service {
 
     // ──────────────────────────── Standalone Tagging ────────────────────────────
 
-    /** A taggable v2 resource: an API, or a stage within one. */
-    private record TaggedResource(String region, String apiId, String stageName) {
+    /** A taggable v2 resource: an API, a stage within one, or a VPC link. */
+    private record TaggedResource(String region, String apiId, String stageName, String vpcLinkId) {
         boolean isStage() {
             return stageName != null;
+        }
+
+        boolean isVpcLink() {
+            return vpcLinkId != null;
         }
     }
 
     /**
      * Parses an API Gateway v2 resource ARN.
      *
-     * <p>Accepted forms: {@code arn:aws:apigateway:{region}::/apis/{apiId}} and
-     * {@code arn:aws:apigateway:{region}::/apis/{apiId}/stages/{stageName}}. Matching on the
+     * <p>Accepted forms: {@code arn:aws:apigateway:{region}::/apis/{apiId}},
+     * {@code arn:aws:apigateway:{region}::/apis/{apiId}/stages/{stageName}} and
+     * {@code arn:aws:apigateway:{region}::/vpclinks/{vpcLinkId}}. Matching on the
      * trailing segment alone would read a stage ARN's stage name as the API id, which surfaces as
      * a misleading "Invalid API id specified" on TagResource.
      */
@@ -1181,10 +1213,13 @@ public class ApiGatewayV2Service {
         String[] segments = arn.resource().replaceFirst("^/", "").split("/");
         if (segments.length >= 4 && "apis".equals(segments[0]) && "stages".equals(segments[2])
                 && !segments[1].isEmpty() && !segments[3].isEmpty()) {
-            return new TaggedResource(region, segments[1], segments[3]);
+            return new TaggedResource(region, segments[1], segments[3], null);
         }
         if (segments.length >= 2 && "apis".equals(segments[0]) && !segments[1].isEmpty()) {
-            return new TaggedResource(region, segments[1], null);
+            return new TaggedResource(region, segments[1], null, null);
+        }
+        if (segments.length == 2 && "vpclinks".equals(segments[0]) && !segments[1].isEmpty()) {
+            return new TaggedResource(region, null, null, segments[1]);
         }
         throw new AwsException("BadRequestException",
                 "Cannot extract apiId from ResourceArn: " + resourceArn, 400);
@@ -1192,6 +1227,18 @@ public class ApiGatewayV2Service {
 
     public void tagResource(String resourceArn, Map<String, String> tags) {
         TaggedResource target = parseArn(resourceArn);
+        if (target.isVpcLink()) {
+            ReservedTags.rejectApiGatewayReservedTagsOnUpdate(tags);
+            VpcLink link = getVpcLink(target.region(), target.vpcLinkId());
+            if (tags != null && !tags.isEmpty()) {
+                if (link.getTags() == null) {
+                    link.setTags(new HashMap<>());
+                }
+                link.getTags().putAll(tags);
+            }
+            vpcLinkStore.put(vpcLinkKey(target.region(), target.vpcLinkId()), link);
+            return;
+        }
         if (target.isStage()) {
             ReservedTags.rejectApiGatewayReservedTagsOnUpdate(tags);
             Stage stage = getStage(target.region(), target.apiId(), target.stageName());
@@ -1217,6 +1264,14 @@ public class ApiGatewayV2Service {
 
     public void untagResource(String resourceArn, List<String> tagKeys) {
         TaggedResource target = parseArn(resourceArn);
+        if (target.isVpcLink()) {
+            VpcLink link = getVpcLink(target.region(), target.vpcLinkId());
+            if (tagKeys != null && link.getTags() != null) {
+                tagKeys.forEach(k -> link.getTags().remove(k));
+            }
+            vpcLinkStore.put(vpcLinkKey(target.region(), target.vpcLinkId()), link);
+            return;
+        }
         if (target.isStage()) {
             Stage stage = getStage(target.region(), target.apiId(), target.stageName());
             if (tagKeys != null && stage.getTags() != null) {
@@ -1234,9 +1289,14 @@ public class ApiGatewayV2Service {
 
     public Map<String, String> getTags(String resourceArn) {
         TaggedResource target = parseArn(resourceArn);
-        Map<String, String> tags = target.isStage()
-                ? getStage(target.region(), target.apiId(), target.stageName()).getTags()
-                : getApi(target.region(), target.apiId()).getTags();
+        Map<String, String> tags;
+        if (target.isVpcLink()) {
+            tags = getVpcLink(target.region(), target.vpcLinkId()).getTags();
+        } else if (target.isStage()) {
+            tags = getStage(target.region(), target.apiId(), target.stageName()).getTags();
+        } else {
+            tags = getApi(target.region(), target.apiId()).getTags();
+        }
         return (tags != null) ? new java.util.HashMap<>(tags) : java.util.Collections.emptyMap();
     }
 

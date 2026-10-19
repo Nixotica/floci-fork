@@ -1,7 +1,7 @@
 package io.github.hectorvent.floci.services.cloudfront;
 
-import io.github.hectorvent.floci.services.cloudfront.model.DefaultCacheBehavior;
 import io.github.hectorvent.floci.services.cloudfront.model.CloudFrontOriginAccessIdentity;
+import io.github.hectorvent.floci.services.cloudfront.model.DefaultCacheBehavior;
 import io.github.hectorvent.floci.services.cloudfront.model.Distribution;
 import io.github.hectorvent.floci.services.cloudfront.model.DistributionConfig;
 import io.github.hectorvent.floci.services.cloudfront.model.Origin;
@@ -78,6 +78,8 @@ class CloudFrontS3AuthServingTest {
                 false,
                 null,
                 "origin-access-identity/cloudfront/" + oai.getId());
+        s3Service.putBucketOwnershipControls(bucket, "<OwnershipControls><Rule>"
+                + "<ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>");
         s3Service.putObjectAcl(
                 bucket,
                 "index.html",

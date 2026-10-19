@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -133,6 +134,20 @@ class LambdaIntegrationTest {
             .post(BASE_PATH + "/functions/no-such-function/invocations")
         .then()
             .statusCode(404);
+    }
+
+    @Test
+    @Order(7)
+    void syncInvoke_malformedClientContext_returns400() {
+        given()
+            .header("X-Amz-Client-Context", "not-base64-json!")
+            .contentType("application/json")
+            .body("{}")
+        .when()
+            .post(BASE_PATH + "/functions/hello-world/invocations")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidRequestContentException"));
     }
 
     @Test
@@ -588,8 +603,7 @@ class LambdaIntegrationTest {
         org.junit.jupiter.api.Assertions.assertEquals('K', pkg[1]);
 
         // Byte-exact: downloaded package hashes to the stored CodeSha256.
-        byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(pkg);
-        String downloadedSha256 = Base64.getEncoder().encodeToString(digest);
+        String downloadedSha256 = Base64.getEncoder().encodeToString(Digests.sha256(pkg));
         org.junit.jupiter.api.Assertions.assertEquals(expectedSha256, downloadedSha256,
                 "downloaded package must be byte-identical to the uploaded zip");
 

@@ -45,10 +45,12 @@ public class Instance {
     private boolean ebsOptimized = false;
     private boolean enaSupport = true;
     private String iamInstanceProfileArn;
+    private String iamInstanceProfileId;
     private Instant iamInstanceProfileAssociationTime;
     private String stateReasonCode;
     private String stateReasonMessage;
     private String region;
+    private String ownerId;
     private List<Tag> tags = new ArrayList<>();
 
     private String rootVolumeId;
@@ -183,6 +185,8 @@ public class Instance {
 
     public String getIamInstanceProfileArn() { return iamInstanceProfileArn; }
     public void setIamInstanceProfileArn(String iamInstanceProfileArn) { this.iamInstanceProfileArn = iamInstanceProfileArn; }
+    public String getIamInstanceProfileId() { return iamInstanceProfileId; }
+    public void setIamInstanceProfileId(String iamInstanceProfileId) { this.iamInstanceProfileId = iamInstanceProfileId; }
     public Instant getIamInstanceProfileAssociationTime() { return iamInstanceProfileAssociationTime; }
     public void setIamInstanceProfileAssociationTime(Instant iamInstanceProfileAssociationTime) { this.iamInstanceProfileAssociationTime = iamInstanceProfileAssociationTime; }
 
@@ -194,6 +198,9 @@ public class Instance {
 
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
+
+    public String getOwnerId() { return ownerId; }
+    public void setOwnerId(String ownerId) { this.ownerId = ownerId; }
 
     public List<Tag> getTags() { return tags; }
     public void setTags(List<Tag> tags) { this.tags = tags; }

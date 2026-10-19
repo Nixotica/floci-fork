@@ -1,16 +1,18 @@
 package io.github.hectorvent.floci.services.lambda;
 
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
-import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
-import io.github.hectorvent.floci.services.lambda.model.InvocationType;
-import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
-import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
+import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -29,13 +31,11 @@ import jakarta.ws.rs.core.UriBuilder;
 import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.io.IOException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.HexFormat;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
@@ -262,7 +262,12 @@ public class LambdaController {
                     .build();
         }
 
-        InvokeResult result = lambdaService.invoke(region, functionName, qualifier, payload, type);
+        String clientContext = type == InvocationType.RequestResponse
+                ? decodeClientContext(headers.getHeaderString("X-Amz-Client-Context")) : null;
+        String durableExecutionName = headers.getHeaderString("X-Amz-Durable-Execution-Name");
+
+        InvokeResult result = lambdaService.invoke(region, functionName, qualifier, payload, type, clientContext,
+                durableExecutionName);
 
         if (type != InvocationType.Event
                 && result.getPayload() != null
@@ -283,6 +288,9 @@ public class LambdaController {
         }
         builder.header("X-Amz-Executed-Version", result.getExecutedVersion());
         builder.header("X-Amz-Request-Id", result.getRequestId());
+        if (result.getDurableExecutionArn() != null) {
+            builder.header("X-Amz-Durable-Execution-Arn", result.getDurableExecutionArn());
+        }
 
         if (result.getPayload() != null && result.getPayload().length > 0) {
             builder.entity(result.getPayload())
@@ -290,6 +298,20 @@ public class LambdaController {
         }
 
         return builder.build();
+    }
+
+    private String decodeClientContext(String encoded) {
+        if (encoded == null || encoded.isEmpty()) {
+            return null;
+        }
+        try {
+            byte[] decoded = Base64.getDecoder().decode(encoded);
+            return objectMapper.writer().with(JsonGenerator.Feature.ESCAPE_NON_ASCII)
+                    .writeValueAsString(objectMapper.readTree(decoded));
+        } catch (IOException | IllegalArgumentException e) {
+            throw new AwsException("InvalidRequestContentException",
+                    "Could not parse the client context: it must be base64-encoded JSON.", 400);
+        }
     }
 
     // ──────────────────────────── Event Source Mappings ────────────────────────────
@@ -769,10 +791,24 @@ public class LambdaController {
         putSnapStart(node, fn);
         putLoggingConfig(node, fn);
         putRuntimeVersionConfig(node, fn);
+        putDurableConfig(node, fn);
 
         @SuppressWarnings("unchecked")
         Map<String, Object> result = objectMapper.convertValue(node, Map.class);
         return result;
+    }
+
+    /** Only durable functions carry a DurableConfig; AWS omits the member for every other function. */
+    private void putDurableConfig(ObjectNode node, LambdaFunction fn) {
+        if (!fn.isDurable()) {
+            return;
+        }
+        ObjectNode durable = node.putObject("DurableConfig");
+        durable.put("ExecutionTimeout", fn.getDurableExecutionTimeout());
+        durable.put("RetentionPeriodInDays", fn.getDurableRetentionPeriodInDays());
+        if (fn.getDurableKmsKeyArn() != null) {
+            durable.put("KMSKeyArn", fn.getDurableKmsKeyArn());
+        }
     }
 
     /**
@@ -826,9 +862,7 @@ public class LambdaController {
             logging.put("SystemLogLevel",
                     fn.getSystemLogLevel() != null ? fn.getSystemLogLevel() : "INFO");
         }
-        logging.put("LogGroup", fn.getLogGroup() != null && !fn.getLogGroup().isBlank()
-                ? fn.getLogGroup()
-                : "/aws/lambda/" + fn.getFunctionName());
+        logging.put("LogGroup", LambdaLogDestinations.logGroup(fn));
     }
 
     /** Managed-runtime only: AWS omits it for container images, which pin their own runtime. */
@@ -855,13 +889,7 @@ public class LambdaController {
      * perpetual diff in anything that records it.
      */
     private static String runtimeVersionId(String runtime) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(runtime.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 unavailable", e);
-        }
+        return Digests.sha256Hex(runtime);
     }
 
     private static List<String> stringList(Map<String, Object> config, String key) {

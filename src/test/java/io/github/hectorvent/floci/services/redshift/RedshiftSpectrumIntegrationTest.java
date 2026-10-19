@@ -1,32 +1,62 @@
 package io.github.hectorvent.floci.services.redshift;
 
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.glue.GlueService;
+import io.github.hectorvent.floci.services.glue.model.Database;
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.redshift.model.Cluster;
+import io.github.hectorvent.floci.services.redshift.spectrum.ExternalCatalogRegistry;
+import io.github.hectorvent.floci.services.redshift.spectrum.ExternalStatement;
+import io.github.hectorvent.floci.services.redshift.spectrum.ExternalStatementParser;
+import io.github.hectorvent.floci.services.redshift.spectrum.GlueTableBuilder;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.testing.SidecarContainersProfile;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.postgresql.PGStatement;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Savepoint;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * Runs Redshift Spectrum queries that read external tables from Glue and S3 through the floci-duck
+ * sidecar, alone and joined with tables inside the cluster.
+ *
+ * <p>The sidecar reads the objects back from Floci's S3 at {@code floci.base-url}, which
+ * {@link SidecarContainersProfile} points at the port the test application listens on, and the
+ * profile namespaces the containers. The class shares that application with the other sidecar
+ * classes, so as each test ends it deletes the IAM role it created, and only one it created.
+ */
 @QuarkusTest
+@TestProfile(SidecarContainersProfile.class)
 class RedshiftSpectrumIntegrationTest {
 
     @Inject
@@ -35,24 +65,41 @@ class RedshiftSpectrumIntegrationTest {
     @Inject
     S3Service s3Service;
 
+    @Inject
+    IamService iamService;
+
+    @Inject
+    GlueService glueService;
+
+    @Inject
+    ExternalCatalogRegistry externalRegistry;
+
+    private static final String ROLE_NAME = "SpectrumItRole";
+    private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/" + ROLE_NAME;
+    private static final String TRUST_POLICY = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Principal":{"Service":"redshift.amazonaws.com"},"Action":"sts:AssumeRole"}]}""";
+
     private String clusterId;
     private String bucket;
+    private String glueDatabase;
+    private boolean roleCreated;
 
     @BeforeAll
     static void requireDocker() {
-        Assumptions.assumeTrue(isDockerAvailable(), "Docker daemon must be available for Redshift Spectrum integration tests");
+        SidecarContainersProfile.requireDocker();
     }
 
-    private static boolean isDockerAvailable() {
-        try {
-            Process process = new ProcessBuilder("docker", "version", "--format", "{{.Server.Version}}")
-                    .redirectErrorStream(true)
-                    .start();
-            int exit = process.waitFor();
-            return exit == 0;
-        } catch (Exception ignored) {
-            return false;
+    private Cluster createClusterWithRole(String identifier) {
+        if (iamService.findRole("000000000000", ROLE_NAME).isEmpty()) {
+            iamService.createRole(ROLE_NAME, "/", TRUST_POLICY, null, 0, null);
+            roleCreated = true;
+            iamService.putRolePolicy(ROLE_NAME, "AllowS3", """
+                    {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                    "Action":["s3:GetObject","s3:ListBucket"],"Resource":"*"}]}""");
         }
+        return redshiftService.createCluster(identifier, "dc2.large", "admin", "Secret123",
+                null, List.of(), List.of(ROLE_ARN));
     }
 
     @AfterEach
@@ -65,6 +112,204 @@ class RedshiftSpectrumIntegrationTest {
             s3Service.deleteObject(bucket, "invalid/part-1.csv");
             s3Service.deleteBucket(bucket);
         }
+        if (glueDatabase != null) {
+            glueService.deleteDatabase(glueDatabase);
+        }
+        if (roleCreated) {
+            iamService.deleteRolePolicy(ROLE_NAME, "AllowS3");
+            iamService.deleteRole(ROLE_NAME);
+        }
+    }
+
+    @Test
+    @Timeout(120)
+    void joinsExternalAndInternalTablesWithAggregation() throws Exception {
+        bucket = "spectrum-relational-" + System.nanoTime();
+        s3Service.createBucket(bucket, "us-east-1");
+        s3Service.putObject(bucket, "events/part-1.csv", "1,10\n1,5\n2,7\n".getBytes(StandardCharsets.UTF_8),
+                "text/csv", null);
+        glueDatabase = "spectrum_relational_" + System.nanoTime();
+        Database database = new Database();
+        database.setName(glueDatabase);
+        glueService.createDatabase(database);
+        clusterId = "it-relational-" + System.nanoTime();
+        Cluster cluster = createClusterWithRole(clusterId);
+        try (Connection connection = waitForConnection(cluster, "admin", "Secret123");
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE EXTERNAL SCHEMA lake FROM DATA CATALOG DATABASE '" + glueDatabase
+                    + "' IAM_ROLE '" + ROLE_ARN + "'");
+            String externalDdl = "CREATE EXTERNAL TABLE lake.events (id INTEGER, amount INTEGER) "
+                    + "ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 's3://"
+                    + bucket + "/events/'";
+            ExternalStatement.CreateTable external = (ExternalStatement.CreateTable)
+                    new ExternalStatementParser().parse(externalDdl).orElseThrow();
+            glueService.createTable(glueDatabase, GlueTableBuilder.toGlueTable(external));
+            statement.execute("CREATE TABLE customers (id INTEGER, country VARCHAR(2))");
+            statement.execute("INSERT INTO customers VALUES (1, 'VN'), (2, 'US')");
+            try (PreparedStatement ddl = connection.prepareStatement("CREATE EXTERNAL SCHEMA rolledback_lake "
+                    + "FROM DATA CATALOG DATABASE '" + glueDatabase + "' IAM_ROLE '" + ROLE_ARN + "'")) {
+                ddl.unwrap(PGStatement.class).setPrepareThreshold(1);
+                assertEquals(0, ddl.getParameterMetaData().getParameterCount());
+                connection.setAutoCommit(false);
+                try {
+                    SQLException rejected = assertThrows(SQLException.class, ddl::execute);
+                    assertEquals("0A000", rejected.getSQLState());
+                } finally {
+                    connection.rollback();
+                    connection.setAutoCommit(true);
+                }
+                assertTrue(externalRegistry.find("000000000000", "000000000000:" + clusterId,
+                        "dev", "rolledback_lake").isEmpty());
+            }
+            connection.setAutoCommit(false);
+            try {
+                SQLException rejected = assertThrows(SQLException.class, () -> statement.execute(
+                        externalDdl.replace("lake.events", "lake.in_transaction")));
+                assertEquals("25001", rejected.getSQLState());
+                assertTrue(rejected.getMessage().contains("cannot run inside a transaction block"));
+            } finally {
+                connection.rollback();
+                connection.setAutoCommit(true);
+            }
+            assertThrows(AwsException.class, () -> glueService.getTable(glueDatabase, "in_transaction"));
+            try (PreparedStatement query = connection.prepareStatement("SELECT c.country, SUM(e.amount) AS total "
+                    + "FROM lake.events e JOIN customers c ON c.id=e.id WHERE e.amount > ? "
+                    + "GROUP BY c.country ORDER BY total DESC")) {
+                query.setInt(1, 0);
+                try (ResultSet rows = query.executeQuery()) {
+                    assertTrue(rows.next());
+                    assertEquals("VN", rows.getString(1));
+                    assertEquals(15L, rows.getLong(2));
+                    assertTrue(rows.next());
+                    assertEquals("US", rows.getString(1));
+                    assertEquals(7L, rows.getLong(2));
+                    assertTrue(!rows.next());
+                }
+                query.unwrap(PGStatement.class).setPrepareThreshold(1);
+                statement.execute("CREATE VIEW event_amounts AS SELECT amount FROM lake.events");
+                s3Service.putObject(bucket, "events/part-1.csv", "1,20\n2,7\n".getBytes(StandardCharsets.UTF_8),
+                        "text/csv", null);
+                try (ResultSet rows = query.executeQuery()) {
+                    assertTrue(rows.next());
+                    assertEquals(20L, rows.getLong(2));
+                }
+                s3Service.putObject(bucket, "events/part-1.csv", "1,30\n2,7\n".getBytes(StandardCharsets.UTF_8),
+                        "text/csv", null);
+                try (ResultSet rows = query.executeQuery()) {
+                    assertTrue(rows.next());
+                    assertEquals(30L, rows.getLong(2));
+                }
+            }
+            try (ResultSet rows = statement.executeQuery("SELECT SUM(a.amount) FROM lake.events a "
+                    + "JOIN lake.events b ON a.id=b.id HAVING SUM(a.amount)>10 ORDER BY 1 LIMIT 1")) {
+                assertTrue(rows.next());
+                assertEquals(37L, rows.getLong(1));
+            }
+            try (ResultSet rows = statement.executeQuery("SELECT SUM(amount) FROM event_amounts")) {
+                assertTrue(rows.next());
+                assertEquals(37L, rows.getLong(1));
+            }
+            connection.setAutoCommit(false);
+            s3Service.putObject(bucket, "events/part-1.csv", "1,35\n2,7\n".getBytes(StandardCharsets.UTF_8),
+                    "text/csv", null);
+            try (PreparedStatement cursor = connection.prepareStatement("SELECT id, amount FROM lake.events ORDER BY id")) {
+                cursor.setFetchSize(1);
+                try (ResultSet rows = cursor.executeQuery()) {
+                    assertTrue(rows.next());
+                    assertEquals(1, rows.getInt(1));
+                    try (PreparedStatement another = connection.prepareStatement("SELECT SUM(amount) FROM lake.events");
+                         ResultSet sum = another.executeQuery()) {
+                        assertTrue(sum.next());
+                        assertEquals(42L, sum.getLong(1));
+                    }
+                    assertTrue(rows.next());
+                    assertEquals(2, rows.getInt(1));
+                    assertTrue(!rows.next());
+                }
+            }
+            Savepoint beforeReload = connection.setSavepoint();
+            s3Service.putObject(bucket, "events/part-1.csv", "1,40\n2,7\n".getBytes(StandardCharsets.UTF_8),
+                    "text/csv", null);
+            try (ResultSet rows = statement.executeQuery("SELECT SUM(amount) FROM lake.events")) {
+                assertTrue(rows.next());
+                assertEquals(47L, rows.getLong(1));
+            }
+            connection.rollback(beforeReload);
+            try (ResultSet rows = statement.executeQuery("SELECT SUM(amount) FROM lake.events")) {
+                assertTrue(rows.next());
+                assertEquals(47L, rows.getLong(1));
+            }
+            connection.rollback();
+            connection.setAutoCommit(true);
+            try (ResultSet rows = statement.executeQuery("SELECT SUM(amount) FROM lake.events")) {
+                assertTrue(rows.next());
+                assertEquals(47L, rows.getLong(1));
+            }
+            s3Service.putObject(bucket, "events/part-1.csv", "1,30\n2,7\n".getBytes(StandardCharsets.UTF_8),
+                    "text/csv", null);
+            RestAssuredJsonUtils.configureAwsContentTypes();
+            String queryId = RestAssuredJsonUtils.awsAction("RedshiftData", "ExecuteStatement", """
+                    {"ClusterIdentifier":"%s","DbUser":"admin","Database":"dev",
+                     "Sql":"SELECT SUM(amount) AS total FROM lake.events","WaitTimeSeconds":30}
+                    """.formatted(clusterId)).then().statusCode(200).extract().path("Id");
+            assertEquals("FINISHED", RestAssuredJsonUtils.awsAction("RedshiftData", "DescribeStatement",
+                    "{\"Id\":\"" + queryId + "\"}").then().statusCode(200).extract().path("Status"));
+            Number total = RestAssuredJsonUtils.awsAction("RedshiftData", "GetStatementResult",
+                    "{\"Id\":\"" + queryId + "\"}").then().statusCode(200).extract().path("Records[0][0].longValue");
+            assertEquals(37L, total.longValue());
+            iamService.updateAssumeRolePolicy(ROLE_NAME, """
+                    {"Version":"2012-10-17","Statement":[{"Effect":"Deny",
+                    "Principal":{"Service":"redshift.amazonaws.com"},"Action":"sts:AssumeRole"}]}""");
+            try {
+                SQLException denied = assertThrows(SQLException.class,
+                        () -> statement.executeQuery("SELECT SUM(amount) FROM lake.events"));
+                assertEquals("42501", denied.getSQLState());
+            } finally {
+                iamService.updateAssumeRolePolicy(ROLE_NAME, TRUST_POLICY);
+            }
+            statement.execute("CREATE USER spectrum_reader PASSWORD 'Password123'");
+            statement.execute("GRANT USAGE ON SCHEMA lake TO spectrum_reader");
+            statement.execute("GRANT SELECT ON lake.events TO spectrum_reader");
+            try (Connection reader = DriverManager.getConnection("jdbc:postgresql://127.0.0.1:"
+                    + cluster.getEndpoint().getPort() + "/dev?socketTimeout=20", "spectrum_reader", "Password123");
+                 Statement readerQuery = reader.createStatement();
+                 ResultSet rows = readerQuery.executeQuery("SELECT SUM(amount) FROM lake.events")) {
+                assertTrue(rows.next());
+                assertEquals(37L, rows.getLong(1));
+            }
+            s3Service.putObject(bucket, "events/part-1.csv", "1,40\n2,7\n".getBytes(StandardCharsets.UTF_8),
+                    "text/csv", null);
+            CountDownLatch ready = new CountDownLatch(2);
+            CountDownLatch start = new CountDownLatch(1);
+            try (ExecutorService queries = Executors.newVirtualThreadPerTaskExecutor()) {
+                Future<Long> first = queries.submit(() -> concurrentTotal(cluster, ready, start));
+                Future<Long> second = queries.submit(() -> concurrentTotal(cluster, ready, start));
+                assertTrue(ready.await(20, TimeUnit.SECONDS));
+                start.countDown();
+                assertEquals(47L, first.get(30, TimeUnit.SECONDS));
+                assertEquals(47L, second.get(30, TimeUnit.SECONDS));
+            }
+            s3Service.putObject(bucket, "events/part-1.csv", "bad,40\n".getBytes(StandardCharsets.UTF_8),
+                    "text/csv", null);
+            assertThrows(SQLException.class, () -> statement.executeQuery("SELECT SUM(amount) FROM lake.events"));
+            s3Service.putObject(bucket, "events/part-1.csv", "1,40\n2,7\n".getBytes(StandardCharsets.UTF_8),
+                    "text/csv", null);
+            try (ResultSet rows = statement.executeQuery("SELECT SUM(amount) FROM lake.events")) {
+                assertTrue(rows.next());
+                assertEquals(47L, rows.getLong(1));
+            }
+            glueService.deleteTable(glueDatabase, "events");
+            SQLException missing = assertThrows(SQLException.class,
+                    () -> statement.executeQuery("SELECT * FROM lake.events"));
+            assertEquals("42P01", missing.getSQLState());
+            try (ResultSet rows = statement.executeQuery("SELECT 1")) {
+                assertTrue(rows.next());
+            }
+        }
+        String deleted = clusterId;
+        redshiftService.deleteCluster(deleted);
+        clusterId = null;
+        assertTrue(externalRegistry.list("000000000000", "000000000000:" + deleted, "dev").isEmpty());
     }
 
     @Test
@@ -75,13 +320,13 @@ class RedshiftSpectrumIntegrationTest {
         s3Service.putObject(bucket, "events/part-1.csv",
                 "id,name\n1,Alice\n2,Bob\n".getBytes(StandardCharsets.UTF_8), "text/csv", null);
         clusterId = "it-spectrum-" + System.nanoTime();
-        Cluster cluster = redshiftService.createCluster(clusterId, "dc2.large", "admin", "Secret123");
+        Cluster cluster = createClusterWithRole(clusterId);
 
         try (Connection connection = waitForConnection(cluster, "admin", "Secret123");
             Statement statement = connection.createStatement()) {
-            statement.execute("CREATE EXTERNAL SCHEMA analytics FROM DATA CATALOG DATABASE 'dev' IAM_ROLE 'role'");
+            statement.execute("CREATE EXTERNAL SCHEMA analytics FROM DATA CATALOG DATABASE 'dev' IAM_ROLE '" + ROLE_ARN + "'");
             SQLException duplicateSchema = assertThrows(SQLException.class, () -> statement.execute(
-                    "CREATE EXTERNAL SCHEMA analytics FROM DATA CATALOG DATABASE 'dev' IAM_ROLE 'role'"));
+                    "CREATE EXTERNAL SCHEMA analytics FROM DATA CATALOG DATABASE 'dev' IAM_ROLE '" + ROLE_ARN + "'"));
             assertEquals("42P06", duplicateSchema.getSQLState());
             statement.execute("CREATE EXTERNAL TABLE analytics.events (id INTEGER, name VARCHAR) "
                     + "STORED AS TEXTFILE LOCATION 's3://" + bucket + "/events/' "
@@ -117,7 +362,7 @@ class RedshiftSpectrumIntegrationTest {
         s3Service.putObject(bucket, "events/part-1.csv",
                 "id,name\n1,Alice\n2,Bob\n".getBytes(StandardCharsets.UTF_8), "text/csv", null);
         clusterId = "it-spectrum-ext-" + System.nanoTime();
-        Cluster cluster = redshiftService.createCluster(clusterId, "dc2.large", "admin", "Secret123");
+        Cluster cluster = createClusterWithRole(clusterId);
 
         String url = "jdbc:postgresql://127.0.0.1:" + cluster.getEndpoint().getPort()
                 + "/dev?socketTimeout=20&loginTimeout=20";
@@ -125,7 +370,7 @@ class RedshiftSpectrumIntegrationTest {
                 .pollInterval(Duration.ofMillis(500)).ignoreExceptions()
                 .until(() -> DriverManager.getConnection(url, "admin", "Secret123"), Objects::nonNull);
             Statement setup = connection.createStatement()) {
-            setup.execute("CREATE EXTERNAL SCHEMA analytics_ext FROM DATA CATALOG DATABASE 'dev' IAM_ROLE 'role'");
+            setup.execute("CREATE EXTERNAL SCHEMA analytics_ext FROM DATA CATALOG DATABASE 'dev' IAM_ROLE '" + ROLE_ARN + "'");
             setup.execute("CREATE EXTERNAL TABLE analytics_ext.events (id INTEGER, name VARCHAR) "
                     + "STORED AS TEXTFILE LOCATION 's3://" + bucket + "/events/' "
                     + "TBLPROPERTIES ('skip.header.line.count'='1')");
@@ -156,7 +401,7 @@ class RedshiftSpectrumIntegrationTest {
                 "id,name\n1,Alice\n2,Bob\n3,Carol\n4,Dave\n5,Eve\n".getBytes(StandardCharsets.UTF_8),
                 "text/csv", null);
         clusterId = "it-spectrum-fetch-" + System.nanoTime();
-        Cluster cluster = redshiftService.createCluster(clusterId, "dc2.large", "admin", "Secret123");
+        Cluster cluster = createClusterWithRole(clusterId);
 
         String url = "jdbc:postgresql://127.0.0.1:" + cluster.getEndpoint().getPort()
                 + "/dev?socketTimeout=20&loginTimeout=20";
@@ -164,7 +409,7 @@ class RedshiftSpectrumIntegrationTest {
                 .pollInterval(Duration.ofMillis(500)).ignoreExceptions()
                 .until(() -> DriverManager.getConnection(url, "admin", "Secret123"), Objects::nonNull);
              Statement setup = connection.createStatement()) {
-            setup.execute("CREATE EXTERNAL SCHEMA analytics_fetch FROM DATA CATALOG DATABASE 'dev' IAM_ROLE 'role'");
+            setup.execute("CREATE EXTERNAL SCHEMA analytics_fetch FROM DATA CATALOG DATABASE 'dev' IAM_ROLE '" + ROLE_ARN + "'");
             setup.execute("CREATE EXTERNAL TABLE analytics_fetch.events (id INTEGER, name VARCHAR) "
                     + "STORED AS TEXTFILE LOCATION 's3://" + bucket + "/events/' "
                     + "TBLPROPERTIES ('skip.header.line.count'='1')");
@@ -187,10 +432,141 @@ class RedshiftSpectrumIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"simple", "extended"})
+    @Timeout(120)
+    void externalLifecycleKeepsGlueCatalogAndCachedRowsConsistent(String queryMode) throws Exception {
+        bucket = "spectrum-lifecycle-" + System.nanoTime();
+        glueDatabase = "lifecycle_" + System.nanoTime();
+        clusterId = "lifecycle-" + System.nanoTime();
+        s3Service.createBucket(bucket, "us-east-1");
+        s3Service.putObject(bucket, "events/part-1.csv", "1,10\n2,20\n".getBytes(StandardCharsets.UTF_8), "text/csv", null);
+        s3Service.putObject(bucket, "invalid/part-1.csv", "3,7\n".getBytes(StandardCharsets.UTF_8), "text/csv", null);
+        Database database = new Database();
+        database.setName(glueDatabase);
+        glueService.createDatabase(database);
+        Cluster cluster = createClusterWithRole(clusterId);
+        String url = "jdbc:postgresql://127.0.0.1:" + cluster.getEndpoint().getPort()
+                + "/dev?preferQueryMode=" + queryMode + "&socketTimeout=30";
+        String create = "CREATE EXTERNAL TABLE lake.events (id INTEGER, amount INTEGER) PARTITIONED BY (dt VARCHAR) "
+                + "ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 's3://" + bucket + "/root/'";
+        String firstPartition = "ALTER TABLE lake.events ADD PARTITION (dt='first') LOCATION 's3://" + bucket + "/events/'";
+        try (Connection connection = DriverManager.getConnection(url, "admin", "Secret123");
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE EXTERNAL SCHEMA lake FROM DATA CATALOG DATABASE '" + glueDatabase
+                    + "' IAM_ROLE '" + ROLE_ARN + "'");
+            statement.execute(create);
+            statement.execute(create.replace("lake.events", "lake.cold_events"));
+            statement.execute("CREATE USER lifecycle_reader PASSWORD 'Password123'");
+            statement.execute("GRANT USAGE ON SCHEMA lake TO lifecycle_reader");
+            try (Connection reader = DriverManager.getConnection(url, "lifecycle_reader", "Password123");
+                 Statement readOnly = reader.createStatement()) {
+                for (String deniedSql : List.of(firstPartition.replace("lake.events", "lake.cold_events"),
+                        "DROP TABLE lake.cold_events", "DROP SCHEMA lake RESTRICT")) {
+                    SQLException denied = assertThrows(SQLException.class, () -> readOnly.execute(deniedSql));
+                    assertEquals("42501", denied.getSQLState());
+                }
+            }
+            assertTrue(glueService.getPartitions(glueDatabase, "cold_events").isEmpty());
+            statement.execute("DROP TABLE lake.cold_events");
+            assertTotal(statement, 0);
+            statement.execute(firstPartition);
+            assertTotal(statement, 30);
+            assertEquals(List.of("first"), glueService.getPartitions(glueDatabase, "events").getFirst().getValues());
+            statement.execute(firstPartition.replace("ADD PARTITION", "ADD IF NOT EXISTS PARTITION")
+                    .replace("/events/'", "/invalid/'"));
+            assertTotal(statement, 30);
+            SQLException duplicate = assertThrows(SQLException.class, () -> statement.execute(firstPartition));
+            assertEquals("42710", duplicate.getSQLState());
+            statement.execute("CREATE VIEW saved_events AS SELECT id FROM lake.events");
+            statement.execute("GRANT SELECT ON lake.events TO lifecycle_reader");
+            lifecycleDataStatement("ALTER TABLE lake.events ADD PARTITION (dt='second') LOCATION 's3://"
+                    + bucket + "/invalid/'");
+            assertTotal(statement, 37);
+            try (Connection reader = DriverManager.getConnection(url, "lifecycle_reader", "Password123");
+                 Statement readOnly = reader.createStatement();
+                 ResultSet rows = readOnly.executeQuery("SELECT COUNT(*) FROM lake.events")) {
+                assertTrue(rows.next());
+                assertEquals(3, rows.getInt(1));
+                SQLException denied = assertThrows(SQLException.class, () -> readOnly.execute("DROP TABLE lake.events"));
+                assertEquals("42501", denied.getSQLState());
+            }
+            try (ResultSet rows = statement.executeQuery("SELECT COUNT(*) FROM svv_external_partitions WHERE schemaname='lake'")) {
+                assertTrue(rows.next());
+                assertEquals(2, rows.getInt(1));
+            }
+            connection.setAutoCommit(false);
+            SQLException transaction = assertThrows(SQLException.class, () -> statement.execute("DROP TABLE lake.events"));
+            assertEquals("25001", transaction.getSQLState());
+            connection.rollback();
+            connection.setAutoCommit(true);
+            assertEquals("events", glueService.getTable(glueDatabase, "events").getName());
+
+            SQLException dependent = assertThrows(SQLException.class, () -> statement.execute("DROP TABLE lake.events"));
+            assertEquals("2BP01", dependent.getSQLState());
+            assertEquals("events", glueService.getTable(glueDatabase, "events").getName());
+            statement.execute("DROP TABLE lake.events CASCADE");
+            assertThrows(AwsException.class, () -> glueService.getTable(glueDatabase, "events"));
+            statement.execute("DROP TABLE IF EXISTS lake.events");
+            lifecycleDataStatement(create);
+            lifecycleDataStatement(firstPartition);
+            assertTotal(statement, 30);
+
+            SQLException restrict = assertThrows(SQLException.class, () -> statement.execute("DROP SCHEMA lake RESTRICT"));
+            assertEquals("2BP01", restrict.getSQLState());
+            lifecycleDataStatement("DROP SCHEMA lake CASCADE");
+            assertTrue(externalRegistry.list("000000000000", "000000000000:" + clusterId, "dev").isEmpty());
+            assertEquals("events", glueService.getTable(glueDatabase, "events").getName());
+            assertEquals(1, glueService.getPartitions(glueDatabase, "events").size());
+            assertEquals(2, s3Service.listObjects(bucket, "", null, 100).size());
+            try (ResultSet rows = statement.executeQuery("SELECT COUNT(*) FROM svv_external_schemas WHERE schemaname='lake'")) {
+                assertTrue(rows.next());
+                assertEquals(0, rows.getInt(1));
+            }
+            statement.execute("DROP SCHEMA IF EXISTS lake");
+            statement.execute("CREATE EXTERNAL SCHEMA lake FROM DATA CATALOG DATABASE '" + glueDatabase
+                    + "' IAM_ROLE '" + ROLE_ARN + "'");
+            assertTotal(statement, 30);
+            lifecycleDataStatement("DROP TABLE lake.events");
+            glueService.deleteDatabase(glueDatabase);
+            glueDatabase = null;
+            statement.execute("DROP SCHEMA lake");
+        }
+    }
+
+    private static void assertTotal(Statement statement, long total) throws SQLException {
+        try (ResultSet rows = statement.executeQuery("SELECT COALESCE(SUM(amount),0) FROM lake.events")) {
+            assertTrue(rows.next());
+            assertEquals(total, rows.getLong(1));
+        }
+    }
+
+    private void lifecycleDataStatement(String sql) {
+        RestAssuredJsonUtils.configureAwsContentTypes();
+        String queryId = RestAssuredJsonUtils.awsAction("RedshiftData", "ExecuteStatement", """
+                {"ClusterIdentifier":"%s","Database":"dev","DbUser":"admin","Sql":"%s","WaitTimeSeconds":30}
+                """.formatted(clusterId, sql.replace("\\", "\\\\").replace("\"", "\\\"")))
+                .then().statusCode(200).extract().path("Id");
+        assertEquals("FINISHED", RestAssuredJsonUtils.awsAction("RedshiftData", "DescribeStatement",
+                "{\"Id\":\"" + queryId + "\"}").then().statusCode(200).extract().path("Status"));
+    }
+
     private static Connection waitForConnection(Cluster cluster, String username, String password) throws SQLException {
         String url = "jdbc:postgresql://127.0.0.1:" + cluster.getEndpoint().getPort() + "/dev";
         return Awaitility.await().atMost(Duration.ofSeconds(30)).pollDelay(Duration.ZERO)
                 .pollInterval(Duration.ofMillis(500)).ignoreExceptions()
                 .until(() -> DriverManager.getConnection(url, username, password), Objects::nonNull);
+    }
+
+    private static long concurrentTotal(Cluster cluster, CountDownLatch ready, CountDownLatch start) throws Exception {
+        try (Connection connection = waitForConnection(cluster, "admin", "Secret123");
+             PreparedStatement query = connection.prepareStatement("SELECT SUM(amount) FROM lake.events")) {
+            ready.countDown();
+            assertTrue(start.await(20, TimeUnit.SECONDS));
+            try (ResultSet rows = query.executeQuery()) {
+                assertTrue(rows.next());
+                return rows.getLong(1);
+            }
+        }
     }
 }

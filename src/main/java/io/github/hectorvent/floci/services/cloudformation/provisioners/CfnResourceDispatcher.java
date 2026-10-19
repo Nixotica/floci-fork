@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 /**
  * Routes each CloudFormation resource to the per-service provisioner that owns its type, through
@@ -31,6 +32,9 @@ import java.util.function.Consumer;
 public class CfnResourceDispatcher {
 
     private static final Logger LOG = Logger.getLogger(CfnResourceDispatcher.class);
+
+    /** The prefix of a stub's {@code Arn} attribute: the mark of a resource nothing was created for. */
+    static final String STUB_ARN_PREFIX = "arn:aws:stub:::"; // partition-literal: stub marker for an unowned type, asserted by tests
 
     private final ObjectMapper objectMapper;
     private final CloudFormationResourceRegistry registry;
@@ -68,13 +72,18 @@ public class CfnResourceDispatcher {
                                    String stackName, String existingPhysicalId,
                                    Map<String, String> existingAttributes) {
         return provision(logicalId, resourceType, properties, engine, region, accountId, stackName,
-                existingPhysicalId, existingAttributes, event -> {});
+                existingPhysicalId, existingAttributes, event -> {}, null);
     }
 
+    /**
+     * {@code priorProperties} are the resource's properties in the previous template, unresolved,
+     * or null when there is none; see {@link ProvisionContext#previouslyDeclared(String)}.
+     */
     public StackResource provision(String logicalId, String resourceType, JsonNode properties,
                                    CloudFormationTemplateEngine engine, String region, String accountId,
                                    String stackName, String existingPhysicalId,
-                                   Map<String, String> existingAttributes, Consumer<StackEvent> progress) {
+                                   Map<String, String> existingAttributes, Consumer<StackEvent> progress,
+                                   JsonNode priorProperties) {
         StackResource resource = new StackResource();
         resource.setLogicalId(logicalId);
         resource.setResourceType(resourceType);
@@ -85,7 +94,14 @@ public class CfnResourceDispatcher {
             CfnResourceProvisioner owner = registry.forType(resourceType).orElse(null);
             if (owner != null) {
                 owner.provision(resource, properties,
-                        new ProvisionContext(engine, region, accountId, stackName, existingPhysicalId, progress));
+                        new ProvisionContext(engine, region, accountId, stackName, existingPhysicalId, progress,
+                                priorProperties));
+                // A provisioner that migrated a stub without writing its own Arn would leave the
+                // stub's, and the real resource would read as a stub on its next update.
+                String arn = resource.getAttributes().get("Arn");
+                if (arn != null && arn.startsWith(STUB_ARN_PREFIX)) {
+                    resource.getAttributes().remove("Arn");
+                }
             } else if (!stubUnsupportedResourceTypesAllowed()) {
                 // Before the physical id below is assigned, so the Cloud Control path sees a
                 // resource with none and reports this message rather than a success. On the stack
@@ -106,7 +122,7 @@ public class CfnResourceDispatcher {
                 resource.setStatusReason(unsupportedResourceTypeMessage(resourceType)
                         + " It was stubbed and nothing was created for it.");
                 resource.setPhysicalId(logicalId + "-" + UUID.randomUUID().toString().substring(0, 8));
-                resource.getAttributes().put("Arn", "arn:aws:stub:::" + logicalId); // partition-literal: stub marker for an unowned type, asserted by tests
+                resource.getAttributes().put("Arn", STUB_ARN_PREFIX + logicalId);
             }
             resource.setStatus("CREATE_COMPLETE");
         } catch (Exception e) {
@@ -115,6 +131,29 @@ public class CfnResourceDispatcher {
             resource.setStatusReason(e.getMessage());
         }
         return resource;
+    }
+
+    /**
+     * Whether this resource is a dispatcher stub, which names nothing that exists: a stub {@code Arn},
+     * the stub's own {@code <LogicalId>-<8 hex>} id and internal {@code __Floci} attributes only.
+     * A real resource an older Floci migrated without dropping the stub's {@code Arn} fails the id
+     * or attribute check, so it does not read as one.
+     */
+    static boolean isStub(String physicalId, Map<String, String> attributes) {
+        String arn = attributes.get("Arn");
+        if (arn == null || !arn.startsWith(STUB_ARN_PREFIX)) {
+            return false;
+        }
+        String logicalId = arn.substring(STUB_ARN_PREFIX.length());
+        if (physicalId == null || !physicalId.matches(Pattern.quote(logicalId) + "-[0-9a-f]{8}")) {
+            return false;
+        }
+        for (String key : attributes.keySet()) {
+            if (!"Arn".equals(key) && !key.startsWith("__Floci")) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -205,6 +244,19 @@ public class CfnResourceDispatcher {
                 .orElseGet(UpdateCleanupResult::notApplicable);
     }
 
+    /** Cleanup owed by an unfinished update while deleting the enclosing stack. */
+    public UpdateCleanupResult completeDeleteCleanup(StackResource resource) {
+        return registry.forType(resource.getResourceType())
+                .map(owner -> owner.completeDeleteCleanup(resource))
+                .filter(UpdateCleanupResult::applicable)
+                .orElseGet(UpdateCleanupResult::notApplicable);
+    }
+
+    /** Clears completed replacement cleanup without assuming a stack update committed. */
+    public void clearDeleteCleanup(StackResource resource) {
+        registry.forType(resource.getResourceType()).ifPresent(owner -> owner.clearDeleteCleanup(resource));
+    }
+
     /**
      * The physical id this update displaced, announced as DELETE_IN_PROGRESS before the stack
      * update closes. A type whose {@code UpdateReplacePolicy} is {@code Retain} owes no cleanup.
@@ -222,6 +274,12 @@ public class CfnResourceDispatcher {
     public boolean retainsFailedUpdateState(StackResource resource) {
         return registry.forType(resource.getResourceType())
                 .map(owner -> owner.retainsFailedUpdateState(resource))
+                .orElse(false);
+    }
+
+    public boolean requiresUpdateRecovery(StackResource resource) {
+        return registry.forType(resource.getResourceType())
+                .map(owner -> owner.requiresUpdateRecovery(resource))
                 .orElse(false);
     }
 
