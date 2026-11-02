@@ -1,11 +1,14 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.AwsCanonicalUserId;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.s3.model.Bucket;
 import io.github.hectorvent.floci.services.s3.model.MultipartUpload;
+import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
@@ -51,6 +54,219 @@ class S3GlobalBucketNamespaceTest {
         Instance<RequestContext> inst = mock(Instance.class);
         when(inst.get()).thenReturn(rc);
         return inst;
+    }
+
+    @Test
+    void legacyGovernanceRetentionIsReadableOnlyByTheDefaultOwnerBeforeMigration() {
+        Instance<RequestContext> context = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        StorageBackend<String, S3Object> rawObjects = new InMemoryStorage<>();
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(rawObjects, context, DEFAULT_ACCT);
+        S3Service service = new S3Service(buckets, objects, Path.of("s3-legacy-retention-test"), true, false);
+        service.createBucket("legacy-retention-bucket", "us-east-1");
+        service.putBucketVersioning("legacy-retention-bucket", "Enabled");
+        service.setBucketObjectLockEnabled("legacy-retention-bucket");
+        S3Object object = service.putObject("legacy-retention-bucket", "object.txt",
+                "payload".getBytes(UTF_8), "text/plain", Map.of());
+        String version = object.getVersionId();
+        service.putObjectRetention("legacy-retention-bucket", "object.txt", version,
+                "GOVERNANCE", Instant.parse("2035-01-01T00:00:00Z"), true);
+        String currentKey = "legacy-retention-bucket/object.txt";
+        String versionKey = currentKey + "#v#" + version;
+        for (String key : List.of(currentKey, versionKey)) {
+            rawObjects.put(key, objects.getForAccount(DEFAULT_ACCT, key).orElseThrow());
+            rawObjects.delete(DEFAULT_ACCT + "/" + key);
+        }
+
+        assertTrue(service.isGovernanceRetentionActive("legacy-retention-bucket", "object.txt", version));
+        assertTrue(service.deleteOverridesGovernanceRetention("legacy-retention-bucket", "object.txt", version));
+        assertTrue(rawObjects.get(versionKey).isPresent());
+        assertTrue(objects.getForAccount(DEFAULT_ACCT, versionKey).isEmpty());
+        caller.set(ACCOUNT_A);
+        service.createBucket("legacy-retention-bucket", "us-east-1");
+        assertFalse(service.isGovernanceRetentionActive("legacy-retention-bucket", "object.txt", version));
+        assertTrue(objects.getForAccount(ACCOUNT_A, versionKey).isEmpty());
+        assertTrue(rawObjects.get(versionKey).isPresent());
+        caller.set(DEFAULT_ACCT);
+        service.deleteObject("legacy-retention-bucket", "object.txt", version, true);
+        assertTrue(objects.getForAccount(DEFAULT_ACCT, versionKey).isEmpty());
+        assertTrue(rawObjects.get(versionKey).isEmpty());
+    }
+
+    @Test
+    void crossAccountListingsReadTheOwnersObjectsAndPreservePrefixPagination() {
+        Instance<RequestContext> context = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        S3Service service = new S3Service(buckets, objects, Path.of("s3-gns-listing-test"), true, true);
+        caller.set(ACCOUNT_A);
+        service.createBucket("owner-listing-bucket", "us-east-1");
+        service.putObject("owner-listing-bucket", "one.txt", "one".getBytes(UTF_8), "text/plain", Map.of());
+        service.putObject("owner-listing-bucket", "nested/two.txt", "two".getBytes(UTF_8),
+                "text/plain", Map.of());
+        caller.set(ACCOUNT_B);
+        service.putObject("owner-listing-bucket", "three.txt", "three".getBytes(UTF_8), "text/plain", Map.of());
+        assertEquals(List.of("nested/two.txt", "one.txt", "three.txt"),
+                service.listObjects("owner-listing-bucket", null, null, 100).stream()
+                        .map(S3Object::getKey).toList());
+        S3Service.ListObjectsResult first =
+                service.listObjectsWithPrefixes("owner-listing-bucket", null, "/", 1, null, null);
+        assertEquals(List.of("nested/"), first.commonPrefixes());
+        assertTrue(first.isTruncated());
+        S3Service.ListObjectsResult next =
+                service.listObjectsWithPrefixes("owner-listing-bucket", null, "/", 100,
+                        first.nextContinuationToken(), null);
+        assertEquals(List.of("one.txt", "three.txt"), next.objects().stream().map(S3Object::getKey).toList());
+        assertEquals(List.of("nested/two.txt"),
+                service.listObjects("owner-listing-bucket", "nested/", null, 100).stream()
+                        .map(S3Object::getKey).toList());
+        assertTrue(service.listBuckets().isEmpty());
+        assertTrue(objects.scanForAccount(ACCOUNT_B, key -> true).isEmpty());
+    }
+
+    @Test
+    void crossAccountObjectOwnerFollowsOwnershipChanges() {
+        S3Service service = globalOwnerService();
+        caller.set(ACCOUNT_A);
+        createBucketWithOwnership(service, "owner-switch-bucket", "ObjectWriter");
+        caller.set(ACCOUNT_B);
+        putOwnedObject(service, "owner-switch-bucket", "writer.txt", null);
+
+        caller.set(ACCOUNT_A);
+        assertObjectOwner(service, "owner-switch-bucket", "writer.txt", ACCOUNT_B);
+        setOwnership(service, "owner-switch-bucket", "BucketOwnerEnforced");
+        assertObjectOwner(service, "owner-switch-bucket", "writer.txt", ACCOUNT_A);
+        setOwnership(service, "owner-switch-bucket", "ObjectWriter");
+        assertObjectOwner(service, "owner-switch-bucket", "writer.txt", ACCOUNT_B);
+    }
+
+    @Test
+    void crossAccountObjectOwnerFollowsBucketOwnershipModes() {
+        S3Service service = globalOwnerService();
+        caller.set(ACCOUNT_A);
+        createBucketWithOwnership(service, "owner-enforced-bucket", "BucketOwnerEnforced");
+        caller.set(ACCOUNT_B);
+        putOwnedObject(service, "owner-enforced-bucket", "enforced.txt", null);
+        caller.set(ACCOUNT_A);
+        assertObjectOwner(service, "owner-enforced-bucket", "enforced.txt", ACCOUNT_A);
+
+        createBucketWithOwnership(service, "owner-preferred-bucket", "BucketOwnerPreferred");
+        caller.set(ACCOUNT_B);
+        putOwnedObject(service, "owner-preferred-bucket", "writer.txt", null);
+        putOwnedObject(service, "owner-preferred-bucket", "bucket-owner.txt", "bucket-owner-full-control");
+        caller.set(ACCOUNT_A);
+        assertObjectOwner(service, "owner-preferred-bucket", "writer.txt", ACCOUNT_B);
+        assertObjectOwner(service, "owner-preferred-bucket", "bucket-owner.txt", ACCOUNT_A);
+
+        createBucketWithOwnership(service, "owner-writer-acl-bucket", "ObjectWriter");
+        caller.set(ACCOUNT_B);
+        putOwnedObject(service, "owner-writer-acl-bucket", "writer-grant.txt", "bucket-owner-full-control");
+        caller.set(ACCOUNT_A);
+        assertObjectOwner(service, "owner-writer-acl-bucket", "writer-grant.txt", ACCOUNT_B);
+        assertTrue(service.getObjectAcl("owner-writer-acl-bucket", "writer-grant.txt", null)
+                .contains("<ID>" + AwsCanonicalUserId.forAccount(ACCOUNT_A) + "</ID>"));
+        caller.set(ACCOUNT_B);
+        service.putObjectAcl("owner-writer-acl-bucket", "writer-grant.txt", null,
+                "", "bucket-owner-full-control", null, null, null, null, null);
+        caller.set(ACCOUNT_A);
+        assertObjectOwner(service, "owner-writer-acl-bucket", "writer-grant.txt", ACCOUNT_B);
+        assertTrue(service.getObjectAcl("owner-writer-acl-bucket", "writer-grant.txt", null)
+                .contains("<ID>" + AwsCanonicalUserId.forAccount(ACCOUNT_A) + "</ID>"));
+    }
+
+    @Test
+    void deletingOwnershipControlsRestoresWriterOwnershipForNewObjects() {
+        S3Service service = globalOwnerService();
+        caller.set(ACCOUNT_A);
+        createBucketWithOwnership(service, "owner-controls-deleted-bucket", "BucketOwnerPreferred");
+        caller.set(ACCOUNT_B);
+        putOwnedObject(service, "owner-controls-deleted-bucket", "before.txt", "bucket-owner-full-control");
+        caller.set(ACCOUNT_A);
+        assertObjectOwner(service, "owner-controls-deleted-bucket", "before.txt", ACCOUNT_A);
+        service.deleteBucketOwnershipControls("owner-controls-deleted-bucket");
+        caller.set(ACCOUNT_B);
+        putOwnedObject(service, "owner-controls-deleted-bucket", "after.txt", "bucket-owner-full-control");
+        caller.set(ACCOUNT_A);
+        assertObjectOwner(service, "owner-controls-deleted-bucket", "before.txt", ACCOUNT_A);
+        assertObjectOwner(service, "owner-controls-deleted-bucket", "after.txt", ACCOUNT_B);
+    }
+
+    @Test
+    void copyAndMultipartCompletionKeepTheObjectWriterAsOwner() {
+        S3Service service = globalOwnerService();
+        caller.set(ACCOUNT_A);
+        createBucketWithOwnership(service, "owner-copy-mpu-bucket", "ObjectWriter");
+        caller.set(ACCOUNT_B);
+        putOwnedObject(service, "owner-copy-mpu-bucket", "source.txt", null);
+        service.copyObject("owner-copy-mpu-bucket", "source.txt", "owner-copy-mpu-bucket", "copy.txt");
+        MultipartUpload upload = service.initiateMultipartUpload(
+                "owner-copy-mpu-bucket", "multipart.txt", "text/plain");
+        service.uploadPart("owner-copy-mpu-bucket", "multipart.txt", upload.getUploadId(), 1,
+                "part-one".getBytes(UTF_8));
+        service.completeMultipartUpload("owner-copy-mpu-bucket", "multipart.txt", upload.getUploadId(),
+                List.of(1), null, null);
+        caller.set(ACCOUNT_A);
+        assertObjectOwner(service, "owner-copy-mpu-bucket", "source.txt", ACCOUNT_B);
+        assertObjectOwner(service, "owner-copy-mpu-bucket", "copy.txt", ACCOUNT_B);
+        assertObjectOwner(service, "owner-copy-mpu-bucket", "multipart.txt", ACCOUNT_B);
+    }
+
+    private S3Service globalOwnerService() {
+        Instance<RequestContext> context = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        return new S3Service(buckets, objects, Path.of("s3-gns-owner-test"), true, true);
+    }
+
+    private static void createBucketWithOwnership(S3Service service, String bucket, String ownership) {
+        service.createBucket(bucket, "us-east-1", ownership, null, null, null, null, null, null);
+    }
+
+    private static void setOwnership(S3Service service, String bucket, String ownership) {
+        service.putBucketOwnershipControls(bucket, "<OwnershipControls><Rule><ObjectOwnership>"
+                + ownership + "</ObjectOwnership></Rule></OwnershipControls>");
+    }
+
+    private static void putOwnedObject(S3Service service, String bucket, String key, String cannedAcl) {
+        service.putObject(bucket, key, "payload".getBytes(UTF_8), "text/plain", Map.of(),
+                new PutObjectOptions().withAcl(cannedAcl));
+    }
+
+    private static void assertObjectOwner(S3Service service, String bucket, String key, String ownerAccount) {
+        S3Object object = service.listObjects(bucket, key, null, 100).getFirst();
+        assertEquals(key, object.getKey());
+        assertEquals(ownerAccount, S3Service.effectiveObjectOwnerAccount(object,
+                service.getBucketOwnerAccountId(bucket), service.bucketOwnershipIsEnforced(bucket)));
+        assertTrue(service.getObjectAcl(bucket, key, null)
+                .contains("<Owner><ID>" + AwsCanonicalUserId.forAccount(ownerAccount) + "</ID>"));
+    }
+
+    /**
+     * CreateBucket only sees the caller's own buckets, so a caller that wants to know whether it
+     * just created one asks ownsBucket, which stays owner-scoped where bucketExists spans accounts.
+     */
+    @Test
+    void ownsBucketIsOwnerScopedWhereBucketExistsSpansAccounts() {
+        Instance<RequestContext> ctx = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), ctx, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), ctx, DEFAULT_ACCT);
+        S3Service globalNs = new S3Service(buckets, objects, Path.of("s3-gns-test"), true, true);
+
+        caller.set(ACCOUNT_A);
+        globalNs.createBucket("owned-by-a", "us-west-2");
+        assertTrue(globalNs.ownsBucket("owned-by-a"));
+
+        caller.set(ACCOUNT_B);
+        assertTrue(globalNs.bucketExists("owned-by-a"));
+        assertFalse(globalNs.ownsBucket("owned-by-a"));
     }
 
     @Test
@@ -227,7 +443,11 @@ class S3GlobalBucketNamespaceTest {
 
         caller.set(ACCOUNT_A);
         globalNs.createBucket("shared-metadata-bucket", "us-east-1");
+        globalNs.deletePublicAccessBlock("shared-metadata-bucket");
+        globalNs.putBucketOwnershipControls("shared-metadata-bucket", "<OwnershipControls><Rule>"
+                + "<ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>");
         globalNs.putBucketVersioning("shared-metadata-bucket", "Enabled");
+        globalNs.setBucketObjectLockEnabled("shared-metadata-bucket");
         S3Object created = globalNs.putObject(
                 "shared-metadata-bucket", "object.txt", "payload".getBytes(UTF_8),
                 "text/plain", Map.of());
@@ -252,15 +472,15 @@ class S3GlobalBucketNamespaceTest {
 
         String defaultAcl = globalNs.getObjectAcl(
                 "shared-metadata-bucket", "object.txt", versionId);
-        assertTrue(defaultAcl.contains(ACCOUNT_A));
-        assertFalse(defaultAcl.contains(ACCOUNT_B));
+        assertTrue(defaultAcl.contains(AwsCanonicalUserId.forAccount(ACCOUNT_A)));
+        assertFalse(defaultAcl.contains(AwsCanonicalUserId.forAccount(ACCOUNT_B)));
         globalNs.putObjectAcl(
                 "shared-metadata-bucket", "object.txt", versionId,
                 "", "public-read", null, null, null, null, null);
         String storedAcl = globalNs.getObjectAcl(
                 "shared-metadata-bucket", "object.txt", versionId);
-        assertTrue(storedAcl.contains(ACCOUNT_A));
-        assertFalse(storedAcl.contains(ACCOUNT_B));
+        assertTrue(storedAcl.contains(AwsCanonicalUserId.forAccount(ACCOUNT_A)));
+        assertFalse(storedAcl.contains(AwsCanonicalUserId.forAccount(ACCOUNT_B)));
 
         globalNs.deleteObjectTagging("shared-metadata-bucket", "object.txt");
         assertTrue(globalNs.getObjectTagging("shared-metadata-bucket", "object.txt").isEmpty());
@@ -308,5 +528,35 @@ class S3GlobalBucketNamespaceTest {
                 "a cross-account multipart completion must not create a caller shadow object");
         assertTrue(objects.getForAccount(ACCOUNT_B, versionKey).isEmpty(),
                 "a cross-account multipart completion must not create a caller shadow version");
+    }
+
+    @Test
+    void ownerPrivateMultipartUploadCanBeCompletedByAnotherAccount() {
+        Instance<RequestContext> ctx = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), ctx, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), ctx, DEFAULT_ACCT);
+        S3Service globalNs = new S3Service(
+                buckets, objects, Path.of("s3-gns-private-multipart-test"), true, true);
+
+        String bucket = "shared-private-multipart-bucket";
+        String key = "object.bin";
+        caller.set(ACCOUNT_A);
+        globalNs.createBucket(bucket, "us-east-1");
+        MultipartUpload upload = globalNs.initiateMultipartUpload(bucket, key,
+                "application/octet-stream", Map.of(), null, new PutObjectOptions().withAcl("private"));
+        globalNs.uploadPart(bucket, key, upload.getUploadId(), 1, "payload".getBytes(UTF_8));
+
+        caller.set(ACCOUNT_B);
+        AwsException rejected = assertThrows(AwsException.class, () -> globalNs.initiateMultipartUpload(
+                bucket, "unauthorized-private.bin", "application/octet-stream", Map.of(), null,
+                new PutObjectOptions().withAcl("private")));
+        assertEquals("AccessControlListNotSupported", rejected.getErrorCode());
+        assertDoesNotThrow(() -> globalNs.completeMultipartUpload(
+                bucket, key, upload.getUploadId(), List.of(1), null, null));
+
+        assertTrue(objects.getForAccount(ACCOUNT_A, bucket + "/" + key).isPresent());
+        assertTrue(objects.getForAccount(ACCOUNT_B, bucket + "/" + key).isEmpty());
     }
 }

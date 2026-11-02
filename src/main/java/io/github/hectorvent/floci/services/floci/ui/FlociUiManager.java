@@ -1,20 +1,10 @@
 package io.github.hectorvent.floci.services.floci.ui;
 
-import java.io.Closeable;
-import java.net.HttpURLConnection;
-import java.net.URI;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Pattern;
-
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.dockerjava.api.exception.DockerClientException;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -30,12 +20,25 @@ import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkReso
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
-import com.github.dockerjava.api.exception.DockerClientException;
-import com.github.dockerjava.api.exception.NotFoundException;
-import com.github.dockerjava.api.model.Container;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
+
+import java.io.Closeable;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.SocketException;
+import java.net.URI;
+import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 /**
  * Manages the lifecycle of the web-console sidecar container, the browser-facing Floci console.
@@ -354,6 +357,7 @@ public class FlociUiManager {
         }
         env.put(PORT_ENV, String.valueOf(console.internalPort()));
         env.put("FLOCI_CLOUD", FLOCI_CLOUD);
+        env.put("FLOCI_INFO_URL", infoUrl(endpoint));
         if (config.services().ui().insecureSkipTlsVerify()) {
             LOG.warn("floci.services.ui.insecure-skip-tls-verify=true: the web console sidecar will "
                     + "not verify Floci's TLS certificate. Intended for Floci's self-signed "
@@ -367,6 +371,12 @@ public class FlociUiManager {
         List<String> rendered = new ArrayList<>(env.size());
         env.forEach((key, value) -> rendered.add(key + "=" + value));
         return rendered;
+    }
+
+    /** Console Contract v2's {@code FLOCI_INFO_URL}: the manifest, at the address the console reaches Floci on. */
+    static String infoUrl(String endpoint) {
+        String base = endpoint.endsWith("/") ? endpoint.substring(0, endpoint.length() - 1) : endpoint;
+        return base + "/_floci/info";
     }
 
     /**
@@ -658,7 +668,7 @@ public class FlociUiManager {
                 return new RuntimeProbe(true, null);
             }
             JsonNode health;
-            try (var input = conn.getInputStream()) {
+            try (InputStream input = conn.getInputStream()) {
                 health = objectMapper.readTree(input);
             }
             String reported = health.path(console.healthReadyField()).asText("");
@@ -778,7 +788,8 @@ public class FlociUiManager {
         this.containerId = existing.getId();
         try {
             int internalPort = profile.internalPort();
-            ContainerInfo info = lifecycleManager.adopt(containerId, List.of(internalPort));
+            ContainerInfo info = lifecycleManager.adopt(containerId, List.of(internalPort),
+                    containerBuilder.resolveDockerNetwork(resolveDockerNetwork()));
             EndpointInfo endpoint = info.getEndpoint(internalPort);
             this.hostPort = resolveHostPort(endpoint, config.services().ui().port());
             this.probeUrl = resolveProbeUrl(profile, endpoint, hostPort);
@@ -867,7 +878,7 @@ public class FlociUiManager {
         for (Throwable t = e; t != null; t = t.getCause()) {
             // BindException and ConnectException both extend SocketException; the docker-java
             // Apache transport surfaces a refused/denied Unix-socket connect this way.
-            if (t instanceof java.net.SocketException || t instanceof java.net.UnknownHostException) {
+            if (t instanceof SocketException || t instanceof UnknownHostException) {
                 return true;
             }
         }

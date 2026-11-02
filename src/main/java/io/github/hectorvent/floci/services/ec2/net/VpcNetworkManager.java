@@ -16,6 +16,7 @@ import org.jboss.logging.Logger;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -25,6 +26,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiPredicate;
 
 /**
@@ -137,8 +139,8 @@ public class VpcNetworkManager {
     private final Object planLock = new Object();
 
     /** So a misconfigured fallback prefix is reported once, not once per VPC. */
-    private final java.util.concurrent.atomic.AtomicBoolean warnedPrefixClamp =
-            new java.util.concurrent.atomic.AtomicBoolean();
+    private final AtomicBoolean warnedPrefixClamp =
+            new AtomicBoolean();
 
     private final ScheduledExecutorService retries = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ec2-vpc-network-teardown");
@@ -170,51 +172,68 @@ public class VpcNetworkManager {
     // ─── Declaration: CreateVpc / CreateSubnet ────────────────────────────────
 
     /**
-     * Records the address plan for a VPC. Called from CreateVpc and from default-resource
-     * seeding; the Docker network itself is only created when the first instance needs it
-     * (see {@link #attach}), because most roots in this corpus create VPCs they never launch
-     * anything into and a Linux bridge per unused VPC is pure daemon churn.
+     * Records a VPC declaration without contacting Docker. Its address plan is resolved when
+     * a consumer first needs an effective CIDR or private address; the network itself is only
+     * created on attachment. Management requests must not wait for the Docker daemon.
      */
     public void declareVpc(String region, String vpcId, String declaredCidr) {
         if (!enabled() || region == null || vpcId == null) {
             return;
         }
-        synchronized (planLock) {
-            // Deliberately not computeIfAbsent: planVpc reads the whole binding map to detect
-            // collisions, and ConcurrentHashMap forbids that from inside a mapping function.
-            String vpcKey = key(region, vpcId);
-            if (!bindings.containsKey(vpcKey)) {
-                bindings.put(vpcKey, planVpc(region, vpcId, declaredCidr));
-            }
-        }
+        bindings.putIfAbsent(key(region, vpcId),
+                new VpcBinding(region, vpcId, declaredCidr, networkName(region, vpcId)));
     }
 
-    /** Records the address plan for a subnet inside an already-declared VPC. */
+    /** Records a subnet declaration inside an already-declared VPC. */
     public void declareSubnet(String region, String vpcId, String subnetId, String declaredCidr) {
         if (!enabled() || region == null || vpcId == null || subnetId == null) {
             return;
         }
-        synchronized (planLock) {
-            VpcBinding vpc = bindings.get(key(region, vpcId));
-            if (vpc == null) {
-                return;
+        VpcBinding vpc = bindings.get(key(region, vpcId));
+        if (vpc == null) {
+            return;
+        }
+        synchronized (vpc.declarationLock) {
+            if (!vpc.subnetDeclarations.containsKey(subnetId)) {
+                vpc.subnetDeclarations.put(subnetId, declaredCidr);
             }
-            if (!vpc.subnets.containsKey(subnetId)) {
+            if (vpc.planned && !vpc.subnets.containsKey(subnetId)) {
                 vpc.subnets.put(subnetId, planSubnet(vpc, subnetId, declaredCidr));
             }
             subnetOwner.put(key(region, subnetId), key(region, vpcId));
         }
     }
 
-    private VpcBinding planVpc(String region, String vpcId, String declaredCidr) {
+    private VpcBinding plannedVpc(String region, String vpcId) {
+        VpcBinding vpc = bindings.get(key(region, vpcId));
+        if (vpc == null || vpc.planned) {
+            return vpc;
+        }
+        synchronized (planLock) {
+            if (!vpc.planned) {
+                planVpc(vpc);
+                synchronized (vpc.declarationLock) {
+                    vpc.subnetDeclarations.forEach((subnetId, cidr) ->
+                            vpc.subnets.put(subnetId, planSubnet(vpc, subnetId, cidr)));
+                    vpc.planned = true;
+                }
+            }
+        }
+        return vpc;
+    }
+
+    private void planVpc(VpcBinding vpc) {
+        String region = vpc.region;
+        String vpcId = vpc.vpcId;
+        String declaredCidr = vpc.declaredCidr;
         Optional<Cidr4> declared = Cidr4.parse(declaredCidr);
-        String rejection = rejectionReason(vpcId, declared, declaredCidr, List.of());
+        String rejection = rejectionReason(region, vpcId, declared, declaredCidr, List.of());
         Cidr4 effective;
         if (rejection == null) {
             effective = declared.orElseThrow();
         }
         else {
-            effective = allocateFromFallbackPool(vpcId, declared.map(Cidr4::prefix).orElse(null));
+            effective = allocateFromFallbackPool(region, vpcId, declared.map(Cidr4::prefix).orElse(null));
             if (effective == null) {
                 LOG.warnv("VPC {0} in {1}: declared CIDR {2} is unusable ({3}) and the fallback pool {4} "
                                 + "is exhausted. This VPC gets no Docker network; its instances keep "
@@ -229,15 +248,15 @@ public class VpcNetworkManager {
                         vpcId, region, String.valueOf(declaredCidr), rejection, effective);
             }
         }
-        return new VpcBinding(region, vpcId, declared.orElse(null), effective, rejection != null,
-                networkName(region, vpcId));
+        vpc.effective = effective;
+        vpc.substituted = rejection != null;
     }
 
     /**
      * @return null when the block can be used as declared, otherwise a human-readable reason
      *         it cannot, which goes verbatim into the substitution WARN.
      */
-    private String rejectionReason(String vpcId, Optional<Cidr4> declared, String declaredText,
+    private String rejectionReason(String region, String vpcId, Optional<Cidr4> declared, String declaredText,
                                    Collection<Cidr4> extraTaken) {
         if (declared.isEmpty()) {
             return declaredText == null || declaredText.isBlank()
@@ -247,11 +266,11 @@ public class VpcNetworkManager {
         if (!cidr.isRfc1918()) {
             return "outside RFC 1918 private space (10/8, 172.16/12, 192.168/16)";
         }
-        Optional<String> clash = firstClash(vpcId, cidr, extraTaken);
+        Optional<String> clash = firstClash(region, vpcId, cidr, extraTaken);
         return clash.orElse(null);
     }
 
-    private Optional<String> firstClash(String vpcId, Cidr4 candidate, Collection<Cidr4> extraTaken) {
+    private Optional<String> firstClash(String region, String vpcId, Cidr4 candidate, Collection<Cidr4> extraTaken) {
         for (Cidr4 taken : extraTaken) {
             if (candidate.overlaps(taken)) {
                 return Optional.of("overlaps an address range already in use (" + taken + ")");
@@ -264,7 +283,7 @@ public class VpcNetworkManager {
                         + "cannot route two identical ranges");
             }
         }
-        for (Cidr4 taken : dockerNetworkSubnets(vpcId)) {
+        for (Cidr4 taken : dockerNetworkSubnets(region, vpcId)) {
             if (candidate.overlaps(taken)) {
                 return Optional.of("overlaps an existing Docker network (" + taken + ")");
             }
@@ -352,7 +371,7 @@ public class VpcNetworkManager {
         return null;
     }
 
-    private Cidr4 allocateFromFallbackPool(String vpcId, Integer declaredPrefix) {
+    private Cidr4 allocateFromFallbackPool(String region, String vpcId, Integer declaredPrefix) {
         EmulatorConfig.VpcNetworksConfig cfg = config.services().ec2().vpcNetworks();
         Optional<Cidr4> pool = Cidr4.parse(cfg.fallbackPool());
         if (pool.isEmpty() || !pool.get().isRfc1918()) {
@@ -366,7 +385,7 @@ public class VpcNetworkManager {
             // asked for, not a /16 that wastes fifteen sixteenths of the pool per VPC.
             prefix = Math.min(declaredPrefix, MAX_ALLOCATABLE_PREFIX);
         }
-        List<Cidr4> taken = new ArrayList<>(dockerNetworkSubnets(vpcId));
+        List<Cidr4> taken = new ArrayList<>(dockerNetworkSubnets(region, vpcId));
         bindings.values().stream().map(b -> b.effective).filter(c -> c != null).forEach(taken::add);
         return allocateSubBlock(pool.get(), prefix, taken);
     }
@@ -450,6 +469,30 @@ public class VpcNetworkManager {
      *         range, the address is unparseable or outside that range, or it is already leased
      */
     public boolean reservePrivateIp(String region, String subnetId, String address) {
+        return lease(region, subnetId, address, true);
+    }
+
+    /**
+     * Leases the address a launch named for itself (RunInstances {@code PrivateIpAddress}), so
+     * the next {@link #allocatePrivateIp} never hands it to another instance.
+     *
+     * <p>Unlike {@link #reservePrivateIp}, it leaves the allocation cursor where it is, so the
+     * addresses the subnet picks on its own keep their order, and it logs no refusal: the caller
+     * has already found the address free, so a lease it meets is one its holder never returned,
+     * or one a failed launch returns only once its container is detached.
+     *
+     * @return true when the address is now leased; false when the subnet has no Docker-backed
+     *         range, the address is unparseable or outside that range, or it is already leased
+     */
+    public boolean claimPrivateIp(String region, String subnetId, String address) {
+        return lease(region, subnetId, address, false);
+    }
+
+    /**
+     * @param restoring whether a restart is re-reserving an address a persisted instance holds,
+     *                  which warns on refusal and moves the cursor past the address
+     */
+    private boolean lease(String region, String subnetId, String address, boolean restoring) {
         if (!enabled() || subnetId == null || address == null) {
             return false;
         }
@@ -459,20 +502,24 @@ public class VpcNetworkManager {
         }
         Optional<Cidr4> parsed = Cidr4.parse(address + "/32");
         if (parsed.isEmpty() || !subnet.effective.containsAddress(parsed.get().network())) {
-            LOG.warnv("Cannot reserve {0} in subnet {1}: it is outside the subnet''s effective range {2}. "
-                            + "Its holder keeps it, and this manager will not hand it out either, since "
-                            + "it is not an address it allocates from.",
-                    String.valueOf(address), subnetId, String.valueOf(subnet.effective));
+            if (restoring) {
+                LOG.warnv("Cannot reserve {0} in subnet {1}: it is outside the subnet''s effective range {2}. "
+                                + "Its holder keeps it, and this manager will not hand it out either, since "
+                                + "it is not an address it allocates from.",
+                        String.valueOf(address), subnetId, String.valueOf(subnet.effective));
+            }
             return false;
         }
         synchronized (subnet) {
             if (!subnet.leased.add(address)) {
-                LOG.warnv("Address {0} in subnet {1} is claimed by more than one instance; the later "
-                        + "claim is ignored.", address, subnetId);
+                if (restoring) {
+                    LOG.warnv("Address {0} in subnet {1} is claimed by more than one instance; the later "
+                            + "claim is ignored.", address, subnetId);
+                }
                 return false;
             }
             long offset = parsed.get().network() - subnet.effective.network();
-            if (offset >= subnet.nextOffset) {
+            if (restoring && offset >= subnet.nextOffset) {
                 subnet.nextOffset = offset + 1;
             }
             return true;
@@ -480,7 +527,9 @@ public class VpcNetworkManager {
     }
 
     public void releasePrivateIp(String region, String subnetId, String address) {
-        SubnetBinding subnet = subnetBinding(region, subnetId);
+        String vpcKey = subnetOwner.get(key(region, subnetId));
+        VpcBinding vpc = vpcKey == null ? null : bindings.get(vpcKey);
+        SubnetBinding subnet = vpc == null ? null : vpc.subnets.get(subnetId);
         if (subnet != null && address != null) {
             subnet.leased.remove(address);
         }
@@ -505,7 +554,7 @@ public class VpcNetworkManager {
         if (!enabled() || containerId == null || address == null) {
             return Optional.empty();
         }
-        VpcBinding vpc = bindings.get(key(region, vpcId));
+        VpcBinding vpc = plannedVpc(region, vpcId);
         if (vpc == null || vpc.effective == null) {
             return Optional.empty();
         }
@@ -549,7 +598,7 @@ public class VpcNetworkManager {
         if (!enabled() || containerId == null || vpcId == null) {
             return false;
         }
-        VpcBinding vpc = bindings.get(key(region, vpcId));
+        VpcBinding vpc = plannedVpc(region, vpcId);
         if (vpc == null || vpc.effective == null) {
             return false;
         }
@@ -594,15 +643,19 @@ public class VpcNetworkManager {
         if (vpc == null || !vpc.created) {
             return;
         }
+        disconnect(vpc.networkName, containerId);
+    }
+
+    private void disconnect(String networkId, String containerId) {
         try {
             dockerClient.disconnectFromNetworkCmd()
-                    .withNetworkId(vpc.networkName)
+                    .withNetworkId(networkId)
                     .withContainerId(containerId)
                     .withForce(true)
                     .exec();
         } catch (Exception e) {
             LOG.debugv("Could not disconnect {0} from VPC network {1}: {2}",
-                    containerId, vpc.networkName, e.getMessage());
+                    containerId, networkId, e.getMessage());
         }
     }
 
@@ -773,7 +826,10 @@ public class VpcNetworkManager {
         }
         VpcBinding vpc = bindings.get(vpcKey);
         if (vpc != null) {
-            vpc.subnets.remove(subnetId);
+            synchronized (vpc.declarationLock) {
+                vpc.subnetDeclarations.remove(subnetId);
+                vpc.subnets.remove(subnetId);
+            }
         }
     }
 
@@ -783,14 +839,37 @@ public class VpcNetworkManager {
         if (vpc == null) {
             return;
         }
-        vpc.subnets.keySet().forEach(subnetId -> subnetOwner.remove(key(region, subnetId)));
-        if (!vpc.created) {
+        synchronized (vpc.declarationLock) {
+            vpc.subnetDeclarations.keySet().forEach(subnetId -> subnetOwner.remove(key(region, subnetId)));
+        }
+        // A network this process never materialised can still exist: one a previous run created
+        // for a VPC none of whose instances has started since. Startup reconciliation noted it,
+        // under its own name, which an older version spelled differently from vpc.networkName.
+        // An upgrade can leave both spellings behind, so every one noted is removed.
+        Set<String> previousRunNetworks = networksFromPreviousRun.remove(key(region, vpcId));
+        Set<String> networkNames = new LinkedHashSet<>();
+        if (vpc.created) {
+            networkNames.add(vpc.networkName);
+        }
+        if (previousRunNetworks != null) {
+            networkNames.addAll(previousRunNetworks);
+        }
+        if (networkNames.isEmpty()) {
             return;
         }
-        removeNetworkWithRetry(vpc.networkName, 1);
+        String flociContainerId = vpc.flociContainerId;
+        if (flociContainerId == null && currentContainerNetworkResolver != null) {
+            flociContainerId = currentContainerNetworkResolver.resolveContainerId().orElse(null);
+        }
+        for (String networkName : networkNames) {
+            removeNetworkWithRetry(networkName, flociContainerId, 1);
+        }
     }
 
-    private void removeNetworkWithRetry(String networkName, int attempt) {
+    private void removeNetworkWithRetry(String networkName, String flociContainerId, int attempt) {
+        if (flociContainerId != null) {
+            disconnect(networkName, flociContainerId);
+        }
         try {
             dockerClient.removeNetworkCmd(networkName).exec();
             LOG.infov("Removed Docker network {0}", networkName);
@@ -799,7 +878,8 @@ public class VpcNetworkManager {
         } catch (Exception e) {
             // Containers terminated moments earlier still hold endpoints for a beat.
             if (attempt < 5 && !retries.isShutdown()) {
-                retries.schedule(() -> removeNetworkWithRetry(networkName, attempt + 1), 2, TimeUnit.SECONDS);
+                retries.schedule(() -> removeNetworkWithRetry(networkName, flociContainerId, attempt + 1),
+                        2, TimeUnit.SECONDS);
                 return;
             }
             LOG.warnv("Could not remove Docker network {0} after {1} attempts: {2}. It will be reconciled "
@@ -808,6 +888,9 @@ public class VpcNetworkManager {
     }
 
     // ─── Startup reconciliation ──────────────────────────────────────────────
+
+    /** Network names by VPC, for VPCs still declared at startup whose networks a previous run created. */
+    private final Map<String, Set<String>> networksFromPreviousRun = new ConcurrentHashMap<>();
 
     /**
      * Removes VPC networks this Floci left behind on a previous run.
@@ -821,12 +904,17 @@ public class VpcNetworkManager {
      * API port) are considered. Several Floci instances share a daemon here; scoping by owner is
      * what makes the deletion safe.
      *
+     * <p>The networks of VPCs that are still declared are kept and remembered, so deleting such a
+     * VPC later removes its network even though this run never materialised it. That listing runs
+     * with {@code reconcile-on-startup} off too; only the removal of orphans is behind the flag.
+     *
      * @param stillDeclared answers whether (region, vpcId) exists in the restored state
      */
     public void reconcileOrphans(BiPredicate<String, String> stillDeclared) {
-        if (!enabled() || !config.services().ec2().vpcNetworks().reconcileOnStartup()) {
+        if (!enabled()) {
             return;
         }
+        boolean reap = config.services().ec2().vpcNetworks().reconcileOnStartup();
         int removed = 0;
         try {
             List<Network> networks = ALIASES.listByLabels(
@@ -846,6 +934,11 @@ public class VpcNetworkManager {
                 String vpcId = ALIASES.labelValue(labels, ContainerStorageHelper.RESOURCE_ID_LABEL);
                 String region = ALIASES.labelValue(labels, ContainerStorageHelper.REGION_LABEL);
                 if (vpcId != null && region != null && stillDeclared.test(region, vpcId)) {
+                    networksFromPreviousRun.computeIfAbsent(key(region, vpcId), k -> ConcurrentHashMap.newKeySet())
+                            .add(network.getName());
+                    continue;
+                }
+                if (!reap) {
                     continue;
                 }
                 disconnectAll(network);
@@ -886,22 +979,14 @@ public class VpcNetworkManager {
             return;
         }
         for (String containerId : containers.keySet()) {
-            try {
-                dockerClient.disconnectFromNetworkCmd()
-                        .withNetworkId(listed.getId())
-                        .withContainerId(containerId)
-                        .withForce(true)
-                        .exec();
-            } catch (Exception e) {
-                LOG.debugv("Could not disconnect {0} from {1}: {2}", containerId, listed.getName(), e.getMessage());
-            }
+            disconnect(listed.getId(), containerId);
         }
     }
 
     // ─── Introspection, for tests and reporting ──────────────────────────────
 
     public Optional<String> effectiveVpcCidr(String region, String vpcId) {
-        VpcBinding vpc = bindings.get(key(region, vpcId));
+        VpcBinding vpc = plannedVpc(region, vpcId);
         return vpc == null || vpc.effective == null ? Optional.empty() : Optional.of(vpc.effective.toString());
     }
 
@@ -917,7 +1002,7 @@ public class VpcNetworkManager {
     }
 
     public boolean isSubstituted(String region, String vpcId) {
-        VpcBinding vpc = bindings.get(key(region, vpcId));
+        VpcBinding vpc = plannedVpc(region, vpcId);
         return vpc != null && vpc.substituted;
     }
 
@@ -932,22 +1017,29 @@ public class VpcNetworkManager {
             return null;
         }
         VpcBinding vpc = bindings.get(vpcKey);
+        if (vpc != null) {
+            vpc = plannedVpc(vpc.region, vpc.vpcId);
+        }
         return vpc == null ? null : vpc.subnets.get(subnetId);
     }
 
     /**
      * Every IPv4 range the daemon has already reserved, so a declared CIDR can be checked before use.
      *
+     * @param ownRegion the Region of the VPC being planned
      * @param ownVpcId the VPC being planned; this instance's surviving network for that same VPC is
      *                 excluded, so a Floci restart re-planning a VPC whose bridge is still up does
-     *                 not read its own network as a collision and substitute a CIDR it already has
+     *                 not read its own network as a collision and substitute a CIDR it already has.
+     *                 Two Regions can hold a VPC with the same id (the legacy {@code vpc-default}),
+     *                 so the network must be for that VPC in the same Region
      */
-    private Set<Cidr4> dockerNetworkSubnets(String ownVpcId) {
-        Set<Cidr4> taken = new java.util.LinkedHashSet<>();
+    private Set<Cidr4> dockerNetworkSubnets(String ownRegion, String ownVpcId) {
+        Set<Cidr4> taken = new LinkedHashSet<>();
         try {
             for (Network network : dockerClient.listNetworksCmd().exec()) {
                 Map<String, String> labels = network.getLabels() == null ? Map.of() : network.getLabels();
                 if (ownVpcId != null && ALIASES.matches(labels, ContainerStorageHelper.RESOURCE_ID_LABEL, ownVpcId)
+                        && ALIASES.matches(labels, ContainerStorageHelper.REGION_LABEL, ownRegion)
                         && ownedByThisDeployment(labels)) {
                     continue;
                 }
@@ -973,21 +1065,23 @@ public class VpcNetworkManager {
     private static final class VpcBinding {
         final String region;
         final String vpcId;
+        final String declaredCidr;
         final Cidr4 declared;
-        final Cidr4 effective;
-        final boolean substituted;
+        Cidr4 effective;
+        boolean substituted;
         final String networkName;
+        final Object declarationLock = new Object();
+        final Map<String, String> subnetDeclarations = new LinkedHashMap<>();
         final Map<String, SubnetBinding> subnets = new ConcurrentHashMap<>();
+        volatile boolean planned;
         volatile boolean created;
         volatile String flociContainerId;
 
-        VpcBinding(String region, String vpcId, Cidr4 declared, Cidr4 effective,
-                   boolean substituted, String networkName) {
+        VpcBinding(String region, String vpcId, String declaredCidr, String networkName) {
             this.region = region;
             this.vpcId = vpcId;
-            this.declared = declared;
-            this.effective = effective;
-            this.substituted = substituted;
+            this.declaredCidr = declaredCidr;
+            this.declared = Cidr4.parse(declaredCidr).orElse(null);
             this.networkName = networkName;
         }
     }

@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InOrder;
 import org.mockito.Mock;
+import org.mockito.MockMakers;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.List;
@@ -22,6 +23,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
@@ -40,7 +42,7 @@ class EmulatorInfoControllerTest {
     @Mock private StorageFactory storageFactory;
     @Mock private Instance<Resettable> resettables;
     @Mock private Instance<ContainerTeardown> containerTeardowns;
-    @Mock private FlociCertificateAuthority certificateAuthority;
+    @Mock(mockMaker = MockMakers.INLINE) private FlociCertificateAuthority certificateAuthority;
     @Mock private EmulatorConfig config;
     @Mock private DynamoDbBackendSelector dynamoDbBackendSelector;
     @Mock private ContainerTeardown sageMakerTeardown;
@@ -60,9 +62,43 @@ class EmulatorInfoControllerTest {
     void info_reportsTheSelectedDynamoDbBackend() {
         when(dynamoDbBackendSelector.selected()).thenReturn("local");
 
-        Map<?, ?> info = (Map<?, ?>) controller.info().getEntity();
+        Map<?, ?> info = (Map<?, ?>) manifestController().info().getEntity();
 
         assertEquals("local", info.get("dynamodb_backend"));
+    }
+
+    @Test
+    void info_isTheConsoleContractManifest() {
+        EmulatorConfig manifestConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(manifestConfig.effectiveBaseUrl()).thenReturn("http://floci:4566");
+        when(manifestConfig.defaultRegion()).thenReturn("us-east-1");
+        when(manifestConfig.defaultAccountId()).thenReturn("000000000000");
+        when(manifestConfig.tls().enabled()).thenReturn(true);
+        when(manifestConfig.services().ui().enabled()).thenReturn(true);
+        when(manifestConfig.services().ui().port()).thenReturn(4500);
+        when(serviceRegistry.getServices()).thenReturn(Map.of("s3", "running", "ec2", "available"));
+
+        Map<?, ?> info = (Map<?, ?>) new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
+                resettables, containerTeardowns, certificateAuthority, manifestConfig, dynamoDbBackendSelector)
+                .info().getEntity();
+
+        assertEquals(1, info.get("manifest_version"));
+        assertEquals(2, info.get("console_contract"));
+        assertEquals("aws", info.get("cloud"));
+        assertEquals("floci", info.get("emulator"));
+        assertEquals("http://floci:4566", info.get("endpoint"));
+        assertEquals("/_floci/health", info.get("health_url"));
+        assertEquals(Map.of("enabled", true), info.get("tls"));
+        assertEquals(Map.of("ec2", "disabled", "s3", "enabled"), info.get("services"));
+        assertEquals(Map.of("region", "us-east-1", "account_id", "000000000000"), info.get("defaults"));
+        assertEquals(Map.of("enabled", true, "port", 4500), info.get("ui"));
+        assertEquals("community", info.get("edition"), "the original keys stay");
+    }
+
+    private EmulatorInfoController manifestController() {
+        return new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
+                resettables, containerTeardowns, certificateAuthority, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
+                dynamoDbBackendSelector);
     }
 
     @Test

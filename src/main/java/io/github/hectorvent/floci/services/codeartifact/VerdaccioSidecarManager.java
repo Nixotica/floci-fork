@@ -9,43 +9,24 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.E
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.PerKeyContainerPool;
+import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
-import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.jboss.logging.Logger;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Lazily starts and manages one Verdaccio container per CodeArtifact repository backing the
- * {@code npm} format. Unlike Reposilite (Maven), Verdaccio has no native concept of multiple
- * named repositories inside one instance, so npm repositories each get their own container
- * instead of sharing one the way {@link ReposiliteSidecarManager} does. The actual per-key
- * container lifecycle (map of running containers, per-key start lock, health poll,
- * restart-on-unhealthy, stop-all on shutdown) is generic and lives in
- * {@link PerKeyContainerPool}; this class only knows how to build and configure a Verdaccio
- * container specifically.
- *
- * <p>Each container is configured with open access (no auth, no upstream proxying) since the
- * real CodeArtifact authorization check happens once at Floci's proxy layer
- * ({@code CodeArtifactNpmDataPlane}), before a request ever reaches the container; the container
- * itself is never reachable directly by a client.
- *
- * <p>Implements {@link ContainerTeardown} rather than observing {@code ShutdownEvent} directly:
- * {@code ContainerTeardowns.stopAll} already runs every implementation both at process shutdown
- * and on {@code /state/reset}/{@code /state/nuke}, so this is what actually stops every
- * repository's container on reset, driven by what {@link #pool} is really tracking rather than by
- * which repository records still exist in storage.
+ * Starts and stops one Verdaccio container per CodeArtifact npm repository, unlike Reposilite's one
+ * shared instance. The HTTP protocol lives in {@link VerdaccioSidecarClient}. Implements
+ * {@link ContainerTeardown} so reset, nuke, and shutdown stop every container this manager started.
  */
 @ApplicationScoped
-public class VerdaccioSidecarManager implements RepositorySidecarManager, ContainerTeardown {
+public class VerdaccioSidecarManager implements ContainerTeardown {
 
     private static final Logger LOG = Logger.getLogger(VerdaccioSidecarManager.class);
-    private static final String FORMAT = "npm";
     private static final int VERDACCIO_PORT = 4873;
     private static final String HEALTH_PATH = "/-/ping";
     private static final String CONFIG_REMOTE_DIR = "/verdaccio/conf";
@@ -79,6 +60,14 @@ public class VerdaccioSidecarManager implements RepositorySidecarManager, Contai
     private final ContainerLifecycleManager lifecycleManager;
     private final EmulatorConfig config;
     private final PerKeyContainerPool pool;
+    private final ConcurrentHashMap<String, UseState> uses = new ConcurrentHashMap<>();
+
+    private static final class UseState {
+        private int active;
+        private boolean releasing;
+        private boolean stopping;
+        private boolean stopped;
+    }
 
     @Inject
     public VerdaccioSidecarManager(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
@@ -89,32 +78,94 @@ public class VerdaccioSidecarManager implements RepositorySidecarManager, Contai
         this.pool = new PerKeyContainerPool(lifecycleManager, HEALTH_PATH);
     }
 
-    @Override
-    public String format() {
-        return FORMAT;
-    }
-
     /**
-     * Base URL of a ready Verdaccio instance for this npm repository, starting its container if
-     * this is the first use. Each repository's container is independent, so concurrent first-use
-     * of two different repositories never blocks on each other (unlike Reposilite's one shared
-     * instance, which does need a single lock around every provisioning call).
-     *
-     * @param publicUrl the externally reachable proxy URL for this specific repository (e.g.
-     *                  {@code http://localhost:4566/codeartifact/npm/<domain>/<repository>/}),
-     *                  passed to the container as {@code VERDACCIO_PUBLIC_URL} so package metadata
-     *                  it returns (notably {@code dist.tarball}) points back through Floci's proxy
-     *                  instead of the container's own internal, unreachable-by-the-client address.
+     * Base URL of a ready Verdaccio for this repository, starting its container on first use.
+     * {@code publicUrl} becomes {@code VERDACCIO_PUBLIC_URL}, so the {@code dist.tarball} links it
+     * returns point back through Floci's proxy.
      */
-    @Override
     public String ensureReady(String npmRepositoryId, String publicUrl) {
         return pool.ensureReady(npmRepositoryId, () -> startContainer(npmRepositoryId, publicUrl));
     }
 
     /** Stops and removes the container for one npm repository, if one was ever started. */
-    @Override
     public void release(String npmRepositoryId) {
-        pool.stopContainer(npmRepositoryId);
+        UseState use = uses.computeIfAbsent(npmRepositoryId, key -> new UseState());
+        synchronized (use) {
+            use.releasing = true;
+        }
+        stopIfUnused(npmRepositoryId, use);
+    }
+
+    /** Only a repository resolved under CodeArtifactService's deletion lock may admit an id. */
+    public void registerRepository(String npmRepositoryId) {
+        uses.putIfAbsent(npmRepositoryId, new UseState());
+    }
+
+    /** Registers a call that may use this repository's sidecar before it touches the container. */
+    public void beginUse(String npmRepositoryId) {
+        UseState use = uses.get(npmRepositoryId);
+        if (use == null) {
+            throw new IllegalStateException("No Verdaccio repository lease for " + npmRepositoryId);
+        }
+        synchronized (use) {
+            if (use.releasing) {
+                throw new IllegalStateException("Verdaccio sidecar is being released for repository "
+                        + npmRepositoryId);
+            }
+            use.active++;
+        }
+    }
+
+    /** Completes a prior {@link #beginUse}, stopping a released container after its last use. */
+    public void endUse(String npmRepositoryId) {
+        UseState use = uses.get(npmRepositoryId);
+        if (use == null) {
+            throw new IllegalStateException("No Verdaccio sidecar use for repository " + npmRepositoryId);
+        }
+        synchronized (use) {
+            if (use.active == 0) {
+                throw new IllegalStateException("No active Verdaccio sidecar use for repository "
+                        + npmRepositoryId);
+            }
+            use.active--;
+        }
+        stopIfUnused(npmRepositoryId, use);
+    }
+
+    private void stopIfUnused(String npmRepositoryId, UseState use) {
+        synchronized (use) {
+            if (!use.releasing || use.active != 0 || use.stopping || use.stopped) {
+                return;
+            }
+            use.stopping = true;
+        }
+        boolean stopped = false;
+        try {
+            if (pool.isTracked(npmRepositoryId)) {
+                pool.stopContainerStrict(npmRepositoryId);
+            }
+            stopped = true;
+        } finally {
+            synchronized (use) {
+                use.stopped = stopped;
+                use.stopping = false;
+                if (stopped) {
+                    uses.remove(npmRepositoryId, use);
+                }
+            }
+        }
+    }
+
+    /**
+     * Whether this npm repository's own Verdaccio container is already running, without starting
+     * one for a repository that has never used npm at all. Every CodeArtifact repository gets an
+     * npm sidecar id at creation regardless of whether it is ever actually used through npm (see
+     * {@code CodeArtifactService#ensureFormatContainerId}'s own callers), so a caller that only
+     * wants to ask an already-running container what it holds must check this first rather than
+     * provision a brand-new container just to find it has nothing.
+     */
+    public boolean isRunning(String npmRepositoryId) {
+        return pool.isTracked(npmRepositoryId);
     }
 
     private PerKeyContainerPool.StartedContainer startContainer(String npmRepositoryId, String publicUrl) {
@@ -137,7 +188,7 @@ public class VerdaccioSidecarManager implements RepositorySidecarManager, Contai
                 .build();
         String containerId = lifecycleManager.create(spec);
         try {
-            copyConfig(containerId);
+            copyConfig(containerId, RetryingTarCopier.DEFAULT_BACKOFF_MS);
             ContainerInfo info = lifecycleManager.startCreated(containerId, spec);
             EndpointInfo endpoint = info.getEndpoint(VERDACCIO_PORT);
             String url = "http://" + endpoint;
@@ -155,29 +206,40 @@ public class VerdaccioSidecarManager implements RepositorySidecarManager, Contai
      * when Floci itself runs in Docker, its own persistent path is not a host path the daemon can
      * mount into a sibling container.
      */
-    private void copyConfig(String containerId) {
-        byte[] content = CONFIG_YAML.getBytes(StandardCharsets.UTF_8);
-        try {
-            ByteArrayOutputStream archive = new ByteArrayOutputStream(content.length + 512);
-            try (TarArchiveOutputStream tar = new TarArchiveOutputStream(archive)) {
-                TarArchiveEntry entry = new TarArchiveEntry(CONFIG_FILE_NAME);
-                entry.setSize(content.length);
-                entry.setMode(0644);
-                tar.putArchiveEntry(entry);
-                tar.write(content);
-                tar.closeArchiveEntry();
-            }
-            lifecycleManager.getDockerClient().copyArchiveToContainerCmd(containerId)
-                    .withRemotePath(CONFIG_REMOTE_DIR)
-                    .withTarInputStream(new ByteArrayInputStream(archive.toByteArray()))
-                    .exec();
-        } catch (IOException e) {
-            throw new IllegalStateException("Could not write the Verdaccio config into container " + containerId, e);
-        }
+    void copyConfig(String containerId, long backoffMillis) {
+        RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, CONFIG_REMOTE_DIR,
+                CONFIG_FILE_NAME, CONFIG_YAML.getBytes(StandardCharsets.UTF_8), 0644,
+                RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, backoffMillis);
     }
 
     @Override
     public void stopManagedContainers() {
-        pool.stopAll();
+        RuntimeException[] failure = new RuntimeException[1];
+        uses.forEach((id, use) -> {
+            synchronized (use) {
+                use.releasing = true;
+            }
+            try {
+                stopIfUnused(id, use);
+            } catch (RuntimeException e) {
+                if (failure[0] == null) {
+                    failure[0] = e;
+                } else {
+                    failure[0].addSuppressed(e);
+                }
+            }
+        });
+        try {
+            pool.stopAllStrictExcept(Set.copyOf(uses.keySet()));
+        } catch (RuntimeException e) {
+            if (failure[0] == null) {
+                failure[0] = e;
+            } else {
+                failure[0].addSuppressed(e);
+            }
+        }
+        if (failure[0] != null) {
+            throw failure[0];
+        }
     }
 }

@@ -105,6 +105,7 @@ nav:
     - DynamoDB: services/dynamodb.md
     - Lambda: services/lambda.md
     - Lambda MicroVMs: services/lambda-microvms.md
+    - Lambda Web Functions: services/lambda-web-functions.md
     - API Gateway: services/api-gateway.md
     - Cognito: services/cognito.md
     - Cognito Identity: services/cognitoidentity.md
@@ -139,6 +140,7 @@ nav:
     - AWS Service Catalog: services/service-catalog.md
     - ElastiCache: services/elasticache.md
     - MemoryDB: services/memorydb.md
+    - Aurora DSQL: services/dsql.md
     - RDS: services/rds.md
     - RDS Data API: services/rds-data.md
     - Timestream for InfluxDB: services/timestream-influxdb.md
@@ -155,6 +157,7 @@ nav:
     - Redshift Serverless: services/redshift-serverless.md
     - Data Firehose: services/firehose.md
     - EventBridge: services/eventbridge.md
+    - EventBridge V2: services/eventbridgev2.md
     - EventBridge Pipes: services/pipes.md
     - EventBridge Scheduler: services/scheduler.md
     - CloudWatch: services/cloudwatch.md
@@ -167,8 +170,10 @@ nav:
     - AppIntegrations: services/appintegrations.md
     - Amazon Data Lifecycle Manager: services/dlm.md
     - ACM: services/acm.md
+    - Payment Cryptography: services/payment-cryptography.md
     - ECS: services/ecs.md
     - ECR: services/ecr.md
+    - AWS Resource Groups: services/resource-groups.md
     - Resource Groups Tagging API: services/resource-groups-tagging.md
     - Resource Explorer 2: services/resource-explorer.md
     - EKS: services/eks.md
@@ -230,4 +235,6 @@ nav:
     - Python: testcontainers/python.md
     - .NET: testcontainers/dotnet.md
     - Go: testcontainers/go.md
-  - Contributing: contributing.md
+  - Development:
+    - Contributing: contributing.md
+    - Local concurrency primitives: concurrency.md

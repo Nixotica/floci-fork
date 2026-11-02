@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ses.model.AccountDetails;
@@ -85,6 +86,10 @@ public class SesAccountService {
         LOG.infov("Updated account VDM attributes for region {0}: enabled={1}", region, vdm.vdmEnabled());
     }
 
+    public boolean isVdmEnabled(String region) {
+        return findAccountVdmAttributes(region).map(AccountVdmAttributes::vdmEnabled).orElse(false);
+    }
+
     /** The probe-confirmed gate the VDM-only operations check before reading the request. */
     public void requireVdmEnabled(String region) {
         requireVdmEnabled(region, "NotFoundException", 404);
@@ -96,8 +101,7 @@ public class SesAccountService {
      * the identical sentence, all probe-confirmed.
      */
     public void requireVdmEnabled(String region, String errorCode, int status) {
-        Optional<AccountVdmAttributes> vdm = findAccountVdmAttributes(region);
-        if (vdm.isEmpty() || !vdm.get().vdmEnabled()) {
+        if (!isVdmEnabled(region)) {
             throw new AwsException(errorCode,
                     "To use this feature you must enable Virtual Deliverability Manager", status);
         }
@@ -161,16 +165,18 @@ public class SesAccountService {
                                                String useCaseDescription, List<String> additionalContacts) {
         List<String> errors = new ArrayList<>();
         if (mailType == null) {
-            errors.add(constraint("mailType", "Member must not be null"));
+            errors.add(SmithyValidationErrors.notNullWithoutValue("mailType"));
         } else if (!MAIL_TYPES.contains(mailType)) {
             errors.add(constraint("mailType", "Member must satisfy enum value set: [MARKETING, TRANSACTIONAL]"));
         }
         if (websiteUrl == null) {
-            errors.add(constraint("websiteURL", "Member must not be null"));
-        } else if (websiteUrl.isEmpty()) {
-            errors.add(constraint("websiteURL", "Member must have length greater than or equal to 1"));
-        } else if (websiteUrl.length() > WEBSITE_URL_MAX) {
-            errors.add(constraint("websiteURL", "Member must have length less than or equal to " + WEBSITE_URL_MAX));
+            errors.add(SmithyValidationErrors.notNullWithoutValue("websiteURL"));
+        } else {
+            String websiteUrlLength = SmithyValidationErrors.sizeOutOfRange("websiteURL", websiteUrl.length(),
+                    1, WEBSITE_URL_MAX);
+            if (websiteUrlLength != null) {
+                errors.add(websiteUrlLength);
+            }
         }
         if (contactLanguage != null && !CONTACT_LANGUAGES.contains(contactLanguage)) {
             errors.add(constraint("contactLanguage", "Member must satisfy enum value set: [EN, JA]"));
@@ -180,12 +186,10 @@ public class SesAccountService {
                     "Member must have length less than or equal to " + USE_CASE_DESCRIPTION_MAX));
         }
         if (additionalContacts != null) {
-            if (additionalContacts.isEmpty()) {
-                errors.add(constraint("additionalContactEmailAddresses",
-                        "Member must have length greater than or equal to 1"));
-            } else if (additionalContacts.size() > CONTACTS_MAX) {
-                errors.add(constraint("additionalContactEmailAddresses",
-                        "Member must have length less than or equal to " + CONTACTS_MAX));
+            String contactsSize = SmithyValidationErrors.sizeOutOfRange("additionalContactEmailAddresses",
+                    additionalContacts.size(), 1, CONTACTS_MAX);
+            if (contactsSize != null) {
+                errors.add(contactsSize);
             }
             for (String contact : additionalContacts) {
                 if (contact == null || contact.length() < CONTACT_MIN || contact.length() > CONTACT_MAX
@@ -199,9 +203,7 @@ public class SesAccountService {
             }
         }
         if (!errors.isEmpty()) {
-            throw new AwsException("BadRequestException",
-                    errors.size() + " validation error" + (errors.size() > 1 ? "s" : "")
-                            + " detected: " + String.join("; ", errors), 400);
+            throw SmithyValidationErrors.badRequest(errors);
         }
         if (!isValidUrl(websiteUrl)) {
             throw new AwsException("BadRequestException", "Url contains invalid format", 400);

@@ -45,12 +45,19 @@ public class ImageResolver {
     );
 
     private final String baseUri;
+    private final Map<String, String> runtimeImages;
 
     public ImageResolver(EmulatorConfig config) {
         this.baseUri = config.services().lambda().ecrBaseUri();
+        this.runtimeImages = config.services().lambda().runtimeImages();
     }
 
     public String resolve(String runtime) {
+        return resolve(runtime, null);
+    }
+
+    /** A platform-specific override precedes the runtime-wide image when a launcher selects a platform. */
+    public String resolve(String runtime, String platform) {
         if (runtime == null || runtime.isBlank()) {
             throw new AwsException("InvalidParameterValueException", "Runtime is required", 400);
         }
@@ -62,6 +69,17 @@ public class ImageResolver {
         if (image == null) {
             throw new AwsException("InvalidParameterValueException",
                     "The runtime parameter " + runtime + " is not supported.", 400);
+        }
+        if (runtimeImages != null) {
+            if (platform != null) {
+                String override = runtimeImages.get(runtime + "." + platform.replace('/', '.'));
+                if (override != null) {
+                    return override;
+                }
+            }
+            if (runtimeImages.containsKey(runtime)) {
+                return runtimeImages.get(runtime);
+            }
         }
         return baseUri + "/lambda/" + image;
     }

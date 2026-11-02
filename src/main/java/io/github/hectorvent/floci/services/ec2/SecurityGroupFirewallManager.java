@@ -7,8 +7,6 @@ import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
-import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -20,6 +18,8 @@ import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.jboss.logging.Logger;
 
 import java.io.ByteArrayInputStream;
@@ -101,6 +101,13 @@ public class SecurityGroupFirewallManager {
     public Namespace createNamespace(String service, String resourceId, String accountId, String region,
                                      Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
                                      Map<String, String> extraLabels) {
+        return createNamespace(service, resourceId, accountId, region, dockerNetwork, portBindings, extraLabels, null);
+    }
+
+    /** Lets the owning service choose the host interface for published namespace ports. */
+    public Namespace createNamespace(String service, String resourceId, String accountId, String region,
+                                     Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
+                                     Map<String, String> extraLabels, String hostIp) {
         if (!enabled()) {
             throw new IllegalStateException("Security-group enforcement is disabled");
         }
@@ -128,7 +135,13 @@ public class SecurityGroupFirewallManager {
                         ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)))
                 .withLabels(extraLabels);
         if (portBindings != null) {
-            portBindings.forEach(builder::withPortBinding);
+            portBindings.forEach((containerPort, hostPort) -> {
+                if (hostIp == null) {
+                    builder.withPortBinding(containerPort, hostPort);
+                } else {
+                    builder.withPortBinding(containerPort, hostPort, hostIp);
+                }
+            });
         }
         ContainerSpec spec = builder.build();
         String helperId = null;

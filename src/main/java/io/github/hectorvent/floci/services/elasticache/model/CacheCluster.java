@@ -15,11 +15,15 @@ public class CacheCluster {
     private CacheClusterStatus cacheClusterStatus;
     private String engine;
     private String engineVersion;
+    // null on records persisted before the field existed; AWS defaults it to true
+    private Boolean autoMinorVersionUpgrade;
     private Endpoint configurationEndpoint;
     private Instant cacheClusterCreateTime;
     private String cacheNodeType;
     private int numCacheNodes;
     private String arn;
+    // Persisted only: a Memcached cluster carries no ARN, so its region is kept here for a restart.
+    private String region;
     private String cacheParameterGroupName;
     private String cacheSubnetGroupName;
     private AuthMode authMode;
@@ -33,6 +37,9 @@ public class CacheCluster {
     private boolean atRestEncryptionEnabled;
     private List<String> securityGroupIds = new ArrayList<>();
     private Map<String, String> tags = new LinkedHashMap<>();
+    private String serverlessCacheName;
+    private String ownerAccountId;
+    private String userGroupId;
 
     // Transient: not persisted, restored on container restart
     private transient String containerId;
@@ -64,6 +71,9 @@ public class CacheCluster {
     public String getEngineVersion() { return engineVersion; }
     public void setEngineVersion(String engineVersion) { this.engineVersion = engineVersion; }
 
+    public boolean isAutoMinorVersionUpgrade() { return autoMinorVersionUpgrade == null || autoMinorVersionUpgrade; }
+    public void setAutoMinorVersionUpgrade(Boolean autoMinorVersionUpgrade) { this.autoMinorVersionUpgrade = autoMinorVersionUpgrade; }
+
     public Endpoint getConfigurationEndpoint() { return configurationEndpoint; }
     public void setConfigurationEndpoint(Endpoint configurationEndpoint) { this.configurationEndpoint = configurationEndpoint; }
 
@@ -78,6 +88,9 @@ public class CacheCluster {
 
     public String getArn() { return arn; }
     public void setArn(String arn) { this.arn = arn; }
+
+    public String getRegion() { return region; }
+    public void setRegion(String region) { this.region = region; }
 
     public String getCacheParameterGroupName() { return cacheParameterGroupName; }
     public void setCacheParameterGroupName(String cacheParameterGroupName) { this.cacheParameterGroupName = cacheParameterGroupName; }
@@ -117,6 +130,15 @@ public class CacheCluster {
 
     public Map<String, String> getTags() { return tags; }
     public void setTags(Map<String, String> tags) { this.tags = tags == null ? new LinkedHashMap<>() : tags; }
+
+    public String getServerlessCacheName() { return serverlessCacheName; }
+    public void setServerlessCacheName(String serverlessCacheName) { this.serverlessCacheName = serverlessCacheName; }
+
+    public String getOwnerAccountId() { return ownerAccountId; }
+    public void setOwnerAccountId(String ownerAccountId) { this.ownerAccountId = ownerAccountId; }
+
+    public String getUserGroupId() { return userGroupId; }
+    public void setUserGroupId(String userGroupId) { this.userGroupId = userGroupId; }
 
     public String getContainerId() { return containerId; }
     public void setContainerId(String containerId) { this.containerId = containerId; }

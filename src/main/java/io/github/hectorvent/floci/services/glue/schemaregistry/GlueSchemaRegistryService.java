@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.services.glue.schemaregistry;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.MetadataInfo;
@@ -16,17 +18,18 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HexFormat;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Objects;
 import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -74,9 +77,9 @@ public class GlueSchemaRegistryService {
     GlueSchemaRegistryService(StorageBackend<String, Registry> registryStore,
                               RegionResolver regionResolver) {
         this(registryStore,
-                new io.github.hectorvent.floci.core.storage.InMemoryStorage<>(),
-                new io.github.hectorvent.floci.core.storage.InMemoryStorage<>(),
-                new io.github.hectorvent.floci.core.storage.InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 regionResolver);
     }
 
@@ -476,7 +479,7 @@ public class GlueSchemaRegistryService {
                 .orElseThrow(() -> new AwsException("EntityNotFoundException",
                         "Schema version not found: " + schemaVersionId, 400));
 
-        Map<String, MetadataInfo> metadata = metadataStore.get(schemaVersionId).orElseGet(java.util.LinkedHashMap::new);
+        Map<String, MetadataInfo> metadata = metadataStore.get(schemaVersionId).orElseGet(LinkedHashMap::new);
         MetadataInfo info = metadata.get(key);
         Instant now = Instant.now();
         if (info == null) {
@@ -490,7 +493,7 @@ public class GlueSchemaRegistryService {
                     info.getOtherMetadataValueList() != null
                             ? new ArrayList<>(info.getOtherMetadataValueList())
                             : new ArrayList<>();
-            for (var item : history) {
+            for (MetadataInfo.OtherMetadataValueListItem item : history) {
                 if (value.equals(item.getMetadataValue())) {
                     throw new AwsException("AlreadyExistsException",
                             "Metadata key/value pair already exists: " + key + "=" + value, 400);
@@ -570,8 +573,8 @@ public class GlueSchemaRegistryService {
         if (metadataList == null || metadataList.isEmpty()) {
             return stored;
         }
-        Map<String, MetadataInfo> filtered = new java.util.LinkedHashMap<>();
-        for (var f : metadataList) {
+        Map<String, MetadataInfo> filtered = new LinkedHashMap<>();
+        for (MetadataKeyValueFilter f : metadataList) {
             MetadataInfo info = stored.get(f.metadataKey());
             if (info == null) continue;
             if (f.metadataValue() == null || f.metadataValue().isBlank()) {
@@ -579,7 +582,7 @@ public class GlueSchemaRegistryService {
             } else if (f.metadataValue().equals(info.getMetadataValue())) {
                 filtered.put(f.metadataKey(), info);
             } else if (info.getOtherMetadataValueList() != null) {
-                for (var item : info.getOtherMetadataValueList()) {
+                for (MetadataInfo.OtherMetadataValueListItem item : info.getOtherMetadataValueList()) {
                     if (f.metadataValue().equals(item.getMetadataValue())) {
                         filtered.put(f.metadataKey(), info);
                         break;
@@ -599,9 +602,9 @@ public class GlueSchemaRegistryService {
         TaggedResource resource = resolveTaggedResource(resourceArn);
         Map<String, String> tags = resource.getTags();
         if (tags == null) {
-            tags = new java.util.LinkedHashMap<>();
+            tags = new LinkedHashMap<>();
         } else {
-            tags = new java.util.LinkedHashMap<>(tags);
+            tags = new LinkedHashMap<>(tags);
         }
         tags.putAll(tagsToAdd);
         resource.setTags(tags);
@@ -617,7 +620,7 @@ public class GlueSchemaRegistryService {
         if (tags == null || tags.isEmpty()) {
             return;
         }
-        Map<String, String> updated = new java.util.LinkedHashMap<>(tags);
+        Map<String, String> updated = new LinkedHashMap<>(tags);
         for (String key : tagKeysToRemove) {
             updated.remove(key);
         }
@@ -735,7 +738,7 @@ public class GlueSchemaRegistryService {
     }
 
     private static List<Long> parseVersionsExpression(String expr) {
-        java.util.SortedSet<Long> versions = new java.util.TreeSet<>();
+        SortedSet<Long> versions = new TreeSet<>();
         for (String token : expr.split(",")) {
             token = token.trim();
             if (token.isEmpty()) continue;
@@ -775,14 +778,14 @@ public class GlueSchemaRegistryService {
     }
 
     private static String simpleUnifiedDiff(String labelA, String a, String labelB, String b) {
-        if (java.util.Objects.equals(a, b)) {
+        if (Objects.equals(a, b)) {
             return "";
         }
         StringBuilder sb = new StringBuilder();
         sb.append("--- ").append(labelA).append('\n');
         sb.append("+++ ").append(labelB).append('\n');
-        java.util.List<String> linesA = a == null ? List.of() : List.of(a.split("\n", -1));
-        java.util.List<String> linesB = b == null ? List.of() : List.of(b.split("\n", -1));
+        List<String> linesA = a == null ? List.of() : List.of(a.split("\n", -1));
+        List<String> linesB = b == null ? List.of() : List.of(b.split("\n", -1));
         int n = linesA.size();
         int m = linesB.size();
         // Compute LCS lengths.
@@ -962,7 +965,7 @@ public class GlueSchemaRegistryService {
     private void rebuildVersionIndexes() {
         versionByNumber.clear();
         versionByDefinitionHash.clear();
-        Map<String, String> arnToSchemaKey = new java.util.HashMap<>();
+        Map<String, String> arnToSchemaKey = new HashMap<>();
         for (Schema s : schemaStore.scan(k -> true)) {
             arnToSchemaKey.put(s.getSchemaArn(), schemaKey(s.getRegistryName(), s.getSchemaName()));
         }
@@ -984,16 +987,7 @@ public class GlueSchemaRegistryService {
         } catch (RuntimeException e) {
             canonical = definition;
         }
-        return sha256Hex(canonical);
-    }
-
-    private static String sha256Hex(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(md.digest(input.getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 not available", e);
-        }
+        return Digests.sha256Hex(canonical);
     }
 
     private Registry autoCreateDefaultRegistry(String region) {

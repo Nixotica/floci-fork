@@ -1,9 +1,9 @@
 package io.github.hectorvent.floci.services.s3;
 
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.testing.ValidateSignaturesProfile;
 import io.github.hectorvent.floci.testutil.S3RequestSigner;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.RestAssured;
 import jakarta.inject.Inject;
@@ -15,23 +15,19 @@ import org.junit.jupiter.api.TestMethodOrder;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.util.Map;
+import java.security.SecureRandom;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 @QuarkusTest
-@TestProfile(PreSignedUrlIntegrationTest.PresignValidationProfile.class)
+@TestProfile(ValidateSignaturesProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class PreSignedUrlIntegrationTest {
-
-    public static final class PresignValidationProfile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.auth.validate-signatures", "true");
-        }
-    }
 
     private static final String BUCKET = "presign-test-bucket";
 
@@ -80,7 +76,11 @@ class PreSignedUrlIntegrationTest {
     @Test
     @Order(3)
     void presignedUrlGeneratesValidStructure() {
-        String url = presignGenerator.generatePresignedUrl(
+        Clock clock = Clock.fixed(Instant.now(), ZoneOffset.UTC);
+        PreSignedUrlGenerator generator = new PreSignedUrlGenerator(
+                "secret", 300, true, "us-east-1", "000000000000",
+                iamService, null, new SecureRandom(), clock);
+        String url = generator.generatePresignedUrl(
                 "http://localhost:4566", BUCKET, "file.txt", "GET", 300);
 
         assertTrue(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
@@ -106,14 +106,14 @@ class PreSignedUrlIntegrationTest {
         assertTrue(iamService.findSecretKey(accessKeyId, sessionToken).isPresent(),
                 "The temporary credential must be registered for SigV4 validation");
 
-        URI secondUri = URI.create(presignGenerator.generatePresignedUrl(
+        URI secondUri = URI.create(generator.generatePresignedUrl(
                 "http://localhost:8080", BUCKET, "file.txt", "GET", 300));
         String secondCredential = queryParam(secondUri, "X-Amz-Credential");
         assertEquals(accessKeyId, secondCredential.substring(0, secondCredential.indexOf('/')),
-                "Only URLs for the same object and method should reuse the scoped credential");
+                "URLs for the same object, method and signing time should reuse the scoped credential");
         assertEquals(sessionToken, queryParam(secondUri, "X-Amz-Security-Token"));
 
-        URI otherUri = URI.create(presignGenerator.generatePresignedUrl(
+        URI otherUri = URI.create(generator.generatePresignedUrl(
                 "http://localhost:8080", BUCKET, "second-file.txt", "GET", 300));
         assertNotEquals(accessKeyId, queryParam(otherUri, "X-Amz-Credential").split("/", 2)[0]);
     }

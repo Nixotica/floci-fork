@@ -7,8 +7,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.StreamSupport;
 
 /**
  * Evaluates a role's trust policy for {@code sts:AssumeRoleWithWebIdentity}, matching the
@@ -174,17 +176,17 @@ public class WebIdentityTrustPolicyEvaluator {
             return false;
         }
 
-        var operators = conditionNode.fields();
+        Iterator<Map.Entry<String, JsonNode>> operators = conditionNode.fields();
         while (operators.hasNext()) {
-            var operatorEntry = operators.next();
+            Map.Entry<String, JsonNode> operatorEntry = operators.next();
             String operator = operatorEntry.getKey();
             JsonNode keys = operatorEntry.getValue();
             if (!keys.isObject()) {
                 return false;
             }
-            var keyIterator = keys.fields();
+            Iterator<Map.Entry<String, JsonNode>> keyIterator = keys.fields();
             while (keyIterator.hasNext()) {
-                var keyEntry = keyIterator.next();
+                Map.Entry<String, JsonNode> keyEntry = keyIterator.next();
                 if (!keySatisfied(operator, keyEntry.getKey(), keyEntry.getValue(),
                         issuerKeyPrefix, claims)) {
                     return false;
@@ -247,7 +249,7 @@ public class WebIdentityTrustPolicyEvaluator {
             return List.of(node.asText());
         }
         if (node.isArray()) {
-            return java.util.stream.StreamSupport
+            return StreamSupport
                     .stream(node.spliterator(), false)
                     .filter(JsonNode::isTextual)
                     .map(JsonNode::asText)

@@ -1,27 +1,34 @@
 package io.github.hectorvent.floci.services.eks;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.common.TagHandler;
 import io.github.hectorvent.floci.core.common.docker.UserDataPipeline;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.ec2.Ec2InstanceLaunchListener;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.Ipv4Cidrs;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupPolicy;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
+import io.github.hectorvent.floci.services.eks.model.AccessConfig;
 import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
-import io.github.hectorvent.floci.services.eks.model.AccessConfig;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
@@ -39,7 +46,6 @@ import io.github.hectorvent.floci.services.eks.model.NodegroupStatus;
 import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import io.github.hectorvent.floci.services.eks.model.Provider;
 import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -65,15 +71,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
-import io.github.hectorvent.floci.core.resource.ResourceProvider;
-import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 
 @ApplicationScoped
-public class EksService implements TagHandler, ResourceProvider {
+public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaunchListener {
 
     private static final Logger LOG = Logger.getLogger(EksService.class);
 
@@ -105,6 +110,9 @@ public class EksService implements TagHandler, ResourceProvider {
     private final Map<String, UserDataClaim> appliedClusterUserData = new ConcurrentHashMap<>();
     private final Map<String, Object> nodeGroupCapacityLocks = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<Boolean>> pendingFirstNodeGroups = new ConcurrentHashMap<>();
+    // Storage hands every caller the same live Cluster, and Cluster keeps identity equality.
+    private final Set<Cluster> clustersBeingDeleted = ConcurrentHashMap.newKeySet();
+    private final Set<String> restoringClusters = ConcurrentHashMap.newKeySet();
 
     @Inject
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
@@ -149,6 +157,14 @@ public class EksService implements TagHandler, ResourceProvider {
                 oidcService, accessEntries, null, null);
     }
 
+    /** Called at boot so this lazily created bean runs {@link #init()}, which restarts persisted clusters. */
+    public void restorePersistedRuntime() {
+        int persistedClusters = allClusterEntries().size();
+        if (persistedClusters > 0) {
+            LOG.infov("Found {0} persisted EKS cluster record(s)", persistedClusters);
+        }
+    }
+
     @PostConstruct
     public void init() {
         backfillOidcIdentities();
@@ -162,8 +178,10 @@ public class EksService implements TagHandler, ResourceProvider {
         }
         if (!config.services().eks().mock()) {
             restorePersistedClusters();
-            startReadinessPoller();
+        } else {
+            restoreMockJoinedInstances();
         }
+        startReadinessPoller();
     }
 
     /**
@@ -212,6 +230,7 @@ public class EksService implements TagHandler, ResourceProvider {
                             cluster.setNodeInstanceType(selectedNodeInstanceType(group)));
                 }
                 clusterManager.restoreCluster(cluster);
+                restoreJoinedInstances(entry.accountId(), cluster);
             } catch (Exception e) {
                 if (!clusterManager.isDockerReachable()) {
                     // Same degradation as create: a restored cluster is metadata that stands on
@@ -231,13 +250,82 @@ public class EksService implements TagHandler, ResourceProvider {
 
     private List<AccountAwareStorageBackend.AccountEntry<Cluster>> allClusterEntries() {
         if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
-            return aware.scanAllAccountEntries(k -> true);
+            return aware.scanAllAccountEntries(k -> true).stream().peek(entry -> {
+                if (entry.value() != null && entry.value().getAccountId() == null) {
+                    entry.value().setAccountId(entry.accountId());
+                }
+            }).toList();
         }
         return storage.scan(k -> true).stream()
                 .map(cluster -> new AccountAwareStorageBackend.AccountEntry<>(
                         cluster.getAccountId() != null ? cluster.getAccountId() : regionResolver.getAccountId(),
                         cluster.getName(), cluster))
                 .toList();
+    }
+
+    private boolean isClusterDeleting(String accountId, Cluster cluster) {
+        return cluster != null && cluster.getName() != null
+                && (cluster.getStatus() == ClusterStatus.DELETING
+                || clustersBeingDeleted.stream().anyMatch(c -> cluster.getName().equals(c.getName())
+                && (accountId == null || c.getAccountId() == null || accountId.equals(c.getAccountId()))));
+    }
+
+    private void saveClusterIfNotDeleting(String accountId, String clusterName, Consumer<Cluster> mutator) {
+        synchronized (clustersBeingDeleted) {
+            Cluster current = findAuthenticationCluster(accountId, clusterName).orElse(null);
+            if (current != null && !isClusterDeleting(accountId, current)) {
+                if (current.getAccountId() == null) {
+                    current.setAccountId(accountId);
+                }
+                mutator.accept(current);
+                putClusterForAccount(accountId, current);
+            }
+        }
+    }
+
+    private void restoreJoinedInstances(String accountId, Cluster cluster) {
+        if (cluster == null || cluster.getJoinedInstanceIds() == null || ec2Service == null
+                || isClusterDeleting(accountId, cluster) || findAuthenticationCluster(accountId, cluster.getName()).isEmpty()) {
+            return;
+        }
+        if (cluster.getAccountId() == null) {
+            cluster.setAccountId(accountId);
+        }
+        Set<String> prunedInstanceIds = new HashSet<>();
+        for (Map.Entry<String, String> instEntry : new ArrayList<>(cluster.getJoinedInstanceIds().entrySet())) {
+            if (isClusterDeleting(accountId, cluster) || findAuthenticationCluster(accountId, cluster.getName()).isEmpty()) {
+                return;
+            }
+            String instId = instEntry.getKey();
+            String reg = instEntry.getValue();
+            RequestScopes.runAs(accountId, reg, () -> {
+                Instance inst = ec2Service.getInstance(reg, instId).orElse(null);
+                if (inst == null || (inst.getState() != null && "terminated".equals(inst.getState().getName()))) {
+                    cluster.getJoinedInstanceIds().remove(instId);
+                    prunedInstanceIds.add(instId);
+                } else {
+                    try {
+                        clusterManager.joinInstance(cluster, inst);
+                    } catch (Exception e) {
+                        LOG.warnv("Failed to re-join instance {0} on restore of cluster {1}: {2}",
+                                instId, cluster.getName(), e.getMessage());
+                    }
+                }
+            });
+        }
+        if (!prunedInstanceIds.isEmpty()) {
+            saveClusterIfNotDeleting(accountId, cluster.getName(), current -> {
+                if (current.getJoinedInstanceIds() != null) {
+                    prunedInstanceIds.forEach(current.getJoinedInstanceIds()::remove);
+                }
+            });
+        }
+    }
+
+    private void restoreMockJoinedInstances() {
+        for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+            restoreJoinedInstances(entry.accountId(), entry.value());
+        }
     }
 
     private Optional<Nodegroup> firstNodeGroup(String clusterName, String accountId) {
@@ -254,6 +342,16 @@ public class EksService implements TagHandler, ResourceProvider {
                 .min(Comparator.comparing(Nodegroup::getCreatedAt,
                         Comparator.nullsLast(Comparator.naturalOrder()))
                 .thenComparing(Nodegroup::getNodegroupName));
+    }
+
+    List<Nodegroup> listNodeGroupsForCluster(String clusterName, String accountId) {
+        String prefix = clusterName + "/";
+        if (nodeGroupStorage instanceof AccountAwareStorageBackend<Nodegroup> aware) {
+            return aware.scanAllAccountEntries(key -> key.startsWith(prefix)).stream()
+                    .filter(entry -> accountId == null || accountId.equals(entry.accountId()))
+                    .map(AccountAwareStorageBackend.AccountEntry::value).toList();
+        }
+        return nodeGroupStorage.scan(key -> key.startsWith(prefix));
     }
 
     /**
@@ -280,7 +378,9 @@ public class EksService implements TagHandler, ResourceProvider {
                         cluster.getIdentity().getOidc().getIssuer());
                 continue;
             }
-            String issuer = oidcService.newIssuerUrl(config.defaultRegion());
+            // The cluster's own region, from its ARN: the issuer must match the one create mints there.
+            String issuer = oidcService.newIssuerUrl(
+                    AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion()));
             cluster.setIdentity(new ClusterIdentity(new OidcIdentity(issuer)));
             oidcService.ensureKeyForAccount(accountId, cluster.getName(), issuer);
             putClusterForAccount(accountId, cluster);
@@ -298,20 +398,41 @@ public class EksService implements TagHandler, ResourceProvider {
     }
 
     void deleteClusterForAccount(String accountId, String clusterName) {
+        synchronized (capacityLock(accountId, clusterName)) {
+            deleteClusterForAccountHoldingCapacity(accountId, clusterName);
+        }
+    }
+
+    private void deleteClusterForAccountHoldingCapacity(String accountId, String clusterName) {
         Cluster cluster = (storage instanceof AccountAwareStorageBackend<Cluster> aware)
                 ? aware.getForAccount(accountId, clusterName).orElse(null)
                 : storage.get(clusterName).orElse(null);
-        clearAppliedClusterUserData(cluster, clusterName);
-        if (cluster == null || cluster.getArn() == null) {
-            String fallbackArn = AwsArnUtils.Arn.of("eks", config.defaultRegion(), accountId,
-                    "cluster/" + clusterName).toString();
-            appliedClusterUserData.remove(fallbackArn);
+        if (cluster != null) {
+            if (cluster.getAccountId() == null) {
+                cluster.setAccountId(accountId);
+            }
+            clustersBeingDeleted.add(cluster);
+            cluster.setStatus(ClusterStatus.DELETING);
         }
-        if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
-            aware.deleteForAccount(accountId, clusterName);
-            return;
+        try {
+            clearAppliedClusterUserData(cluster, clusterName);
+            if (cluster == null || cluster.getArn() == null) {
+                String fallbackArn = AwsArnUtils.Arn.of("eks", config.defaultRegion(), accountId,
+                        "cluster/" + clusterName).toString();
+                appliedClusterUserData.remove(fallbackArn);
+            }
+            synchronized (clustersBeingDeleted) {
+                if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
+                    aware.deleteForAccount(accountId, clusterName);
+                    return;
+                }
+                storage.delete(clusterName);
+            }
+        } finally {
+            if (cluster != null) {
+                clustersBeingDeleted.remove(cluster);
+            }
         }
-        storage.delete(clusterName);
     }
 
     private void clearAppliedClusterUserData(Cluster cluster, String fallbackName) {
@@ -338,7 +459,7 @@ public class EksService implements TagHandler, ResourceProvider {
                     new Tag("kubernetes.io/cluster/" + clusterName, "owned"),
                     new Tag("aws:eks:cluster-name", clusterName)
             );
-            ec2Service.createTags(region, List.of(sg.getGroupId()), tags);
+            ec2Service.createSystemTags(region, List.of(sg.getGroupId()), tags);
 
             UserIdGroupPair selfPair = new UserIdGroupPair();
             selfPair.setGroupId(sg.getGroupId());
@@ -539,6 +660,18 @@ public class EksService implements TagHandler, ResourceProvider {
         }
 
         cluster.setRoleArn(request.getRoleArn());
+
+        List<String> clusterArgs;
+        try {
+            clusterArgs = EksClusterArgs.parseAndValidateClusterArgs(request.getTags(), name);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("InvalidParameterException", e.getMessage(), 400);
+        }
+        if (!clusterArgs.isEmpty()) {
+            cluster.setClusterArgs(clusterArgs);
+        }
+        cluster.setTags(request.getTags() != null ? ReservedTags.stripReservedTags(request.getTags()) : new HashMap<>());
+
         ResourcesVpcConfig vpcConfig = buildVpcConfigResponse(request.getResourcesVpcConfig(), resolvedVpcId);
         SecurityGroup clusterSg = null;
         if (ec2Service != null && !vpcConfig.getVpcId().isBlank()) {
@@ -560,7 +693,6 @@ public class EksService implements TagHandler, ResourceProvider {
         cluster.setLogging(buildLogging(request.getLogging()));
         cluster.setEncryptionConfig(buildEncryptionConfig(request.getEncryptionConfig()));
         cluster.setStatus(ClusterStatus.CREATING);
-        cluster.setTags(request.getTags() != null ? new HashMap<>(request.getTags()) : new HashMap<>());
         cluster.setPlatformVersion("eks.1");
         cluster.setCertificateAuthority(new CertificateAuthority(""));
 
@@ -617,6 +749,37 @@ public class EksService implements TagHandler, ResourceProvider {
                 ? aware.getForAccount(accountId, name) : storage.get(name);
     }
 
+    /**
+     * The ARN of what an EKS route names in the caller's account, looked up as its handler looks it up: the
+     * cluster {@code clusterName} when {@code collection} is null, or else the node group, Fargate profile,
+     * add-on, access entry or Pod Identity association {@code name} in that cluster, by the route's
+     * collection segment, or for the update {@code name} the add-on it was made to. Empty when there is none,
+     * or the handler would refuse the lookup.
+     */
+    public Optional<String> findResourceArn(String clusterName, String collection, String name) {
+        Optional<Cluster> cluster = storage.get(clusterName);
+        if (cluster.isEmpty() || collection == null) {
+            return cluster.map(Cluster::getArn);
+        }
+        try {
+            return Optional.ofNullable(switch (collection) {
+                case "node-groups" -> describeNodeGroup(clusterName, name).getNodegroupArn();
+                case "fargate-profiles" -> describeFargateProfile(clusterName, name).getFargateProfileArn();
+                case "addons" -> addons.describe(cluster.get(), name).addonArn();
+                case "access-entries" -> accessEntries.describe(cluster.get(), name).accessEntryArn();
+                case "pod-identity-associations" -> podIdentityAssociations.describe(cluster.get(), name).associationArn();
+                case "updates" -> {
+                    String addon = addons.updateAddonName(cluster.get(), name);
+                    yield addon == null ? null : addons.describe(cluster.get(), addon).addonArn();
+                }
+                default -> null;
+            });
+        } catch (AwsException expected) {
+            // The handler answers this lookup with the same error, so the route names no resource to act on.
+            return Optional.empty();
+        }
+    }
+
     public Cluster describeCluster(String name) {
         Cluster cluster = storage.get(name)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
@@ -627,6 +790,69 @@ public class EksService implements TagHandler, ResourceProvider {
         return cluster;
     }
 
+    @Override
+    public void onInstanceLaunched(String accountId, String region, Instance instance) {
+        extractInstanceClusterName(instance).ifPresent(name ->
+                RequestScopes.runAs(accountId, region, () -> {
+                    try {
+                        Cluster cluster = describeCluster(name);
+                        validateInstanceRegion(cluster, instance);
+                        saveClusterIfNotDeleting(accountId, name, current ->
+                                clusterManager.recordJoinedInstanceId(current, instance));
+                    } catch (AwsException e) {
+                        LOG.warnv("Cannot join instance {0} to cluster {1}: {2}",
+                                instance.getInstanceId(), name, e.getMessage());
+                    } catch (Exception e) {
+                        LOG.warnv("Failed to join instance {0} to cluster {1}: {2}",
+                                instance.getInstanceId(), name, e.getMessage());
+                    }
+                }));
+    }
+
+    private Optional<String> extractInstanceClusterName(Instance instance) {
+        return (instance != null && instance.getUserData() != null && !instance.getUserData().isBlank())
+                ? EksBootstrapUserData.extractClusterName(instance.getUserData()) : Optional.empty();
+    }
+
+    void joinInstance(String clusterName, Instance instance) {
+        Cluster cluster = describeCluster(clusterName);
+        validateInstanceRegion(cluster, instance);
+        clusterManager.joinInstance(cluster, instance);
+        storage.put(cluster.getName(), cluster);
+    }
+
+    void joinInstance(String clusterName, String instanceId) {
+        String region = resolveClusterRegion(describeCluster(clusterName));
+        Instance instance = ec2Service != null ? ec2Service.getInstance(region, instanceId).orElse(null) : null;
+        if (instance == null) {
+            throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + instanceId + "' does not exist", 400);
+        }
+        joinInstance(clusterName, instance);
+    }
+
+    private void validateInstanceRegion(Cluster cluster, Instance instance) {
+        String clusterReg = resolveClusterRegion(cluster);
+        String instReg = instance.getRegion();
+        if (instReg == null && instance.getPlacement() != null && instance.getPlacement().getAvailabilityZone() != null) {
+            String az = instance.getPlacement().getAvailabilityZone();
+            if (az.length() > 1 && Character.isLetter(az.charAt(az.length() - 1))) {
+                instReg = az.substring(0, az.length() - 1);
+            }
+        }
+        if (instReg != null && !instReg.equals(clusterReg)) {
+            throw new AwsException("InvalidParameterException", "Cannot join instance " + instance.getInstanceId()
+                    + " in region " + instReg + " to cluster " + cluster.getName() + " in region " + clusterReg, 400);
+        }
+    }
+
+    List<Instance> getJoinedInstances(String clusterName) {
+        return clusterManager.getJoinedInstances(describeCluster(clusterName));
+    }
+
+    boolean isInstanceJoined(String clusterName, String instanceId) {
+        return clusterManager.isInstanceJoined(describeCluster(clusterName), instanceId);
+    }
+
     public List<String> listClusters() {
         return storage.scan(k -> true).stream()
                 .map(Cluster::getName)
@@ -634,26 +860,57 @@ public class EksService implements TagHandler, ResourceProvider {
     }
 
     public Cluster deleteCluster(String name) {
-        Cluster cluster = storage.get(name)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "No cluster found for name: " + name, 404));
+        // A first node group replacing the node holds this lock while the swap runs; deleting
+        // meanwhile would find no container to stop and have its cluster written back. Read the
+        // cluster only once the lock is held: a delete that waited may find it gone.
+        synchronized (capacityLock(regionResolver.getAccountId(), name)) {
+            Cluster cluster = storage.get(name)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "No cluster found for name: " + name, 404));
+            if (cluster.getAccountId() == null) {
+                cluster.setAccountId(regionResolver.getAccountId());
+            }
+            return deleteClusterHoldingCapacity(name, cluster);
+        }
+    }
 
-        cluster.setStatus(ClusterStatus.DELETING);
-        if (!config.services().eks().mock()) {
-            clusterManager.stopCluster(cluster);
+    private Cluster deleteClusterHoldingCapacity(String name, Cluster cluster) {
+        // One delete at a time per cluster, so a delete that fails cannot restore the status or
+        // state of a cluster another delete is tearing down. Deletes from other threads already
+        // wait on the capacity lock; this refuses one nested on the same thread.
+        if (!clustersBeingDeleted.add(cluster)) {
+            throw new AwsException("ResourceInUseException",
+                    "Cluster is already being deleted: " + name, 409);
         }
-        deleteClusterSecurityGroup(cluster);
-        accessEntries.deleteClusterEntries(cluster);
-        if (podIdentityAssociations != null) {
-            podIdentityAssociations.deleteClusterAssociations(cluster);
+        try {
+            ClusterStatus previousStatus = cluster.getStatus();
+            cluster.setStatus(ClusterStatus.DELETING);
+            if (!config.services().eks().mock()) {
+                try {
+                    clusterManager.stopCluster(cluster);
+                } catch (RuntimeException e) {
+                    // The cluster record is kept for a retry, so it must not stay stuck in DELETING.
+                    cluster.setStatus(previousStatus);
+                    throw e;
+                }
+            }
+            deleteClusterSecurityGroup(cluster);
+            accessEntries.deleteClusterEntries(cluster);
+            if (podIdentityAssociations != null) {
+                podIdentityAssociations.deleteClusterAssociations(cluster);
+            }
+            if (addons != null) {
+                addons.deleteClusterAddons(cluster);
+            }
+            synchronized (clustersBeingDeleted) {
+                storage.delete(name);
+                clearAppliedClusterUserData(cluster, name);
+                oidcService.deleteKey(name);
+            }
+            return cluster;
+        } finally {
+            clustersBeingDeleted.remove(cluster);
         }
-        if (addons != null) {
-            addons.deleteClusterAddons(cluster);
-        }
-        storage.delete(name);
-        clearAppliedClusterUserData(cluster, name);
-        oidcService.deleteKey(name);
-        return cluster;
     }
 
     public Nodegroup createNodeGroup(String clusterName, CreateNodeGroupRequest request) {
@@ -742,8 +999,7 @@ public class EksService implements TagHandler, ResourceProvider {
         nodeGroup.setTags(request.getTags() != null ? new HashMap<>(request.getTags()) : new HashMap<>());
 
         String capacityKey = accountId + "/" + clusterName;
-        Object capacityLock = nodeGroupCapacityLocks.computeIfAbsent(capacityKey,
-                ignored -> new Object());
+        Object capacityLock = capacityLock(accountId, clusterName);
         boolean hasUserData = launchTemplateData != null && launchTemplateData.getUserData() != null
                 && !launchTemplateData.getUserData().isBlank();
         Cluster currentCluster;
@@ -759,6 +1015,10 @@ public class EksService implements TagHandler, ResourceProvider {
             boolean firstGroup = firstNodeGroup(clusterName, accountId).isEmpty() && pendingFirst == null;
             if (firstGroup && !config.services().eks().mock() && clusterManager != null) {
                 applyFirstNodeGroupCapacity(clusterName, nodegroupName, currentCluster, nodeGroup);
+                if (currentCluster.getContainerId() != null && currentCluster.getStatus() == ClusterStatus.ACTIVE) {
+                    LOG.infov("EKS cluster {0} is already running; nodegroup {1} node labels and taints are not applied to the running node",
+                            clusterName, nodegroupName);
+                }
             } else if (!firstGroup && pendingFirst == null
                     && !config.services().eks().mock() && clusterManager != null) {
                 if (currentCluster.getNodeInstanceType() == null) {
@@ -771,6 +1031,13 @@ public class EksService implements TagHandler, ResourceProvider {
                     LOG.warnv("EKS cluster {0} has one shared node; nodegroup {1} cannot change its capacity from {2}",
                             clusterName, nodegroupName, currentCluster.getNodeInstanceType());
                 }
+                firstNodeGroup(clusterName, accountId).ifPresent(first -> {
+                    if (!nodegroupName.equals(first.getNodegroupName())) {
+                        LOG.warnv(
+                                "EKS cluster {0} has one shared node; nodegroup {1} metadata (labels/taints) is not applied to the node (already represented by nodegroup {2})",
+                                clusterName, nodegroupName, first.getNodegroupName());
+                    }
+                });
             }
 
             if (nodeGroup.getStatus() == NodegroupStatus.ACTIVE && (hasUserData || pendingFirst != null)) {
@@ -839,13 +1106,16 @@ public class EksService implements TagHandler, ResourceProvider {
         String previousType = EksClusterManager.nodeInstanceType(currentCluster);
         currentCluster.setNodeInstanceType(selectedType);
         if (currentCluster.getContainerId() != null && !selectedType.equals(previousType)) {
-            currentCluster.setStatus(ClusterStatus.CREATING);
             try {
                 if (!clusterManager.restartForNodeCapacity(currentCluster, previousType)) {
                     nodeGroup.setStatus(NodegroupStatus.CREATE_FAILED);
                     nodeGroup.setHealth(failedNodeGroupHealth(nodegroupName,
                             "Could not apply node capacity; the previous node was restored"));
                 }
+                // Set only now: before the swap the poller would verify the old container, still
+                // answering while it stops. A failed swap restarts the previous node, so it is
+                // verified too.
+                currentCluster.setFinalizePending(true);
             } catch (RuntimeException e) {
                 currentCluster.setNodeInstanceType(previousType);
                 currentCluster.setStatus(ClusterStatus.FAILED);
@@ -917,9 +1187,13 @@ public class EksService implements TagHandler, ResourceProvider {
                 .collect(Collectors.toList());
     }
 
+    /** Serializes node group capacity changes and cluster deletion; taken before clustersBeingDeleted. */
+    private Object capacityLock(String accountId, String clusterName) {
+        return nodeGroupCapacityLocks.computeIfAbsent(accountId + "/" + clusterName, ignored -> new Object());
+    }
+
     public Nodegroup deleteNodeGroup(String clusterName, String nodegroupName) {
-        Object capacityLock = nodeGroupCapacityLocks.computeIfAbsent(
-                regionResolver.getAccountId() + "/" + clusterName, ignored -> new Object());
+        Object capacityLock = capacityLock(regionResolver.getAccountId(), clusterName);
         synchronized (capacityLock) {
             Nodegroup nodeGroup = describeNodeGroup(clusterName, nodegroupName);
             nodeGroup.setStatus(NodegroupStatus.DELETING);
@@ -930,7 +1204,7 @@ public class EksService implements TagHandler, ResourceProvider {
     }
 
     public FargateProfile createFargateProfile(String clusterName, CreateFargateProfileRequest request) {
-        describeCluster(clusterName);
+        Cluster cluster = describeCluster(clusterName);
 
         String fargateProfileName = request.getFargateProfileName();
         if (fargateProfileName == null || fargateProfileName.isBlank()) {
@@ -946,7 +1220,7 @@ public class EksService implements TagHandler, ResourceProvider {
                     "Fargate profile already exists: " + fargateProfileName, 409);
         }
 
-        String region = config.defaultRegion();
+        String region = resolveClusterRegion(cluster);
         String accountId = regionResolver.getAccountId();
         String id = UUID.randomUUID().toString();
         String arn = AwsArnUtils.Arn.of("eks", region, accountId,
@@ -996,41 +1270,41 @@ public class EksService implements TagHandler, ResourceProvider {
         return "eks";
     }
 
+    /** EKS models no {@code responseCode} on either tag write, so both answer 200. */
+    @Override
+    public int tagResourceSuccessStatus() {
+        return 200;
+    }
+
+    @Override
+    public int untagResourceSuccessStatus() {
+        return 200;
+    }
+
     @Override
     public void tagResource(String region, String resourceArn, Map<String, String> tags) {
-        String clusterName = extractClusterName(resourceArn);
-        Cluster cluster = storage.get(clusterName)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "Resource not found: " + resourceArn, 404));
-
-        if (cluster.getTags() == null) {
-            cluster.setTags(new HashMap<>());
-        }
-        cluster.getTags().putAll(tags);
-        storage.put(clusterName, cluster);
+        ReservedTags.rejectReservedTagsOnUpdate(tags);
+        retag(resourceArn, current -> {
+            Map<String, String> next = new HashMap<>(current);
+            next.putAll(tags);
+            return next;
+        });
     }
 
     @Override
     public void untagResource(String region, String resourceArn, List<String> tagKeys) {
-        String clusterName = extractClusterName(resourceArn);
-        Cluster cluster = storage.get(clusterName)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "Resource not found: " + resourceArn, 404));
-
-        if (cluster.getTags() != null && tagKeys != null) {
-            tagKeys.forEach(cluster.getTags()::remove);
-        }
-        storage.put(clusterName, cluster);
+        retag(resourceArn, current -> {
+            Map<String, String> next = new HashMap<>(current);
+            if (tagKeys != null) {
+                tagKeys.forEach(next::remove);
+            }
+            return next;
+        });
     }
 
     @Override
     public Map<String, String> listTags(String region, String resourceArn) {
-        String clusterName = extractClusterName(resourceArn);
-        Cluster cluster = storage.get(clusterName)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "Resource not found: " + resourceArn, 404));
-
-        return cluster.getTags() != null ? cluster.getTags() : Map.of();
+        return retag(resourceArn, UnaryOperator.identity());
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags) {
@@ -1045,14 +1319,81 @@ public class EksService implements TagHandler, ResourceProvider {
         return listTags(null, resourceArn);
     }
 
-    private String extractClusterName(String resourceArn) {
-        // arn:aws:eks:us-east-1:000000000000:cluster/my-cluster
-        int idx = resourceArn.lastIndexOf('/');
-        if (idx < 0 || idx == resourceArn.length() - 1) {
-            throw new AwsException("InvalidParameterException",
-                    "Invalid resource ARN: " + resourceArn, 400);
+    /**
+     * Applies {@code edit} to the tags of the resource {@code resourceArn} names and returns them.
+     * TagResource takes a cluster, node group, Fargate profile, add-on, pod identity association or
+     * access entry ARN; each child ARN names its cluster as the segment after the resource type.
+     */
+    private Map<String, String> retag(String resourceArn, UnaryOperator<Map<String, String>> edit) {
+        String resource = AwsArnUtils.isArnFor(resourceArn, "eks") ? AwsArnUtils.parse(resourceArn).resource() : "";
+        String[] parts = resource.split("/", -1);
+        boolean child = !"cluster".equals(parts[0]);
+        if (parts.length < (child ? 3 : 2) || parts[1].isEmpty() || (child && parts[2].isEmpty())) {
+            throw new AwsException("BadRequestException", "Invalid resource ARN: " + resourceArn, 400);
         }
-        return resourceArn.substring(idx + 1);
+        String clusterName = parts[1];
+        String childName = child ? parts[2] : "";
+        UnaryOperator<Map<String, String>> change = current -> {
+            Map<String, String> next = edit.apply(current);
+            if (!next.equals(current)) {
+                checkTagLimits(next);
+            }
+            return next;
+        };
+        Optional<Map<String, String>> tags = switch (parts[0]) {
+            case "cluster" -> storage.get(clusterName).map(cluster -> applyTags(cluster.getTags(), change, next -> {
+                cluster.setTags(new HashMap<>(next));
+                storage.put(clusterName, cluster);
+            }));
+            case "nodegroup" -> nodeGroupStorage.get(nodeGroupKey(clusterName, childName))
+                    .filter(nodegroup -> resourceArn.equals(nodegroup.getNodegroupArn()))
+                    .map(nodegroup -> applyTags(nodegroup.getTags(), change, next -> {
+                        nodegroup.setTags(new HashMap<>(next));
+                        nodeGroupStorage.put(nodeGroupKey(clusterName, childName), nodegroup);
+                    }));
+            case "fargateprofile" -> fargateProfileStorage.get(fargateProfileKey(clusterName, childName))
+                    .filter(profile -> resourceArn.equals(profile.getFargateProfileArn()))
+                    .map(profile -> applyTags(profile.getTags(), change, next -> {
+                        profile.setTags(new HashMap<>(next));
+                        fargateProfileStorage.put(fargateProfileKey(clusterName, childName), profile);
+                    }));
+            case "addon" -> addons == null ? Optional.empty() : storage.get(clusterName)
+                    .flatMap(cluster -> addons.retag(cluster, childName, resourceArn, change));
+            case "podidentityassociation" -> podIdentityAssociations == null ? Optional.empty()
+                    : storage.get(clusterName)
+                            .flatMap(cluster -> podIdentityAssociations.retag(cluster, childName, resourceArn, change));
+            case "access-entry" -> accessEntries == null ? Optional.empty() : storage.get(clusterName)
+                    .flatMap(cluster -> accessEntries.retag(cluster, resourceArn, change));
+            default -> Optional.empty();
+        };
+        return tags.orElseThrow(() -> new AwsException("NotFoundException",
+                "Resource not found: " + resourceArn, 404));
+    }
+
+    /** The TagMap limits: at most 50 tags, keys of 1 to 128 characters and values of at most 256. */
+    private static void checkTagLimits(Map<String, String> tags) {
+        if (tags.size() > 50) {
+            throw new AwsException("BadRequestException", "Too many tags: maximum is 50", 400);
+        }
+        for (Map.Entry<String, String> tag : tags.entrySet()) {
+            if (tag.getKey() == null || tag.getKey().isEmpty() || tag.getKey().length() > 128) {
+                throw new AwsException("BadRequestException", "Invalid tag key: " + tag.getKey(), 400);
+            }
+            if (tag.getValue() == null || tag.getValue().length() > 256) {
+                throw new AwsException("BadRequestException", "Invalid tag value for key: " + tag.getKey(), 400);
+            }
+        }
+    }
+
+    /** The tags {@code change} makes of {@code current}, handed to {@code store} only when they differ. */
+    private static Map<String, String> applyTags(Map<String, String> current,
+                                                 UnaryOperator<Map<String, String>> change,
+                                                 Consumer<Map<String, String>> store) {
+        Map<String, String> next = Map.copyOf(change.apply(current != null ? current : Map.of()));
+        if (!next.equals(current)) {
+            store.accept(next);
+        }
+        return next;
     }
 
     /**
@@ -1389,22 +1730,63 @@ public class EksService implements TagHandler, ResourceProvider {
     }
 
     private void startReadinessPoller() {
-        poller.scheduleAtFixedRate(() -> {
-            try {
-                for (Cluster cluster : allClusters()) {
-                    if (cluster.getStatus() == ClusterStatus.CREATING) {
-                        if (clusterManager.isReady(cluster)) {
-                            LOG.infov("EKS cluster {0} is now ACTIVE", cluster.getName());
-                            clusterManager.finalizeCluster(cluster);
+        poller.scheduleAtFixedRate(this::pollClusterReadiness, 2, 3, TimeUnit.SECONDS);
+    }
+
+    void pollClusterReadiness() {
+        try {
+            for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+                Cluster cluster = entry.value();
+                boolean replacedNode = cluster.getStatus() == ClusterStatus.ACTIVE && cluster.isFinalizePending();
+                if (cluster.getStatus() == ClusterStatus.CREATING || replacedNode) {
+                    if (clusterManager.isReady(cluster)) {
+                        clusterManager.finalizeCluster(cluster);
+                        // A delete that ran while the API server was probed must not get its
+                        // cluster written back.
+                        synchronized (clustersBeingDeleted) {
+                            if (isClusterDeleting(entry.accountId(), cluster)) {
+                                continue;
+                            }
+                            cluster.setFinalizePending(false);
                             cluster.setStatus(ClusterStatus.ACTIVE);
                             putCluster(cluster);
                         }
+                        if (replacedNode) {
+                            LOG.infov("Replaced k3s node of EKS cluster {0} is ready", cluster.getName());
+                        } else {
+                            LOG.infov("EKS cluster {0} is now ACTIVE", cluster.getName());
+                        }
+                        restoreJoinedInstancesAsync(entry.accountId(), cluster);
                     }
+                } else if (cluster.getStatus() == ClusterStatus.ACTIVE && hasPendingJoinedInstances(cluster)) {
+                    restoreJoinedInstancesAsync(entry.accountId(), cluster);
                 }
-            } catch (Exception e) {
-                LOG.error("Error in EKS readiness poller", e);
             }
-        }, 2, 3, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            LOG.error("Error in EKS readiness poller", e);
+        }
+    }
+
+    private void restoreJoinedInstancesAsync(String accountId, Cluster cluster) {
+        if (cluster == null || cluster.getName() == null || isClusterDeleting(accountId, cluster)) {
+            return;
+        }
+        String key = (accountId != null ? accountId : "default") + "/" + cluster.getName();
+        if (!restoringClusters.add(key)) {
+            return;
+        }
+        CompletableFuture.runAsync(() -> {
+            try {
+                restoreJoinedInstances(accountId, cluster);
+            } finally {
+                restoringClusters.remove(key);
+            }
+        });
+    }
+
+    private boolean hasPendingJoinedInstances(Cluster cluster) {
+        return cluster != null && cluster.getJoinedInstanceIds() != null
+                && cluster.getJoinedInstanceIds().keySet().stream().anyMatch(id -> !clusterManager.isInstanceJoined(cluster, id));
     }
 
     public Optional<Cluster> findClusterByIssuer(String issuer) {

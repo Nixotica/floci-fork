@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
+import io.github.hectorvent.floci.services.iam.PublicAccessConditions;
 import org.jboss.logging.Logger;
 
 import java.util.Iterator;
@@ -47,12 +48,6 @@ final class S3PublicAccessEvaluator {
         ALLOW,
         DENY,
         NEUTRAL
-    }
-
-    record PrincipalPolicyEvaluation(
-            PublicAccessDecision decision,
-            boolean directPrincipalAllow
-    ) {
     }
 
     private S3PublicAccessEvaluator() {
@@ -101,25 +96,12 @@ final class S3PublicAccessEvaluator {
             String action,
             String resourceArn,
             Map<String, String> context) {
-        return principalPolicyEvaluation(
-                objectMapper, policy, principalType, principalValue, action, resourceArn, context).decision();
-    }
-
-    static PrincipalPolicyEvaluation principalPolicyEvaluation(
-            ObjectMapper objectMapper,
-            String policy,
-            String principalType,
-            String principalValue,
-            String action,
-            String resourceArn,
-            Map<String, String> context) {
         if (policy == null || policy.isBlank()) {
-            return new PrincipalPolicyEvaluation(PublicAccessDecision.NEUTRAL, false);
+            return PublicAccessDecision.NEUTRAL;
         }
         try {
             JsonNode statements = objectMapper.readTree(policy).path("Statement");
             boolean allowed = false;
-            boolean directPrincipalAllow = false;
             Iterable<JsonNode> iterable = statements.isArray() ? statements : List.of(statements);
             for (JsonNode statement : iterable) {
                 String effect = statement.path("Effect").asText("");
@@ -135,18 +117,14 @@ final class S3PublicAccessEvaluator {
                     continue;
                 }
                 if ("Deny".equalsIgnoreCase(effect)) {
-                    return new PrincipalPolicyEvaluation(PublicAccessDecision.DENY, false);
+                    return PublicAccessDecision.DENY;
                 }
                 allowed = true;
-                directPrincipalAllow |= principalDirectlyMatches(
-                        statement, principalType, principalValue);
             }
-            PublicAccessDecision decision = allowed
-                    ? PublicAccessDecision.ALLOW : PublicAccessDecision.NEUTRAL;
-            return new PrincipalPolicyEvaluation(decision, directPrincipalAllow);
+            return allowed ? PublicAccessDecision.ALLOW : PublicAccessDecision.NEUTRAL;
         } catch (JsonProcessingException e) {
             LOG.debugv("Failed to evaluate S3 bucket policy for principal access: {0}", e.getMessage());
-            return new PrincipalPolicyEvaluation(PublicAccessDecision.NEUTRAL, false);
+            return PublicAccessDecision.NEUTRAL;
         }
     }
 
@@ -197,7 +175,8 @@ final class S3PublicAccessEvaluator {
             return hasPublicPrincipal(statement.path("Principal"));
         }
         // An Allow on NotPrincipal grants to everyone the statement does not name.
-        return statement.hasNonNull("NotPrincipal");
+        return statement.hasNonNull("NotPrincipal")
+                && !hasPublicPrincipal(statement.path("NotPrincipal"));
     }
 
     private static boolean conditionPinsToFixedValues(JsonNode conditions) {
@@ -224,7 +203,7 @@ final class S3PublicAccessEvaluator {
                 }
                 if (NON_PUBLIC_CONDITION_KEYS.contains(key)
                         && !operatorName.equalsIgnoreCase("IpAddress")
-                        && allValuesFixed(entry.getValue(), S3PublicAccessEvaluator::isFixedValue)) {
+                        && allValuesFixed(entry.getValue(), PublicAccessConditions::isFixedValue)) {
                     return true;
                 }
                 if (SOURCE_IP_CONDITION_KEY.equals(key)
@@ -262,13 +241,6 @@ final class S3PublicAccessEvaluator {
         return false;
     }
 
-    private static boolean isFixedValue(String value) {
-        return !value.isEmpty()
-                && value.indexOf('*') < 0
-                && value.indexOf('?') < 0
-                && !value.contains("${");
-    }
-
     private static boolean isFixedAccountAccessPointArn(String value) {
         return BUCKET_POLICY_ACCESS_POINT_ARN.matcher(value).matches();
     }
@@ -278,40 +250,17 @@ final class S3PublicAccessEvaluator {
             return false;
         }
         if (value.isTextual()) {
-            return isNarrowCidr(value.asText());
+            return PublicAccessConditions.isNarrowSourceIp(value.asText());
         }
         if (value.isArray() && !value.isEmpty()) {
             for (JsonNode item : value) {
-                if (!item.isTextual() || !isNarrowCidr(item.asText())) {
+                if (!item.isTextual() || !PublicAccessConditions.isNarrowSourceIp(item.asText())) {
                     return false;
                 }
             }
             return true;
         }
         return false;
-    }
-
-    /**
-     * AWS still calls a policy public when it is conditioned on an {@code aws:SourceIp} range
-     * broader than /8 for IPv4 or /32 for IPv6, so only a prefix at least that long makes the
-     * statement non-public. A bare address carries no prefix and is as narrow as a range gets.
-     */
-    private static boolean isNarrowCidr(String cidr) {
-        int slash = cidr.indexOf('/');
-        if (slash < 0) {
-            return isFixedValue(cidr);
-        }
-        String address = cidr.substring(0, slash);
-        if (!isFixedValue(address)) {
-            return false;
-        }
-        try {
-            int prefixLength = Integer.parseInt(cidr.substring(slash + 1).trim());
-            return address.indexOf(':') >= 0 ? prefixLength >= 32 : prefixLength >= 8;
-        } catch (NumberFormatException e) {
-            LOG.debugv("Treating aws:SourceIp value with an unparseable prefix as public: {0}", cidr);
-            return false;
-        }
     }
 
     static String bucketArn(String partition, String bucketName) {
@@ -346,83 +295,6 @@ final class S3PublicAccessEvaluator {
         if (statement.hasNonNull("NotPrincipal")) {
             return !principalNodeMatches(
                     statement.path("NotPrincipal"), principalType, principalValue);
-        }
-        return false;
-    }
-
-    private static boolean principalDirectlyMatches(
-            JsonNode statement, String principalType, String principalValue) {
-        if (!statement.hasNonNull("Principal")) {
-            return false;
-        }
-        JsonNode principal = statement.path("Principal");
-        return principalNodeDirectlyMatches(principal, principalType, principalValue)
-                || ("AWS".equalsIgnoreCase(principalType)
-                && hasPublicPrincipal(principal)
-                && conditionDirectlyMatchesPrincipalArn(
-                        statement.path("Condition"), principalValue));
-    }
-
-    private static boolean conditionDirectlyMatchesPrincipalArn(
-            JsonNode conditions, String principalValue) {
-        if (conditions == null || !conditions.isObject()) {
-            return false;
-        }
-        Iterator<Map.Entry<String, JsonNode>> operators = conditions.fields();
-        while (operators.hasNext()) {
-            Map.Entry<String, JsonNode> operator = operators.next();
-            if (!("StringEquals".equalsIgnoreCase(operator.getKey())
-                    || "ArnEquals".equalsIgnoreCase(operator.getKey()))
-                    || !operator.getValue().isObject()) {
-                continue;
-            }
-            Iterator<Map.Entry<String, JsonNode>> entries = operator.getValue().fields();
-            while (entries.hasNext()) {
-                Map.Entry<String, JsonNode> entry = entries.next();
-                if ("aws:PrincipalArn".equalsIgnoreCase(entry.getKey())
-                        && conditionValueMatches(entry.getValue(), principalValue, false)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private static boolean principalNodeDirectlyMatches(
-            JsonNode principal, String principalType, String principalValue) {
-        if (principal == null || principal.isMissingNode() || principal.isNull()) {
-            return false;
-        }
-        if (principal.isTextual() || principal.isArray()) {
-            return principalValueDirectlyMatches(principal, principalValue);
-        }
-        if (!principal.isObject()) {
-            return false;
-        }
-        Iterator<Map.Entry<String, JsonNode>> fields = principal.fields();
-        while (fields.hasNext()) {
-            Map.Entry<String, JsonNode> field = fields.next();
-            if (field.getKey().equalsIgnoreCase(principalType)
-                    && principalValueDirectlyMatches(field.getValue(), principalValue)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean principalValueDirectlyMatches(JsonNode candidate, String principalValue) {
-        if (candidate == null || candidate.isNull()) {
-            return false;
-        }
-        if (candidate.isTextual()) {
-            return candidate.asText().equals(principalValue);
-        }
-        if (candidate.isArray()) {
-            for (JsonNode item : candidate) {
-                if (principalValueDirectlyMatches(item, principalValue)) {
-                    return true;
-                }
-            }
         }
         return false;
     }

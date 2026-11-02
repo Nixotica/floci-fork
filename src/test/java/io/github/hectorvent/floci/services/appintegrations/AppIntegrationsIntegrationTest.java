@@ -1,10 +1,15 @@
 package io.github.hectorvent.floci.services.appintegrations;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ExtractableResponse;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -220,7 +225,7 @@ class AppIntegrationsIntegrationTest {
     @Test
     @Order(11)
     void createDataIntegration() {
-        var response = given()
+        ExtractableResponse<Response> response = given()
             .contentType("application/json")
             .body("""
                 {
@@ -263,8 +268,8 @@ class AppIntegrationsIntegrationTest {
             .body("Description", equalTo("salesforce pull"))
             .body("ScheduleConfiguration.FirstExecutionFrom", equalTo("1439788800000"));
 
-        String encodedArn = java.net.URLEncoder.encode(dataIntegrationArn,
-                java.nio.charset.StandardCharsets.UTF_8);
+        String encodedArn = URLEncoder.encode(dataIntegrationArn,
+                StandardCharsets.UTF_8);
         given()
             .urlEncodingEnabled(false)
         .when()

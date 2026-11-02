@@ -3,7 +3,9 @@ package io.github.hectorvent.floci.services.s3;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.s3.model.ChecksumAlgorithm;
+import io.github.hectorvent.floci.services.s3.model.CopyObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.ObjectAnnotation;
+import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -12,7 +14,9 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.List;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -230,7 +234,7 @@ class S3ServiceAnnotationsTest {
         putAnnotation("version-bound", "payload");
         String versionId = s3Service.getObject(BUCKET, "docs/readme.txt", null).getVersionId();
         s3Service.deleteObject(BUCKET, "docs/readme.txt", versionId);
-        assertThrowsAws("NoSuchKey", () ->
+        assertThrowsAws("NoSuchVersion", () ->
                 s3Service.getObjectAnnotation(BUCKET, "docs/readme.txt", "version-bound", versionId));
     }
 
@@ -348,7 +352,7 @@ class S3ServiceAnnotationsTest {
     void copyObjectCopiesAnnotationsByDefault() {
         putAnnotation("copied", "payload");
         s3Service.copyObject(BUCKET, "docs/readme.txt", BUCKET, "docs/copy.txt",
-                new io.github.hectorvent.floci.services.s3.model.CopyObjectOptions());
+                new CopyObjectOptions());
         ObjectAnnotation annotation = s3Service.getObjectAnnotation(BUCKET, "docs/copy.txt", "copied", null);
         assertEquals("payload", new String(
                 s3Service.readObjectAnnotationPayload(annotation), StandardCharsets.UTF_8));
@@ -361,7 +365,7 @@ class S3ServiceAnnotationsTest {
     void copyObjectWithExcludeDirectiveSkipsAnnotations() {
         putAnnotation("excluded", "payload");
         s3Service.copyObject(BUCKET, "docs/readme.txt", BUCKET, "docs/copy2.txt",
-                new io.github.hectorvent.floci.services.s3.model.CopyObjectOptions()
+                new CopyObjectOptions()
                         .withAnnotationDirective("EXCLUDE"));
         assertThrowsAws("NoSuchAnnotation", () ->
                 s3Service.getObjectAnnotation(BUCKET, "docs/copy2.txt", "excluded", null));
@@ -372,14 +376,14 @@ class S3ServiceAnnotationsTest {
         putAnnotation("cross-bucket", "payload");
         s3Service.createBucket("cross-bucket-dest", "us-east-1");
         s3Service.copyObject(BUCKET, "docs/readme.txt", "cross-bucket-dest", "docs/copy.txt",
-                new io.github.hectorvent.floci.services.s3.model.CopyObjectOptions());
+                new CopyObjectOptions());
         ObjectAnnotation annotation = s3Service.getObjectAnnotation("cross-bucket-dest",
                 "docs/copy.txt", "cross-bucket", null);
         assertEquals("payload", new String(
                 s3Service.readObjectAnnotationPayload(annotation), StandardCharsets.UTF_8));
 
         s3Service.copyObject(BUCKET, "docs/readme.txt", "cross-bucket-dest", "docs/copy-excluded.txt",
-                new io.github.hectorvent.floci.services.s3.model.CopyObjectOptions()
+                new CopyObjectOptions()
                         .withAnnotationDirective("EXCLUDE"));
         assertThrowsAws("NoSuchAnnotation", () ->
                 s3Service.getObjectAnnotation("cross-bucket-dest", "docs/copy-excluded.txt", "cross-bucket", null));
@@ -395,7 +399,7 @@ class S3ServiceAnnotationsTest {
         // root is empty for every account partition.
         Path accountsRoot = tempDir.resolve("s3").resolve(".accounts");
         if (Files.isDirectory(accountsRoot)) {
-            try (var accounts = Files.list(accountsRoot)) {
+            try (Stream<Path> accounts = Files.list(accountsRoot)) {
                 for (Path account : accounts.toList()) {
                     Path annotationsRoot = account.resolve(".annotations");
                     assertFalse(Files.exists(annotationsRoot),
@@ -458,7 +462,7 @@ class S3ServiceAnnotationsTest {
     void selfCopyPreservesAnnotations() {
         putAnnotation("kept-through-copy", "payload");
         s3Service.copyObject(BUCKET, "docs/readme.txt", BUCKET, "docs/readme.txt",
-                new io.github.hectorvent.floci.services.s3.model.CopyObjectOptions());
+                new CopyObjectOptions());
         assertEquals("payload", readPayload("kept-through-copy"));
         ObjectAnnotation annotation = s3Service.getObjectAnnotation(BUCKET, "docs/readme.txt",
                 "kept-through-copy", null);
@@ -467,15 +471,26 @@ class S3ServiceAnnotationsTest {
     }
 
     @Test
-    void deleteMarkerOnPreVersioningObjectRemovesItsAnnotations() throws Exception {
+    void deleteMarkerOnPreVersioningObjectPreservesItsAnnotationsUntilPermanentDeletion() throws Exception {
         putAnnotation("pre-versioning", "payload");
         s3Service.putBucketVersioning(BUCKET, "Enabled");
-        s3Service.deleteObject(BUCKET, "docs/readme.txt");
+        S3Object marker = s3Service.deleteObject(BUCKET, "docs/readme.txt");
 
-        // The annotations are gone, including the payload files on disk.
-        try (var stream = Files.walk(tempDir.resolve("s3").resolve(".accounts")
+        ObjectAnnotation annotation = s3Service.getObjectAnnotation(
+                BUCKET, "docs/readme.txt", "pre-versioning", "null");
+        assertEquals("payload", new String(
+                s3Service.readObjectAnnotationPayload(annotation), StandardCharsets.UTF_8));
+        try (Stream<Path> stream = Files.walk(tempDir.resolve("s3").resolve(".accounts")
                 .resolve("000000000000").resolve(".annotations"))) {
-            List<java.nio.file.Path> files = stream.filter(Files::isRegularFile).toList();
+            List<Path> files = stream.filter(Files::isRegularFile).toList();
+            assertEquals(1, files.size());
+        }
+
+        s3Service.deleteObject(BUCKET, "docs/readme.txt", marker.getVersionId());
+        s3Service.deleteObject(BUCKET, "docs/readme.txt", "null");
+        try (Stream<Path> stream = Files.walk(tempDir.resolve("s3").resolve(".accounts")
+                .resolve("000000000000").resolve(".annotations"))) {
+            List<Path> files = stream.filter(Files::isRegularFile).toList();
             assertTrue(files.isEmpty(), "annotation payload files should be removed, found: " + files);
         }
     }
@@ -492,10 +507,11 @@ class S3ServiceAnnotationsTest {
 
     @Test
     void governanceRetentionBlocksAnnotationDeleteWithoutBypass() {
+        s3Service.setBucketObjectLockEnabled(BUCKET);
         s3Service.putObject(BUCKET, "locked.txt", "body".getBytes(StandardCharsets.UTF_8),
-                null, null, new io.github.hectorvent.floci.services.s3.model.PutObjectOptions()
+                null, null, new PutObjectOptions()
                         .withObjectLockMode("GOVERNANCE")
-                        .withRetainUntilDate(java.time.Instant.now().plusSeconds(3600)));
+                        .withRetainUntilDate(Instant.now().plusSeconds(3600)));
         // Put is symmetric with delete: a retention-protected version cannot receive annotations.
         assertThrowsAws("AccessDenied", () ->
                 s3Service.putObjectAnnotation(BUCKET, "locked.txt", "locked-ann", null,
@@ -505,9 +521,9 @@ class S3ServiceAnnotationsTest {
         s3Service.putObjectAnnotation(BUCKET, "governed-plain.txt", "ann", null,
                 "payload".getBytes(StandardCharsets.UTF_8), null, null);
         s3Service.putObject(BUCKET, "governed-plain.txt", "body v2".getBytes(StandardCharsets.UTF_8),
-                null, null, new io.github.hectorvent.floci.services.s3.model.PutObjectOptions()
+                null, null, new PutObjectOptions()
                         .withObjectLockMode("GOVERNANCE")
-                        .withRetainUntilDate(java.time.Instant.now().plusSeconds(3600)));
+                        .withRetainUntilDate(Instant.now().plusSeconds(3600)));
         // Replacing the annotation via a re-put is blocked too: the protection cannot be
         // circumvented by a put.
         assertThrowsAws("AccessDenied", () ->
@@ -522,10 +538,11 @@ class S3ServiceAnnotationsTest {
 
     @Test
     void complianceRetentionBlocksAnnotationPutAndDelete() {
+        s3Service.setBucketObjectLockEnabled(BUCKET);
         s3Service.putObject(BUCKET, "compliance.txt", "body".getBytes(StandardCharsets.UTF_8),
-                null, null, new io.github.hectorvent.floci.services.s3.model.PutObjectOptions()
+                null, null, new PutObjectOptions()
                         .withObjectLockMode("COMPLIANCE")
-                        .withRetainUntilDate(java.time.Instant.now().plusSeconds(3600)));
+                        .withRetainUntilDate(Instant.now().plusSeconds(3600)));
         // Put is blocked outright on a COMPLIANCE-protected version (no bypass exists for put).
         assertThrowsAws("AccessDenied", () ->
                 s3Service.putObjectAnnotation(BUCKET, "compliance.txt", "compliance-ann", null,
@@ -558,9 +575,9 @@ class S3ServiceAnnotationsTest {
                 "disk-backed", null);
         assertEquals("on disk", readPayload("disk-backed"));
         // The .s3ann file exists under the account-scoped .annotations root.
-        try (var stream = Files.walk(tempDir.resolve("s3").resolve(".accounts")
+        try (Stream<Path> stream = Files.walk(tempDir.resolve("s3").resolve(".accounts")
                 .resolve("000000000000").resolve(".annotations"))) {
-            List<java.nio.file.Path> files = stream.filter(Files::isRegularFile).toList();
+            List<Path> files = stream.filter(Files::isRegularFile).toList();
             assertEquals(1, files.size());
             assertTrue(files.get(0).getFileName().toString().endsWith(".s3ann"));
             assertEquals("on disk", Files.readString(files.get(0), StandardCharsets.UTF_8));

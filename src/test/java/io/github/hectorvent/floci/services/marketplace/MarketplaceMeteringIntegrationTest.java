@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.marketplace;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
+import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -17,7 +19,7 @@ class MarketplaceMeteringIntegrationTest {
     @Test
     void resolveCustomerIsStableForRegistrationToken() {
         String body = "{\"RegistrationToken\":\"local-registration-token\"}";
-        var first = rpc("ResolveCustomer", body).statusCode(200)
+        Response first = rpc("ResolveCustomer", body).statusCode(200)
                 .body("CustomerAWSAccountId", notNullValue()).body("LicenseArn", notNullValue())
                 .extract().response();
         rpc("ResolveCustomer", body).statusCode(200)
@@ -50,7 +52,7 @@ class MarketplaceMeteringIntegrationTest {
                 .statusCode(200).body("Signature", matchesPattern("^[^.]+\\.[^.]+\\.[^.]+$"));
     }
 
-    private static io.restassured.response.ValidatableResponse rpc(String action, String body) {
+    private static ValidatableResponse rpc(String action, String body) {
         return given().contentType("application/x-amz-json-1.1").header("Authorization", auth())
                 .header("X-Amz-Target", "AWSMPMeteringService." + action).body(body).post("/").then();
     }

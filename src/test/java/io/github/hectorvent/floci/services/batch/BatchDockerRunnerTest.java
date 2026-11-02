@@ -30,9 +30,9 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -89,7 +89,7 @@ class BatchDockerRunnerTest {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
-        when(builder.build()).thenReturn(mock(ContainerSpec.class));
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
 
         BatchDockerRunner runner = new BatchDockerRunner(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), config, detector);
@@ -111,6 +111,8 @@ class BatchDockerRunnerTest {
                 "io.floci.resource-id", "job-1",
                 "io.floci.account", "000000000000",
                 "io.floci.region", "us-east-1"));
+        // A job's JVMs trust Floci's CA as well.
+        verify(builder).withJavaTrustStore();
     }
 
     @Test
@@ -144,7 +146,7 @@ class BatchDockerRunnerTest {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
-        when(builder.build()).thenReturn(mock(ContainerSpec.class));
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
         BatchDockerRunner runner = new BatchDockerRunner(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), config, mock(ContainerDetector.class));
         BatchJob job = job();
@@ -181,7 +183,7 @@ class BatchDockerRunnerTest {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
-        when(builder.build()).thenReturn(mock(ContainerSpec.class));
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
         BatchDockerRunner runner = new BatchDockerRunner(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), config, mock(ContainerDetector.class));
 
@@ -228,7 +230,7 @@ class BatchDockerRunnerTest {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
-        when(builder.build()).thenReturn(mock(ContainerSpec.class));
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
         BatchDockerRunner runner = new BatchDockerRunner(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), config, mock(ContainerDetector.class));
         BatchJob job = job();

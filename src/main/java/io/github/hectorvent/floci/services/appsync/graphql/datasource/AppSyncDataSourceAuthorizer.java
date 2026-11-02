@@ -3,10 +3,11 @@ package io.github.hectorvent.floci.services.appsync.graphql.datasource;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnShapes;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.services.appsync.model.DataSource;
 import io.github.hectorvent.floci.services.appsync.model.DataSourceType;
 import io.github.hectorvent.floci.services.iam.AssumeRolePolicyEvaluator;
@@ -63,8 +64,7 @@ public class AppSyncDataSourceAuthorizer {
         } catch (IllegalArgumentException e) {
             throw denied(dataSource, "serviceRoleArn is not an IAM role ARN");
         }
-        if (!"iam".equals(roleId.service()) || !roleId.region().isEmpty()
-                || roleId.accountId().isBlank() || !roleId.resource().startsWith("role/")
+        if (!AwsArnShapes.isIamRole(roleId)
                 || roleId.resource().endsWith("/")) {
             throw denied(dataSource, "serviceRoleArn is not an IAM role ARN");
         }
@@ -93,7 +93,7 @@ public class AppSyncDataSourceAuthorizer {
         if (!roleArn.equals(role.get().getArn())) {
             throw denied(dataSource, "service role does not exist");
         }
-        String servicePrincipal = "appsync." + AwsRegions.dnsSuffixFor(region);
+        String servicePrincipal = ServicePrincipals.of("appsync");
         if (!trustEvaluator.allowsService(role.get().getAssumeRolePolicyDocument(),
                 servicePrincipal, sourceArn, sourceAccount)) {
             throw denied(dataSource, "service role does not trust " + servicePrincipal);
@@ -166,7 +166,7 @@ public class AppSyncDataSourceAuthorizer {
             return List.of();
         }
         String endpointRegion = text(endpoint, "awsRegion");
-        String clusterArn = cluster.startsWith("arn:") ? cluster
+        String clusterArn = AwsArnUtils.looksLikeArn(cluster) ? cluster
                 : AwsArnUtils.Arn.of("rds", endpointRegion == null ? region : endpointRegion,
                         regionResolver.getAccountId(), "cluster:" + cluster).toString();
         List<Permission> permissions = new ArrayList<>();

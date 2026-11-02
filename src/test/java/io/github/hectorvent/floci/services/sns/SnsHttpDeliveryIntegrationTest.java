@@ -11,10 +11,12 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -32,8 +34,8 @@ class SnsHttpDeliveryIntegrationTest {
     private static int httpPort;
     private static final List<ReceivedRequest> receivedRequests = new CopyOnWriteArrayList<>();
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final java.util.logging.Logger LOG =
-            java.util.logging.Logger.getLogger(SnsHttpDeliveryIntegrationTest.class.getName());
+    private static final Logger LOG =
+            Logger.getLogger(SnsHttpDeliveryIntegrationTest.class.getName());
     record ReceivedRequest(String body, Map<String, List<String>> headers) {}
 
     @BeforeAll
@@ -67,7 +69,7 @@ class SnsHttpDeliveryIntegrationTest {
                 // Record even on failure so awaitRequests unblocks and the assertion
                 // reports the real state instead of timing out opaquely.
                 receivedRequests.add(received);
-                LOG.log(java.util.logging.Level.SEVERE,
+                LOG.log(Level.SEVERE,
                         "confirming-webhook: subscription confirmation failed", e);
                 exchange.sendResponseHeaders(500, 0);
             } finally {
@@ -198,8 +200,8 @@ class SnsHttpDeliveryIntegrationTest {
         assertEquals("Hello HTTP endpoint!", envelope.get("Message").asText());
         assertEquals("Test Subject", envelope.get("Subject").asText());
         assertEquals("1", envelope.get("SignatureVersion").asText());
-        assertEquals("EXAMPLE", envelope.get("Signature").asText());
-        assertEquals("EXAMPLE", envelope.get("SigningCertURL").asText());
+        assertFalse(envelope.get("Signature").asText().isEmpty());
+        assertTrue(envelope.get("SigningCertURL").asText().endsWith(".pem"));
         assertTrue(envelope.get("UnsubscribeURL").asText().contains("Action=Unsubscribe"));
         assertNotNull(envelope.get("MessageId").asText());
         assertNotNull(envelope.get("Timestamp").asText());

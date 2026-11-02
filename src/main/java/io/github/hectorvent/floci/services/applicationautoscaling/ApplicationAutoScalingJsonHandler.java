@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.Alarm;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.PredefinedMetricSpecification;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.ScalableTarget;
@@ -86,15 +88,20 @@ public class ApplicationAutoScalingJsonHandler {
     }
 
     private Response handleDescribeScalableTargets(JsonNode request, String region) {
-        List<ScalableTarget> found = service.describeScalableTargets(
+        PaginatedResult<ScalableTarget> result = service.describeScalableTargets(
                 text(request, "ServiceNamespace"),
                 stringList(request.path("ResourceIds")),
                 text(request, "ScalableDimension"),
+                optionalMaxResults(request),
+                text(request, "NextToken"),
                 region);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("ScalableTargets");
-        found.forEach(t -> array.add(scalableTargetJson(t)));
+        result.items().forEach(t -> array.add(scalableTargetJson(t)));
+        if (result.nextToken() != null) {
+            response.put("NextToken", result.nextToken());
+        }
         return Response.ok(response).build();
     }
 
@@ -128,16 +135,21 @@ public class ApplicationAutoScalingJsonHandler {
     }
 
     private Response handleDescribeScalingPolicies(JsonNode request, String region) {
-        List<ScalingPolicy> found = service.describeScalingPolicies(
+        PaginatedResult<ScalingPolicy> result = service.describeScalingPolicies(
                 text(request, "ServiceNamespace"),
                 text(request, "ResourceId"),
                 text(request, "ScalableDimension"),
                 stringList(request.path("PolicyNames")),
+                optionalMaxResults(request),
+                text(request, "NextToken"),
                 region);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("ScalingPolicies");
-        found.forEach(p -> array.add(scalingPolicyJson(p)));
+        result.items().forEach(p -> array.add(scalingPolicyJson(p)));
+        if (result.nextToken() != null) {
+            response.put("NextToken", result.nextToken());
+        }
         return Response.ok(response).build();
     }
 
@@ -331,66 +343,11 @@ public class ApplicationAutoScalingJsonHandler {
     }
 
     private TargetTrackingConfiguration parseTargetTracking(JsonNode node) {
-        if (node == null || node.isMissingNode() || node.isNull()) {
-            return null;
-        }
-        TargetTrackingConfiguration config = new TargetTrackingConfiguration();
-        if (node.hasNonNull("TargetValue")) {
-            config.setTargetValue(node.get("TargetValue").asDouble());
-        }
-        JsonNode predefined = node.path("PredefinedMetricSpecification");
-        if (predefined.isObject()) {
-            PredefinedMetricSpecification spec = new PredefinedMetricSpecification();
-            spec.setPredefinedMetricType(text(predefined, "PredefinedMetricType"));
-            spec.setResourceLabel(text(predefined, "ResourceLabel"));
-            config.setPredefinedMetricSpecification(spec);
-        }
-        JsonNode customized = node.path("CustomizedMetricSpecification");
-        if (customized.isObject()) {
-            config.setCustomizedMetricSpecification(
-                    objectMapper.convertValue(customized, new com.fasterxml.jackson.core.type.TypeReference<>() {}));
-        }
-        if (node.hasNonNull("DisableScaleIn")) {
-            config.setDisableScaleIn(node.get("DisableScaleIn").asBoolean());
-        }
-        if (node.hasNonNull("ScaleInCooldown")) {
-            config.setScaleInCooldown(node.get("ScaleInCooldown").asInt());
-        }
-        if (node.hasNonNull("ScaleOutCooldown")) {
-            config.setScaleOutCooldown(node.get("ScaleOutCooldown").asInt());
-        }
-        return config;
+        return ScalingConfigurationParser.parseTargetTracking(node, objectMapper);
     }
 
     private StepScalingConfiguration parseStepScaling(JsonNode node) {
-        if (node == null || node.isMissingNode() || node.isNull()) {
-            return null;
-        }
-        StepScalingConfiguration config = new StepScalingConfiguration();
-        config.setAdjustmentType(text(node, "AdjustmentType"));
-        config.setMetricAggregationType(text(node, "MetricAggregationType"));
-        if (node.hasNonNull("Cooldown")) {
-            config.setCooldown(node.get("Cooldown").asInt());
-        }
-        if (node.hasNonNull("MinAdjustmentMagnitude")) {
-            config.setMinAdjustmentMagnitude(node.get("MinAdjustmentMagnitude").asInt());
-        }
-        List<StepAdjustment> steps = new ArrayList<>();
-        for (JsonNode stepNode : node.path("StepAdjustments")) {
-            StepAdjustment step = new StepAdjustment();
-            if (stepNode.hasNonNull("MetricIntervalLowerBound")) {
-                step.setMetricIntervalLowerBound(stepNode.get("MetricIntervalLowerBound").asDouble());
-            }
-            if (stepNode.hasNonNull("MetricIntervalUpperBound")) {
-                step.setMetricIntervalUpperBound(stepNode.get("MetricIntervalUpperBound").asDouble());
-            }
-            if (stepNode.hasNonNull("ScalingAdjustment")) {
-                step.setScalingAdjustment(stepNode.get("ScalingAdjustment").asInt());
-            }
-            steps.add(step);
-        }
-        config.setStepAdjustments(steps);
-        return config;
+        return ScalingConfigurationParser.parseStepScaling(node);
     }
 
     private Map<String, String> parseTags(JsonNode node) {
@@ -423,5 +380,16 @@ public class ApplicationAutoScalingJsonHandler {
     private static Integer integer(JsonNode node, String field) {
         JsonNode value = node.path(field);
         return value.isMissingNode() || value.isNull() ? null : value.asInt();
+    }
+
+    private static Integer optionalMaxResults(JsonNode request) {
+        JsonNode value = request.get("MaxResults");
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isIntegralNumber() || !value.canConvertToInt()) {
+            throw new AwsException("ValidationException", "MaxResults must be an integer.", 400);
+        }
+        return value.intValue();
     }
 }

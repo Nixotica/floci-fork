@@ -8,7 +8,6 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
@@ -345,7 +344,6 @@ public class HttpProxyInvoker {
 
         switch (method.toUpperCase()) {
             case "GET" -> hrb.GET();
-            case "DELETE" -> hrb.DELETE();
             case "HEAD" -> hrb.method("HEAD", HttpRequest.BodyPublishers.noBody());
             case "OPTIONS" -> hrb.method("OPTIONS", HttpRequest.BodyPublishers.noBody());
             default -> hrb.method(method.toUpperCase(),

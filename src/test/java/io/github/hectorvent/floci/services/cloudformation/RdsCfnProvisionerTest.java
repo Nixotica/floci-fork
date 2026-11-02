@@ -2,19 +2,21 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCleanupResult;
-import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.rds.RdsService;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
 import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
 import io.github.hectorvent.floci.services.rds.model.DbEndpoint;
 import io.github.hectorvent.floci.services.rds.model.DbInstance;
+import io.github.hectorvent.floci.services.rds.model.DbInstanceSettings;
 import io.github.hectorvent.floci.services.rds.model.DbParameterGroup;
 import io.github.hectorvent.floci.services.rds.model.DbProxy;
 import io.github.hectorvent.floci.services.rds.model.DbProxyAuth;
 import io.github.hectorvent.floci.services.rds.model.DbProxyTargetGroup;
+import io.github.hectorvent.floci.services.rds.model.DbRoleAssociation;
 import io.github.hectorvent.floci.services.rds.model.DbSubnetGroup;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
@@ -23,12 +25,15 @@ import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import io.github.hectorvent.floci.services.ssm.model.ParameterHistory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
-import org.mockito.InOrder;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
+import org.mockito.Mockito;
+import org.mockito.stubbing.Answer;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -74,6 +79,8 @@ class RdsCfnProvisionerTest {
     @BeforeEach
     void setUp() {
         rdsService = mock(RdsService.class);
+        when(rdsService.instanceCertificate(any())).thenReturn(
+                new RdsService.InstanceCertificate("rds-ca-rsa2048-g1", Instant.parse("2061-05-25T23:34:57Z")));
         secretsManagerService = mock(SecretsManagerService.class);
         ssmService = mock(SsmService.class);
         importResolver = name -> null;
@@ -126,6 +133,14 @@ class RdsCfnProvisionerTest {
                 "us-east-1", "000000000000", "my-stack", existingPhysicalId, Map.of());
     }
 
+    /** Any {@code createDbInstance} call returns {@code instance}. */
+    private void stubCreateDbInstance(DbInstance instance) {
+        when(rdsService.createDbInstance(any(), any(), any(), any(), any(), any(), any(),
+                anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
+                any(), anyMap(), anyList(), nullable(String.class), nullable(String.class),
+                anyBoolean(), any(DbInstanceSettings.class))).thenReturn(instance);
+    }
+
     @Test
     void provisionsDbInstanceWithMappedArgsAndEndpointAttributes() {
         DbInstance instance = mock(DbInstance.class);
@@ -133,9 +148,7 @@ class RdsCfnProvisionerTest {
         when(instance.getEndpoint()).thenReturn(new DbEndpoint("mydb.local", 5432));
         when(instance.getDbInstanceArn()).thenReturn("arn:aws:rds:us-east-1:000000000000:db:mydb");
         when(instance.getDbiResourceId()).thenReturn("db-ABCDEFGHIJKLMNOP");
-        when(rdsService.createDbInstance(any(), any(), any(), any(), any(), any(), any(),
-                anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
-                any(), anyMap(), nullable(String.class))).thenReturn(instance);
+        stubCreateDbInstance(instance);
 
         StackResource r = provision("Db", "AWS::RDS::DBInstance", """
                 {"DBInstanceIdentifier":"mydb","Engine":"postgres","EngineVersion":"16",
@@ -154,16 +167,59 @@ class RdsCfnProvisionerTest {
         // CFN properties mapped to the create-method arguments; absent optionals are null.
         verify(rdsService).createDbInstance("mydb", "postgres", "16", "admin", "secret",
                 "appdb", "db.t3.small", 50, false, null, null, null,
-                null, false, false, null, Map.of(), "us-east-1");
+                null, false, false, null, Map.of(), List.of(), null, "us-east-1", true,
+                DbInstanceSettings.defaults());
+    }
+
+    @Test
+    void aDbInstanceTakesItsCaCertificateAndExposesItsDetails() {
+        DbInstance instance = mock(DbInstance.class);
+        when(instance.getDbInstanceIdentifier()).thenReturn("mydb");
+        stubCreateDbInstance(instance);
+        when(rdsService.instanceCertificate(instance)).thenReturn(
+                new RdsService.InstanceCertificate("rds-ca-ecc384-g1", Instant.parse("2121-05-25T23:41:55Z")));
+
+        StackResource r = provision("Db", "AWS::RDS::DBInstance", """
+                {"DBInstanceIdentifier":"mydb","Engine":"postgres","MasterUsername":"admin",
+                 "MasterUserPassword":"secret","CACertificateIdentifier":"rds-ca-ecc384-g1"}
+                """);
+
+        assertEquals("CREATE_COMPLETE", r.getStatus());
+        assertEquals("rds-ca-ecc384-g1", r.getAttributes().get("CertificateDetails.CAIdentifier"));
+        assertEquals("2121-05-25T23:41:55Z", r.getAttributes().get("CertificateDetails.ValidTill"));
+        verify(rdsService).createDbInstance("mydb", "postgres", null, "admin", "secret",
+                null, "db.t3.micro", 20, false, null, null, null,
+                null, false, false, null, Map.of(), List.of(), null, "us-east-1", true,
+                DbInstanceSettings.defaults().withCaCertificateIdentifier("rds-ca-ecc384-g1"));
+    }
+
+    @Test
+    void deletesANewDbInstanceWhoseAssociatedRolesAreRefused() {
+        DbInstance instance = mock(DbInstance.class);
+        when(instance.getDbInstanceIdentifier()).thenReturn("mydb");
+        stubCreateDbInstance(instance);
+        when(rdsService.addRoleToDbInstance("us-east-1", "mydb", "arn:aws:iam::000000000000:role/a", "s3Import"))
+                .thenReturn(instance);
+        when(rdsService.addRoleToDbInstance("us-east-1", "mydb", "arn:aws:iam::000000000000:role/b", "s3Import"))
+                .thenThrow(new AwsException("InvalidParameterValue", "s3Import is not supported here", 400));
+
+        StackResource r = provision("Db", "AWS::RDS::DBInstance", """
+                {"DBInstanceIdentifier":"mydb","Engine":"postgres","MasterUsername":"admin",
+                 "MasterUserPassword":"secret","AssociatedRoles":[
+                   {"RoleArn":"arn:aws:iam::000000000000:role/a","FeatureName":"s3Import"},
+                   {"RoleArn":"arn:aws:iam::000000000000:role/b","FeatureName":"s3Import"}]}
+                """);
+
+        assertEquals("CREATE_FAILED", r.getStatus());
+        assertTrue(r.getStatusReason().contains("s3Import is not supported here"), r.getStatusReason());
+        verify(rdsService).deleteDbInstance("mydb", "us-east-1");
     }
 
     @Test
     void provisionsDbInstanceInStackRegion() {
         DbInstance instance = mock(DbInstance.class);
         when(instance.getDbInstanceIdentifier()).thenReturn("mydb");
-        when(rdsService.createDbInstance(any(), any(), any(), any(), any(), any(), any(),
-                anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
-                any(), anyMap(), nullable(String.class))).thenReturn(instance);
+        stubCreateDbInstance(instance);
 
         provision("Db", "AWS::RDS::DBInstance", """
                 {"DBInstanceIdentifier":"mydb","Engine":"postgres","MasterUsername":"admin",
@@ -172,7 +228,8 @@ class RdsCfnProvisionerTest {
 
         verify(rdsService).createDbInstance("mydb", "postgres", null, "admin", "secret",
                 null, "db.t3.micro", 20, false, null, null, null,
-                null, false, false, null, Map.of(), "us-west-2");
+                null, false, false, null, Map.of(), List.of(), null, "us-west-2", true,
+                DbInstanceSettings.defaults());
     }
 
     @Test
@@ -205,6 +262,61 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbCluster("mycluster", "aurora-postgresql", "16.3",
                 "admin", "secret", "appdb", false, null, null, null, false, "us-east-1",
                 null, null, null, false, null, null, false);
+    }
+
+    @Test
+    void dbClusterEnableHttpEndpointIsAppliedOnCreateAndUpdate() {
+        createDbClusterEchoesRequestedId();
+        DbCluster enabled = mock(DbCluster.class);
+        when(enabled.getDbClusterIdentifier()).thenReturn("dataapi");
+        when(enabled.isHttpEndpointEnabled()).thenReturn(true);
+        when(rdsService.setHttpEndpoint("us-east-1", "dataapi", true)).thenReturn(enabled);
+
+        StackResource r = provision("Cluster", "AWS::RDS::DBCluster", """
+                {"DBClusterIdentifier":"dataapi","Engine":"aurora-postgresql","EnableHttpEndpoint":true}
+                """);
+        assertEquals("CREATE_COMPLETE", r.getStatus());
+        verify(rdsService).setHttpEndpoint("us-east-1", "dataapi", true);
+
+        // An update that leaves the property out turns the endpoint off again.
+        when(rdsService.getDbCluster("dataapi")).thenReturn(enabled);
+        when(rdsService.modifyDbCluster(eq("dataapi"), any(), any(), any(), any(), any(), any())).thenReturn(enabled);
+        DbCluster disabled = mock(DbCluster.class);
+        when(disabled.getDbClusterIdentifier()).thenReturn("dataapi");
+        when(rdsService.setHttpEndpoint("us-east-1", "dataapi", false)).thenReturn(disabled);
+        provisionExisting("Cluster", "AWS::RDS::DBCluster", """
+                {"DBClusterIdentifier":"dataapi","Engine":"aurora-postgresql"}
+                """, "us-east-1", "dataapi", Map.of("DBClusterIdentifier", "dataapi"));
+        verify(rdsService).setHttpEndpoint("us-east-1", "dataapi", false);
+    }
+
+    @Test
+    void aMalformedEnableHttpEndpointFailsInsteadOfTurningTheEndpointOff() {
+        DbCluster enabled = mock(DbCluster.class);
+        when(enabled.getDbClusterIdentifier()).thenReturn("dataapi");
+        when(enabled.isHttpEndpointEnabled()).thenReturn(true);
+        when(rdsService.getDbCluster("dataapi")).thenReturn(enabled);
+        when(rdsService.modifyDbCluster(eq("dataapi"), any(), any(), any(), any(), any(), any())).thenReturn(enabled);
+
+        StackResource r = provisionExisting("Cluster", "AWS::RDS::DBCluster", """
+                {"DBClusterIdentifier":"dataapi","Engine":"aurora-postgresql","EnableHttpEndpoint":"yes"}
+                """, "us-east-1", "dataapi", Map.of("DBClusterIdentifier", "dataapi"));
+
+        assertEquals("CREATE_FAILED", r.getStatus());
+        assertTrue(r.getStatusReason().contains("EnableHttpEndpoint must be true or false"), r.getStatusReason());
+        verify(rdsService, never()).setHttpEndpoint(any(), any(), anyBoolean());
+        verify(rdsService, never()).modifyDbCluster(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void dbClusterEnableHttpEndpointOnANonAuroraEngineFailsBeforeCreating() {
+        StackResource r = provision("Cluster", "AWS::RDS::DBCluster", """
+                {"DBClusterIdentifier":"dataapi","Engine":"postgres","EnableHttpEndpoint":true}
+                """);
+        assertEquals("CREATE_FAILED", r.getStatus());
+        assertTrue(r.getStatusReason().contains("Aurora"), r.getStatusReason());
+        verify(rdsService, never()).createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
+                any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
     }
 
     @Test
@@ -327,9 +439,7 @@ class RdsCfnProvisionerTest {
 
         DbInstance instance = mock(DbInstance.class);
         when(instance.getDbInstanceIdentifier()).thenReturn("mydb");
-        when(rdsService.createDbInstance(any(), any(), any(), any(), any(), any(), any(),
-                anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
-                any(), anyMap(), nullable(String.class))).thenReturn(instance);
+        stubCreateDbInstance(instance);
 
         provision("Db", "AWS::RDS::DBInstance", """
                 {"DBInstanceIdentifier":"mydb","Engine":"postgres",
@@ -340,7 +450,8 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbInstance(
                 eq("mydb"), eq("postgres"), any(), eq("resolved-user"), eq("resolved-secret"),
                 any(), any(), anyInt(), anyBoolean(), any(), any(), any(), any(),
-                anyBoolean(), anyBoolean(), any(), anyMap(), eq("us-west-2"));
+                anyBoolean(), anyBoolean(), any(), anyMap(), anyList(), nullable(String.class), eq("us-west-2"),
+                anyBoolean(), any(DbInstanceSettings.class));
         verify(secretsManagerService, times(2))
                 .getSecretValue("my-secret", null, null, "us-west-2");
     }
@@ -613,9 +724,7 @@ class RdsCfnProvisionerTest {
 
         DbInstance instance = mock(DbInstance.class);
         when(instance.getDbInstanceIdentifier()).thenReturn("mydb");
-        when(rdsService.createDbInstance(any(), any(), any(), any(), any(), any(), any(),
-                anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
-                any(), anyMap(), nullable(String.class))).thenReturn(instance);
+        stubCreateDbInstance(instance);
 
         StackResource resource = provision("Db", "AWS::RDS::DBInstance", """
                 {"DBInstanceIdentifier":"mydb","Engine":"postgres",
@@ -627,7 +736,8 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbInstance(
                 eq("mydb"), eq("postgres"), any(), eq("admin"), eq("resolved-secure"),
                 any(), any(), anyInt(), anyBoolean(), any(), any(), any(), any(),
-                anyBoolean(), anyBoolean(), any(), anyMap(), eq("us-east-1"));
+                anyBoolean(), anyBoolean(), any(), anyMap(), anyList(), nullable(String.class), eq("us-east-1"),
+                anyBoolean(), any(DbInstanceSettings.class));
     }
 
     @ParameterizedTest
@@ -1302,7 +1412,8 @@ class RdsCfnProvisionerTest {
         when(rdsService.getDbInstance("mydb")).thenReturn(existing);
         DbInstance reconciled = mock(DbInstance.class);
         when(reconciled.getDbInstanceIdentifier()).thenReturn("mydb");
-        when(rdsService.modifyDbInstance(eq("mydb"), any(), anyBoolean(), any())).thenReturn(reconciled);
+        when(rdsService.modifyDbInstance(eq("mydb"), any(), any(), any(), any(), any(), any(), any(),
+                any(DbInstanceSettings.class))).thenReturn(reconciled);
 
         StackResource r = provisionUpdate("Db", "AWS::RDS::DBInstance", """
                 {"DBInstanceIdentifier":"mydb","Engine":"postgres","MasterUsername":"admin",
@@ -1312,8 +1423,27 @@ class RdsCfnProvisionerTest {
         assertEquals("mydb", r.getPhysicalId());
         verify(rdsService, never()).createDbInstance(any(), any(), any(), any(), any(), any(), any(),
                 anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
-                any(), anyMap(), nullable(String.class));
-        verify(rdsService).modifyDbInstance("mydb", "secret", false, null);
+                any(), anyMap(), anyList(), nullable(String.class), nullable(String.class),
+                anyBoolean(), any(DbInstanceSettings.class));
+        verify(rdsService).modifyDbInstance("mydb", "secret", false, null, null, null, null, null,
+                DbInstanceSettings.unchanged());
+    }
+
+    @Test
+    void updateStackChangesAnExistingDbInstancesCaCertificate() {
+        when(rdsService.getDbInstance("mydb")).thenReturn(mock(DbInstance.class));
+        DbInstance reconciled = mock(DbInstance.class);
+        when(reconciled.getDbInstanceIdentifier()).thenReturn("mydb");
+        when(rdsService.modifyDbInstance(eq("mydb"), any(), any(), any(), any(), any(), any(), any(),
+                any(DbInstanceSettings.class))).thenReturn(reconciled);
+
+        provisionUpdate("Db", "AWS::RDS::DBInstance", """
+                {"DBInstanceIdentifier":"mydb","Engine":"postgres","MasterUsername":"admin",
+                 "MasterUserPassword":"secret","CACertificateIdentifier":"rds-ca-rsa4096-g1"}
+                """, "mydb");
+
+        verify(rdsService).modifyDbInstance("mydb", "secret", false, null, null, null, null, null,
+                DbInstanceSettings.unchanged().withCaCertificateIdentifier("rds-ca-rsa4096-g1"));
     }
 
     @Test
@@ -1342,7 +1472,7 @@ class RdsCfnProvisionerTest {
 
     /** RdsService hands back a cluster named after whatever id the provisioner asked to create. */
     private void createDbClusterEchoesRequestedId() {
-        org.mockito.stubbing.Answer<DbCluster> echo = invocation -> {
+        Answer<DbCluster> echo = invocation -> {
             DbCluster created = mock(DbCluster.class);
             doReturn(invocation.getArgument(0)).when(created).getDbClusterIdentifier();
             return created;
@@ -1450,6 +1580,91 @@ class RdsCfnProvisionerTest {
         verify(rdsService, never()).modifyDbCluster(any(), any(), any(), any(), any(), any(), any());
         assertFalse(provisioner.hasReplacementUpdate(r), "nothing is owed to the cleanup");
         assertFalse(provisioner.rollbackUpdate(r), "there is no replacement to undo");
+    }
+
+    @Test
+    void rolledBackDbClusterReplacementPutsTheRolesRecordBack() {
+        // The replacement records its template's roles; rolling it back to the prior cluster must
+        // bring back the prior record too, or the next update removes roles by the wrong list.
+        priorUnnamedCluster("provisioned", false);
+        createDbClusterEchoesRequestedId();
+        when(rdsService.addRolesToNewDbCluster(any(), any(), anyList())).thenAnswer(invocation -> {
+            DbCluster withRoles = mock(DbCluster.class);
+            doReturn(invocation.getArgument(1)).when(withRoles).getDbClusterIdentifier();
+            return withRoles;
+        });
+        String priorRecord = "[{\"RoleArn\":\"arn:aws:iam::000000000000:role/prior\"}]";
+        StackResource r = provisionExisting("Cluster", "AWS::RDS::DBCluster", """
+                {"Engine":"aurora-postgresql","EngineMode":"serverless",
+                 "AssociatedRoles":[{"RoleArn":"arn:aws:iam::000000000000:role/replacement"}]}
+                """, "us-east-1", PRIOR_CLUSTER,
+                Map.of("DBClusterIdentifier", PRIOR_CLUSTER, "__FlociAssociatedRoles", priorRecord));
+        assertNotEquals(PRIOR_CLUSTER, r.getPhysicalId());
+        assertTrue(r.getAttributes().get("__FlociAssociatedRoles").contains("role/replacement"));
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals(priorRecord, r.getAttributes().get("__FlociAssociatedRoles"));
+    }
+
+    @Test
+    void failedDbInstanceRoleUpdateUndoesItsOwnChanges() {
+        // The update removes the declared s3Import role, adds a Lambda role, then the next add is
+        // refused: the Lambda role comes off again and the s3Import role goes back on.
+        String old = "arn:aws:iam::000000000000:role/old";
+        String lambda = "arn:aws:iam::000000000000:role/lambda";
+        String refused = "arn:aws:iam::000000000000:role/refused";
+        DbInstance before = mock(DbInstance.class);
+        when(before.getDbInstanceIdentifier()).thenReturn("mydb");
+        when(before.getAssociatedRoles()).thenReturn(List.of(new DbRoleAssociation(old, "s3Import")));
+        DbInstance withoutOld = mock(DbInstance.class);
+        when(withoutOld.getDbInstanceIdentifier()).thenReturn("mydb");
+        DbInstance withLambda = mock(DbInstance.class);
+        when(withLambda.getDbInstanceIdentifier()).thenReturn("mydb");
+        when(withLambda.getAssociatedRoles()).thenReturn(List.of(new DbRoleAssociation(lambda, "Lambda")));
+        when(rdsService.getDbInstance("mydb")).thenReturn(before);
+        when(rdsService.modifyDbInstance(eq("mydb"), any(), any(), any(), any(), any(), any(), any(),
+                any(DbInstanceSettings.class))).thenReturn(before);
+        when(rdsService.removeRoleFromDbInstance("us-east-1", "mydb", old, "s3Import")).thenReturn(withoutOld);
+        when(rdsService.addRoleToDbInstance("us-east-1", "mydb", lambda, "Lambda")).thenReturn(withLambda);
+        when(rdsService.addRoleToDbInstance("us-east-1", "mydb", refused, "s3Export"))
+                .thenThrow(new AwsException("InvalidDBInstanceState", "not available", 400));
+
+        StackResource r = provisionExisting("Db", "AWS::RDS::DBInstance", """
+                {"DBInstanceIdentifier":"mydb","Engine":"postgres","MasterUsername":"admin",
+                 "MasterUserPassword":"secret","AssociatedRoles":[
+                   {"RoleArn":"arn:aws:iam::000000000000:role/lambda","FeatureName":"Lambda"},
+                   {"RoleArn":"arn:aws:iam::000000000000:role/refused","FeatureName":"s3Export"}]}
+                """, "us-east-1", "mydb", Map.of("DBInstanceIdentifier", "mydb",
+                "__FlociAssociatedRoles", "[{\"RoleArn\":\"" + old + "\",\"FeatureName\":\"s3Import\"}]"));
+
+        assertEquals("CREATE_FAILED", r.getStatus());
+        InOrder undo = inOrder(rdsService);
+        undo.verify(rdsService).removeRoleFromDbInstance("us-east-1", "mydb", lambda, "Lambda");
+        undo.verify(rdsService).addRoleToDbInstance("us-east-1", "mydb", old, "s3Import");
+        verify(rdsService, never()).deleteDbInstance(any(), any());
+    }
+
+    @Test
+    void renamedDbInstanceKeepsItsPredecessorWhenTheNewRolesAreRefused() {
+        // The roles go on before the renamed instance's predecessor is deleted, so a refused list
+        // costs only the new instance.
+        DbInstance renamed = mock(DbInstance.class);
+        when(renamed.getDbInstanceIdentifier()).thenReturn("newdb");
+        stubCreateDbInstance(renamed);
+        when(rdsService.addRoleToDbInstance(any(), eq("newdb"), any(), any()))
+                .thenThrow(new AwsException("InvalidParameterValue", "feature not supported", 400));
+
+        StackResource r = provisionExisting("Db", "AWS::RDS::DBInstance", """
+                {"DBInstanceIdentifier":"newdb","Engine":"postgres","MasterUsername":"admin",
+                 "MasterUserPassword":"secret",
+                 "AssociatedRoles":[{"RoleArn":"arn:aws:iam::000000000000:role/a","FeatureName":"s3Import"}]}
+                """, "us-east-1", "olddb", Map.of("DBInstanceIdentifier", "olddb"));
+
+        assertEquals("CREATE_FAILED", r.getStatus());
+        verify(rdsService).deleteDbInstance("newdb", "us-east-1");
+        verify(rdsService, never()).deleteDbInstance("olddb");
+        verify(rdsService, never()).deleteDbInstance("olddb", "us-east-1");
     }
 
     @Test
@@ -1873,7 +2088,7 @@ class RdsCfnProvisionerTest {
     void targetGroupDeleteIsIdempotentWhenProxyDeletionAlreadyRemovedIt() {
         String targetGroupArn =
                 "arn:aws:rds:us-east-1:000000000000:target-group:prx-tg-already-gone";
-        org.mockito.Mockito.doThrow(new AwsException("DBProxyTargetGroupNotFoundFault",
+        Mockito.doThrow(new AwsException("DBProxyTargetGroupNotFoundFault",
                 "target group not found", 404))
                 .when(rdsService).clearDbProxyTargetGroupByArn(targetGroupArn, "us-east-1");
 

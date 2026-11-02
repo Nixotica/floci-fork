@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -7,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
 import java.util.zip.ZipEntry;
@@ -235,8 +237,7 @@ class LambdaListLayersParametersIntegrationTest {
         // as a cursor, which would silently skip or empty the page.
         for (String forged : new String[] {"lp-alpha.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                                            "lp-alpha.", ".signature", "lp-alpha"}) {
-            String encoded = Base64.getUrlEncoder().withoutPadding()
-                    .encodeToString(forged.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            String encoded = Base64Url.encode(forged);
             given()
                 .queryParam("CompatibleRuntime", PAGE_RUNTIME)
                 .queryParam("Marker", encoded)
@@ -264,12 +265,11 @@ class LambdaListLayersParametersIntegrationTest {
             .extract().path("NextMarker");
 
         String decoded = new String(Base64.getUrlDecoder().decode(marker),
-                java.nio.charset.StandardCharsets.UTF_8);
+                StandardCharsets.UTF_8);
         String spliced = LAYER_B + decoded.substring(decoded.lastIndexOf('.'));
         given()
             .queryParam("CompatibleRuntime", PAGE_RUNTIME)
-            .queryParam("Marker", Base64.getUrlEncoder().withoutPadding()
-                    .encodeToString(spliced.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+            .queryParam("Marker", Base64Url.encode(spliced))
         .when()
             .get("/2018-10-31/layers")
         .then()

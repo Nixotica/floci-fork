@@ -3,15 +3,26 @@ package io.github.hectorvent.floci.services.ses;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.List;
+import java.util.stream.Stream;
 
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.EXPECTED_NULL;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.LIST;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.NUMBER;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.STRUCTURE;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.assertSerializationException;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
@@ -29,7 +40,7 @@ class SesDkimSigningActionsIntegrationTest {
     private static final String V2_AUTH =
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/ses/aws4_request";
 
-    private io.restassured.specification.RequestSpecification v1(String action) {
+    private RequestSpecification v1(String action) {
         return given().contentType("application/x-www-form-urlencoded")
                 .header("Authorization", V1_AUTH).formParam("Action", action);
     }
@@ -96,6 +107,7 @@ class SesDkimSigningActionsIntegrationTest {
         given().header("Authorization", V2_AUTH)
         .when().get("/v2/email/identities/" + domain).then().statusCode(200)
                 .body("DkimAttributes.CurrentSigningKeyLength", equalTo("RSA_1024_BIT"))
+                .body("DkimAttributes.SigningHostedZone", equalTo("dkim.amazonses.com"))
                 .body("DkimAttributes.Tokens", equalTo(after));
     }
 
@@ -125,7 +137,9 @@ class SesDkimSigningActionsIntegrationTest {
         given().contentType("application/json").header("Authorization", V2_AUTH)
                 .body("{\"SigningAttributesOrigin\":\"AWS_SES\"}")
         .when().put("/v2/email/identities/ghost-signing.floci.test/dkim/signing")
-        .then().statusCode(404).body("__type", equalTo("NotFoundException"));
+        .then().statusCode(404).body("__type", equalTo("NotFoundException"))
+                .body("message", equalTo(
+                        "The specified email identity, ghost-signing.floci.test, does not exist."));
     }
 
     @Test
@@ -197,6 +211,7 @@ class SesDkimSigningActionsIntegrationTest {
         .when().get("/v2/email/identities/" + domain).then().statusCode(200)
                 .body("DkimAttributes.Status", equalTo("PENDING"))
                 .body("DkimAttributes.SigningAttributesOrigin", equalTo("EXTERNAL"))
+                .body("DkimAttributes.SigningHostedZone", nullValue())
                 .body("DkimAttributes.Tokens", hasSize(0));
     }
 
@@ -204,7 +219,34 @@ class SesDkimSigningActionsIntegrationTest {
     void putDkimSigningAttributes_nonObjectBody_returns400() {
         given().contentType("application/json").header("Authorization", V2_AUTH).body("[]")
         .when().put("/v2/email/identities/dkim-nonobj.floci.test/dkim/signing")
-        .then().statusCode(400).body("__type", equalTo("BadRequestException"));
+        .then().statusCode(400).body("__type", equalTo("SerializationException"))
+                .body("message", equalTo("Start of list found where not expected"));
+    }
+
+    // The identity does not exist and some cases send an invalid origin: AWS reads the body
+    // against the shapes before either check.
+    static Stream<Arguments> putDkimSigningAttributesWrongMemberTypeCases() {
+        return Stream.of(
+                Arguments.of("stringSigningAttributes",
+                        "{\"SigningAttributesOrigin\": \"AWS_SES\", \"SigningAttributes\": \"x\"}", EXPECTED_NULL),
+                Arguments.of("stringSigningAttributesWithInvalidOrigin",
+                        "{\"SigningAttributesOrigin\": \"BAD\", \"SigningAttributes\": \"x\"}", EXPECTED_NULL),
+                Arguments.of("arraySigningAttributes",
+                        "{\"SigningAttributesOrigin\": \"AWS_SES\", \"SigningAttributes\": []}", LIST),
+                Arguments.of("arrayNextSigningKeyLength",
+                        "{\"SigningAttributesOrigin\": \"AWS_SES\", "
+                                + "\"SigningAttributes\": {\"NextSigningKeyLength\": []}}", LIST),
+                Arguments.of("objectDomainSigningSelector",
+                        "{\"SigningAttributesOrigin\": \"EXTERNAL\", "
+                                + "\"SigningAttributes\": {\"DomainSigningSelector\": {}}}", STRUCTURE),
+                Arguments.of("numericOrigin", "{\"SigningAttributesOrigin\": 1}", NUMBER));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("putDkimSigningAttributesWrongMemberTypeCases")
+    void putDkimSigningAttributes_wrongMemberType(String caseName, String body, String message) {
+        assertSerializationException("PUT", "/v2/email/identities/dkim-missing.floci.test/dkim/signing",
+                body, message);
     }
 
     @Test
@@ -248,6 +290,7 @@ class SesDkimSigningActionsIntegrationTest {
         .when().get("/v2/email/identities/bob@" + domain).then().statusCode(200)
                 .body("DkimAttributes.SigningEnabled", equalTo(true))
                 .body("DkimAttributes.Status", equalTo("PENDING"))
+                .body("DkimAttributes.SigningHostedZone", equalTo("dkim.amazonses.com"))
                 .body("DkimAttributes.Tokens", equalTo(domainTokens))
                 .body("DkimAttributes.Tokens", not(hasSize(0)));
     }

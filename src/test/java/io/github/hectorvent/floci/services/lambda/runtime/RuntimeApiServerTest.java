@@ -4,10 +4,15 @@ import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.PendingInvocation;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
+import io.vertx.ext.web.RoutingContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.BindException;
@@ -17,19 +22,23 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-
-import org.junit.jupiter.api.condition.EnabledOnOs;
-import org.junit.jupiter.api.condition.OS;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -50,7 +59,7 @@ class RuntimeApiServerTest {
         server = new RuntimeApiServer(vertx, port);
         server.start().get(5, TimeUnit.SECONDS);
         httpClient = HttpClient.newBuilder()
-                .connectTimeout(java.time.Duration.ofSeconds(5))
+                .connectTimeout(Duration.ofSeconds(5))
                 .build();
         scheduler = Executors.newSingleThreadScheduledExecutor();
     }
@@ -85,6 +94,21 @@ class RuntimeApiServerTest {
     }
 
     @Test
+    @Timeout(10)
+    void nextEndpoint_firstPollEndsTheInitPhase() throws Exception {
+        assertFalse(server.hasRuntimePolled());
+
+        httpClient.sendAsync(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET()
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        awaitWaitingContexts(1);
+
+        assertTrue(server.hasRuntimePolled());
+    }
+
+    @Test
     @Timeout(15)
     void nextEndpoint_blocksUntilInvocationArrives() throws Exception {
         PendingInvocation invocation = new PendingInvocation(
@@ -107,6 +131,31 @@ class RuntimeApiServerTest {
         assertTrue(elapsed >= 1500, "should have blocked ~2s waiting for invocation");
         assertEquals("req-1", response.headers().firstValue("Lambda-Runtime-Aws-Request-Id").orElse(""));
         assertTrue(response.body().contains("key"));
+    }
+
+    @Test
+    @Timeout(10)
+    void nextEndpoint_emitsClientContextHeaderOnlyWhenPresent() throws Exception {
+        String clientContext = "{\"custom\":{\"traceparent\":\"00-abc-def-01\"}}";
+        PendingInvocation withContext = new PendingInvocation(
+                "req-ctx", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>());
+        withContext.setClientContext(clientContext);
+        server.enqueue(withContext);
+
+        HttpRequest next = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                .GET().build();
+        HttpResponse<String> first = httpClient.send(next, HttpResponse.BodyHandlers.ofString());
+        assertEquals(clientContext, first.headers().firstValue("Lambda-Runtime-Client-Context").orElse(null));
+
+        server.enqueue(new PendingInvocation(
+                "req-noctx", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>()));
+        HttpResponse<String> second = httpClient.send(next, HttpResponse.BodyHandlers.ofString());
+        assertTrue(second.headers().firstValue("Lambda-Runtime-Client-Context").isEmpty());
     }
 
     @Test
@@ -290,7 +339,52 @@ class RuntimeApiServerTest {
         assertErrorEndpointReportsUnhandled("req-plain-header", "ValueError");
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {8192, 1024 * 1024 - 1})
+    @Timeout(15)
+    void errorEndpoint_acceptsGoRuntimeXrayCauseHeaders(int headerBytes) throws Exception {
+        String cause = "{\"message\":\"" + "x".repeat(headerBytes - 14) + "\"}";
+        assertEquals(headerBytes, cause.length());
+        assertErrorEndpointReportsUnhandled("req-xray-header", "Runtime.UserException", cause);
+    }
+
+    @Test
+    @Timeout(15)
+    void errorEndpoint_rejectsHeadersBeyondItsBudgetWithoutConsumingInvocation() throws Exception {
+        String requestId = "req-oversized-header";
+        String payload = "{\"errorMessage\":\"original failure\",\"errorType\":\"X\"}";
+        CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
+        server.enqueue(new PendingInvocation(requestId, "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test", resultFuture));
+        HttpResponse<String> next = httpClient.send(HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                .GET().build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, next.statusCode());
+        URI error = URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/" + requestId + "/error");
+
+        HttpResponse<String> rejected = httpClient.send(HttpRequest.newBuilder(error)
+                .header("Lambda-Runtime-Function-Xray-Error-Cause", "x".repeat(1024 * 1024 + 16 * 1024 + 1))
+                .POST(HttpRequest.BodyPublishers.ofString(payload)).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(431, rejected.statusCode());
+        assertFalse(resultFuture.isDone());
+
+        // The decoder closes the rejected connection; retry independently of when its EOF arrives.
+        try (HttpClient retryClient = HttpClient.newHttpClient()) {
+            HttpResponse<String> retry = retryClient.send(HttpRequest.newBuilder(error)
+                    .POST(HttpRequest.BodyPublishers.ofString(payload)).build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(202, retry.statusCode());
+        }
+        InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
+        assertEquals("Unhandled", result.getFunctionError());
+        assertEquals(payload, new String(result.getPayload()));
+    }
+
     private void assertErrorEndpointReportsUnhandled(String requestId, String errorTypeHeader) throws Exception {
+        assertErrorEndpointReportsUnhandled(requestId, errorTypeHeader, null);
+    }
+
+    private void assertErrorEndpointReportsUnhandled(String requestId, String errorTypeHeader,
+                                                     String xrayCause) throws Exception {
         CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
         PendingInvocation invocation = new PendingInvocation(
                 requestId, "{}".getBytes(), System.currentTimeMillis() + 60_000,
@@ -308,11 +402,16 @@ class RuntimeApiServerTest {
         if (errorTypeHeader != null) {
             errorRequest.header("Lambda-Runtime-Function-Error-Type", errorTypeHeader);
         }
-        httpClient.send(errorRequest.build(), HttpResponse.BodyHandlers.ofString());
+        if (xrayCause != null) {
+            errorRequest.header("Lambda-Runtime-Function-Xray-Error-Cause", xrayCause);
+        }
+        HttpResponse<String> ack = httpClient.send(errorRequest.build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(202, ack.statusCode());
+        assertEquals("OK", new JsonObject(ack.body()).getString("status"));
 
         InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
         assertEquals("Unhandled", result.getFunctionError());
-        assertTrue(new String(result.getPayload()).contains("boom"));
+        assertEquals("{\"errorMessage\":\"boom\",\"errorType\":\"X\"}", new String(result.getPayload()));
     }
 
     /**
@@ -531,12 +630,12 @@ class RuntimeApiServerTest {
      * sendInvocation subsequently ran.
      */
     private void installGatedServerWithDispatchObservation(
-            java.util.function.Consumer<io.vertx.ext.web.RoutingContext> afterEnqueueLockReleased,
-            java.util.function.Consumer<String> onSendInvocation) throws Exception {
+            Consumer<RoutingContext> afterEnqueueLockReleased,
+            Consumer<String> onSendInvocation) throws Exception {
         server.stop().get(5, TimeUnit.SECONDS);
         port = findFreePort();
         server = new RuntimeApiServer(vertx, port) {
-            @Override protected void afterEnqueueDispatchLockReleased(io.vertx.ext.web.RoutingContext waitingCtx) {
+            @Override protected void afterEnqueueDispatchLockReleased(RoutingContext waitingCtx) {
                 afterEnqueueLockReleased.accept(waitingCtx);
             }
             @Override protected void beforeSendInvocationWrite(String requestId) {
@@ -705,8 +804,8 @@ class RuntimeApiServerTest {
         // A disconnect between the two reads made neither branch fire and stranded
         // the invocation in inFlight until the function deadline. Force that
         // interleaving by ending the ctx from afterEnqueueDispatchLockReleased.
-        java.util.concurrent.atomic.AtomicInteger sendInvocationCalls =
-                new java.util.concurrent.atomic.AtomicInteger();
+        AtomicInteger sendInvocationCalls =
+                new AtomicInteger();
         installGatedServerWithDispatchObservation(
                 waitingCtx -> {
                     if (!waitingCtx.response().ended()) {
@@ -742,16 +841,16 @@ class RuntimeApiServerTest {
         // .end() flush strands the invocation in inFlight. Force it by ending the
         // parked ctx from beforeSendInvocationWrite; assert onFailure requeues +
         // clears inFlight.
-        java.util.concurrent.atomic.AtomicReference<io.vertx.ext.web.RoutingContext> parkedCtx =
-                new java.util.concurrent.atomic.AtomicReference<>();
+        AtomicReference<RoutingContext> parkedCtx =
+                new AtomicReference<>();
         server.stop().get(5, TimeUnit.SECONDS);
         port = findFreePort();
         server = new RuntimeApiServer(vertx, port) {
-            @Override protected void afterEnqueueDispatchLockReleased(io.vertx.ext.web.RoutingContext waitingCtx) {
+            @Override protected void afterEnqueueDispatchLockReleased(RoutingContext waitingCtx) {
                 parkedCtx.set(waitingCtx);
             }
             @Override protected void beforeSendInvocationWrite(String requestId) {
-                io.vertx.ext.web.RoutingContext ctx = parkedCtx.get();
+                RoutingContext ctx = parkedCtx.get();
                 if (ctx != null && !ctx.response().ended()) {
                     ctx.response().setStatusCode(500).end();
                 }
@@ -868,7 +967,7 @@ class RuntimeApiServerTest {
         // request-line get through, proving the listener is up.
         HttpRequest probe = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
-                .timeout(java.time.Duration.ofMillis(500))
+                .timeout(Duration.ofMillis(500))
                 .GET()
                 .build();
         CompletableFuture<HttpResponse<String>> probeFuture =
@@ -1286,21 +1385,21 @@ class RuntimeApiServerTest {
     @Test
     @Timeout(15)
     void notifyExtensionsOfInvoke_requeuedOnWriteFailure_deliversInvokeExactlyOnce() throws Exception {
-        java.util.concurrent.atomic.AtomicInteger sendInvocationCalls =
-                new java.util.concurrent.atomic.AtomicInteger();
-        java.util.concurrent.atomic.AtomicReference<io.vertx.ext.web.RoutingContext> parkedCtx =
-                new java.util.concurrent.atomic.AtomicReference<>();
+        AtomicInteger sendInvocationCalls =
+                new AtomicInteger();
+        AtomicReference<RoutingContext> parkedCtx =
+                new AtomicReference<>();
         server.stop().get(5, TimeUnit.SECONDS);
         port = findFreePort();
         server = new RuntimeApiServer(vertx, port) {
-            @Override protected void afterEnqueueDispatchLockReleased(io.vertx.ext.web.RoutingContext waitingCtx) {
+            @Override protected void afterEnqueueDispatchLockReleased(RoutingContext waitingCtx) {
                 parkedCtx.set(waitingCtx);
             }
             @Override protected void beforeSendInvocationWrite(String requestId) {
                 if (sendInvocationCalls.incrementAndGet() == 1) {
                     // Simulate the client disconnecting between dispatch commitment and the
                     // write landing, forcing sendInvocation()'s write to fail.
-                    io.vertx.ext.web.RoutingContext ctx = parkedCtx.get();
+                    RoutingContext ctx = parkedCtx.get();
                     if (ctx != null && !ctx.response().ended()) {
                         ctx.response().setStatusCode(500).end();
                     }
@@ -1687,7 +1786,7 @@ class RuntimeApiServerTest {
 
         HttpResponse<String> next = httpClient.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
-                        .timeout(java.time.Duration.ofSeconds(5))
+                        .timeout(Duration.ofSeconds(5))
                         .GET().build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(204, next.statusCode(),
@@ -1868,7 +1967,7 @@ class RuntimeApiServerTest {
         HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/2020-01-01/extension/event/next"))
                         .header("Lambda-Extension-Identifier", survivorId)
-                        .timeout(java.time.Duration.ofSeconds(5))
+                        .timeout(Duration.ofSeconds(5))
                         .GET().build(),
                 HttpResponse.BodyHandlers.ofString());
 
@@ -1934,13 +2033,13 @@ class RuntimeApiServerTest {
     @Timeout(60)
     void extensionShutdown_racedAgainstStop_isNeverOrphaned() throws Exception {
         int iterations = 500;
-        java.util.concurrent.atomic.AtomicInteger totalDelivered = new java.util.concurrent.atomic.AtomicInteger();
+        AtomicInteger totalDelivered = new AtomicInteger();
 
         for (int i = 0; i < iterations; i++) {
             // A fresh client per iteration — the port may be reused from an earlier iteration, and
             // a shared client's connection pool could otherwise hand back a stale pooled
             // connection to that iteration's now-closed server.
-            HttpClient client = HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build();
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
             int freshPort = findFreePort();
             RuntimeApiServer freshServer = new RuntimeApiServer(vertx, freshPort);
             freshServer.start().get(5, TimeUnit.SECONDS);
@@ -2006,7 +2105,7 @@ class RuntimeApiServerTest {
     @Timeout(60)
     void enqueueRacedAgainstStop_alwaysCompletesResultFuture() throws Exception {
         int iterations = 500;
-        java.util.concurrent.ThreadLocalRandom random = java.util.concurrent.ThreadLocalRandom.current();
+        ThreadLocalRandom random = ThreadLocalRandom.current();
 
         for (int i = 0; i < iterations; i++) {
             int freshPort = findFreePort();
@@ -2052,7 +2151,7 @@ class RuntimeApiServerTest {
         int iterations = 300;
 
         for (int i = 0; i < iterations; i++) {
-            HttpClient client = HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build();
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
             int freshPort = findFreePort();
             RuntimeApiServer freshServer = new RuntimeApiServer(vertx, freshPort);
             freshServer.start().get(5, TimeUnit.SECONDS);
@@ -2101,7 +2200,7 @@ class RuntimeApiServerTest {
         int iterations = 300;
 
         for (int i = 0; i < iterations; i++) {
-            HttpClient client = HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build();
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
             int freshPort = findFreePort();
             RuntimeApiServer freshServer = new RuntimeApiServer(vertx, freshPort);
             freshServer.start().get(5, TimeUnit.SECONDS);
@@ -2182,7 +2281,7 @@ class RuntimeApiServerTest {
 
     private String registerExtensionOn(HttpClient client, int targetPort, String name, String... events)
             throws Exception {
-        String eventsJson = String.join(",", java.util.Arrays.stream(events).map(e -> "\"" + e + "\"").toList());
+        String eventsJson = String.join(",", Arrays.stream(events).map(e -> "\"" + e + "\"").toList());
         HttpResponse<String> response = client.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + targetPort + "/2020-01-01/extension/register"))
                         .header("Lambda-Extension-Name", name)
@@ -2231,7 +2330,7 @@ class RuntimeApiServerTest {
     }
 
     private String registerExtension(String name, String... events) throws Exception {
-        String eventsJson = String.join(",", java.util.Arrays.stream(events).map(e -> "\"" + e + "\"").toList());
+        String eventsJson = String.join(",", Arrays.stream(events).map(e -> "\"" + e + "\"").toList());
         HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/2020-01-01/extension/register"))
                         .header("Lambda-Extension-Name", name)
@@ -2242,52 +2341,35 @@ class RuntimeApiServerTest {
         return response.headers().firstValue("Lambda-Extension-Identifier").orElseThrow();
     }
 
-    /**
-     * Lowest port used by {@link #findFreePort()}. Deliberately below the OS ephemeral range
-     * (49152-65535 on macOS, 32768-60999 on typical Linux) — see {@link #findFreePort()}.
-     */
+    @Test
+    void findFreePort_skipsOccupiedLoopbackPort() throws IOException {
+        int occupiedPort = findFreePort();
+        try (ServerSocket listener = new ServerSocket()) {
+            listener.setReuseAddress(true);
+            listener.bind(new InetSocketAddress("127.0.0.1", occupiedPort));
+            NEXT_PORT_OFFSET.set(occupiedPort - TEST_PORT_BASE);
+
+            assertNotEquals(occupiedPort, findFreePort());
+        }
+    }
+
     private static final int TEST_PORT_BASE = 20000;
-    /**
-     * Wide enough that the rotation does not wrap back onto a port still in TIME_WAIT: one run of
-     * this class performs ~1600 port draws, and a closed listener's port stays unusable for tens of
-     * seconds afterwards. Running several test classes in the same JVM multiplies that count, which
-     * is when a narrower window started producing sporadic connect failures.
-     */
     private static final int TEST_PORT_RANGE = 25000;
 
-    /** Rotates across the range so consecutive calls don't retry a port still in TIME_WAIT. */
-    private static final java.util.concurrent.atomic.AtomicInteger NEXT_PORT_OFFSET =
-            new java.util.concurrent.atomic.AtomicInteger(
-                    java.util.concurrent.ThreadLocalRandom.current().nextInt(TEST_PORT_RANGE));
+    // Rotate ports to avoid immediately reusing connections from the stress tests.
+    private static final AtomicInteger NEXT_PORT_OFFSET =
+            new AtomicInteger(ThreadLocalRandom.current().nextInt(TEST_PORT_RANGE));
 
-    /**
-     * Returns a port that is free <em>and</em> outside the OS ephemeral range.
-     *
-     * <p>Binding port 0 (the obvious implementation) draws from the ephemeral range, which is
-     * exactly where the OS and background applications allocate their own listeners. Long-running
-     * desktop agents routinely hold stable ports in that range — on the machine this was diagnosed
-     * on, {@code LogiPlugin} (49200-49204), {@code rapportd} (56698, 63091-63092) and
-     * {@code CommCenter} (65000-65001) all sit inside it. The stress tests below perform well over
-     * a thousand port draws per run, so a collision is near-certain: the probe socket closes, the
-     * other process (or the OS) claims the port before Vert.x binds it, and the test's request is
-     * answered by a stranger — observed as a spurious {@code 501} from an unrelated HTTP daemon, or
-     * as a bind failure/start() timeout. Neither has anything to do with the concurrency under test.
-     *
-     * <p>Ports 20000-29999 sit below every common ephemeral range, so nothing else on the host is
-     * handing them out. The bind check still guards against a genuinely occupied port.
-     */
     private static int findFreePort() throws IOException {
         for (int attempt = 0; attempt < TEST_PORT_RANGE; attempt++) {
             int candidate = TEST_PORT_BASE
                     + Math.floorMod(NEXT_PORT_OFFSET.getAndIncrement(), TEST_PORT_RANGE);
             try (ServerSocket socket = new ServerSocket()) {
-                // Without SO_REUSEADDR the probe leaves the port in TIME_WAIT, which would block
-                // the server that is about to bind it for real.
-                socket.setReuseAddress(true);
+                socket.setReuseAddress(false);
                 socket.bind(new InetSocketAddress("0.0.0.0", candidate));
                 return candidate;
-            } catch (IOException inUse) {
-                // Occupied — try the next port in the rotation.
+            } catch (IOException expected) {
+                // An occupied port is skipped.
             }
         }
         throw new IOException("no free port in " + TEST_PORT_BASE + "-" + (TEST_PORT_BASE + TEST_PORT_RANGE));

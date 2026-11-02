@@ -10,8 +10,8 @@ import static org.hamcrest.Matchers.anEmptyMap;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
-import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 
 /**
  * {@code GetUsage}.
@@ -22,7 +22,7 @@ import static org.hamcrest.Matchers.notNullValue;
  *
  * <p>Each pair is {@code [used, remaining]}, not {@code [used, quota]}: on real API Gateway the
  * second element is the quota limit minus cumulative use. Both are zero here because nothing meters
- * requests per key and a usage plan stores no quota.
+ * requests per key, so there is no use to report or to subtract from a plan's quota.
  */
 @QuarkusTest
 class ApiGatewayGetUsageIntegrationTest {

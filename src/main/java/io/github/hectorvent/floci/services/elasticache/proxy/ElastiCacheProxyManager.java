@@ -18,19 +18,27 @@ public class ElastiCacheProxyManager {
     private static final Logger LOG = Logger.getLogger(ElastiCacheProxyManager.class);
 
     private final SigV4Validator sigV4Validator;
+    private final ElastiCacheTlsCertificates tlsCertificates;
     private final ConcurrentHashMap<String, ElastiCacheAuthProxy> proxies = new ConcurrentHashMap<>();
 
     @Inject
-    public ElastiCacheProxyManager(SigV4Validator sigV4Validator) {
+    public ElastiCacheProxyManager(SigV4Validator sigV4Validator, ElastiCacheTlsCertificates tlsCertificates) {
         this.sigV4Validator = sigV4Validator;
+        this.tlsCertificates = tlsCertificates;
     }
 
     public void startProxy(String groupId, AuthMode authMode, int proxyPort,
                            String backendHost, int backendPort,
                            ElastiCacheAuthProxy.PasswordValidator passwordValidator) {
+        startProxy(groupId, authMode, proxyPort, backendHost, backendPort, passwordValidator, groupId);
+    }
+
+    public void startProxy(String groupId, AuthMode authMode, int proxyPort,
+                           String backendHost, int backendPort,
+                           ElastiCacheAuthProxy.PasswordValidator passwordValidator, String authIdentity) {
         ElastiCacheAuthProxy proxy = new ElastiCacheAuthProxy(
-                groupId, authMode, backendHost, backendPort,
-                passwordValidator, sigV4Validator);
+                authIdentity, authMode, backendHost, backendPort,
+                passwordValidator, sigV4Validator, tlsCertificates::sslContext);
         try {
             proxy.start(proxyPort);
             proxies.put(groupId, proxy);
@@ -45,6 +53,22 @@ public class ElastiCacheProxyManager {
         if (proxy != null) {
             proxy.stop();
             LOG.infov("Stopped proxy for group {0}", groupId);
+        }
+    }
+
+    /** Closes the proxy's unencrypted connections; its encrypted ones carry on. */
+    public void dropUnencryptedConnections(String groupId) {
+        ElastiCacheAuthProxy proxy = proxies.get(groupId);
+        if (proxy != null) {
+            proxy.dropUnencryptedConnections();
+        }
+    }
+
+    /** Applies a changed access string of {@code username} to the open sessions of the group's proxy. */
+    public void refreshUser(String groupId, String username) {
+        ElastiCacheAuthProxy proxy = proxies.get(groupId);
+        if (proxy != null) {
+            proxy.refreshUser(username);
         }
     }
 

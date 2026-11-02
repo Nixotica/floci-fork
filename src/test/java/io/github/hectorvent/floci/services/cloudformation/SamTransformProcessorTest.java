@@ -6,8 +6,15 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.text.MessageFormat;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -127,10 +134,12 @@ class SamTransformProcessorTest {
 
         JsonNode resources = processor.expandSamTemplate(template).path("Resources");
 
-        assertTrue(resources.has("MyFuncVersion"));
-        assertEquals("AWS::Lambda::Version", resources.path("MyFuncVersion").path("Type").asText());
+        // SAM's id: the first ten hex digits of the SHA-1 of {"ZipFile": ...} as sorted compact JSON.
+        String versionId = "MyFuncVersion102360dfc3";
+        assertTrue(resources.has(versionId), resources.toString());
+        assertEquals("AWS::Lambda::Version", resources.path(versionId).path("Type").asText());
         assertEquals("MyFunc",
-                resources.path("MyFuncVersion").path("Properties").path("FunctionName").path("Ref").asText());
+                resources.path(versionId).path("Properties").path("FunctionName").path("Ref").asText());
 
         // Suffix is sanitize()d, so the logical id stays alphanumeric — see the alias-name case
         // below, where the raw name would otherwise leak a '-' into it.
@@ -141,11 +150,797 @@ class SamTransformProcessorTest {
         assertEquals("production", aliasProps.path("Name").asText());
         assertEquals("MyFunc", aliasProps.path("FunctionName").path("Ref").asText());
 
-        // The alias deliberately targets $LATEST rather than the published version real SAM points
-        // at: Floci cannot invoke a published version (#1987 cold-start timeout, #1988 warm-pool
-        // keying), so the faithful form would break the alias-qualified invoke this expansion
-        // exists to enable.
-        assertEquals("$LATEST", aliasProps.path("FunctionVersion").asText());
+        assertEquals(objectMapper.readTree("[\"" + versionId + "\",\"Version\"]"),
+                aliasProps.path("FunctionVersion").path("Fn::GetAtt"));
+    }
+
+    @Test
+    void expandSamTemplate_autoPublishAliasResolvesReferenceableProperty() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "FnPermission": {
+                  "Type": "AWS::Lambda::Permission",
+                  "Properties": {
+                    "Action": "lambda:InvokeFunction",
+                    "FunctionName": {"Ref": "Fn.Alias"},
+                    "Principal": "events.amazonaws.com"
+                  }
+                },
+                "Fn": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler",
+                    "Runtime": "nodejs22.x",
+                    "AutoPublishAlias": "live",
+                    "InlineCode": "exports.handler = async () => ({});"
+                  }
+                }
+              },
+              "Outputs": {
+                "AliasArn": {"Value": {"Ref": "Fn.Alias"}},
+                "FunctionName": {"Value": {"Ref": "Fn"}}
+              }
+            }
+            """);
+
+        JsonNode expanded = processor.expandSamTemplate(template);
+        assertEquals("FnAliasLive", expanded.path("Resources").path("FnPermission")
+                .path("Properties").path("FunctionName").path("Ref").asText());
+        assertEquals("FnAliasLive", expanded.path("Outputs").path("AliasArn")
+                .path("Value").path("Ref").asText());
+        assertEquals("Fn", expanded.path("Outputs").path("FunctionName")
+                .path("Value").path("Ref").asText());
+    }
+
+    @Test
+    void expandSamTemplate_autoPublishAliasReferenceUsesGeneratedIdAfterCollision() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "FnAliasLive": {"Type": "AWS::S3::Bucket"},
+                "Fn": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler",
+                    "Runtime": "nodejs22.x",
+                    "AutoPublishAlias": "live",
+                    "InlineCode": "exports.handler = async () => ({});"
+                  }
+                },
+                "FnPermission": {
+                  "Type": "AWS::Lambda::Permission",
+                  "Properties": {"FunctionName": {"Ref": "Fn.Alias"}}
+                }
+              }
+            }
+            """);
+
+        JsonNode resources = processor.expandSamTemplate(template).path("Resources");
+        assertEquals("AWS::S3::Bucket", resources.path("FnAliasLive").path("Type").asText());
+        assertEquals("AWS::Lambda::Alias", resources.path("FnAliasLive2").path("Type").asText());
+        assertEquals("FnAliasLive2", resources.path("FnPermission").path("Properties")
+                .path("FunctionName").path("Ref").asText());
+    }
+
+    /** The ids are the ones SAM gives the same function. */
+    @Test
+    void expandSamTemplate_autoPublishAliasVersionIdFollowsSamsHashInput() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "InlineCode": "%s"%s
+                  }
+                }
+              }
+            }
+            """;
+        String code = "exports.handler = async () => ({});";
+
+        assertEquals("MyFuncVersion102360dfc3", publishedVersionId(template.formatted(code, "")));
+        assertEquals("MyFuncVersion102360dfc3", publishedVersionId(template.formatted(code, ", \"Timeout\": 9")),
+                "Timeout is outside SAM's hash input, so changing it publishes no version");
+        assertEquals("MyFuncVersion390d0d3f1c",
+                publishedVersionId(template.formatted("exports.handler = async () => ({ changed: true });", "")));
+        assertEquals("MyFuncVersion450730da1b", publishedVersionId(template.formatted(code,
+                ", \"MemorySize\": 256, \"Environment\": {\"Variables\": {\"STAGE\": \"dev\"}}")));
+        assertEquals("MyFuncVersionccaa7bd288", publishedVersionId(template.formatted(code,
+                ", \"Environment\": {\"Variables\": {\"STAGE\": \"dev\", \"APP\": \"orders\"}}")),
+                "nested keys are sorted too");
+    }
+
+    /**
+     * SAM also hashes a function's SnapStart when its ApplyOn is anything but "None", so turning
+     * SnapStart on names a new version; absent, empty or "None" leaves the id unchanged. With
+     * AutoPublishAliasAllProperties it is hashed like every other property.
+     */
+    @Test
+    void expandSamTemplate_autoPublishAliasVersionIdIncludesAppliedSnapStart() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "java21", "AutoPublishAlias": "live",
+                    "InlineCode": "exports.handler = async () => ({});"%s
+                  }
+                }
+              }
+            }
+            """;
+        String snapStart = ", \"SnapStart\": {\"ApplyOn\": \"PublishedVersions\"}";
+
+        assertEquals("MyFuncVersiona8f283d3fa", publishedVersionId(template.formatted(snapStart)));
+        assertEquals("MyFuncVersion2154246fbb",
+                publishedVersionId(template.formatted(", \"MemorySize\": 256" + snapStart)));
+        assertEquals("MyFuncVersion3c4b5efba5",
+                publishedVersionId(template.formatted(", \"SnapStart\": {\"ApplyOn\": null}")),
+                "a null ApplyOn is not None, so SAM hashes it");
+        for (String off : List.of("", ", \"SnapStart\": {\"ApplyOn\": \"None\"}", ", \"SnapStart\": {}")) {
+            assertEquals("MyFuncVersion102360dfc3", publishedVersionId(template.formatted(off)), off);
+        }
+        String allProperties = ", \"AutoPublishAliasAllProperties\": true";
+        // The SHA-1 of the properties the transform gives the function, as sorted compact JSON:
+        // {"Code":{"ZipFile":"..."},"Handler":"index.handler","Role":{"Fn::GetAtt":["MyFuncRole","Arn"]},
+        // "Runtime":"java21"}
+        assertEquals("MyFuncVersionef5795a086", publishedVersionId(template.formatted(allProperties)));
+        assertEquals("MyFuncVersion60f02511cd",
+                publishedVersionId(template.formatted(allProperties + ", \"Timeout\": 9")),
+                "every property is hashed, Timeout included");
+        assertEquals("MyFuncVersion6c94e3ab8d",
+                publishedVersionId(template.formatted(allProperties + ", \"SnapStart\": {\"ApplyOn\": \"None\"}")),
+                "SnapStart is hashed whatever its ApplyOn");
+        assertEquals("MyFuncVersion102360dfc3",
+                publishedVersionId(template.formatted(", \"AutoPublishAliasAllProperties\": false")),
+                "false hashes as if the property were absent");
+    }
+
+    /**
+     * SAM hashes the code with every character outside printable ASCII, DEL included, written as a
+     * lowercase hex escape (JSON's short escapes such as a newline's stay short), and a character
+     * beyond the Basic Multilingual Plane as its surrogate pair.
+     */
+    @Test
+    void expandSamTemplate_autoPublishAliasVersionIdEscapesTheCodeAsSamDoes() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "InlineCode": "%s"
+                  }
+                }
+              }
+            }
+            """;
+
+        assertEquals("MyFuncVersion307c99f964", publishedVersionId(template.formatted(
+                "exports.handler = async () => ({ msg: 'caf\u00e9 \u2192 ok' });")));
+        assertEquals("MyFuncVersion3bd79f6f3e", publishedVersionId(template.formatted("a\u007fb\\u001fc")));
+        assertEquals("MyFuncVersion3d3709555d", publishedVersionId(template.formatted("x \uD83D\uDE00")));
+    }
+
+    /**
+     * SAM resolves parameters only in the code: one that only {@code Environment} or
+     * {@code MemorySize} uses is hashed as the {@code Ref}, so changing its value publishes nothing.
+     */
+    @Test
+    void expandSamTemplate_autoPublishAliasVersionIdIgnoresParametersOutsideTheCode() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Parameters": {"Release": {"Type": "String"}, "Memory": {"Type": "Number"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "CodeUri": "s3://artifacts/app.zip", "MemorySize": {"Ref": "Memory"},
+                    "Environment": {"Variables": {"RELEASE": {"Ref": "Release"}}}
+                  }
+                }
+              }
+            }
+            """;
+
+        assertEquals(publishedVersionId(template, Map.of("Release", "1", "Memory", "128")),
+                publishedVersionId(template, Map.of("Release", "2", "Memory", "256")));
+    }
+
+    /**
+     * A given {@code AutoPublishCodeSha256} names the version: SAM takes its first ten characters
+     * and hashes nothing else, so the code alone no longer names the version.
+     */
+    @Test
+    void expandSamTemplate_autoPublishCodeSha256TakesTheHashesPlace() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "InlineCode": "%s", "AutoPublishCodeSha256": "%s"
+                  }
+                }
+              }
+            }
+            """;
+        String code = "exports.handler = async () => ({});";
+        String sha = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b";
+
+        assertEquals("MyFuncVersion6b86b273ff", publishedVersionId(template.formatted(code, sha)));
+        assertEquals("MyFuncVersion6b86b273ff",
+                publishedVersionId(template.formatted("exports.handler = async () => ({ changed: true });", sha)),
+                "a code change under the same AutoPublishCodeSha256 keeps the version");
+        assertEquals("MyFuncVersionabc", publishedVersionId(template.formatted(code, "abc")));
+        assertEquals("MyFuncVersion102360dfc3", publishedVersionId(template.formatted(code, "")),
+                "an empty AutoPublishCodeSha256 gives no hash, so the code is hashed");
+    }
+
+    /**
+     * SAM refuses an AutoPublishCodeSha256 that is not a string: on any function when it is neither a
+     * string nor a one-key object, and with AutoPublishAlias when it does not resolve to a string.
+     */
+    @Test
+    void expandSamTemplate_autoPublishCodeSha256MustBeAString() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "Bucket": {"Type": "AWS::S3::Bucket"},
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x",%s
+                    "InlineCode": "exports.handler = async () => ({});", "AutoPublishCodeSha256": %s
+                  }
+                }
+              }
+            }
+            """;
+        String alias = " \"AutoPublishAlias\": \"live\",";
+
+        AwsException number = assertThrows(AwsException.class,
+                () -> processor.expandSamTemplate(objectMapper.readTree(template.formatted("", "12"))));
+        assertEquals("ValidationError", number.getErrorCode());
+        assertEquals("Resource with id [MyFunc] is invalid. Type of property 'AutoPublishCodeSha256' is invalid.",
+                number.getMessage(), "checked whether or not the function publishes a version");
+        assertEquals("Resource with id [MyFunc] is invalid. Type of property 'AutoPublishCodeSha256' is invalid.",
+                assertThrows(AwsException.class, () -> publishedVersionId(template.formatted(alias,
+                        "{\"Fn::Sub\": \"a\", \"Fn::Join\": [\"\", []]}"))).getMessage());
+        for (String unresolved : List.of("{\"Fn::GetAtt\": [\"Bucket\", \"Arn\"]}", "{\"Sha\": \"abc\"}")) {
+            assertEquals("Resource with id [MyFunc] is invalid. AutoPublishCodeSha256 must be a string",
+                    assertThrows(AwsException.class, () -> publishedVersionId(template.formatted(alias, unresolved)))
+                            .getMessage(), unresolved);
+        }
+        assertEquals("Resource with id [MyFuncVersion1.2.3-rc] is invalid. Logical ids must be alphanumeric.",
+                assertThrows(AwsException.class, () -> publishedVersionId(template.formatted(alias, "\"1.2.3-rc\"")))
+                        .getMessage());
+        assertEquals("MyFuncVersionabcdefghij", publishedVersionId(template.formatted(alias, "\"abcdefghij-x\"")),
+                "only the first ten characters name the version");
+    }
+
+    /** As in SAM, the function's Description reaches the Lambda function as written. */
+    @Test
+    void expandSamTemplate_functionDescriptionIsCopiedToTheFunction() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Parameters": {"Purpose": {"Type": "String", "Default": "orders"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x",
+                    "InlineCode": "exports.handler = async () => ({});"%s
+                  }
+                }
+              }
+            }
+            """;
+
+        assertEquals("\"Orders API\"", functionDescription(template.formatted(", \"Description\": \"Orders API\"")));
+        assertEquals("{\"Ref\":\"Purpose\"}", functionDescription(template.formatted(
+                ", \"Description\": {\"Ref\": \"Purpose\"}")), "an intrinsic function is left to CloudFormation");
+        assertEquals("\"Orders API\"", functionDescription(template.formatted(
+                ", \"Description\": \"Orders API\", \"AutoPublishAlias\": \"live\"")),
+                "AutoPublishAlias without AutoPublishCodeSha256 leaves it as written");
+        assertEquals("\"Orders API\"", functionDescription(template.formatted(
+                ", \"Description\": \"Orders API\", \"AutoPublishCodeSha256\": \"abc\"")),
+                "AutoPublishCodeSha256 without AutoPublishAlias leaves it as written");
+        assertTrue(processor.expandSamTemplate(objectMapper.readTree(template.formatted(""))).path("Resources")
+                .path("MyFunc").path("Properties").path("Description").isMissingNode());
+        String allProperties = ", \"AutoPublishAlias\": \"live\", \"AutoPublishAliasAllProperties\": true";
+        assertNotEquals(publishedVersionId(template.formatted(allProperties + ", \"Description\": \"first\"")),
+                publishedVersionId(template.formatted(allProperties + ", \"Description\": \"second\"")),
+                "under AutoPublishAliasAllProperties a new Description names a new version");
+    }
+
+    /**
+     * With AutoPublishAlias, SAM appends a given AutoPublishCodeSha256 to the function's Description, so
+     * that a new value alone changes the function and a version publishes for it. A function without a
+     * description gets the bare hash, a plain string gets the hash after a space, and an intrinsic
+     * function is wrapped in an Fn::Join with the hash.
+     */
+    @Test
+    void expandSamTemplate_autoPublishCodeSha256IsAppendedToTheDescription() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Parameters": {
+                "AutoPublishCodeSha256": {"Type": "String",
+                  "Default": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"},
+                "Purpose": {"Type": "String", "Default": "orders"}
+              },
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "InlineCode": "exports.handler = async () => ({});", "AutoPublishCodeSha256": %s%s
+                  }
+                }
+              }
+            }
+            """;
+        String sha = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b";
+        String ref = "{\"Ref\": \"AutoPublishCodeSha256\"}";
+
+        assertEquals("\"" + sha + "\"", functionDescription(template.formatted(ref, "")));
+        assertEquals("\"My testing description " + sha + "\"",
+                functionDescription(template.formatted(ref, ", \"Description\": \"My testing description\"")));
+        assertEquals("{\"Fn::Join\":[\" \",[{\"Fn::Join\":[\":\",[\"a\",\"b\",\"c\"]]},\"" + sha + "\"]]}",
+                functionDescription(template.formatted(ref,
+                        ", \"Description\": {\"Fn::Join\": [\":\", [\"a\", \"b\", \"c\"]]}")));
+
+        assertEquals("\"payments abc\"", functionDescription(template.formatted("\"abc\"",
+                ", \"Description\": {\"Ref\": \"Purpose\"}"), Map.of("Purpose", "payments")),
+                "a parameter is resolved first, as SAM resolves it");
+        assertEquals("{\"Fn::Join\":[\" \",[{\"Fn::Sub\":\"payments handler\"},\"abc\"]]}",
+                functionDescription(template.formatted("\"abc\"", ", \"Description\": {\"Fn::Sub\": "
+                        + "\"${Purpose} handler\"}"), Map.of("Purpose", "payments")),
+                "any other intrinsic function stays, with its parameters resolved");
+        assertEquals("\"abc\"", functionDescription(template.formatted("\"abc\"", ", \"Description\": \"\"")));
+        assertEquals("\"orders\"", functionDescription(template.formatted("\"\"", ", \"Description\": \"orders\"")),
+                "an empty AutoPublishCodeSha256 appends nothing");
+        assertEquals("{\"Ref\":\"Purpose\"}", functionDescription(template.formatted("\"\"",
+                ", \"Description\": {\"Ref\": \"Purpose\"}"), Map.of("Purpose", "payments")),
+                "with nothing appended the Description stays as written");
+        assertEquals("\"Shared abc\"", functionDescription(template.formatted("\"abc\"", "").replace("\"Resources\"",
+                "\"Globals\": {\"Function\": {\"Description\": \"Shared\"}}, \"Resources\"")),
+                "a Description from Globals takes the value too");
+        assertEquals("\"orders \"", functionDescription(template.formatted(ref, ", \"Description\": \"orders\""),
+                Map.of("AutoPublishCodeSha256", "")),
+                "SAM tests the property as written, so a Ref to an empty value still appends it");
+        assertEquals("\"\"", functionDescription(template.formatted(ref, ""), Map.of("AutoPublishCodeSha256", "")),
+                "and a function without a Description gets an empty one");
+    }
+
+    private String functionDescription(String template) throws Exception {
+        return functionDescription(template, Map.of());
+    }
+
+    private String functionDescription(String template, Map<String, String> parameterValues) throws Exception {
+        return processor.expandSamTemplate(objectMapper.readTree(template), parameterValues).path("Resources")
+                .path("MyFunc").path("Properties").path("Description").toString();
+    }
+
+    /** SAM's types for the other version properties, and VersionDeletionPolicy needs AutoPublishAlias. */
+    @Test
+    void expandSamTemplate_versionPropertiesHaveSamsTypes() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Parameters": {"Policy": {"Type": "String", "Default": "Retain"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x",
+                    "InlineCode": "exports.handler = async () => ({});"%s
+                  }
+                }
+              }
+            }
+            """;
+        String alias = ", \"AutoPublishAlias\": \"live\"";
+
+        for (String allProperties : List.of("\"true\"", "1", "{\"Ref\": \"HashAll\"}")) {
+            assertEquals("Resource with id [MyFunc] is invalid. Type of property 'AutoPublishAliasAllProperties' "
+                            + "is invalid.",
+                    assertThrows(AwsException.class, () -> processor.expandSamTemplate(objectMapper.readTree(
+                            template.formatted(alias + ", \"AutoPublishAliasAllProperties\": " + allProperties))))
+                            .getMessage(), allProperties);
+        }
+        assertEquals("Resource with id [MyFunc] is invalid. Property 'VersionDeletionPolicy' should be a one of the "
+                        + "strings: 'Delete' or 'Retain'.",
+                assertThrows(AwsException.class, () -> processor.expandSamTemplate(objectMapper.readTree(
+                        template.formatted(alias + ", \"VersionDeletionPolicy\": \"retain\"")))).getMessage());
+        assertEquals("Resource with id [MyFunc] is invalid. 'VersionDeletionPolicy' requires 'AutoPublishAlias'.",
+                assertThrows(AwsException.class, () -> processor.expandSamTemplate(objectMapper.readTree(
+                        template.formatted(", \"VersionDeletionPolicy\": \"Retain\"")))).getMessage());
+        assertEquals("{\"Ref\":\"Policy\"}", processor.expandSamTemplate(objectMapper.readTree(
+                        template.formatted(alias + ", \"VersionDeletionPolicy\": {\"Ref\": \"Policy\"}")))
+                .path("Resources").path("MyFuncVersion102360dfc3").path("DeletionPolicy").toString(),
+                "an intrinsic function is copied unresolved, as SAM copies it");
+    }
+
+    /** As in SAM, a given AutoPublishCodeSha256 names the version under AutoPublishAliasAllProperties too. */
+    @Test
+    void expandSamTemplate_autoPublishCodeSha256OutranksAutoPublishAliasAllProperties() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "AutoPublishAliasAllProperties": true, "AutoPublishCodeSha256": "abc123",
+                    "InlineCode": "exports.handler = async () => ({});", "Timeout": %d
+                  }
+                }
+              }
+            }
+            """;
+
+        assertEquals("MyFuncVersionabc123", publishedVersionId(template.formatted(3)));
+        assertEquals("MyFuncVersionabc123", publishedVersionId(template.formatted(9)));
+    }
+
+    /** Globals.Function carries AutoPublishAliasAllProperties and VersionDeletionPolicy, as SAM's do. */
+    @Test
+    void expandSamTemplate_versionPropertiesComeFromGlobals() throws Exception {
+        JsonNode resources = processor.expandSamTemplate(objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Globals": {"Function": {"AutoPublishAlias": "live", "AutoPublishAliasAllProperties": true,
+                "VersionDeletionPolicy": "Delete"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {"Handler": "index.handler", "Runtime": "nodejs20.x",
+                    "InlineCode": "exports.handler = async () => ({});"}
+                }
+              }
+            }
+            """)).path("Resources");
+
+        // Without AutoPublishAliasAllProperties the id is MyFuncVersion102360dfc3.
+        assertEquals("[\"MyFuncVersionb6788accf2\",\"Version\"]", resources.path("MyFuncAliasLive")
+                .path("Properties").path("FunctionVersion").path("Fn::GetAtt").toString());
+        assertEquals("Delete", resources.path("MyFuncVersionb6788accf2").path("DeletionPolicy").asText());
+    }
+
+    /** SAM's Globals do not take AutoPublishCodeSha256, which would name every function's version. */
+    @Test
+    void expandSamTemplate_globalsRefuseAutoPublishCodeSha256() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Globals": {"Function": {"AutoPublishAlias": "live", "AutoPublishCodeSha256": "release1234"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {"Handler": "index.handler", "Runtime": "nodejs20.x",
+                    "InlineCode": "exports.handler = async () => ({});"}
+                }
+              }
+            }
+            """);
+
+        AwsException refused = assertThrows(AwsException.class, () -> processor.expandSamTemplate(template));
+        assertEquals("ValidationError", refused.getErrorCode());
+        assertEquals("'Globals' section is invalid. 'AutoPublishCodeSha256' is not a supported property of "
+                + "'Function'.", refused.getMessage());
+    }
+
+    /**
+     * SAM gives the version the function's VersionDescription as its Description, as written, so
+     * CloudFormation resolves an intrinsic function in it. The function does not take it, and
+     * without AutoPublishAlias there is no version to take it.
+     */
+    @Test
+    void expandSamTemplate_versionDescriptionDescribesTheVersion() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Parameters": {"Release": {"Type": "String", "Default": "1"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x",%s
+                    "InlineCode": "exports.handler = async () => ({});", "VersionDescription": %s
+                  }
+                }
+              }
+            }
+            """;
+        String alias = " \"AutoPublishAlias\": \"live\",";
+
+        JsonNode resources = processor.expandSamTemplate(objectMapper.readTree(
+                template.formatted(alias, "\"first release\""))).path("Resources");
+        assertEquals("first release",
+                resources.path("MyFuncVersion102360dfc3").path("Properties").path("Description").asText());
+        assertFalse(resources.path("MyFunc").path("Properties").has("Description"), "the function takes no description");
+        assertEquals("{\"Fn::Sub\":\"release ${Release}\"}", versionProperties(template.formatted(alias,
+                "{\"Fn::Sub\": \"release ${Release}\"}")).path("Description").toString(),
+                "an intrinsic function is copied unresolved, as SAM copies it");
+        assertEquals("\"\"", versionProperties(template.formatted(alias, "\"\"")).path("Description").toString(),
+                "SAM keeps an empty value");
+        assertFalse(versionProperties(template.formatted(alias, "null")).has("Description"),
+                "SAM drops a null value");
+
+        JsonNode unpublished = processor.expandSamTemplate(objectMapper.readTree(
+                template.formatted("", "\"first release\""))).path("Resources");
+        assertTrue(unpublished.has("MyFuncRole"));
+        assertEquals(2, unpublished.size(), "only the function and its role: " + unpublished);
+        assertFalse(unpublished.path("MyFunc").path("Properties").has("Description"));
+    }
+
+    /** The version resource SAM's translator gives this function, id and Description included. */
+    @Test
+    void expandSamTemplate_versionDescriptionGivesSamsVersionResource() throws Exception {
+        JsonNode resources = processor.expandSamTemplate(objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MinimalFunction": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "CodeUri": "s3://sam-demo-bucket/hello.zip", "Handler": "hello.handler",
+                    "Runtime": "python2.7", "AutoPublishAlias": "live", "VersionDescription": "sam-testing"
+                  }
+                }
+              }
+            }
+            """)).path("Resources");
+
+        assertEquals(objectMapper.readTree("""
+            {"Type": "AWS::Lambda::Version", "DeletionPolicy": "Retain",
+              "Properties": {"Description": "sam-testing", "FunctionName": {"Ref": "MinimalFunction"}}}
+            """), resources.path("MinimalFunctionVersion640128d35d"), resources.toString());
+    }
+
+    /**
+     * SAM leaves VersionDescription out of the version's id, by default, under
+     * AutoPublishAliasAllProperties and beside a given AutoPublishCodeSha256, so a new one alone
+     * names no new version. The version takes it without the AutoPublishCodeSha256.
+     */
+    @Test
+    void expandSamTemplate_versionDescriptionIsNotPartOfTheVersionId() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "InlineCode": "exports.handler = async () => ({});"%s%s
+                  }
+                }
+              }
+            }
+            """;
+        String described = ", \"VersionDescription\": \"first release\"";
+        String codeSha256 = ", \"AutoPublishCodeSha256\": \"abc123\"";
+
+        for (String versionProperty : List.of("", ", \"AutoPublishAliasAllProperties\": true", codeSha256)) {
+            assertEquals(publishedVersionId(template.formatted(versionProperty, "")),
+                    publishedVersionId(template.formatted(versionProperty, described)), versionProperty);
+        }
+        assertEquals("MyFuncVersion102360dfc3", publishedVersionId(template.formatted("", described)));
+        assertEquals("first release", processor.expandSamTemplate(objectMapper.readTree(
+                template.formatted(codeSha256, described))).path("Resources").path("MyFuncVersionabc123")
+                .path("Properties").path("Description").asText());
+    }
+
+    /** SAM's Globals do not take VersionDescription either, which would describe every function's version. */
+    @Test
+    void expandSamTemplate_globalsRefuseVersionDescription() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Globals": {"Function": {"AutoPublishAlias": "live", "VersionDescription": "every release"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {"Handler": "index.handler", "Runtime": "nodejs20.x",
+                    "InlineCode": "exports.handler = async () => ({});"}
+                }
+              }
+            }
+            """);
+
+        AwsException refused = assertThrows(AwsException.class, () -> processor.expandSamTemplate(template));
+        assertEquals("ValidationError", refused.getErrorCode());
+        assertEquals("'Globals' section is invalid. 'VersionDescription' is not a supported property of "
+                + "'Function'.", refused.getMessage());
+    }
+
+    private JsonNode versionProperties(String template) throws Exception {
+        return processor.expandSamTemplate(objectMapper.readTree(template)).path("Resources")
+                .path("MyFuncVersion102360dfc3").path("Properties");
+    }
+
+    /**
+     * SAM retains each version it publishes unless the function sets a {@code DeletionPolicy}, which
+     * the version and alias both take, or a {@code VersionDeletionPolicy}; a function on a capacity
+     * provider defaults to {@code Delete}.
+     */
+    @Test
+    void expandSamTemplate_autoPublishAliasVersionDeletionPolicyFollowsSam() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",%s
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "InlineCode": "exports.handler = async () => ({});"%s
+                  }
+                }
+              }
+            }
+            """;
+
+        JsonNode retained = processor.expandSamTemplate(objectMapper.readTree(template.formatted("", "")))
+                .path("Resources");
+        assertEquals("Retain", retained.path("MyFuncVersion102360dfc3").path("DeletionPolicy").asText());
+        assertTrue(retained.path("MyFuncAliasLive").path("DeletionPolicy").isMissingNode(),
+                "the alias takes only what the function declares");
+        assertEquals("Delete", versionDeletionPolicy(template.formatted(
+                " \"DeletionPolicy\": \"Delete\",", ", \"VersionDeletionPolicy\": \"Retain\"")));
+        assertEquals("Delete", versionDeletionPolicy(template.formatted(
+                "", ", \"VersionDeletionPolicy\": \"Delete\"")));
+        assertEquals("Retain", versionDeletionPolicy(template.formatted(
+                "", ", \"VersionDeletionPolicy\": \"Retain\"")));
+        assertEquals("Delete", versionDeletionPolicy(template.formatted(
+                "", ", \"CapacityProviderConfig\": {\"Arn\": \"capacity-provider-arn\"}")));
+        assertEquals("Retain", versionDeletionPolicy(template.formatted("", ", \"VersionDeletionPolicy\": \"Retain\", "
+                + "\"CapacityProviderConfig\": {\"Arn\": \"capacity-provider-arn\"}")));
+    }
+
+    private String versionDeletionPolicy(String template) throws Exception {
+        return processor.expandSamTemplate(objectMapper.readTree(template)).path("Resources")
+                .path("MyFuncVersion102360dfc3").path("DeletionPolicy").asText();
+    }
+
+    @Test
+    void expandSamTemplate_autoPublishAliasVersionIdResolvesParameterReferencesInTheCode() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Parameters": {"CodeKey": {"Type": "String", "Default": "v1/code.zip"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "CodeUri": {"Bucket": "artifacts", "Key": {"Ref": "CodeKey"}}
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode resources = processor.expandSamTemplate(template, Map.of("CodeKey", "v2/code.zip"))
+                .path("Resources");
+
+        assertEquals("[\"MyFuncVersionf3ad9caea0\",\"Version\"]",
+                resources.path("MyFuncAliasLive").path("Properties").path("FunctionVersion")
+                        .path("Fn::GetAtt").toString());
+        // SAM writes the resolved value into the function's Code; floci keeps the Ref, which
+        // CloudFormation resolves to the same value. Resolving for the hash must not rewrite it.
+        assertEquals("CodeKey", resources.path("MyFunc").path("Properties").path("Code").path("S3Key")
+                .path("Ref").asText());
+    }
+
+    /**
+     * A parameter reaches the hash the way SAM resolves it: as a {@code Ref}, as a {@code ${Name}}
+     * in an {@code Fn::Sub}, under {@code AutoPublishAliasAllProperties} too, and in
+     * {@code AutoPublishCodeSha256}. Otherwise a parameter-only update changes the function but
+     * publishes no version, and the alias keeps the old code.
+     */
+    @Test
+    void expandSamTemplate_autoPublishAliasVersionIdFollowsParametersInEveryForm() throws Exception {
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Parameters": {"Release": {"Type": "String"}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x", "AutoPublishAlias": "live",
+                    "CodeUri": {"Bucket": "artifacts", "Key": %s}%s
+                  }
+                }
+              }
+            }
+            """;
+        String sub = "{\"Fn::Sub\": \"app-${Release}.zip\"}";
+        String ref = "{\"Ref\": \"Release\"}";
+
+        assertEquals(publishedVersionId(template.formatted("{\"Fn::Sub\": \"app-2.zip\"}", ""), Map.of()),
+                publishedVersionId(template.formatted(sub, ""), Map.of("Release", "2")),
+                "a substituted parameter hashes as its value");
+        assertNotEquals(publishedVersionId(template.formatted(sub, ""), Map.of("Release", "1")),
+                publishedVersionId(template.formatted(sub, ""), Map.of("Release", "2")));
+        assertNotEquals(publishedVersionId(template.formatted(ref, ""), Map.of("Release", "1")),
+                publishedVersionId(template.formatted(ref, ""), Map.of("Release", "2")));
+        String allProperties = ", \"AutoPublishAliasAllProperties\": true";
+        assertNotEquals(publishedVersionId(template.formatted(ref, allProperties), Map.of("Release", "1")),
+                publishedVersionId(template.formatted(ref, allProperties), Map.of("Release", "2")));
+        String codeSha = ", \"AutoPublishCodeSha256\": {\"Ref\": \"Release\"}";
+        assertEquals("MyFuncVersion2",
+                publishedVersionId(template.formatted("\"app.zip\"", codeSha), Map.of("Release", "2")));
+        assertEquals(publishedVersionId(template.formatted("\"app.zip\"", ""), Map.of()),
+                publishedVersionId(template.formatted("\"app.zip\"", codeSha), Map.of("Release", "")),
+                "a Ref resolving to an empty value leaves the hash in place");
+    }
+
+    private String publishedVersionId(String template) throws Exception {
+        return publishedVersionId(template, Map.of());
+    }
+
+    private String publishedVersionId(String template, Map<String, String> parameterValues) throws Exception {
+        JsonNode resources = processor.expandSamTemplate(objectMapper.readTree(template), parameterValues)
+                .path("Resources");
+        return resources.path("MyFuncAliasLive").path("Properties").path("FunctionVersion")
+                .path("Fn::GetAtt").get(0).asText();
+    }
+
+    /**
+     * SAM itself refuses a template that already declares an id it generates; floci has always
+     * renamed its generated resource instead, and the alias must still follow the generated version.
+     */
+    @Test
+    void expandSamTemplate_autoPublishAliasUsesGeneratedVersionWhenLogicalIdCollides() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFuncVersion102360dfc3": {"Type": "AWS::S3::Bucket"},
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x",
+                    "AutoPublishAlias": {"Ref": "StageName"},
+                    "InlineCode": "exports.handler = async () => ({});"
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode resources = processor.expandSamTemplate(template).path("Resources");
+        JsonNode versionRef = resources.path("MyFuncAlias").path("Properties")
+                .path("FunctionVersion").path("Fn::GetAtt");
+        String generatedVersion = versionRef.get(0).asText();
+        assertEquals("MyFuncVersion102360dfc32", generatedVersion);
+        assertEquals("AWS::S3::Bucket", resources.path("MyFuncVersion102360dfc3").path("Type").asText());
+        assertEquals("AWS::Lambda::Version", resources.path(generatedVersion).path("Type").asText());
+        assertEquals("Version", versionRef.get(1).asText());
+        assertEquals("StageName", resources.path("MyFuncAlias").path("Properties")
+                .path("Name").path("Ref").asText());
     }
 
     @Test
@@ -1325,6 +2120,67 @@ class SamTransformProcessorTest {
     }
 
     @Test
+    void expandSamTemplate_prependsGlobalFunctionLayers() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Globals": {"Function": {"Layers": ["arn:aws:lambda:us-east-1:123456789012:layer:shared:1"]}},
+              "Resources": {
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "InlineCode": "exports.handler = async () => ({});",
+                    "Layers": ["arn:aws:lambda:us-east-1:123456789012:layer:local:1"]
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode layers = processor.expandSamTemplate(template)
+                .path("Resources").path("MyFunc").path("Properties").path("Layers");
+        assertEquals(2, layers.size());
+        assertEquals("arn:aws:lambda:us-east-1:123456789012:layer:shared:1", layers.get(0).asText());
+        assertEquals("arn:aws:lambda:us-east-1:123456789012:layer:local:1", layers.get(1).asText());
+    }
+
+    @Test
+    void expandSamTemplate_functionArchitecturesReplaceGlobals() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Globals": {"Function": {"Architectures": ["x86_64"]}},
+              "Resources": {"MyFunc": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                  "Runtime": "nodejs20.x",
+                  "Handler": "index.handler",
+                  "InlineCode": "exports.handler = async () => ({});",
+                  "Architectures": ["arm64"]
+                }
+              }, "InheritedFunc": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                  "Runtime": "nodejs20.x",
+                  "Handler": "index.handler",
+                  "InlineCode": "exports.handler = async () => ({});"
+                }
+              }}
+            }
+            """);
+
+        JsonNode expanded = processor.expandSamTemplate(template);
+        JsonNode architectures = expanded
+                .path("Resources").path("MyFunc").path("Properties").path("Architectures");
+        assertEquals(objectMapper.readTree("[\"arm64\"]"), architectures);
+        JsonNode inheritedArchitectures = expanded
+                .path("Resources").path("InheritedFunc").path("Properties").path("Architectures");
+        assertEquals(objectMapper.readTree("[\"x86_64\"]"), inheritedArchitectures);
+    }
+
+    @Test
     void expandSamTemplate_mergesNestedMapsFromGlobals() throws Exception {
         // Environment.Variables must merge key-wise: globals-only keys preserved, function keys win on clash
         JsonNode template = objectMapper.readTree("""
@@ -1356,6 +2212,50 @@ class SamTransformProcessorTest {
         assertEquals("g", vars.path("GLOBAL_VAR").asText());          // globals-only key preserved
         assertEquals("l", vars.path("LOCAL_VAR").asText());           // function-only key added
         assertEquals("from-function", vars.path("SHARED").asText());  // clash resolved in favor of function
+    }
+
+    @Test
+    void expandSamTemplate_replacesIntrinsicValuesWithinGlobalsMaps() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Globals": {"Function": {"Environment": {"Variables": {
+                "GLOBAL": "global",
+                "URL": {"Fn::Join": ["", ["https://global.example", "/old"]]},
+                "SCALAR": {"Fn::Sub": "global-${AWS::Region}"},
+                "REFERENCE": {"Ref": "GlobalParam"}
+              }}}},
+              "Resources": {"MyFunc": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                  "Runtime": "nodejs20.x",
+                  "Handler": "index.handler",
+                  "InlineCode": "exports.handler = async () => ({});",
+                  "Environment": {"Variables": {
+                    "LOCAL": "local",
+                    "URL": {"Fn::Join": ["", ["https://local.example", "/v1"]]},
+                    "SCALAR": {"Fn::Base64": "local"},
+                    "REFERENCE": {"Fn::Sub": "local-${AWS::Region}"}
+                  }}
+                }
+              }}
+            }
+            """);
+
+        JsonNode variables = processor.expandSamTemplate(template)
+                .path("Resources").path("MyFunc").path("Properties")
+                .path("Environment").path("Variables");
+        assertEquals("global", variables.path("GLOBAL").asText());
+        assertEquals("local", variables.path("LOCAL").asText());
+        assertEquals(objectMapper.readTree("""
+                {"Fn::Join": ["", ["https://local.example", "/v1"]]}
+                """), variables.path("URL"));
+        assertEquals(objectMapper.readTree("""
+                {"Fn::Base64": "local"}
+                """), variables.path("SCALAR"));
+        assertEquals(objectMapper.readTree("""
+                {"Fn::Sub": "local-${AWS::Region}"}
+                """), variables.path("REFERENCE"));
     }
 
     @Test
@@ -2296,13 +3196,13 @@ class SamTransformProcessorTest {
             }
             """);
 
-        java.util.List<java.util.logging.LogRecord> logged = new java.util.concurrent.CopyOnWriteArrayList<>();
-        java.util.logging.Logger logger =
-                java.util.logging.Logger.getLogger(SamTransformProcessor.class.getName());
-        java.util.logging.Level original = logger.getLevel();
-        java.util.logging.Handler handler = new java.util.logging.Handler() {
+        List<LogRecord> logged = new CopyOnWriteArrayList<>();
+        Logger logger =
+                Logger.getLogger(SamTransformProcessor.class.getName());
+        Level original = logger.getLevel();
+        Handler handler = new Handler() {
             @Override
-            public void publish(java.util.logging.LogRecord logRecord) {
+            public void publish(LogRecord logRecord) {
                 logged.add(logRecord);
             }
 
@@ -2315,7 +3215,7 @@ class SamTransformProcessorTest {
             }
         };
         logger.addHandler(handler);
-        logger.setLevel(java.util.logging.Level.ALL);
+        logger.setLevel(Level.ALL);
         try {
             processor.expandSamTemplate(template);
         } finally {
@@ -2326,7 +3226,7 @@ class SamTransformProcessorTest {
         String expected = "Unsupported SAM resource type AWS::Serverless::Application (MyApp): "
                 + "left in the template for the CloudFormation provisioner.";
         assertTrue(logged.stream().anyMatch(r ->
-                        r.getLevel().intValue() >= java.util.logging.Level.WARNING.intValue()
+                        r.getLevel().intValue() >= Level.WARNING.intValue()
                                 && expected.equals(text(r))),
                 "expected the unexpanded SAM type to be reported at warn, got: "
                         + logged.stream().map(r -> r.getLevel() + " " + text(r)).toList());
@@ -2336,10 +3236,10 @@ class SamTransformProcessorTest {
      * The record's text. Which logging backend is in play decides whether the parameters are
      * already substituted or still carried alongside the pattern.
      */
-    private static String text(java.util.logging.LogRecord record) {
+    private static String text(LogRecord record) {
         Object[] parameters = record.getParameters();
         return parameters == null || parameters.length == 0
                 ? record.getMessage()
-                : java.text.MessageFormat.format(record.getMessage(), parameters);
+                : MessageFormat.format(record.getMessage(), parameters);
     }
 }

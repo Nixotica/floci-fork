@@ -4,19 +4,25 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import io.github.hectorvent.floci.services.ram.model.PrincipalAssociation;
-import io.github.hectorvent.floci.services.ram.model.ResourceShare;
-import io.github.hectorvent.floci.services.ram.model.ResourceShareInvitation;
-import io.github.hectorvent.floci.services.ram.model.SharedResource;
 import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
+import io.github.hectorvent.floci.services.ram.model.PrincipalAssociation;
+import io.github.hectorvent.floci.services.ram.model.ResourceShare;
+import io.github.hectorvent.floci.services.ram.model.ResourceShareAssociation;
+import io.github.hectorvent.floci.services.ram.model.ResourceShareInvitation;
+import io.github.hectorvent.floci.services.ram.model.SharePermission;
+import io.github.hectorvent.floci.services.ram.model.SharedResource;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -26,6 +32,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /**
@@ -53,19 +61,36 @@ public class RamService {
     /** The modeled ResourceShareStatus enum. */
     private static final List<String> SHARE_STATUSES =
             List.of("PENDING", "ACTIVE", "FAILED", "DELETING", "DELETED");
+    private static final List<String> ASSOCIATION_TYPES = List.of("PRINCIPAL", "RESOURCE", "SOURCE");
+    private static final List<String> ASSOCIATION_STATUSES = List.of("ASSOCIATING", "ASSOCIATED", "FAILED",
+            "DISASSOCIATING", "DISASSOCIATED", "SUSPENDED", "SUSPENDING", "RESTORING");
+    /** The owner segment of an AWS managed permission ARN. */
+    private static final String MANAGED_PERMISSION_OWNER = "aws";
+    /**
+     * Creation and update time reported for every AWS managed permission. It is fixed so the same
+     * permission reports the same times in every share and does not move when a share changes.
+     */
+    private static final Instant MANAGED_PERMISSION_TIME = Instant.parse("2018-11-14T00:00:00Z");
+    private static final String RESOURCE_SHARE_PREFIX = "resource-share/";
     /** An AWS account id, as opposed to an organization/OU principal ARN. */
     private static final Pattern ACCOUNT_ID_PRINCIPAL = Pattern.compile("\\d{12}");
 
     private final StorageFactory storageFactory;
     private final OrganizationsService organizationsService;
+    private final Clock clock;
     private StorageBackend<String, ResourceShare> shares;
     private StorageBackend<String, Boolean> settings;
     private StorageBackend<String, ResourceShareInvitation> invitations;
 
     @Inject
     public RamService(StorageFactory storageFactory, OrganizationsService organizationsService) {
+        this(storageFactory, organizationsService, Clock.systemUTC());
+    }
+
+    RamService(StorageFactory storageFactory, OrganizationsService organizationsService, Clock clock) {
         this.storageFactory = storageFactory;
         this.organizationsService = organizationsService;
+        this.clock = clock;
     }
 
     /** Constructor used by isolated service tests with an explicit Organizations test double. */
@@ -154,6 +179,19 @@ public class RamService {
             result.add(share);
         }
         return result;
+    }
+
+    public PaginatedResult<ResourceShare> getResourceSharesPage(String callerAccountId, String resourceOwner,
+                                                                 String name, List<String> resourceShareArns,
+                                                                 String resourceShareStatus, String region,
+                                                                 Integer maxResults, String nextToken) {
+        return paginateRamResults(
+                () -> getResourceShares(callerAccountId, resourceOwner, name,
+                        resourceShareArns, resourceShareStatus, region),
+                ResourceShare::getResourceShareArn, maxResults, nextToken,
+                () -> "ram-resource-shares|" + callerAccountId + "|" + region + "|" + resourceOwner
+                        + "|" + (name == null ? "~" : Base64Url.encode(name)) + "|" + resourceShareStatus + "|"
+                        + resourceShareArns.stream().distinct().sorted().map(Base64Url::encode).toList());
     }
 
     /**
@@ -291,8 +329,7 @@ public class RamService {
 
     /** {@code arn:aws:ram:<region>:<account>:resource-share/<id>} → {@code <region>}. */
     private static String extractRegion(String resourceShareArn) {
-        String[] parts = resourceShareArn.split(":", 6);
-        return parts.length < 4 ? "" : parts[3];
+        return AwsArnUtils.regionOrDefault(resourceShareArn, "");
     }
 
     private void putInvitation(ResourceShareInvitation invitation) {
@@ -316,15 +353,7 @@ public class RamService {
         requireResourceOwner(resourceOwner);
         List<SharedResource> result = new ArrayList<>();
         for (ResourceShare share : sharesIn(region)) {
-            if (!isVisible(share, callerAccountId, resourceOwner)) {
-                continue;
-            }
-            // A deleted share stays readable via GetResourceShares (status DELETED)
-            // but its contents stop being consumable.
-            if ("DELETED".equals(share.getStatus())) {
-                continue;
-            }
-            if (!resourceShareArns.isEmpty() && !resourceShareArns.contains(share.getResourceShareArn())) {
+            if (!isConsumableShare(share, callerAccountId, resourceOwner, resourceShareArns)) {
                 continue;
             }
             for (String resourceArn : share.getResourceArns()) {
@@ -335,14 +364,15 @@ public class RamService {
         return result;
     }
 
-    public ResourceShare deleteResourceShare(String resourceShareArn, String callerAccountId, String region) {
+    public synchronized ResourceShare deleteResourceShare(String resourceShareArn, String callerAccountId,
+                                                          String region) {
         return putForOwner(
                 requireOwnedShare(resourceShareArn, callerAccountId, region).withStatus("DELETED"));
     }
 
-    public ResourceShare updateResourceShare(String resourceShareArn, String name,
-                                             Boolean allowExternalPrincipals, String callerAccountId,
-                                             String region) {
+    public synchronized ResourceShare updateResourceShare(String resourceShareArn, String name,
+                                                          Boolean allowExternalPrincipals, String callerAccountId,
+                                                          String region) {
         ResourceShare share = requireOwnedShare(resourceShareArn, callerAccountId, region);
         if (name != null) {
             share = share.withName(name);
@@ -372,9 +402,9 @@ public class RamService {
         }
     }
 
-    public ResourceShare disassociateResourceShare(String resourceShareArn, List<String> resourceArns,
-                                                    List<String> principals, String callerAccountId,
-                                                    String region) {
+    public synchronized ResourceShare disassociateResourceShare(String resourceShareArn,
+                                                                 List<String> resourceArns, List<String> principals,
+                                                                 String callerAccountId, String region) {
         ResourceShare share = requireOwnedShare(resourceShareArn, callerAccountId, region);
         ResourceShare updated = share.withPrincipalsAndResources(
                 withoutAll(share.getPrincipals(), principals),
@@ -391,15 +421,7 @@ public class RamService {
         requireResourceOwner(resourceOwner);
         List<PrincipalAssociation> result = new ArrayList<>();
         for (ResourceShare share : sharesIn(region)) {
-            if (!isVisible(share, callerAccountId, resourceOwner)) {
-                continue;
-            }
-            // A deleted share stays readable via GetResourceShares (status DELETED)
-            // but its contents stop being consumable.
-            if ("DELETED".equals(share.getStatus())) {
-                continue;
-            }
-            if (!resourceShareArns.isEmpty() && !resourceShareArns.contains(share.getResourceShareArn())) {
+            if (!isConsumableShare(share, callerAccountId, resourceOwner, resourceShareArns)) {
                 continue;
             }
             for (String principal : share.getPrincipals()) {
@@ -410,16 +432,137 @@ public class RamService {
         return result;
     }
 
-    public void tagResource(String resourceShareArn, Map<String, String> newTags, String callerAccountId,
-                            String region) {
+    public PaginatedResult<ResourceShareAssociation> getResourceShareAssociations(
+            String callerAccountId, String region, String associationType, String associationStatus,
+            List<String> resourceShareArns, String resourceArn, String principal,
+            Integer maxResults, String nextToken) {
+        if (associationType == null || !ASSOCIATION_TYPES.contains(associationType)) {
+            throw new AwsException("InvalidParameterException", "associationType must be one of "
+                    + ASSOCIATION_TYPES + ".", 400);
+        }
+        if (associationStatus != null && !ASSOCIATION_STATUSES.contains(associationStatus)) {
+            throw new AwsException("InvalidParameterException", "associationStatus must be one of "
+                    + ASSOCIATION_STATUSES + ".", 400);
+        }
+        if (("RESOURCE".equals(associationType) && principal != null)
+                || ("PRINCIPAL".equals(associationType) && resourceArn != null)) {
+            throw new AwsException("InvalidParameterException",
+                    "The entity filter is not valid for this associationType.", 400);
+        }
+        requireValidArns(resourceShareArns);
+        if (resourceArn != null && !isValidArn(resourceArn)) {
+            throw new AwsException("MalformedArnException", "Invalid resourceArn: " + resourceArn, 400);
+        }
+        return paginateRamResults(() -> {
+            List<ResourceShareAssociation> associations = new ArrayList<>();
+            if (associationStatus == null || "ASSOCIATED".equals(associationStatus)) {
+                for (ResourceShare share : sharesIn(region)) {
+                    if (!isConsumableShare(share, callerAccountId, "SELF", resourceShareArns)) {
+                        continue;
+                    }
+                    if ("RESOURCE".equals(associationType)) {
+                        for (String entity : new LinkedHashSet<>(share.getResourceArns())) {
+                            if (resourceArn == null || resourceArn.equals(entity)) {
+                                associations.add(association(share, entity, "RESOURCE"));
+                            }
+                        }
+                    } else if ("PRINCIPAL".equals(associationType)) {
+                        for (String entity : new LinkedHashSet<>(share.getPrincipals())) {
+                            if (principal == null || principal.equals(entity)) {
+                                associations.add(association(share, entity, "PRINCIPAL"));
+                            }
+                        }
+                    }
+                }
+            }
+            return associations;
+        },
+                association -> association.resourceShareArn() + "\u0000" + association.associatedEntity(),
+                maxResults, nextToken,
+                () -> "ram-associations|" + callerAccountId + "|" + region + "|" + associationType
+                        + "|" + associationStatus + "|" + resourceShareArns.stream().sorted().toList()
+                        + "|" + resourceArn + "|" + principal);
+    }
+
+    private static <T> PaginatedResult<T> paginateRamResults(Supplier<List<T>> items,
+                                                               Function<T, String> cursorOf,
+                                                               Integer maxResults, String nextToken,
+                                                               Supplier<String> namespace) {
+        if (maxResults != null && (maxResults < 1 || maxResults > 500)) {
+            throw new AwsException("InvalidParameterException", "maxResults must be between 1 and 500.", 400);
+        }
+        if (nextToken != null && nextToken.isEmpty()) {
+            throw new AwsException("InvalidNextTokenException", "Invalid nextToken.", 400);
+        }
+        return Pagination.paginate(items.get(), cursorOf,
+                maxResults != null ? maxResults : 100, nextToken, namespace.get(),
+                ignored -> new AwsException("InvalidNextTokenException", "Invalid nextToken.", 400));
+    }
+
+    private static ResourceShareAssociation association(ResourceShare share, String entity, String type) {
+        return new ResourceShareAssociation(share.getResourceShareArn(), share.getName(), entity, type,
+                share.getCreationTime(), share.getLastUpdatedTime());
+    }
+
+    /**
+     * Floci has no explicit permission model: every resource type in a share is governed by RAM's
+     * default AWS managed permission for that type, so one summary is returned per distinct type.
+     * Readable by the owner and by an account the share is visible to, like the other reads.
+     */
+    public List<SharePermission> listResourceSharePermissions(String resourceShareArn,
+                                                              String callerAccountId, String region) {
+        if (resourceShareArn == null || resourceShareArn.isBlank()) {
+            throw new AwsException("InvalidParameterException", "resourceShareArn is required.", 400);
+        }
+        if (!isResourceShareArn(resourceShareArn)) {
+            throw new AwsException("MalformedArnException",
+                    "The specified Amazon Resource Name (ARN) has a format that isn't valid: "
+                            + resourceShareArn, 400);
+        }
+        ResourceShare share = sharesIn(region).stream()
+                .filter(candidate -> candidate.getResourceShareArn().equals(resourceShareArn))
+                .filter(candidate -> !"DELETED".equals(candidate.getStatus()))
+                .filter(candidate -> candidate.getOwningAccountId().equals(callerAccountId)
+                        || isVisible(candidate, callerAccountId, "OTHER-ACCOUNTS"))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("UnknownResourceException",
+                        "ResourceShare " + resourceShareArn + " does not exist.", 400));
+        String partition = AwsArnUtils.parse(resourceShareArn).partition();
+        Map<String, SharePermission> byType = new LinkedHashMap<>();
+        for (String resourceArn : share.getResourceArns()) {
+            String type = ramResourceType(resourceArn);
+            if (type.isEmpty() || byType.containsKey(type)) {
+                continue;
+            }
+            String name = "AWSRAMDefaultPermission" + type.substring(type.indexOf(':') + 1);
+            byType.put(type, new SharePermission(
+                    AwsArnUtils.Arn.global(partition, "ram", MANAGED_PERMISSION_OWNER,
+                            "permission/" + name).toString(),
+                    name, type, MANAGED_PERMISSION_TIME, MANAGED_PERMISSION_TIME));
+        }
+        return List.copyOf(byType.values());
+    }
+
+    private static boolean isResourceShareArn(String arn) {
+        if (!isValidArn(arn)) {
+            return false;
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        return "ram".equals(parsed.service())
+                && parsed.resource().startsWith(RESOURCE_SHARE_PREFIX)
+                && parsed.resource().length() > RESOURCE_SHARE_PREFIX.length();
+    }
+
+    public synchronized void tagResource(String resourceShareArn, Map<String, String> newTags,
+                                         String callerAccountId, String region) {
         ResourceShare share = requireOwnedShare(resourceShareArn, callerAccountId, region);
         Map<String, String> merged = new LinkedHashMap<>(share.getTags());
         merged.putAll(newTags);
         putForOwner(share.withTags(merged));
     }
 
-    public void untagResource(String resourceShareArn, List<String> tagKeys, String callerAccountId,
-                              String region) {
+    public synchronized void untagResource(String resourceShareArn, List<String> tagKeys,
+                                           String callerAccountId, String region) {
         ResourceShare share = requireOwnedShare(resourceShareArn, callerAccountId, region);
         Map<String, String> remaining = new LinkedHashMap<>(share.getTags());
         tagKeys.forEach(remaining::remove);
@@ -463,12 +606,31 @@ public class RamService {
     }
 
     /**
-     * The single write seam: every create and every mutation lands here, so stamping
-     * lastUpdatedTime once at this point keeps it advancing without six call sites having to
-     * remember to do it. Returns the stamped share so callers respond with what was stored.
+     * The single write seam: every create and every mutation lands here. Existing shares are
+     * stamped here so lastUpdatedTime advances without six call sites having to remember to do it;
+     * a fresh share keeps its equal creation and last-updated timestamps. The read, timestamp
+     * calculation, and write are one critical section so concurrent mutations cannot reuse a stamp.
+     * Returns the stored share.
      */
-    private ResourceShare putForOwner(ResourceShare share) {
-        ResourceShare stamped = share.withLastUpdatedTime(Instant.now());
+    private synchronized ResourceShare putForOwner(ResourceShare share) {
+        String owningAccountId = share.getOwningAccountId();
+        Optional<ResourceShare> previous;
+        if (shares instanceof AccountAwareStorageBackend<ResourceShare> accountAware) {
+            previous = accountAware.getForAccountMigratingLegacy(
+                    owningAccountId, share.getResourceShareArn(),
+                    candidate -> owningAccountId.equals(candidate.getOwningAccountId()));
+        } else {
+            previous = shares.get(share.getResourceShareArn());
+        }
+        ResourceShare stamped = share;
+        if (previous.isPresent()) {
+            Instant now = clock.instant();
+            Instant previousLastUpdated = previous.get().getLastUpdatedTime();
+            if (now.toEpochMilli() <= previousLastUpdated.toEpochMilli()) {
+                now = Instant.ofEpochMilli(previousLastUpdated.toEpochMilli() + 1);
+            }
+            stamped = share.withLastUpdatedTime(now);
+        }
         if (shares instanceof AccountAwareStorageBackend<ResourceShare> accountAware) {
             accountAware.putForAccount(
                     stamped.getOwningAccountId(), stamped.getResourceShareArn(), stamped);
@@ -533,6 +695,14 @@ public class RamService {
         }
         return share.getPrincipals().stream()
                 .anyMatch(principal -> isVisibleToPrincipal(share, principal, callerAccountId));
+    }
+
+    private boolean isConsumableShare(ResourceShare share, String callerAccountId,
+                                      String resourceOwner, List<String> resourceShareArns) {
+        // Deleted shares remain readable through GetResourceShares, but not these contents.
+        return isVisible(share, callerAccountId, resourceOwner)
+                && !"DELETED".equals(share.getStatus())
+                && (resourceShareArns.isEmpty() || resourceShareArns.contains(share.getResourceShareArn()));
     }
 
     private boolean isVisibleToPrincipal(ResourceShare share, String principal, String callerAccountId) {
@@ -614,14 +784,14 @@ public class RamService {
 
     /** {@code arn:aws:ec2:...:transit-gateway/tgw-1} → {@code ec2:TransitGateway}. */
     private static String ramResourceType(String resourceArn) {
-        String[] parts = resourceArn.split(":", 6);
-        if (parts.length < 6) {
+        if (!AwsArnUtils.isArn(resourceArn)) {
             return "";
         }
-        String service = parts[2];
-        String resource = parts[5];
-        int slash = resource.indexOf('/');
-        String typeSegment = slash >= 0 ? resource.substring(0, slash) : resource;
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(resourceArn);
+        String service = parsed.service();
+        String resource = parsed.resource();
+        int separator = indexOfTypeSeparator(resource);
+        String typeSegment = separator >= 0 ? resource.substring(0, separator) : resource;
         StringBuilder camel = new StringBuilder();
         for (String word : typeSegment.split("-")) {
             if (!word.isEmpty()) {
@@ -629,5 +799,15 @@ public class RamService {
             }
         }
         return service + ":" + camel;
+    }
+
+    /** ARN resources name their type before either a slash ({@code subnet/x}) or a colon ({@code cluster:x}). */
+    private static int indexOfTypeSeparator(String resource) {
+        int slash = resource.indexOf('/');
+        int colon = resource.indexOf(':');
+        if (slash < 0) {
+            return colon;
+        }
+        return colon < 0 ? slash : Math.min(slash, colon);
     }
 }

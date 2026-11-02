@@ -3,9 +3,9 @@ package io.github.hectorvent.floci.services.codedeploy;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.codedeploy.model.DeploymentGroup;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -63,7 +64,7 @@ class CodeDeployServicePersistenceTest {
         assertEquals("Registered",
                 reloaded.getOnPremisesInstance(REGION, "onprem-1").getRegistrationStatus());
         Map<String, String> appTags = reloaded.listTagsForResource(first.applicationArn(REGION, "web-app"))
-                .stream().collect(java.util.stream.Collectors.toMap(t -> t.get("Key"), t -> t.get("Value")));
+                .stream().collect(Collectors.toMap(t -> t.get("Key"), t -> t.get("Value")));
         assertEquals("prod", appTags.get("env"));   // tagResource
         assertEquals("platform", appTags.get("team")); // createApplication tags
     }
@@ -90,7 +91,7 @@ class CodeDeployServicePersistenceTest {
         assertEquals(List.of("g1"), reloaded.listDeploymentGroups(REGION, "keep-app"));
         assertThrows(Exception.class, () -> reloaded.getDeploymentGroup(REGION, "keep-app", "g2"));
         Map<String, String> tags = reloaded.listTagsForResource(arn).stream()
-                .collect(java.util.stream.Collectors.toMap(t -> t.get("Key"), t -> t.get("Value")));
+                .collect(Collectors.toMap(t -> t.get("Key"), t -> t.get("Value")));
         assertEquals("prod", tags.get("env"));
         assertTrue(!tags.containsKey("team"), "untagged key must not reappear after restart");
     }

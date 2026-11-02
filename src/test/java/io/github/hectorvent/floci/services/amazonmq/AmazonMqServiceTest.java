@@ -3,8 +3,8 @@ package io.github.hectorvent.floci.services.amazonmq;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.amazonmq.container.RabbitMqManager;
 import io.github.hectorvent.floci.services.amazonmq.model.Broker;
@@ -30,8 +30,8 @@ class AmazonMqServiceTest {
                 .thenReturn(AccountAwareStorageBackend.inMemory("000000000000"));
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var mqConfig = Mockito.mock(EmulatorConfig.AmazonMqServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.AmazonMqServiceConfig mqConfig = Mockito.mock(EmulatorConfig.AmazonMqServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.amazonmq()).thenReturn(mqConfig);
         when(mqConfig.mock()).thenReturn(true);
@@ -191,8 +191,8 @@ class AmazonMqServiceTest {
                 .thenReturn(AccountAwareStorageBackend.inMemory("000000000000"));
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var mqConfig = Mockito.mock(EmulatorConfig.AmazonMqServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.AmazonMqServiceConfig mqConfig = Mockito.mock(EmulatorConfig.AmazonMqServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.amazonmq()).thenReturn(mqConfig);
         when(mqConfig.mock()).thenReturn(false);

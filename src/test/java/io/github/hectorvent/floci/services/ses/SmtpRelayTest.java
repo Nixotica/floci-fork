@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ses;
 
+import io.github.hectorvent.floci.services.ses.model.MessageAttachment;
 import io.github.hectorvent.floci.services.ses.model.MessageHeader;
 import io.github.hectorvent.floci.services.ses.model.MessageTag;
 import io.vertx.core.Future;
@@ -13,6 +14,8 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -196,8 +199,8 @@ class SmtpRelayTest {
         SmtpRelay relay = enabledRelay();
 
         String rawMime = "From: s@example.com\r\nTo: t@example.com\r\nSubject: B64\r\n\r\nDecoded body";
-        String encoded = java.util.Base64.getEncoder().encodeToString(
-                rawMime.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String encoded = Base64.getEncoder().encodeToString(
+                rawMime.getBytes(StandardCharsets.UTF_8));
         relay.relayRaw(raw("from@example.com", List.of("to@example.com"), encoded));
 
         ArgumentCaptor<MailMessage> captor = ArgumentCaptor.forClass(MailMessage.class);
@@ -336,8 +339,8 @@ class SmtpRelayTest {
     @Test
     void parseRawRecipients_acceptsBase64Encoded() {
         String raw = "From: a@example.com\r\nTo: only@example.com\r\nSubject: x\r\n\r\nbody";
-        String b64 = java.util.Base64.getEncoder().encodeToString(
-                raw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String b64 = Base64.getEncoder().encodeToString(
+                raw.getBytes(StandardCharsets.UTF_8));
         assertEquals(List.of("only@example.com"), SmtpRelay.parseRawRecipients(b64));
     }
 
@@ -348,16 +351,16 @@ class SmtpRelayTest {
         // into garbage.
         String raw = "From: s@example.com\r\nMessage-ID: <caller@example.com>\r\nSubject: x\r\n\r\nbody";
         assertEquals(raw, new String(SmtpRelay.tryBase64Decode(raw),
-                java.nio.charset.StandardCharsets.UTF_8));
+                StandardCharsets.UTF_8));
     }
 
     @Test
     void tryBase64Decode_base64Payload_isDecoded() {
         String raw = "From: s@example.com\r\nSubject: x\r\n\r\nbody";
-        String encoded = java.util.Base64.getEncoder().encodeToString(
-                raw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String encoded = Base64.getEncoder().encodeToString(
+                raw.getBytes(StandardCharsets.UTF_8));
         assertEquals(raw, new String(SmtpRelay.tryBase64Decode(encoded),
-                java.nio.charset.StandardCharsets.UTF_8));
+                StandardCharsets.UTF_8));
     }
 
     @Test
@@ -380,8 +383,8 @@ class SmtpRelayTest {
                 + "Cc: cc@example.com\r\n"
                 + "Bcc: bcc@example.com\r\n"
                 + "Subject: Hello world\r\n\r\nbody";
-        String b64 = java.util.Base64.getEncoder().encodeToString(
-                raw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String b64 = Base64.getEncoder().encodeToString(
+                raw.getBytes(StandardCharsets.UTF_8));
         SmtpRelay.RawMessageHeaders h = SmtpRelay.parseRawHeaders(b64);
         assertEquals("Hello world", h.subject());
         assertEquals(List.of("to1@example.com", "to2@example.com"), h.to());
@@ -436,6 +439,37 @@ class SmtpRelayTest {
         assertEquals("", h.returnPath());
         assertEquals("", h.configurationSet());
         assertTrue(h.messageTags().isEmpty());
+    }
+
+    @Test
+    void parseRawHeaders_extractsSenderAndTheFirstSendingAuthorizationHeaders() {
+        String raw = "From: sender@example.com\r\n"
+                + "Sender: Assistant <assistant@example.com>\r\n"
+                + "To: to@example.com\r\n"
+                + "X-SES-SOURCE-ARN: arn:aws:ses:us-east-1:111111111111:identity/example.com\r\n"
+                + "X-SES-SOURCE-ARN: arn:aws:ses:us-east-1:222222222222:identity/example.com\r\n"
+                + "X-SES-FROM-ARN: arn:aws:ses:us-east-1:333333333333:identity/example.com\r\n"
+                + "X-SES-RETURN-PATH-ARN: arn:aws:ses:us-east-1:444444444444:identity/example.com\r\n"
+                + "Subject: x\r\n\r\nbody";
+
+        SmtpRelay.RawMessageHeaders h = SmtpRelay.parseRawHeaders(raw);
+
+        assertEquals("assistant@example.com", h.sender());
+        assertEquals("arn:aws:ses:us-east-1:111111111111:identity/example.com", h.sourceArn());
+        assertEquals("arn:aws:ses:us-east-1:333333333333:identity/example.com", h.fromArn());
+        assertEquals("arn:aws:ses:us-east-1:444444444444:identity/example.com", h.returnPathArn());
+    }
+
+    @Test
+    void parseRawHeaders_withoutSenderOrSendingAuthorizationHeaders_returnsBlanks() {
+        String raw = "From: sender@example.com\r\nTo: to@example.com\r\nSubject: x\r\n\r\nbody";
+
+        SmtpRelay.RawMessageHeaders h = SmtpRelay.parseRawHeaders(raw);
+
+        assertEquals("", h.sender());
+        assertEquals("", h.sourceArn());
+        assertEquals("", h.fromArn());
+        assertEquals("", h.returnPathArn());
     }
 
     @Test
@@ -645,8 +679,8 @@ class SmtpRelayTest {
                 + "Content-Description: Quarterly report\r\n"
                 + "Content-Transfer-Encoding: base64\r\n"
                 + "\r\n"
-                + java.util.Base64.getEncoder().encodeToString("PDF-BYTES".getBytes(
-                        java.nio.charset.StandardCharsets.UTF_8)) + "\r\n"
+                + Base64.getEncoder().encodeToString("PDF-BYTES".getBytes(
+                        StandardCharsets.UTF_8)) + "\r\n"
                 + "--outer--";
         relay.relayRaw(raw("from@example.com", List.of("to@example.com"), rawMime));
 
@@ -723,8 +757,8 @@ class SmtpRelayTest {
                 + "Content-ID: <logo>\r\n"
                 + "Content-Transfer-Encoding: base64\r\n"
                 + "\r\n"
-                + java.util.Base64.getEncoder().encodeToString("PNG".getBytes(
-                        java.nio.charset.StandardCharsets.UTF_8)) + "\r\n"
+                + Base64.getEncoder().encodeToString("PNG".getBytes(
+                        StandardCharsets.UTF_8)) + "\r\n"
                 + "--rel--";
         relay.relayRaw(raw("from@example.com", List.of("to@example.com"), rawMime));
 
@@ -796,5 +830,78 @@ class SmtpRelayTest {
         ArgumentCaptor<MailMessage> captor = ArgumentCaptor.forClass(MailMessage.class);
         verify(mailClient).sendMail(captor.capture());
         return captor.getValue();
+    }
+
+    private static MessageAttachment attachment(String name, String type,
+                                                MessageAttachment.Disposition disposition, String contentId) {
+        return new MessageAttachment(name, name.getBytes(StandardCharsets.UTF_8), type, disposition,
+                null, contentId, null);
+    }
+
+    @Test
+    void relay_simpleAttachments_inlineWithContentIdIsRelatedAndTheRestAreAttachments() {
+        SmtpRelay relay = enabledRelay();
+
+        relay.relay(SmtpRelay.RelayMessage.builder("from@example.com")
+                .to(List.of("to@example.com"))
+                .subject("Subject")
+                .bodyHtml("<img src=\"cid:logo\">")
+                .attachments(List.of(
+                        attachment("report.pdf", "application/pdf", MessageAttachment.Disposition.ATTACHMENT, null),
+                        attachment("logo.png", "image/png", MessageAttachment.Disposition.INLINE, "logo"),
+                        attachment("notes.txt", null, null, null)))
+                .build());
+
+        MailMessage sent = captureSent();
+        assertEquals(1, sent.getInlineAttachment().size());
+        MailAttachment logo = sent.getInlineAttachment().get(0);
+        assertEquals("<logo>", logo.getContentId());
+        assertEquals("inline", logo.getDisposition());
+        assertEquals("image/png", logo.getContentType());
+        assertEquals(2, sent.getAttachment().size());
+        assertEquals("attachment", sent.getAttachment().get(0).getDisposition());
+        assertEquals("report.pdf", sent.getAttachment().get(0).getName());
+        // No ContentType and no ContentDisposition: guessed from the name, relayed as an attachment.
+        assertEquals("text/plain", sent.getAttachment().get(1).getContentType());
+        assertEquals("attachment", sent.getAttachment().get(1).getDisposition());
+    }
+
+    @Test
+    void relay_inlineAttachmentWithoutHtmlBody_travelsAsAnInlineDispositionAttachment() {
+        SmtpRelay relay = enabledRelay();
+
+        relay.relay(SmtpRelay.RelayMessage.builder("from@example.com")
+                .to(List.of("to@example.com"))
+                .subject("Subject")
+                .bodyText("text only")
+                .attachments(List.of(
+                        attachment("logo.png", "image/png", MessageAttachment.Disposition.INLINE, "logo")))
+                .build());
+
+        MailMessage sent = captureSent();
+        assertNull(sent.getInlineAttachment());
+        assertEquals(1, sent.getAttachment().size());
+        assertEquals("inline", sent.getAttachment().get(0).getDisposition());
+    }
+
+    @Test
+    void encodeMime_simpleWithAttachments_isOneParsableMultipartMessage() throws Exception {
+        byte[] mime = SmtpRelay.encodeMime(SmtpRelay.RelayMessage.builder("from@example.com")
+                .to(List.of("to@example.com"))
+                .bcc(List.of("hidden@example.com"))
+                .subject("Subject")
+                .bodyText("text")
+                .bodyHtml("<img src=\"cid:logo\">")
+                .messageId("mid-1")
+                .attachments(List.of(
+                        attachment("report.pdf", "application/pdf", MessageAttachment.Disposition.ATTACHMENT, null),
+                        attachment("logo.png", "image/png", MessageAttachment.Disposition.INLINE, "logo")))
+                .build());
+
+        String text = new String(mime, StandardCharsets.UTF_8);
+        assertTrue(text.contains("Message-ID: <mid-1@email.amazonses.com>"), text);
+        assertEquals(text.indexOf("Message-ID:"), text.lastIndexOf("Message-ID:"), text);
+        assertFalse(text.contains("hidden@example.com"), text);
+        assertNotNull(SmtpRelay.parseMime(mime));
     }
 }

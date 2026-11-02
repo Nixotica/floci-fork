@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -30,6 +31,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -296,6 +298,57 @@ class CloudWatchDashboardCfnProvisionerTest {
         assertEquals("generated", r.getAttributes().get("FlociDashboardNameMode"));
     }
 
+    /**
+     * A stub migrated without a name keeps the stub's id as the dashboard's name, and the
+     * dispatcher drops the stub Arn, so renaming it later deletes the real dashboard it displaced.
+     */
+    @Test
+    void aDashboardMigratedFromAStubIsOwedItsDeleteWhenALaterUpdateRenamesIt() {
+        CfnResourceDispatcher dispatcher = new CfnResourceDispatcher(MAPPER,
+                new CloudFormationResourceRegistry(List.of(provisioner)), null, null);
+        StackResource migrated = dispatcher.provision("Dashboard", TYPE, props("""
+                {"DashboardBody": "{}"}
+                """), engine, REGION, ACCOUNT_ID, STACK, "Dashboard-1a2b3c4d",
+                Map.of("Arn", "arn:aws:stub:::Dashboard"));
+        assertEquals("CREATE_COMPLETE", migrated.getStatus(), migrated.getStatusReason());
+        assertEquals("Dashboard-1a2b3c4d", migrated.getPhysicalId());
+        dispatcher.clearUpdate(migrated);
+
+        StackResource renamed = dispatcher.provision("Dashboard", TYPE, props("""
+                {"DashboardName": "DashTwo", "DashboardBody": "{}"}
+                """), engine, REGION, ACCOUNT_ID, STACK, migrated.getPhysicalId(), migrated.getAttributes());
+
+        assertEquals("CREATE_COMPLETE", renamed.getStatus(), renamed.getStatusReason());
+        assertEquals("DashTwo", renamed.getPhysicalId());
+        assertEquals("Dashboard-1a2b3c4d", dispatcher.updateCleanupPhysicalId(renamed),
+                "the migrated dashboard is real, so the rename owes its delete");
+    }
+
+    /**
+     * An unnamed stub migration creates the dashboard under the stub's id, so a failed stack update
+     * deletes it and puts the stub back.
+     */
+    @Test
+    void rollingBackAnUnnamedStubMigrationDeletesTheDashboardItCreatedAndRestoresTheStub() {
+        CfnResourceDispatcher dispatcher = new CfnResourceDispatcher(MAPPER,
+                new CloudFormationResourceRegistry(List.of(provisioner)), null, null);
+        when(dashboards.getDashboard("Dashboard-1a2b3c4d", REGION))
+                .thenThrow(new AwsException("ResourceNotFound", "Dashboard does not exist: Dashboard-1a2b3c4d", 404));
+        StackResource migrated = dispatcher.provision("Dashboard", TYPE, props("""
+                {"DashboardBody": "{}"}
+                """), engine, REGION, ACCOUNT_ID, STACK, "Dashboard-1a2b3c4d",
+                Map.of("Arn", "arn:aws:stub:::Dashboard"));
+        assertEquals("CREATE_COMPLETE", migrated.getStatus(), migrated.getStatusReason());
+        assertEquals("Dashboard-1a2b3c4d", migrated.getPhysicalId());
+
+        assertTrue(dispatcher.rollbackUpdate(migrated));
+
+        verify(dashboards).deleteDashboards(List.of("Dashboard-1a2b3c4d"), REGION);
+        assertEquals("Dashboard-1a2b3c4d", migrated.getPhysicalId());
+        assertEquals("arn:aws:stub:::Dashboard", migrated.getAttributes().get("Arn"));
+        assertFalse(migrated.getAttributes().containsKey("FlociDashboardNameMode"));
+    }
+
     @Test
     void moreTagsThanTheSchemaAllowsAreRejected() {
         StringBuilder tags = new StringBuilder();
@@ -317,7 +370,7 @@ class CloudWatchDashboardCfnProvisionerTest {
     @Test
     void anInPlaceUpdateIsRolledBackFromTheBodyAndTagsItReplaced() {
         Dashboard before = new Dashboard("ops", arn("ops"), "{\"widgets\":[{\"type\":\"text\"}]}");
-        before.setTags(new java.util.LinkedHashMap<>(Map.of("team", "platform")));
+        before.setTags(new LinkedHashMap<>(Map.of("team", "platform")));
         when(dashboards.getDashboard("ops", REGION)).thenReturn(before);
         when(dashboards.listTagsForResource(arn("ops"), REGION)).thenReturn(Map.of("team", "platform"));
 
@@ -402,7 +455,7 @@ class CloudWatchDashboardCfnProvisionerTest {
     @Test
     void anInPlaceUpdateThatFailedOnItsTagsPutsTheBodyBack() {
         Dashboard before = new Dashboard("ops", arn("ops"), OLD_BODY);
-        before.setTags(new java.util.LinkedHashMap<>(Map.of("team", "platform")));
+        before.setTags(new LinkedHashMap<>(Map.of("team", "platform")));
         when(dashboards.getDashboard("ops", REGION)).thenReturn(before);
         when(dashboards.listTagsForResource(arn("ops"), REGION)).thenReturn(Map.of("team", "platform"));
         doThrow(new AwsException("InternalServiceError", "boom", 500))
@@ -419,7 +472,7 @@ class CloudWatchDashboardCfnProvisionerTest {
     @Test
     void anUnwoundInPlaceUpdateIsMarkedRestored() {
         Dashboard before = new Dashboard("ops", arn("ops"), OLD_BODY);
-        before.setTags(new java.util.LinkedHashMap<>(Map.of("team", "platform")));
+        before.setTags(new LinkedHashMap<>(Map.of("team", "platform")));
         when(dashboards.getDashboard("ops", REGION)).thenReturn(before);
         when(dashboards.listTagsForResource(arn("ops"), REGION)).thenReturn(Map.of("team", "platform"));
         doThrow(new AwsException("InternalServiceError", "boom", 500))
@@ -439,13 +492,46 @@ class CloudWatchDashboardCfnProvisionerTest {
     }
 
     /**
+     * A replacement whose rollback could not delete it stays owed. A later update reaches the
+     * dashboard only once ContinueUpdateRollback skipped it, and that update's own unwind restores
+     * its snapshot and leaves the orphan to the cleanup instead of retrying its delete.
+     */
+    @Test
+    void anUnwindAfterASkippedRollbackRestoresTheBodyAndLeavesTheOrphanOwed() {
+        StackResource r = provision("""
+                {"DashboardName": "ops-v2", "DashboardBody": "{}"}
+                """, "ops");
+        doThrow(new AwsException("InternalServiceError", "delete unavailable", 500)).doNothing()
+                .when(dashboards).deleteDashboards(List.of("ops-v2"), REGION);
+        assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
+        assertEquals("ops", r.getPhysicalId());
+        assertEquals("ops-v2", provisioner.updateCleanupPhysicalId(r));
+        Dashboard before = new Dashboard("ops", arn("ops"), OLD_BODY);
+        before.setTags(new HashMap<>(Map.of("team", "platform")));
+        when(dashboards.getDashboard("ops", REGION)).thenReturn(before);
+        when(dashboards.listTagsForResource(arn("ops"), REGION)).thenReturn(Map.of("team", "platform"));
+        doThrow(new AwsException("InternalServiceError", "boom", 500))
+                .when(dashboards).untagResource(arn("ops"), List.of("team"), REGION);
+        r.getAttributes().put("FlociDashboardNameMode", "explicit");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"DashboardName": "ops", "DashboardBody": "{}", "Tags": [{"Key": "env", "Value": "dev"}]}
+                """), new ProvisionContext(engine, REGION, ACCOUNT_ID, STACK, "ops")));
+
+        verify(dashboards).putDashboard(eq("ops"), eq(OLD_BODY), anyMap(), eq(REGION));
+        assertEquals("true", r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR));
+        verify(dashboards, times(1)).deleteDashboards(List.of("ops-v2"), REGION);
+        assertEquals("ops-v2", provisioner.updateCleanupPhysicalId(r));
+    }
+
+    /**
      * An unwind that cannot put the body back keeps the snapshot and records the failure, so the
      * stack ends in UPDATE_ROLLBACK_FAILED instead of claiming the prior dashboard is live.
      */
     @Test
     void anUnwindThatCannotRestoreIsReportedAsARollbackFailure() {
         Dashboard before = new Dashboard("ops", arn("ops"), OLD_BODY);
-        before.setTags(new java.util.LinkedHashMap<>(Map.of("team", "platform")));
+        before.setTags(new LinkedHashMap<>(Map.of("team", "platform")));
         when(dashboards.getDashboard("ops", REGION)).thenReturn(before);
         when(dashboards.listTagsForResource(arn("ops"), REGION)).thenReturn(Map.of("team", "platform"));
         doThrow(new AwsException("InternalServiceError", "boom", 500))
@@ -475,7 +561,7 @@ class CloudWatchDashboardCfnProvisionerTest {
     @Test
     void anUnwindThatFailsWithTheUpdatesOwnExceptionIsStillRecorded() {
         Dashboard before = new Dashboard("ops", arn("ops"), OLD_BODY);
-        before.setTags(new java.util.LinkedHashMap<>(Map.of("team", "platform")));
+        before.setTags(new LinkedHashMap<>(Map.of("team", "platform")));
         when(dashboards.getDashboard("ops", REGION)).thenReturn(before);
         when(dashboards.listTagsForResource(arn("ops"), REGION)).thenReturn(Map.of("team", "platform"));
         when(dashboards.putDashboard(eq("ops"), anyString(), anyMap(), eq(REGION))).thenReturn(before);

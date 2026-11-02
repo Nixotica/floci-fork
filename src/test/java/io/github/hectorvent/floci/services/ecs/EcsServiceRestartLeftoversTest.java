@@ -18,6 +18,8 @@ import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.NetworkBinding;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.HashMap;
 import java.util.List;
@@ -48,6 +50,63 @@ class EcsServiceRestartLeftoversTest {
     private static final String REGION = "us-east-1";
     private static final String TARGET_GROUP_ARN =
             "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/web/0123456789abcdef";
+
+    @Test
+    void pendingPreviousRunVolumesDoNotBlockRunTaskOrServiceTasksAndRetryOnTicks() {
+        SharedStorageFactory storage = new SharedStorageFactory();
+        persistServiceWithLoadBalancer(storage);
+        EcsContainerManager manager = mock(EcsContainerManager.class);
+        when(manager.removeLeftoverContainers()).thenReturn(true);
+        when(manager.removeLeftoverTaskVolumes()).thenReturn(false, false, true);
+        when(manager.getExitCodeIfStopped(anyString())).thenReturn(null);
+        when(manager.startTask(any(), any(), any(), anyString())).thenAnswer(invocation -> {
+            EcsTask task = invocation.getArgument(0);
+            return new EcsTaskHandle(task.getTaskArn(), Map.of("web", "docker-id"), Map.of());
+        });
+        EcsService restarted = service(storage, false, manager, mock(EcsLoadBalancerRegistrar.class), null);
+        restarted.releasePreviousRunLeftovers();
+        EcsTask task = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null,
+                null, null, REGION).getFirst();
+        assertEquals("RUNNING", task.getLastStatus());
+        restarted.reconcileServices();
+        verify(manager, times(2)).startTask(any(), any(), any(), anyString());
+        verify(manager).removeLeftoverTaskVolumes();
+
+        restarted.reconcile();
+        restarted.reconcile();
+        restarted.reconcile();
+        verify(manager, times(3)).removeLeftoverTaskVolumes();
+        verify(manager).removeLeftoverContainers();
+        verify(manager, times(2)).startTask(any(), any(), any(), anyString());
+    }
+
+    @Test
+    void volumeCleanupWaitsForContainersAndRetriesWithoutAnyTaskLaunch() {
+        EcsContainerManager manager = mock(EcsContainerManager.class);
+        when(manager.removeLeftoverContainers()).thenReturn(false, true);
+        when(manager.removeLeftoverTaskVolumes()).thenReturn(false, true);
+        when(manager.getExitCodeIfStopped(anyString())).thenReturn(null);
+        when(manager.startTask(any(), any(), any(), anyString())).thenAnswer(invocation -> {
+            EcsTask task = invocation.getArgument(0);
+            return new EcsTaskHandle(task.getTaskArn(), Map.of("web", "docker-id"), Map.of());
+        });
+        EcsService restarted = service(new SharedStorageFactory(), false, manager,
+                mock(EcsLoadBalancerRegistrar.class), null);
+        restarted.releasePreviousRunLeftovers();
+        restarted.reconcile();
+        verify(manager, never()).removeLeftoverTaskVolumes();
+        ContainerDefinition definition = new ContainerDefinition();
+        definition.setName("web");
+        definition.setImage("busybox:stable");
+        restarted.registerTaskDefinition("web", List.of(definition), NetworkMode.bridge, null, null,
+                null, null, List.of(), REGION);
+        restarted.runTask(null, "web", 1, LaunchType.EC2, null, null, null, null, REGION);
+        restarted.reconcile();
+        restarted.reconcile();
+        restarted.reconcile();
+        verify(manager, times(2)).removeLeftoverTaskVolumes();
+        verify(manager, times(2)).removeLeftoverContainers();
+    }
 
     @Test
     void releasesTheRegistrationsThePreviousRunRecorded() {
@@ -138,6 +197,7 @@ class EcsServiceRestartLeftoversTest {
                 mock(EcsLoadBalancerRegistrar.class), null).releasePreviousRunLeftovers();
 
         verify(containerManager, never()).removeLeftoverContainers();
+        verify(containerManager, never()).removeLeftoverTaskVolumes();
     }
 
     @Test
@@ -158,6 +218,7 @@ class EcsServiceRestartLeftoversTest {
         restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION);
 
         verify(containerManager, never()).removeLeftoverContainers();
+        verify(containerManager, never()).removeLeftoverTaskVolumes();
         verify(containerManager).startTask(any(), any(), any(), anyString());
         verify(lbRegistrar).releaseRecordedTargets();
         verify(discoveryRegistrar).releaseRecordedInstances();
@@ -178,21 +239,21 @@ class EcsServiceRestartLeftoversTest {
         }
     }
 
-    @Test
-    void aStartingTaskEvictsTheUnrecordedRegistrationsAtItsAddress() {
+    @ParameterizedTest
+    @CsvSource({"127.0.0.1, 32781", "172.19.0.4, 80"})
+    void aStartingTaskEvictsTheUnrecordedRegistrationsAtItsAddress(String host, int targetPort) {
         EcsContainerManager containerManager = mock(EcsContainerManager.class);
         when(containerManager.removeLeftoverContainers()).thenReturn(true);
         when(containerManager.startTask(any(), any(), any(), anyString())).thenAnswer(invocation -> {
             EcsTask task = invocation.getArgument(0);
             Container container = new Container();
             container.setName("web");
-            container.setNetworkBindings(List.of(new NetworkBinding("0.0.0.0", 80, 80, "tcp")));
+            container.setNetworkBindings(List.of(new NetworkBinding("0.0.0.0", 80, 32781, "tcp")));
             task.setContainers(List.of(container));
             task.setPrivateIpAddress("10.0.1.5");
             return new EcsTaskHandle(task.getTaskArn(), Map.of("web", "docker-id"), Map.of());
         });
-        // Floci running natively: targets reach the task on loopback, Cloud Map registers its Docker address.
-        when(containerManager.resolveContainerHost(any())).thenReturn("127.0.0.1");
+        when(containerManager.resolveContainerHost(any())).thenReturn(host);
         when(containerManager.resolvePeerAddress(any())).thenReturn(Optional.of("172.19.0.4"));
         when(containerManager.taskVpcId(any(), anyString())).thenReturn("vpc-app");
         EcsLoadBalancerRegistrar lbRegistrar = mock(EcsLoadBalancerRegistrar.class);
@@ -220,7 +281,7 @@ class EcsServiceRestartLeftoversTest {
         assertEquals("RUNNING", task.getLastStatus());
         // A target only on the ports the container serves, and never at the VPC-scoped ENI address.
         verify(lbRegistrar).evictUnrecordedTargets(task, Set.of(TARGET_GROUP_ARN),
-                Set.of(new EcsTaskAddress("127.0.0.1", 80)), REGION);
+                Set.of(new EcsTaskAddress(host, targetPort)), REGION);
         verify(discoveryRegistrar).evictUnrecordedInstances(task, Set.of("srv-alpha"),
                 Set.of(new EcsTaskAddress("10.0.1.5", null, "vpc-app"), new EcsTaskAddress("172.19.0.4", null)),
                 REGION);

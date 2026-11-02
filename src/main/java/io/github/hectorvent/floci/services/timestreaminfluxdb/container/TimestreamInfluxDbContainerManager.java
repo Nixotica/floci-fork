@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.C
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -185,8 +186,11 @@ public class TimestreamInfluxDbContainerManager implements ContainerTeardown {
         }
     }
 
-    public void restart(String containerId) {
+    public InfluxDbEndpoint restart(String containerId) {
         lifecycleManager.getDockerClient().restartContainerCmd(containerId).exec();
+        EndpointInfo endpoint = lifecycleManager.resolveEndpoint(containerId, INFLUX_PORT,
+                containerBuilder.resolveDockerNetwork(config.services().timestreamInfluxdb().dockerNetwork()).orElse(null));
+        return new InfluxDbEndpoint(containerId, endpoint.host(), endpoint.port());
     }
 
     public void stop(String resourceId, String containerId) {
@@ -342,12 +346,16 @@ public class TimestreamInfluxDbContainerManager implements ContainerTeardown {
     }
 
     private void copyToContainer(String containerId, Path archive, String remotePath) throws IOException {
-        try (InputStream stream = Files.newInputStream(archive)) {
-            lifecycleManager.getDockerClient().copyArchiveToContainerCmd(containerId)
-                    .withRemotePath(remotePath)
-                    .withTarInputStream(stream)
-                    .exec();
-        }
+        copyToContainer(containerId, archive, remotePath, RetryingTarCopier.DEFAULT_BACKOFF_MS);
+    }
+
+    void copyToContainer(String containerId, Path archive, String remotePath, long backoffMillis) throws IOException {
+        RetryingTarCopier.copyStreamed(lifecycleManager.getDockerClient(), containerId, remotePath,
+                archive.getFileName().toString(), out -> {
+                    try (InputStream stream = Files.newInputStream(archive)) {
+                        stream.transferTo(out);
+                    }
+                }, RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, backoffMillis);
     }
 
     private void execOrThrow(String containerId, String[] command, String description) {

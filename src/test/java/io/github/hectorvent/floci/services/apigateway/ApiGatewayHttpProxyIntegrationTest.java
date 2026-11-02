@@ -3,17 +3,20 @@ package io.github.hectorvent.floci.services.apigateway;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.testutil.ExecuteApiRequestSigner;
+import io.github.hectorvent.floci.testutil.FreePorts;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.http.ContentType;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -67,9 +70,7 @@ class ApiGatewayHttpProxyIntegrationTest {
         backendServer.start();
         backendPort = backendServer.getAddress().getPort();
 
-        try (ServerSocket probe = new ServerSocket(0)) {
-            deadPort = probe.getLocalPort();
-        }
+        deadPort = FreePorts.anyInterfacePort();
     }
 
     @AfterAll
@@ -129,6 +130,11 @@ class ApiGatewayHttpProxyIntegrationTest {
 
     private String createProxyApi(String name, String targetUri, String requestParametersJson,
                                   String authorizationType) {
+        return createProxyApi(name, targetUri, requestParametersJson, authorizationType, "/{proxy+}", "ANY");
+    }
+
+    private String createProxyApi(String name, String targetUri, String requestParametersJson,
+                                  String authorizationType, String resourcePath, String httpMethod) {
         String apiId = given()
                 .contentType(ContentType.JSON)
                 .body("{\"name\":\"" + name + "\"}")
@@ -140,15 +146,18 @@ class ApiGatewayHttpProxyIntegrationTest {
         String rootId = given().when().get("/restapis/" + apiId + "/resources")
                 .then().statusCode(200).extract().path("item[0].id");
 
-        String resourceId = given()
-                .contentType(ContentType.JSON)
-                .body("{\"pathPart\":\"{proxy+}\"}")
-                .when().post("/restapis/" + apiId + "/resources/" + rootId)
-                .then().statusCode(201).extract().path("id");
+        String resourceId = rootId;
+        for (String pathPart : resourcePath.substring(1).split("/")) {
+            resourceId = given()
+                    .contentType(ContentType.JSON)
+                    .body(Map.of("pathPart", pathPart))
+                    .when().post("/restapis/" + apiId + "/resources/" + resourceId)
+                    .then().statusCode(201).extract().path("id");
+        }
 
         given().contentType(ContentType.JSON)
                 .body("{\"authorizationType\":\"" + authorizationType + "\"}")
-                .when().put("/restapis/" + apiId + "/resources/" + resourceId + "/methods/ANY")
+                .when().put("/restapis/" + apiId + "/resources/" + resourceId + "/methods/" + httpMethod)
                 .then().statusCode(201);
 
         String integrationBody = "{\"type\":\"HTTP_PROXY\",\"httpMethod\":\"ANY\",\"uri\":\"" + targetUri + "\""
@@ -156,17 +165,10 @@ class ApiGatewayHttpProxyIntegrationTest {
                 + "}";
         given().contentType(ContentType.JSON)
                 .body(integrationBody)
-                .when().put("/restapis/" + apiId + "/resources/" + resourceId + "/methods/ANY/integration")
+                .when().put("/restapis/" + apiId + "/resources/" + resourceId + "/methods/" + httpMethod + "/integration")
                 .then().statusCode(201);
 
-        String deploymentId = given().contentType(ContentType.JSON)
-                .body("{\"description\":\"v1\"}")
-                .when().post("/restapis/" + apiId + "/deployments")
-                .then().statusCode(201).extract().path("id");
-        given().contentType(ContentType.JSON)
-                .body("{\"stageName\":\"test\",\"deploymentId\":\"" + deploymentId + "\"}")
-                .when().post("/restapis/" + apiId + "/stages")
-                .then().statusCode(201);
+        createStage(apiId, deploy(apiId));
 
         return apiId;
     }
@@ -221,11 +223,93 @@ class ApiGatewayHttpProxyIntegrationTest {
                 .when().get("/execute-api/" + apiId + "/test/orders/42?limit=5")
                 .then().statusCode(200)
                 .header("X-Backend-Marker", "hit")
-                .body("from", org.hamcrest.Matchers.equalTo("backend"));
+                .body("from", Matchers.equalTo("backend"));
 
         assertEquals("GET", lastMethod.get());
         assertEquals("/orders/42", lastPath.get());
         assertEquals("limit=5", lastQuery.get());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "/{proxy+}, /checkpoint/status, /checkpoint/status",
+            "/api/v1/auth/signup/{proxy+}, /api/v1/auth/signup/status, /status",
+            "/api/v1/auth/signup/{proxy+}, /api/v1/auth/signup/checkpoint/status, /checkpoint/status"
+    })
+    void mapsOnlyTheGreedySuffixIntoTheIntegrationPath(String resourcePath, String requestPath,
+                                                      String expectedSuffix) {
+        resetRecordings();
+        String apiId = createProxyApi("http-proxy-greedy-path-api",
+                "http://127.0.0.1:" + backendPort + "/api/v1/auth/signup/{proxy}",
+                "{\"integration.request.path.proxy\":\"method.request.path.proxy\"}",
+                "NONE", resourcePath, "ANY");
+
+        given().when().get("/execute-api/" + apiId + "/test" + requestPath)
+                .then().statusCode(200);
+
+        assertEquals("GET", lastMethod.get());
+        assertEquals("/api/v1/auth/signup" + expectedSuffix, lastPath.get());
+    }
+
+    @Test
+    void substitutesNestedGreedySuffixWithoutExplicitParameterMapping() {
+        resetRecordings();
+        String apiId = createProxyApi("http-proxy-implicit-greedy-api",
+                "http://127.0.0.1:" + backendPort + "/files/{proxy}", null,
+                "NONE", "/files/{proxy+}", "ANY");
+
+        given().when().get("/execute-api/" + apiId + "/test/files/images/logo.png")
+                .then().statusCode(200);
+
+        assertEquals("/files/images/logo.png", lastPath.get());
+    }
+
+    @Test
+    void mapsGreedyParameterWithADifferentName() {
+        resetRecordings();
+        String apiId = createProxyApi("http-proxy-named-greedy-api",
+                "http://127.0.0.1:" + backendPort + "/static/{remainder}",
+                "{\"integration.request.path.remainder\":\"method.request.path.rest\"}",
+                "NONE", "/assets/{rest+}", "ANY");
+
+        given().when().get("/execute-api/" + apiId + "/test/assets/images/logo.png")
+                .then().statusCode(200);
+
+        assertEquals("/static/images/logo.png", lastPath.get());
+    }
+
+    @Test
+    void mapsOrdinaryNamedParameters() {
+        resetRecordings();
+        String apiId = createProxyApi("http-proxy-named-path-api",
+                "http://127.0.0.1:" + backendPort + "/tenants/{tenant}/files/{file}",
+                "{\"integration.request.path.tenant\":\"method.request.path.tenantId\","
+                        + "\"integration.request.path.file\":\"method.request.path.fileId\"}",
+                "NONE", "/accounts/{tenantId}/assets/{fileId}", "ANY");
+
+        given().when().get("/execute-api/" + apiId + "/test/accounts/acme/assets/logo.png")
+                .then().statusCode(200);
+
+        assertEquals("/tenants/acme/files/logo.png", lastPath.get());
+    }
+
+    @Test
+    void forwardsUnauthenticatedOptionsWithOnlyTheGreedySuffix() {
+        resetRecordings();
+        String apiId = createProxyApi("http-proxy-options-greedy-api",
+                "http://127.0.0.1:" + backendPort + "/api/v1/auth/signup/{proxy}",
+                "{\"integration.request.path.proxy\":\"method.request.path.proxy\"}",
+                "NONE", "/api/v1/auth/signup/{proxy+}", "OPTIONS");
+
+        given()
+                .header("Origin", "https://example.com")
+                .header("Access-Control-Request-Method", "GET")
+                .when().options("/execute-api/" + apiId + "/test/api/v1/auth/signup/checkpoint/status")
+                .then().statusCode(200);
+
+        assertEquals("OPTIONS", lastMethod.get());
+        assertEquals("/api/v1/auth/signup/checkpoint/status", lastPath.get());
+        assertNull(lastAuthorization.get());
     }
 
     @Test
@@ -261,7 +345,7 @@ class ApiGatewayHttpProxyIntegrationTest {
                 .when().get("/execute-api/" + apiId + "/test/orders/42")
                 .then()
                 .statusCode(200)
-                .body("from", org.hamcrest.Matchers.equalTo("backend"));
+                .body("from", Matchers.equalTo("backend"));
 
         assertEquals("/42", lastPath.get());
     }
@@ -282,6 +366,42 @@ class ApiGatewayHttpProxyIntegrationTest {
         assertEquals("{\"symbol\":\"ACME\"}", lastBody.get());
     }
 
+    // AWS forwards a DELETE body like any other (e.g. a batch delete taking a list of ids), and
+    // every execute-api URL form reaches the same dispatch, so each must hand the body over.
+    @ParameterizedTest
+    @CsvSource({
+            "/execute-api/{apiId}/test/orders",
+            "/_aws/execute-api/{apiId}/test/orders",
+            "/restapis/{apiId}/test/_user_request_/orders",
+    })
+    void forwardsRequestBodyOnDelete(String urlTemplate) {
+        resetRecordings();
+        String apiId = createProxyApi("http-proxy-delete-api", backendUri(), null);
+
+        given()
+                .contentType(ContentType.JSON)
+                .body("{\"ids\":[\"a\",\"b\"]}")
+                .when().delete(urlTemplate.replace("{apiId}", apiId))
+                .then().statusCode(200);
+
+        assertEquals("DELETE", lastMethod.get());
+        assertEquals("/orders", lastPath.get());
+        assertEquals("{\"ids\":[\"a\",\"b\"]}", lastBody.get());
+    }
+
+    @Test
+    void deleteWithoutBodyStillReachesTheBackend() {
+        resetRecordings();
+        String apiId = createProxyApi("http-proxy-delete-empty-api", backendUri(), null);
+
+        given()
+                .when().delete("/execute-api/" + apiId + "/test/orders/42")
+                .then().statusCode(200);
+
+        assertEquals("DELETE", lastMethod.get());
+        assertEquals("", lastBody.get());
+    }
+
     @Test
     void relaysBackendErrorStatusVerbatim() {
         resetRecordings();
@@ -292,7 +412,7 @@ class ApiGatewayHttpProxyIntegrationTest {
         given()
                 .when().get("/execute-api/" + apiId + "/test/orders/missing")
                 .then().statusCode(404)
-                .body("from", org.hamcrest.Matchers.equalTo("backend"));
+                .body("from", Matchers.equalTo("backend"));
     }
 
     @Test

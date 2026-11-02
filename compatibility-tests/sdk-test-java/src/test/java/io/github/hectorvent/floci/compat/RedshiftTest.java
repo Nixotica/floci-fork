@@ -11,10 +11,10 @@ import software.amazon.awssdk.services.redshift.RedshiftClient;
 import software.amazon.awssdk.services.redshift.model.Cluster;
 import software.amazon.awssdk.services.redshift.model.CreateClusterRequest;
 import software.amazon.awssdk.services.redshift.model.CreateClusterResponse;
-import software.amazon.awssdk.services.redshift.model.DescribeClustersRequest;
-import software.amazon.awssdk.services.redshift.model.DescribeClustersResponse;
 import software.amazon.awssdk.services.redshift.model.DeleteClusterRequest;
 import software.amazon.awssdk.services.redshift.model.DeleteClusterResponse;
+import software.amazon.awssdk.services.redshift.model.DescribeClustersRequest;
+import software.amazon.awssdk.services.redshift.model.DescribeClustersResponse;
 import software.amazon.awssdk.services.redshift.model.GetClusterCredentialsResponse;
 import software.amazon.awssdk.services.redshift.model.GetClusterCredentialsWithIamResponse;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -31,7 +31,6 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
-
 import java.time.Duration;
 import java.time.Instant;
 import java.util.function.Supplier;
@@ -111,8 +110,8 @@ public class RedshiftTest {
         String address = cluster.endpoint().address();
         int port = cluster.endpoint().port();
         String jdbcUrl = "jdbc:postgresql://" + address + ":" + port + "/dev";
-        try (java.sql.Connection conn =
-                     java.sql.DriverManager.getConnection(jdbcUrl, "admin", "Password123")) {
+        try (Connection conn =
+                     DriverManager.getConnection(jdbcUrl, "admin", "Password123")) {
             assertTrue(conn.isValid(5));
         }
     }
@@ -209,6 +208,7 @@ public class RedshiftTest {
         RedshiftClient client = getClient();
         DeleteClusterResponse res = withRetry(() -> client.deleteCluster(DeleteClusterRequest.builder()
                 .clusterIdentifier("test-cluster")
+                .skipFinalClusterSnapshot(true)
                 .build()));
         assertEquals("test-cluster", res.cluster().clusterIdentifier());
         assertEquals("deleting", res.cluster().clusterStatus());

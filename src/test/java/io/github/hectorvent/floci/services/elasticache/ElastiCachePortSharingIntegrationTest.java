@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.elasticache;
 
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import jakarta.inject.Inject;
@@ -15,6 +16,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
@@ -85,6 +87,9 @@ class ElastiCachePortSharingIntegrationTest {
                     + ".CacheNodes.CacheNode.Endpoint.Port";
 
     private static int firstPort;
+
+    @TestHTTPResource("/")
+    static URI baseUri;
     private static int secondPort;
 
     /** The manager that starts these caches' containers, so the guard is the service's own. */
@@ -96,6 +101,7 @@ class ElastiCachePortSharingIntegrationTest {
         for (String groupId : List.of(FIRST_GROUP, SECOND_GROUP)) {
             try {
                 given()
+                    .port(baseUri.getPort())
                     .formParam("Action", "DeleteReplicationGroup")
                     .formParam("ReplicationGroupId", groupId)
                     .header("Authorization", AUTH_HEADER)
@@ -269,7 +275,7 @@ class ElastiCachePortSharingIntegrationTest {
      * endpoint reaching a different group's proxy produces.
      */
     private static String withAuth(int port, String token, String... command) throws IOException {
-        try (Socket socket = new Socket("localhost", port)) {
+        try (Socket socket = ElastiCacheTestConnections.openSocket("localhost", port)) {
             socket.setSoTimeout(10_000);
             OutputStream out = socket.getOutputStream();
             InputStream in = socket.getInputStream();

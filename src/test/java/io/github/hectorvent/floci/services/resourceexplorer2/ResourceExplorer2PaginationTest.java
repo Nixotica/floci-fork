@@ -1,13 +1,14 @@
 package io.github.hectorvent.floci.services.resourceexplorer2;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import org.junit.jupiter.api.Test;
 
 import java.util.Base64;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Unit tests for the pure pagination math behind ListResources/Search:
@@ -26,7 +27,7 @@ class ResourceExplorer2PaginationTest {
 
     @Test
     void firstPageStartsAtZero() {
-        var b = ResourceExplorer2Service.pageBounds(50, 10, null, CAP);
+        ResourceExplorer2Service.PageBounds b = ResourceExplorer2Service.pageBounds(50, 10, null, CAP);
         assertEquals(0, b.start());
         assertEquals(10, b.end());
         assertEquals(50, b.total());
@@ -34,7 +35,7 @@ class ResourceExplorer2PaginationTest {
 
     @Test
     void secondPageOffsetsByToken() {
-        var b = ResourceExplorer2Service.pageBounds(50, 10, token(10), CAP);
+        ResourceExplorer2Service.PageBounds b = ResourceExplorer2Service.pageBounds(50, 10, token(10), CAP);
         assertEquals(10, b.start());
         assertEquals(20, b.end());
         assertEquals(50, b.total());
@@ -42,14 +43,14 @@ class ResourceExplorer2PaginationTest {
 
     @Test
     void lastPageIsPartial() {
-        var b = ResourceExplorer2Service.pageBounds(25, 10, token(20), CAP);
+        ResourceExplorer2Service.PageBounds b = ResourceExplorer2Service.pageBounds(25, 10, token(20), CAP);
         assertEquals(20, b.start());
         assertEquals(25, b.end());
     }
 
     @Test
     void nullMaxResultsDefaultsTo100() {
-        var b = ResourceExplorer2Service.pageBounds(200, null, null, CAP);
+        ResourceExplorer2Service.PageBounds b = ResourceExplorer2Service.pageBounds(200, null, null, CAP);
         assertEquals(100, b.end());
     }
 
@@ -57,7 +58,7 @@ class ResourceExplorer2PaginationTest {
     void offsetBeyondSizeClampsToEmptyPageInsteadOfThrowing() {
         // The live result set can shrink between calls; a stale offset must not produce
         // subList(fromIndex > toIndex) which would throw and 500.
-        var b = ResourceExplorer2Service.pageBounds(10, 100, token(999), CAP);
+        ResourceExplorer2Service.PageBounds b = ResourceExplorer2Service.pageBounds(10, 100, token(999), CAP);
         assertEquals(10, b.start());
         assertEquals(10, b.end());
         assertEquals(0, b.end() - b.start());
@@ -65,19 +66,19 @@ class ResourceExplorer2PaginationTest {
 
     @Test
     void garbageTokenIsRejected() {
-        assertThrows(io.github.hectorvent.floci.core.common.AwsException.class,
+        assertThrows(AwsException.class,
                 () -> ResourceExplorer2Service.pageBounds(50, 10, "!!!not-base64!!!", CAP));
     }
 
     @Test
     void negativeTokenOffsetIsRejected() {
-        assertThrows(io.github.hectorvent.floci.core.common.AwsException.class,
+        assertThrows(AwsException.class,
                 () -> ResourceExplorer2Service.pageBounds(50, 10, token(-1), CAP));
     }
 
     @Test
     void totalIsCappedAt1000() {
-        var b = ResourceExplorer2Service.pageBounds(1500, 1000, null, CAP);
+        ResourceExplorer2Service.PageBounds b = ResourceExplorer2Service.pageBounds(1500, 1000, null, CAP);
         assertEquals(1000, b.total());
         assertEquals(0, b.start());
         assertEquals(1000, b.end());
@@ -85,7 +86,7 @@ class ResourceExplorer2PaginationTest {
 
     @Test
     void paginationStaysWithinTheCap() {
-        var b = ResourceExplorer2Service.pageBounds(1500, 100, token(950), CAP);
+        ResourceExplorer2Service.PageBounds b = ResourceExplorer2Service.pageBounds(1500, 100, token(950), CAP);
         assertEquals(1000, b.total());
         assertEquals(950, b.start());
         assertEquals(1000, b.end());
@@ -93,7 +94,7 @@ class ResourceExplorer2PaginationTest {
 
     @Test
     void offsetBeyondCapClampsToEmpty() {
-        var b = ResourceExplorer2Service.pageBounds(1500, 100, token(1200), CAP);
+        ResourceExplorer2Service.PageBounds b = ResourceExplorer2Service.pageBounds(1500, 100, token(1200), CAP);
         assertEquals(1000, b.total());
         assertEquals(1000, b.start());
         assertEquals(1000, b.end());

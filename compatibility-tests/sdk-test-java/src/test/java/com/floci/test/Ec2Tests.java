@@ -1,12 +1,15 @@
 package com.floci.test;
 
 import org.junit.jupiter.api.*;
+import software.amazon.awssdk.regions.RegionMetadata;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.*;
 import software.amazon.awssdk.services.ec2.model.Tag;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -34,6 +37,32 @@ class Ec2Tests {
     static void setup() {
         ec2 = TestFixtures.ec2Client();
         keyName = "sdk-test-key";
+    }
+
+    @Test
+    @Order(-1)
+    void spotRequestsPreserveOriginalUserData() {
+        String encoded = "/w";
+        SpotInstanceRequest request = ec2.requestSpotInstances(RequestSpotInstancesRequest.builder()
+                .instanceCount(1)
+                .launchSpecification(RequestSpotLaunchSpecification.builder()
+                        .imageId("ami-0abcdef1234567890")
+                        .instanceType(InstanceType.T3_MICRO)
+                        .userData(encoded).build())
+                .build()).spotInstanceRequests().get(0);
+        try {
+            assertThat(request.launchSpecification().userData()).isEqualTo(encoded);
+            assertThat(ec2.describeSpotInstanceRequests(DescribeSpotInstanceRequestsRequest.builder()
+                    .spotInstanceRequestIds(request.spotInstanceRequestId()).build())
+                    .spotInstanceRequests().get(0).launchSpecification().userData()).isEqualTo(encoded);
+            assertThat(ec2.describeInstanceAttribute(DescribeInstanceAttributeRequest.builder()
+                    .instanceId(request.instanceId()).attribute(InstanceAttributeName.USER_DATA).build())
+                    .userData().value()).isEqualTo(encoded);
+        } finally {
+            ec2.terminateInstances(TerminateInstancesRequest.builder().instanceIds(request.instanceId()).build());
+            ec2.cancelSpotInstanceRequests(CancelSpotInstanceRequestsRequest.builder()
+                    .spotInstanceRequestIds(request.spotInstanceRequestId()).build());
+        }
     }
 
     @Test
@@ -200,6 +229,8 @@ class Ec2Tests {
     void describeAvailabilityZones() {
         DescribeAvailabilityZonesResponse resp = ec2.describeAvailabilityZones();
         assertThat(resp.availabilityZones()).hasSize(3);
+        assertThat(resp.availabilityZones()).allSatisfy(zone ->
+                assertThat(zone.networkBorderGroup()).isEqualTo(TestFixtures.region().id()));
     }
 
     @Test
@@ -447,7 +478,7 @@ class Ec2Tests {
         CreateSubnetResponse resp = ec2.createSubnet(CreateSubnetRequest.builder()
                 .vpcId(vpcId)
                 .cidrBlock("10.0.1.0/24")
-                .availabilityZone("us-east-1a")
+                .availabilityZone(TestFixtures.availabilityZone())
                 .tagSpecifications(
                         TagSpecification.builder()
                                 .resourceType(ResourceType.SUBNET)
@@ -827,8 +858,42 @@ class Ec2Tests {
     void createTags() {
         ec2.createTags(CreateTagsRequest.builder()
                 .resources(instanceId)
-                .tags(software.amazon.awssdk.services.ec2.model.Tag.builder().key("Name").value("sdk-test-instance").build())
+                .tags(Tag.builder().key("Name").value("sdk-test-instance").build())
                 .build());
+    }
+
+    @Test
+    @Order(52)
+    @DisplayName("DescribeTags - paginator pages with MaxResults and honours tag:<key>")
+    void describeTagsPaginatesAndFiltersByTagKey() {
+        String pagedVpcId = ec2.createVpc(CreateVpcRequest.builder().cidrBlock("10.98.0.0/16").build())
+                .vpc().vpcId();
+        try {
+            List<Tag> tags = new ArrayList<>();
+            for (int i = 1; i <= 12; i++) {
+                tags.add(Tag.builder().key(String.format("Page%02d", i)).value(i == 1 ? "TeamA" : "v").build());
+            }
+            ec2.createTags(CreateTagsRequest.builder().resources(pagedVpcId).tags(tags).build());
+            Filter byId = Filter.builder().name("resource-id").values(pagedVpcId).build();
+
+            List<DescribeTagsResponse> pages = ec2.describeTagsPaginator(DescribeTagsRequest.builder()
+                    .filters(byId).maxResults(5).build()).stream().toList();
+            assertThat(pages).extracting(page -> page.tags().size()).containsExactly(5, 5, 2);
+            assertThat(pages.get(2).nextToken()).isNull();
+            assertThat(pages.stream().flatMap(page -> page.tags().stream()).map(TagDescription::key).distinct())
+                    .hasSize(12);
+
+            assertThat(ec2.describeTags(DescribeTagsRequest.builder()
+                    .filters(byId, Filter.builder().name("tag:Page01").values("Team?").build())
+                    .build()).tags())
+                    .singleElement()
+                    .satisfies(tag -> {
+                        assertThat(tag.key()).isEqualTo("Page01");
+                        assertThat(tag.resourceType()).isEqualTo(ResourceType.VPC);
+                    });
+        } finally {
+            ec2.deleteVpc(DeleteVpcRequest.builder().vpcId(pagedVpcId).build());
+        }
     }
 
     @Test
@@ -947,24 +1012,46 @@ class Ec2Tests {
         DescribeVpcEndpointServicesResponse resp = ec2.describeVpcEndpointServices(
                 DescribeVpcEndpointServicesRequest.builder().build());
 
-        assertThat(resp.serviceNames()).contains("com.amazonaws.us-east-1.s3");
+        // The S3 gateway keeps com.amazonaws everywhere. Outside the commercial partition and GovCloud,
+        // AWS names some interface services under the partition's DNS suffix reversed (cn.com.amazonaws,
+        // eu.amazonaws, gov.ic.c2s, ...): ecr.api in every China, EUSC and ISO region, S3 only in China,
+        // where the two S3 offerings therefore split.
+        String region = TestFixtures.region().id();
+        String reversedSuffix = reversedDnsSuffix();
+        String s3Gateway = "com.amazonaws." + region + ".s3";
+        String s3Interface = ("aws-cn".equals(TestFixtures.partition()) ? reversedSuffix : "com.amazonaws")
+                + "." + region + ".s3";
+        assertThat(resp.serviceNames()).contains(s3Gateway, s3Interface);
         assertThat(resp.serviceDetails()).isNotEmpty();
 
-        ServiceDetail s3 = resp.serviceDetails().stream()
-                .filter(d -> d.serviceName().equals("com.amazonaws.us-east-1.s3"))
-                .findFirst()
-                .orElseThrow();
-        // S3 is the one service offering both endpoint types.
-        assertThat(s3.serviceType().stream().map(ServiceTypeDetail::serviceTypeAsString).toList())
-                .containsExactlyInAnyOrder("Gateway", "Interface");
-        assertThat(s3.availabilityZones()).isNotEmpty();
+        if (s3Interface.equals(s3Gateway)) {
+            // S3 is the one service offering both endpoint types.
+            assertThat(serviceTypes(resp, s3Gateway)).containsExactlyInAnyOrder("Gateway", "Interface");
+        } else {
+            assertThat(serviceTypes(resp, s3Gateway)).containsExactly("Gateway");
+            assertThat(serviceTypes(resp, s3Interface)).containsExactly("Interface");
+        }
+        assertThat(serviceDetail(resp, s3Gateway).availabilityZones()).isNotEmpty();
+        assertThat(serviceTypes(resp, reversedSuffix + "." + region + ".ecr.api")).containsExactly("Interface");
+    }
 
-        ServiceDetail ecr = resp.serviceDetails().stream()
-                .filter(d -> d.serviceName().equals("com.amazonaws.us-east-1.ecr.api"))
+    private static String reversedDnsSuffix() {
+        RegionMetadata metadata = TestFixtures.region().metadata();
+        List<String> labels = new ArrayList<>(List.of(
+                (metadata == null ? "amazonaws.com" : metadata.partition().dnsSuffix()).split("\\.")));
+        Collections.reverse(labels);
+        return String.join(".", labels);
+    }
+
+    private static ServiceDetail serviceDetail(DescribeVpcEndpointServicesResponse resp, String name) {
+        return resp.serviceDetails().stream()
+                .filter(d -> d.serviceName().equals(name))
                 .findFirst()
                 .orElseThrow();
-        assertThat(ecr.serviceType().stream().map(ServiceTypeDetail::serviceTypeAsString).toList())
-                .containsExactly("Interface");
+    }
+
+    private static List<String> serviceTypes(DescribeVpcEndpointServicesResponse resp, String name) {
+        return serviceDetail(resp, name).serviceType().stream().map(ServiceTypeDetail::serviceTypeAsString).toList();
     }
 
     @Test
@@ -987,7 +1074,7 @@ class Ec2Tests {
         String endpointId = null;
         try {
             ownSubnetId = ec2.createSubnet(CreateSubnetRequest.builder()
-                    .vpcId(vpcId).cidrBlock("10.0.90.0/24").availabilityZone("us-east-1a")
+                    .vpcId(vpcId).cidrBlock("10.0.90.0/24").availabilityZone(TestFixtures.availabilityZone())
                     .build()).subnet().subnetId();
             ownGroupId = ec2.createSecurityGroup(CreateSecurityGroupRequest.builder()
                     .groupName("vpce-eni-sdk-test").description("endpoint interface ids")
@@ -1002,6 +1089,8 @@ class Ec2Tests {
                             .securityGroupIds(ownGroupId)
                             .build());
             endpointId = created.vpcEndpoint().vpcEndpointId();
+            assertThat(created.vpcEndpoint().ipAddressType()).isEqualTo(IpAddressType.IPV4);
+            assertThat(created.vpcEndpoint().stateAsString()).isEqualTo("available");
 
             // Asserted on the CREATE response and again on DESCRIBE, because Terraform
             // reads the ids from one and then re-reads them from the other between plan
@@ -1014,6 +1103,14 @@ class Ec2Tests {
             DescribeVpcEndpointsResponse described = ec2.describeVpcEndpoints(
                     DescribeVpcEndpointsRequest.builder().vpcEndpointIds(endpointId).build());
             VpcEndpoint ep = described.vpcEndpoints().get(0);
+            assertThat(ep.ipAddressType()).isEqualTo(IpAddressType.IPV4);
+            assertThat(ep.stateAsString()).isEqualTo("available");
+            ec2.modifyVpcEndpoint(ModifyVpcEndpointRequest.builder().vpcEndpointId(endpointId)
+                    .ipAddressType(IpAddressType.DUALSTACK).build());
+            assertThat(ec2.describeVpcEndpoints(DescribeVpcEndpointsRequest.builder()
+                    .vpcEndpointIds(endpointId).build()).vpcEndpoints().get(0).ipAddressType())
+                    .isEqualTo(IpAddressType.DUALSTACK);
+
 
             assertThat(ep.networkInterfaceIds())
                     .as("DescribeVpcEndpoints response")

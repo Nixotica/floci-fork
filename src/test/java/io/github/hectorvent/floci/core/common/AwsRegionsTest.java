@@ -14,6 +14,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AwsRegionsTest {
 
+    @ParameterizedTest
+    @CsvSource({
+            "us-east-1, ec2.internal",
+            "us-west-2, us-west-2.compute.internal",
+            "eu-central-1, eu-central-1.compute.internal"})
+    void ec2PrivateDnsNamesUseTheRegionalDomain(String region, String domain) {
+        assertEquals(domain, AwsRegions.ec2PrivateDnsDomain(region));
+        assertEquals("ip-10-24-34-0." + domain,
+                AwsRegions.ec2PrivateIpDnsName("10.24.34.0", region));
+    }
+
     /**
      * {@code ALL} is what the emulator advertises; {@code KNOWN_IDS} is what it recognises. The
      * second must contain the first, or DescribeRegions could name a region that hostname parsing
@@ -21,7 +32,7 @@ class AwsRegionsTest {
      */
     @Test
     void everyAdvertisedRegionIsAKnownRegionId() {
-        for (String region : AwsRegions.ALL) {
+        for (String region : AwsRegions.advertised("aws")) {
             assertTrue(AwsRegions.KNOWN_IDS.contains(region),
                     region + " is advertised by DescribeRegions but is not a known region id");
         }
@@ -111,8 +122,7 @@ class AwsRegionsTest {
 
     @Test
     void advertisedListsArePerPartition() {
-        assertEquals(AwsRegions.ALL, AwsRegions.advertised("aws"));
-        assertEquals(34, AwsRegions.ALL.size());
+        assertEquals(34, AwsRegions.advertised("aws").size());
         assertEquals(List.of("cn-north-1", "cn-northwest-1"), AwsRegions.advertised("aws-cn"));
         assertTrue(AwsRegions.KNOWN_IDS.contains("eusc-de-east-1"));
         assertTrue(AwsRegions.KNOWN_IDS.contains("us-isof-south-1"));

@@ -46,6 +46,13 @@ class CredentialScopeAliasTest {
 
 
     @Test
+    void eventBridgeV2NormalisesToEvents() {
+        // EventBridge V2 signs as events and its actions are events:CreateSubscriber and peers, but it
+        // cannot claim the events scope, which routes to EventBridge, so its catalog key is aliased.
+        assertEquals("events", catalog.canonicalCredentialScope("eventsv2"));
+    }
+
+    @Test
     void ssoPortalAliasNormalisesToSso() {
         assertEquals("sso", catalog.canonicalCredentialScope("awsssoportal"));
     }
@@ -68,7 +75,6 @@ class CredentialScopeAliasTest {
         // canonical scope from the external key would rewrite valid scopes onto prefixes AWS
         // never issues, so every action would resolve to null and enforcement would be skipped.
         assertEquals("ses", catalog.canonicalCredentialScope("ses"));
-        assertEquals("sesv2", catalog.canonicalCredentialScope("sesv2"));
         assertEquals("bedrock", catalog.canonicalCredentialScope("bedrock"));
         assertEquals("logs", catalog.canonicalCredentialScope("logs"));
     }
@@ -83,7 +89,7 @@ class CredentialScopeAliasTest {
                 .filter(scope -> !scope.equals(catalog.canonicalCredentialScope(scope)))
                 .collect(Collectors.toMap(scope -> scope, catalog::canonicalCredentialScope));
 
-        assertEquals(Map.of("s3express", "s3", "iot-jobs-data", "iot", "awsssoportal", "sso"), rewritten);
+        assertEquals(Map.of("s3express", "s3", "iot-jobs-data", "iot", "awsssoportal", "sso", "monitoring", "cloudwatch"), rewritten);
     }
 
     @Test

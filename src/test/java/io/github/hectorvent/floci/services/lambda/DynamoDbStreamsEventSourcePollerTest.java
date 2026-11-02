@@ -28,6 +28,8 @@ import io.github.hectorvent.floci.services.s3.model.Bucket;
 import io.github.hectorvent.floci.services.s3.model.ObjectAnnotation;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
+import io.github.hectorvent.floci.services.sns.SnsService;
+import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.quarkus.test.junit.QuarkusTest;
 import io.vertx.core.Vertx;
 import jakarta.enterprise.event.Event;
@@ -49,7 +51,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -106,9 +107,9 @@ class DynamoDbStreamsEventSourcePollerTest {
     private EsmStore esmStore;
     private EmulatorConfig config;
     private PipesFilterMatcher filterMatcher;
-    private io.github.hectorvent.floci.services.sqs.SqsService sqsService;
-    private io.github.hectorvent.floci.services.sns.SnsService snsService;
-    private io.github.hectorvent.floci.services.s3.S3Service s3Service;
+    private SqsService sqsService;
+    private SnsService snsService;
+    private S3Service s3Service;
     private final AtomicLong clock = new AtomicLong();
     private final AtomicLong sequence = new AtomicLong();
 
@@ -134,9 +135,9 @@ class DynamoDbStreamsEventSourcePollerTest {
         aliasStore = mock(LambdaAliasStore.class);
         esmStore = new EsmStore(new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, ACCOUNT_ID));
         filterMatcher = new PipesFilterMatcher(OBJECT_MAPPER);
-        sqsService = mock(io.github.hectorvent.floci.services.sqs.SqsService.class);
-        snsService = mock(io.github.hectorvent.floci.services.sns.SnsService.class);
-        s3Service = mock(io.github.hectorvent.floci.services.s3.S3Service.class);
+        sqsService = mock(SqsService.class);
+        snsService = mock(SnsService.class);
+        s3Service = mock(S3Service.class);
 
         poller = pollerOver(reader, esmStore);
     }
@@ -145,7 +146,11 @@ class DynamoDbStreamsEventSourcePollerTest {
     private DynamoDbStreamsEventSourcePoller pollerOver(DynamoDbStreamReader streamReader, EsmStore store) {
         return new DynamoDbStreamsEventSourcePoller(
                 mock(Vertx.class), streamReader, executorService, new LambdaTargetResolver(functionStore, aliasStore),
-                store, OBJECT_MAPPER, config, filterMatcher, sqsService, snsService, s3Service, clock::get);
+                store, OBJECT_MAPPER, config, filterMatcher, batchFailures(), clock::get);
+    }
+
+    private StreamBatchFailures batchFailures() {
+        return new StreamBatchFailures(sqsService, snsService, s3Service, OBJECT_MAPPER, config);
     }
 
     /**
@@ -243,7 +248,7 @@ class DynamoDbStreamsEventSourcePollerTest {
         Vertx vertx = mock(Vertx.class);
         DynamoDbStreamsEventSourcePoller p = new DynamoDbStreamsEventSourcePoller(
                 vertx, reader, executorService, new LambdaTargetResolver(functionStore, aliasStore),
-                esmStore, OBJECT_MAPPER, config, filterMatcher, sqsService, snsService, s3Service, clock::get);
+                esmStore, OBJECT_MAPPER, config, filterMatcher, batchFailures(), clock::get);
 
         p.startPersistedPollers();
 
@@ -406,14 +411,14 @@ class DynamoDbStreamsEventSourcePollerTest {
     void versionQualifiedMappingInvokesThatVersion() {
         stubTrimHorizon(List.of(ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}")));
         LambdaFunction version1 = stubVersion("1");
-        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("1")))
                 .thenReturn(new InvokeResult());
         EventSourceMapping esm = filterEsm();
         esm.setFunctionArn("arn:aws:lambda:us-east-1:" + ACCOUNT_ID + ":function:fn:1");
 
         pollerWith(mock(EsmStore.class)).pollAndInvoke(esm);
 
-        verify(executorService, timeout(2000)).invoke(eq(version1), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(executorService, timeout(2000)).invoke(eq(version1), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("1"));
     }
 
     @Test
@@ -425,14 +430,14 @@ class DynamoDbStreamsEventSourcePollerTest {
         alias.setFunctionName("fn");
         alias.setFunctionVersion("2");
         when(aliasStore.getForAccount(ACCOUNT_ID, "us-east-1", "fn", "live")).thenReturn(Optional.of(alias));
-        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("live")))
                 .thenReturn(new InvokeResult());
         EventSourceMapping esm = filterEsm();
         esm.setFunctionArn("arn:aws:lambda:us-east-1:" + ACCOUNT_ID + ":function:fn:live");
 
         pollerWith(mock(EsmStore.class)).pollAndInvoke(esm);
 
-        verify(executorService, timeout(2000)).invoke(eq(version2), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(executorService, timeout(2000)).invoke(eq(version2), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("live"));
     }
 
     private LambdaFunction stubVersion(String version) {
@@ -541,6 +546,45 @@ class DynamoDbStreamsEventSourcePollerTest {
         assertEquals(2, readRecords(payload.getValue()).size());
         verify(store, timeout(2000)).saveForAccount(eq(ACCOUNT_ID), any());
         assertEquals("s2", esm.getShardSequenceNumbers().get(SHARD_ID));
+    }
+
+    @Test
+    void userIdentityFilterDeliversOnlyTheTtlDeletion() {
+        stubTrimHorizon(List.of(
+                ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}"),
+                removal("s2", false),
+                removal("s3", true)));
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult());
+        EventSourceMapping esm = filterEsm(
+                "{\"userIdentity\":{\"type\":[\"Service\"],\"principalId\":[\"dynamodb.amazonaws.com\"]}}");
+
+        pollerWith(mock(EsmStore.class)).pollAndInvoke(esm);
+
+        ArgumentCaptor<byte[]> payload = ArgumentCaptor.forClass(byte[].class);
+        verify(executorService, timeout(2000)).invoke(any(), payload.capture(), eq(InvocationType.RequestResponse));
+        JsonNode records = readRecords(payload.getValue());
+        assertEquals(1, records.size());
+        assertEquals("s3", records.get(0).path("dynamodb").path("SequenceNumber").asText());
+        assertEquals("REMOVE", records.get(0).path("eventName").asText());
+        assertEquals(OBJECT_MAPPER.createObjectNode().put("type", "Service").put("principalId", "dynamodb.amazonaws.com"),
+                records.get(0).path("userIdentity"));
+    }
+
+    /**
+     * A REMOVE record as GetRecords returns it. One that time to live made carries the DynamoDB service
+     * identity with the Streams API's capitalised member names, as AWS writes it.
+     */
+    private DynamoDbStreamReader.Record removal(String seq, boolean byTtl) {
+        DynamoDbStreamReader.Record record = ddbRecord(seq, "REMOVE", "{\"status\":{\"S\":\"expired\"}}");
+        ObjectNode dynamodb = (ObjectNode) record.awsRecord().path("dynamodb");
+        dynamodb.set("OldImage", dynamodb.remove("NewImage"));
+        if (byTtl) {
+            ((ObjectNode) record.awsRecord()).putObject("userIdentity")
+                    .put("PrincipalId", "dynamodb.amazonaws.com")
+                    .put("Type", "Service");
+        }
+        return record;
     }
 
     @Test
@@ -904,8 +948,8 @@ class DynamoDbStreamsEventSourcePollerTest {
                 invocation -> requestContextInstance.get().getAccountId());
         s3Service = new S3Service(
                 storageFactory, config,
-                mock(io.github.hectorvent.floci.services.sqs.SqsService.class),
-                mock(io.github.hectorvent.floci.services.sns.SnsService.class),
+                mock(SqsService.class),
+                mock(SnsService.class),
                 mock(Instance.class), mock(EventBridgeService.class), mock(Event.class),
                 regionResolver, OBJECT_MAPPER, mock(IamService.class));
 
@@ -950,17 +994,6 @@ class DynamoDbStreamsEventSourcePollerTest {
     }
 
     @Test
-    void s3OnFailureKeyUsesUtcLayout() {
-        UUID randomId = UUID.fromString("12345678-1234-1234-1234-123456789abc");
-
-        String key = DynamoDbStreamsEventSourcePoller.buildS3OnFailureKey(
-                "esm-1", "shard-1", Instant.parse("2026-09-14T23:07:08Z"), randomId);
-
-        assertEquals("aws/lambda/esm-1/shard-1/2026/09/14/"
-                + "2026-09-14T23.07.08-12345678-1234-1234-1234-123456789abc", key);
-    }
-
-    @Test
     void onFailurePayloadUsesEpochSecondsNotMillisForArrivalTimestamps() throws Exception {
         // Chosen so the seconds/millis interpretations land 46+ years apart: a millis bug cannot
         // accidentally parse back to this epoch-seconds value.
@@ -990,13 +1023,10 @@ class DynamoDbStreamsEventSourcePollerTest {
         ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
         verify(sqsService, timeout(2000)).sendMessage(anyString(), bodyCaptor.capture(), anyInt(), anyString());
 
-        JsonNode dlqPayload = OBJECT_MAPPER.readTree(bodyCaptor.getValue());
-        Instant first = Instant.parse(
-                dlqPayload.path("DDBStreamBatchInfo").path("approximateArrivalOfFirstRecord").asText());
-        Instant last = Instant.parse(
-                dlqPayload.path("DDBStreamBatchInfo").path("approximateArrivalOfLastRecord").asText());
-        assertEquals(knownEpochSeconds, first.getEpochSecond());
-        assertEquals(knownEpochSeconds, last.getEpochSecond());
+        // 1_700_000_000 epoch seconds, written in whole seconds as in the AWS DynamoDB Streams example.
+        JsonNode batchInfo = OBJECT_MAPPER.readTree(bodyCaptor.getValue()).path("DDBStreamBatchInfo");
+        assertEquals("2023-11-14T22:13:20Z", batchInfo.path("approximateArrivalOfFirstRecord").asText());
+        assertEquals("2023-11-14T22:13:20Z", batchInfo.path("approximateArrivalOfLastRecord").asText());
     }
 
     @Test
@@ -1284,7 +1314,7 @@ class DynamoDbStreamsEventSourcePollerTest {
     void retryBackoffDoublesFromThePollIntervalAndCapsOut() {
         assertEquals(2_000, poller.retryBackoffMs(1));
         assertEquals(4_000, poller.retryBackoffMs(2));
-        assertEquals(DynamoDbStreamsEventSourcePoller.MAX_RETRY_BACKOFF_MS, poller.retryBackoffMs(20));
+        assertEquals(StreamBatchFailures.MAX_RETRY_BACKOFF_MS, poller.retryBackoffMs(20));
     }
 
     @Test

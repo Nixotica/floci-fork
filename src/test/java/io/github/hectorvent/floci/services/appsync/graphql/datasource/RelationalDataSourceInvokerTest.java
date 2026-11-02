@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -22,8 +23,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -180,7 +181,7 @@ class RelationalDataSourceInvokerTest {
                 "variableTypeHintMap", Map.of(":v0", "TIMESTAMP")), "eu-west-1");
 
         JsonNode parameters = captureRequest().path("parameters");
-        Map<String, JsonNode> byName = new java.util.LinkedHashMap<>();
+        Map<String, JsonNode> byName = new LinkedHashMap<>();
         parameters.forEach(parameter -> byName.put(parameter.path("name").asText(), parameter));
         // Without the hint the value binds as text and PostgreSQL refuses the comparison outright:
         // "operator does not exist: timestamp with time zone >= character varying".

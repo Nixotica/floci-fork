@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.services.identitystore.model.Group;
 import io.github.hectorvent.floci.services.identitystore.model.Membership;
 import io.github.hectorvent.floci.services.identitystore.model.User;
@@ -31,11 +32,14 @@ import jakarta.ws.rs.core.UriInfo;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.Base64;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @ApplicationScoped
 @Path("/{tenantId}/scim/v2")
@@ -469,7 +473,7 @@ public class ScimController {
         if (request.has("groups")) {
             throw validation("groups cannot be specified when creating a user.");
         }
-        for (String unsupported : java.util.List.of("ims", "photos", "x509Certificates", "entitlements", "password")) {
+        for (String unsupported : List.of("ims", "photos", "x509Certificates", "entitlements", "password")) {
             if (request.has(unsupported)) {
                 throw validation(unsupported + " is not supported.");
             }
@@ -681,9 +685,9 @@ public class ScimController {
         String identityStoreId;
         Matcher prefixed = PREFIXED_TENANT.matcher(tenantId);
         if (prefixed.matches()) {
-            identityStoreId = "d-" + prefixed.group(1).toLowerCase(java.util.Locale.ROOT);
+            identityStoreId = "d-" + prefixed.group(1).toLowerCase(Locale.ROOT);
         } else if (LEGACY_TENANT.matcher(tenantId).matches()) {
-            identityStoreId = tenantId.toLowerCase(java.util.Locale.ROOT);
+            identityStoreId = tenantId.toLowerCase(Locale.ROOT);
         } else {
             throw unauthorized("Authorization header is invalid or tenant ID is incorrect.");
         }
@@ -738,7 +742,7 @@ public class ScimController {
         ArrayNode targetArray = target.putArray(targetField);
         for (JsonNode item : array) {
             ObjectNode targetItem = targetArray.addObject();
-            for (var field : fields.entrySet()) {
+            for (Map.Entry<String, String> field : fields.entrySet()) {
                 JsonNode value = item.get(field.getKey());
                 if (value != null && !value.isNull()) {
                     targetItem.set(field.getValue(), value.deepCopy());
@@ -756,7 +760,7 @@ public class ScimController {
         ArrayNode targetArray = target.putArray(targetField);
         for (JsonNode item : array) {
             ObjectNode targetItem = targetArray.addObject();
-            for (var field : fields.entrySet()) {
+            for (Map.Entry<String, String> field : fields.entrySet()) {
                 JsonNode value = item.get(field.getKey());
                 if (value != null && !value.isNull()) {
                     targetItem.set(field.getValue(), value.deepCopy());
@@ -805,9 +809,9 @@ public class ScimController {
                 if (!value.isObject() || value.isEmpty()) {
                     throw validation("A patch operation without path must provide an object value.");
                 }
-                var fields = value.fields();
+                Iterator<Map.Entry<String, JsonNode>> fields = value.fields();
                 while (fields.hasNext()) {
-                    var entry = fields.next();
+                    Map.Entry<String, JsonNode> entry = fields.next();
                     validatePatchUserAttribute(identityStoreId, userId, op, entry.getKey(), entry.getValue());
                     if ("userName".equals(entry.getKey())) {
                         userNameChanges++;
@@ -914,9 +918,9 @@ public class ScimController {
             String path = optionalText(operation, "path");
             JsonNode value = operation.get("value");
             if (path == null) {
-                var fields = value.fields();
+                Iterator<Map.Entry<String, JsonNode>> fields = value.fields();
                 while (fields.hasNext()) {
-                    var entry = fields.next();
+                    Map.Entry<String, JsonNode> entry = fields.next();
                     applyPatchUserAttribute(identityStoreId, userId, op, entry.getKey(), entry.getValue());
                 }
             } else {
@@ -1269,10 +1273,10 @@ public class ScimController {
     }
 
     private List<User> usersForGroup(String identityStoreId, List<User> users, String groupId) {
-        java.util.Set<String> userIds = identityStoreService.listMembershipsForScim(identityStoreId).stream()
+        Set<String> userIds = identityStoreService.listMembershipsForScim(identityStoreId).stream()
                 .filter(membership -> groupId.equals(membership.groupId()))
                 .map(Membership::userId)
-                .collect(java.util.stream.Collectors.toSet());
+                .collect(Collectors.toSet());
         return users.stream().filter(user -> userIds.contains(user.userId())).toList();
     }
 
@@ -1331,10 +1335,10 @@ public class ScimController {
 
     private List<Group> groupsForMember(String identityStoreId, List<Group> groups, String memberId) {
         requireScimUser(identityStoreId, memberId);
-        java.util.Set<String> groupIds = identityStoreService.listMembershipsForScim(identityStoreId).stream()
+        Set<String> groupIds = identityStoreService.listMembershipsForScim(identityStoreId).stream()
                 .filter(membership -> memberId.equals(membership.userId()))
                 .map(Membership::groupId)
-                .collect(java.util.stream.Collectors.toSet());
+                .collect(Collectors.toSet());
         return groups.stream().filter(group -> groupIds.contains(group.groupId())).toList();
     }
 
@@ -1362,8 +1366,7 @@ public class ScimController {
 
     private static String encodeCursor(int offset, String filter) {
         String fingerprint = filter == null ? "" : filter;
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(
-                (offset + "\n" + fingerprint).getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(offset + "\n" + fingerprint);
     }
 
     private static int decodeCursor(String cursor, String filter) {
@@ -1374,7 +1377,7 @@ public class ScimController {
             throw validation("cursor is invalid.");
         }
         try {
-            String decoded = new String(Base64.getUrlDecoder().decode(cursor), StandardCharsets.UTF_8);
+            String decoded = Base64Url.decode(cursor);
             int separator = decoded.indexOf('\n');
             if (separator <= 0) {
                 throw validation("cursor is invalid.");

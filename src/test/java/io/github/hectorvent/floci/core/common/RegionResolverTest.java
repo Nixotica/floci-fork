@@ -1,7 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
-import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.Cookie;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -26,6 +26,32 @@ class RegionResolverTest {
                 "SignedHeaders=host, Signature=abc123");
 
         assertEquals("us-west-2", resolver.resolveRegion(headers));
+    }
+
+    @Test
+    void sigV4aRegionSetOfOneRegionSelectsIt() {
+        assertEquals("eu-west-1", resolver.resolveRegionFromRegionSet("eu-west-1"));
+        assertEquals("eu-west-1", resolver.resolveRegionFromRegionSet(" eu-west-1 "));
+    }
+
+    @Test
+    void sigV4aWildcardListOrMissingRegionSetServesTheDefaultRegion() {
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet("*"));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet("eu-*"));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet("eu-west-1,us-west-2"));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(""));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(null));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(","));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(",,"));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(" , , "));
+    }
+
+    @Test
+    void sigV4aAuthorizationResolvesFromRegionSet() {
+        HttpHeaders headers = stubHeaders(
+                "AWS4-ECDSA-P256-SHA256 Credential=AKID/20260215/sqs/aws4_request, SignedHeaders=host, Signature=abc",
+                "eu-west-1");
+        assertEquals("eu-west-1", resolver.resolveRegion(headers));
     }
 
     @Test
@@ -220,6 +246,51 @@ class RegionResolverTest {
         assertEquals("aws", resolver.partitionForRegion("aws-global"));
     }
 
+    /**
+     * AWS never signs with a pseudo-region, so one named in a credential scope is served as its
+     * partition's implicit global region instead of becoming a regional namespace of its own.
+     */
+    @Test
+    void aPseudoSigningRegionIsServedAsItsPartitionsGlobalRegion() {
+        assertEquals("cn-northwest-1", resolver.resolveRegionFromAuth(
+                "AWS4-HMAC-SHA256 Credential=AKID/20260617/aws-cn-global/sqs/aws4_request, SignedHeaders=host, Signature=abc"));
+        assertEquals("us-east-1", resolver.resolveRegionFromAuthOrNull(
+                "AWS4-HMAC-SHA256 Credential=AKID/20260617/aws-global/sqs/aws4_request, SignedHeaders=host, Signature=abc"));
+        assertEquals("us-gov-west-1",
+                resolver.resolveRegionFromPresignedCredential("AKID/20260617/aws-us-gov-global/s3/aws4_request"));
+        assertEquals("cn-north-1", resolver.resolveRegionFromAuth(
+                "AWS4-HMAC-SHA256 Credential=AKID/20260617/cn-north-1/sqs/aws4_request, SignedHeaders=host, Signature=abc"));
+        assertEquals("xx-nowhere-9", resolver.resolveRegionFromAuth(
+                "AWS4-HMAC-SHA256 Credential=AKID/20260617/xx-nowhere-9/sqs/aws4_request, SignedHeaders=host, Signature=abc"),
+                "an unknown label stays raw so the unknown-region guard can name it");
+    }
+
+    /**
+     * A region no partition publishes is scoped to the deployment's partition when served
+     * ({@code floci.partitions.allow-unknown-regions}), and its ARNs must agree with that scope.
+     */
+    @Test
+    void buildArnMintsAnUnknownRegionInTheDeploymentPartition() {
+        RegionResolver china = new RegionResolver("cn-north-1", "000000000000");
+        assertEquals("arn:aws-cn:sqs:xx-nowhere-9:000000000000:q", china.buildArn("sqs", "xx-nowhere-9", "q"));
+        assertEquals("arn:aws:sqs:us-east-1:000000000000:q", china.buildArn("sqs", "us-east-1", "q"));
+        assertEquals("arn:aws:sqs:xx-nowhere-9:000000000000:q", resolver.buildArn("sqs", "xx-nowhere-9", "q"));
+    }
+
+    @Test
+    void buildArnPreservesAnExplicitOwnerAcrossRegionalAndGlobalScopes() {
+        RegionResolver china = new RegionResolver("cn-north-1", "000000000000");
+        assertEquals("arn:aws-cn:rds:xx-nowhere-9:222222222222:db:db1",
+                china.buildArn("rds", "xx-nowhere-9", "222222222222", "db:db1"));
+        assertEquals("arn:aws:rds:us-east-1:222222222222:db:db1",
+                china.buildArn("rds", "us-east-1", "222222222222", "db:db1"));
+        assertEquals("arn:aws-cn:iam::222222222222:role/r",
+                china.buildArn("iam", "", "222222222222", "role/r"));
+        assertEquals("arn:aws-cn:iam::222222222222:role/r",
+                china.buildArn("iam", null, "222222222222", "role/r"));
+        assertEquals("arn:aws-cn:s3:::bucket", china.buildArn("s3", "", "", "bucket"));
+    }
+
     @Test
     void getPartitionOutsideARequestIsTheDeploymentPartition() {
         assertEquals("aws", resolver.getPartition());
@@ -246,15 +317,23 @@ class RegionResolverTest {
     }
 
     private static HttpHeaders stubHeaders(String authorizationValue) {
+        return stubHeaders(authorizationValue, null);
+    }
+
+    private static HttpHeaders stubHeaders(String authorizationValue, String regionSetValue) {
         return new HttpHeaders() {
             @Override public List<String> getRequestHeader(String name) {
                 if ("Authorization".equalsIgnoreCase(name) && authorizationValue != null) {
                     return List.of(authorizationValue);
                 }
+                if ("X-Amz-Region-Set".equalsIgnoreCase(name) && regionSetValue != null) {
+                    return List.of(regionSetValue);
+                }
                 return List.of();
             }
             @Override public String getHeaderString(String name) {
                 if ("Authorization".equalsIgnoreCase(name)) return authorizationValue;
+                if ("X-Amz-Region-Set".equalsIgnoreCase(name)) return regionSetValue;
                 return null;
             }
             @Override public MultivaluedMap<String, String> getRequestHeaders() { return new MultivaluedHashMap<>(); }

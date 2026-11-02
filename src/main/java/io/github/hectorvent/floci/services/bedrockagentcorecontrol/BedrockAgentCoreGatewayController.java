@@ -4,8 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.Gateway;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.GatewayTarget;
@@ -26,6 +26,7 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Map;
 
 /** Standard-REST endpoints for AgentCore gateways and gateway targets. */
@@ -287,7 +288,7 @@ public class BedrockAgentCoreGatewayController {
 
     private static void putInstant(ObjectNode node, String field, Instant instant) {
         if (instant != null) {
-            node.put(field, instant.truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString());
+            node.put(field, instant.truncatedTo(ChronoUnit.SECONDS).toString());
         }
     }
 

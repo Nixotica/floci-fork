@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -13,14 +15,23 @@ import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * AWS Pricing API emulation backed by a bundled static snapshot.
@@ -42,6 +53,8 @@ public class PricingService {
     private static final String ATTRIBUTE_VALUES_DIR = "attribute-values";
     private static final String PRODUCTS_DIR = "products";
     private static final String PRICE_LISTS_DIR = "price-lists";
+    /** The products snapshot Floci bundles; a request without a region code reads it. */
+    private static final String SNAPSHOT_REGION = "us-east-1"; // partition-literal: names the bundled snapshot file
 
     private final ObjectMapper objectMapper;
     private final SnapshotLoader loader;
@@ -209,8 +222,8 @@ public class PricingService {
         requireNonEmpty(currencyCode, "CurrencyCode");
         requireSafePathSegment(serviceCode, "ServiceCode");
         if (effectiveDate == null) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value at 'EffectiveDate' failed to satisfy constraint: Member must not be null.", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value at 'EffectiveDate' failed to satisfy constraint: Member must not be null.");
         }
 
         if (!servicesByCode.containsKey(serviceCode)) {
@@ -231,7 +244,7 @@ public class PricingService {
         // Group entries per (region, currency) and keep the one whose
         // effective window covers `effectiveDate`. AWS returns one price list
         // per service/region/currency pair, matched by effective date.
-        Map<String, JsonNode> winningByKey = new java.util.LinkedHashMap<>();
+        Map<String, JsonNode> winningByKey = new LinkedHashMap<>();
         Map<String, Instant> winningEffective = new HashMap<>();
         if (node != null && node.isArray()) {
             for (JsonNode entry : node) {
@@ -289,13 +302,13 @@ public class PricingService {
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("Url", "https://pricing-snapshot.floci.local/"
-                + java.net.URLEncoder.encode(priceListArn, java.nio.charset.StandardCharsets.UTF_8)
+                + URLEncoder.encode(priceListArn, StandardCharsets.UTF_8)
                 + "/" + fileFormat.toLowerCase());
         return response;
     }
 
     private List<JsonNode> loadProducts(String serviceCode, String region) {
-        String resolvedRegion = (region == null || region.isEmpty()) ? "us-east-1" : region; // partition-literal: fallback only when the record carries no region; no resolver in scope (follow-up)
+        String resolvedRegion = (region == null || region.isEmpty()) ? SNAPSHOT_REGION : region;
         requireSafePathSegment(resolvedRegion, "regionCode");
         String resource = PRODUCTS_DIR + "/" + serviceCode + "/" + resolvedRegion + ".json";
         JsonNode node;
@@ -365,8 +378,7 @@ public class PricingService {
     }
 
     private static String encodeToken(int offset) {
-        return Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(Integer.toString(offset).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return Base64Url.encode(Integer.toString(offset));
     }
 
     private static int decodeToken(String token) {
@@ -374,8 +386,7 @@ public class PricingService {
             return 0;
         }
         try {
-            byte[] decoded = Base64.getUrlDecoder().decode(token);
-            return Integer.parseInt(new String(decoded, java.nio.charset.StandardCharsets.UTF_8));
+            return Integer.parseInt(Base64Url.decode(token));
         } catch (IllegalArgumentException e) {
             return -1;
         }
@@ -383,8 +394,8 @@ public class PricingService {
 
     private static void requireNonEmpty(String value, String field) {
         if (value == null || value.isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value at '" + field + "' failed to satisfy constraint: Member must not be null.", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value at '" + field + "' failed to satisfy constraint: Member must not be null.");
         }
     }
 
@@ -411,35 +422,35 @@ public class PricingService {
         JsonNode effective = entry.path("EffectiveDate");
         if (!effective.isMissingNode() && !effective.isNull() && !effective.asText().isEmpty()) {
             try {
-                return java.time.OffsetDateTime.parse(effective.asText()).toInstant();
-            } catch (java.time.format.DateTimeParseException ignored) {
+                return OffsetDateTime.parse(effective.asText()).toInstant();
+            } catch (DateTimeParseException ignored) {
                 try {
                     return Instant.parse(effective.asText());
-                } catch (java.time.format.DateTimeParseException ignored2) {
+                } catch (DateTimeParseException ignored2) {
                     // fall through to ARN parsing
                 }
             }
         }
         String arn = entry.path("PriceListArn").asText("");
-        java.util.regex.Matcher m = ARN_TIMESTAMP.matcher(arn);
+        Matcher m = ARN_TIMESTAMP.matcher(arn);
         if (m.find()) {
             String ts = m.group(1);
             try {
-                return java.time.LocalDateTime.parse(ts, ARN_TIMESTAMP_FMT)
-                        .toInstant(java.time.ZoneOffset.UTC);
-            } catch (java.time.format.DateTimeParseException ignored) {
+                return LocalDateTime.parse(ts, ARN_TIMESTAMP_FMT)
+                        .toInstant(ZoneOffset.UTC);
+            } catch (DateTimeParseException ignored) {
                 // fall through
             }
         }
         return null;
     }
 
-    private static final java.util.regex.Pattern SAFE_PATH_SEGMENT =
-            java.util.regex.Pattern.compile("[A-Za-z0-9._-]+");
-    private static final java.util.regex.Pattern ARN_TIMESTAMP =
-            java.util.regex.Pattern.compile("/(\\d{14})(?:/|$)");
-    private static final java.time.format.DateTimeFormatter ARN_TIMESTAMP_FMT =
-            java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
+    private static final Pattern SAFE_PATH_SEGMENT =
+            Pattern.compile("[A-Za-z0-9._-]+");
+    private static final Pattern ARN_TIMESTAMP =
+            Pattern.compile("/(\\d{14})(?:/|$)");
+    private static final DateTimeFormatter ARN_TIMESTAMP_FMT =
+            DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
 
     record ServiceEntry(String serviceCode, List<String> attributeNames) {
     }

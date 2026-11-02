@@ -1,13 +1,13 @@
 package io.github.hectorvent.floci.services.lambda;
 
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
-import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
-import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
+import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.GET;
@@ -89,8 +89,9 @@ public class ApiGatewayController {
     @Path("/{proxy: .*}")
     public Response handleDelete(@Context HttpHeaders headers, @Context UriInfo uriInfo,
                                   @PathParam("functionName") String functionName,
-                                  @PathParam("proxy") String proxy) {
-        return proxyRequest("DELETE", functionName, proxy, headers, uriInfo, null);
+                                  @PathParam("proxy") String proxy,
+                                  byte[] body) {
+        return proxyRequest("DELETE", functionName, proxy, headers, uriInfo, body);
     }
 
     @PATCH
@@ -166,7 +167,7 @@ public class ApiGatewayController {
         // Headers
         ObjectNode headersNode = event.putObject("headers");
         MultivaluedMap<String, String> reqHeaders = headers.getRequestHeaders();
-        for (Map.Entry<String, java.util.List<String>> entry : reqHeaders.entrySet()) {
+        for (Map.Entry<String, List<String>> entry : reqHeaders.entrySet()) {
             if (!entry.getValue().isEmpty()) {
                 headersNode.put(entry.getKey(), entry.getValue().get(0));
             }
@@ -176,7 +177,7 @@ public class ApiGatewayController {
         MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
         if (!queryParams.isEmpty()) {
             ObjectNode qspNode = event.putObject("queryStringParameters");
-            for (Map.Entry<String, java.util.List<String>> entry : queryParams.entrySet()) {
+            for (Map.Entry<String, List<String>> entry : queryParams.entrySet()) {
                 if (!entry.getValue().isEmpty()) {
                     qspNode.put(entry.getKey(), entry.getValue().get(0));
                 }

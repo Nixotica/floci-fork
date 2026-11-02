@@ -1,6 +1,6 @@
 # DynamoDB
 
-**Protocol:** JSON 1.1 (`X-Amz-Target: DynamoDB_20120810.*`)
+**Protocol:** JSON 1.0 (`X-Amz-Target: DynamoDB_20120810.*`)
 **Endpoint:** `POST http://localhost:4566/`
 
 ## Supported Actions
@@ -28,12 +28,18 @@
 | `TagResource` | Tag a table |
 | `UntagResource` | Remove tags |
 | `ListTagsOfResource` | List tags |
-| `DescribeContinuousBackups` | Get PITR backup configuration |
-| `UpdateContinuousBackups` | Enable/disable PITR |
+| `DescribeContinuousBackups` | Get the point-in-time recovery status and restore window |
+| `UpdateContinuousBackups` | Enable or disable point-in-time recovery |
+| `RestoreTableToPointInTime` | Create a new table from a table as it was at a point in time |
+| `CreateBackup` | Take an on-demand backup of a table |
+| `DescribeBackup` | Get a backup and the table it was taken from |
+| `ListBackups` | List backups by table, type and creation time |
+| `DeleteBackup` | Delete a backup |
+| `RestoreTableFromBackup` | Create a new table from a backup |
 | `DescribeKinesisStreamingDestination` | List Kinesis streaming destinations |
 | `EnableKinesisStreamingDestination` | Enable Kinesis streaming for a table |
 | `DisableKinesisStreamingDestination` | Disable Kinesis streaming for a table |
-| `ExportTableToPointInTime` | Export table data to S3 as gzip NDJSON |
+| `ExportTableToPointInTime` | Export table data, or the changes of a period, to S3 |
 | `CreateGlobalTable` | Make an existing table a global table (2017.11.29) |
 | `DescribeGlobalTable` | Read a global table's replication group |
 | `UpdateGlobalTable` | Add or remove replica regions |
@@ -43,6 +49,59 @@
 | `ImportTable` | Create a table and load DynamoDB JSON from S3 into it |
 | `DescribeImport` | Get import status and metadata |
 | `ListImports` | List imports, optionally filtered by table ARN |
+
+## Legacy 2011-12-05 clients
+
+The JSON 1.0 target `DynamoDB_20111205` supports `DescribeTable`, `Query` and
+`BatchWriteItem`. These operations use the selected DynamoDB backend and the
+caller's account and region. Table schemas, query conditions and continuation
+keys, batch delete keys, unprocessed writes and consumed capacity are translated
+between the two API versions. Missing tables return `ResourceNotFoundException`.
+Other operations under this legacy target return `UnknownOperationException`;
+the modern target remains the full API.
+
+The explicit Boto 2 suite in `compatibility-tests/sdk-test-python/legacy/`
+exercises table discovery, paginated key queries and
+batch deletion against the same tables used by Boto 3. The wire contracts follow
+the AWS [2011-12-05 DescribeTable](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/API_DescribeTables_v20111205.html),
+[Query](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/API_Query_v20111205.html)
+and [BatchWriteItem](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/API_BatchWriteItem_v20111205.html)
+documentation.
+
+## Query and Scan IAM selection
+
+With IAM enforcement enabled, `dynamodb:Select` includes the effective selection
+for `Query` and `Scan`: `ALL_ATTRIBUTES` for an unprojected table read,
+`ALL_PROJECTED_ATTRIBUTES` for an unprojected index read, and
+`SPECIFIC_ATTRIBUTES` when a nonblank projection expression or a nonempty
+attribute list is supplied. Blank expressions and empty lists retain the table or
+index default for IAM evaluation. An explicit `Select` value
+is preserved. Legacy Query uses `Count` and `AttributesToGet` for the same purpose.
+
+`dynamodb:Attributes` still describes attributes named in the request, not all
+attributes returned. An attributes-only condition does not require a projection;
+use a `dynamodb:Select` condition when the policy must require specific attributes.
+
+## Legacy conditional requests
+
+The native backend accepts `KeyConditions` together with `FilterExpression`.
+For legacy `Expected` conditions it also accepts `ComparisonOperator` with a single
+`Value`, including EQ and NE, just as the live AWS service does. Supplying both
+`Value` and `AttributeValueList`, omitting a required operand, or supplying the wrong
+number of operands returns `ValidationException` without changing the item.
+`NULL` and `NOT_NULL` take no operands.
+
+These behaviors were verified against AWS in `us-east-1` on October 12, 2026:
+40 pairs of equivalent conditional writes, matching and nonmatching queries,
+and 30 operand cases for each of `PutItem`, `UpdateItem` and `DeleteItem`.
+The SDK regression cases and recorded error messages are in
+`compatibility-tests/sdk-test-python/tests/test_dynamodb_legacy_expected.py` and
+`tests/fixtures/dynamodb-legacy-expected-aws.json` within that suite.
+
+AWS's [ExpectedAttributeValue documentation](https://docs.aws.amazon.com/sdk-for-python/v4/reference/clients/dynamodb/structures/ExpectedAttributeValue/)
+describes the parameter families as incompatible more broadly. Floci preserves
+the combinations accepted by the live service; this does not make every mixture
+of legacy and expression parameters valid.
 
 ## Streams {#streams}
 
@@ -67,8 +126,29 @@ the reset.
 
 With TTL enabled, a sweep runs every 60 seconds and deletes the items whose TTL attribute holds an
 epoch time in the past. Each deletion writes a `REMOVE` record to the table's stream and is
-forwarded to an active Kinesis streaming destination. Between sweeps, reads already leave expired
-items out.
+forwarded to an active Kinesis streaming destination. Between sweeps, expired items remain visible
+to reads until they are physically deleted, as on AWS. Use a filter expression on the TTL attribute
+to exclude expired items from a Query or Scan result.
+
+As in AWS, the records of a TTL deletion carry the DynamoDB service identity, which a `DeleteItem`
+removal does not. The member names depend on where the record is read. The DynamoDB Streams API
+(`GetRecords`) capitalises them, as the SDK's `Identity` shape expects:
+
+```json
+"userIdentity": {"PrincipalId": "dynamodb.amazonaws.com", "Type": "Service"}
+```
+
+The records that Lambda event source mappings and EventBridge Pipes deliver and filter use the
+lowercase names the DynamoDB developer guide shows, and so does the Kinesis streaming destination
+record:
+
+```json
+"userIdentity": {"type": "Service", "principalId": "dynamodb.amazonaws.com"}
+```
+
+A Lambda event source mapping or an EventBridge pipe that should see only TTL deletions filters on
+it with the pattern
+`{"userIdentity": {"type": ["Service"], "principalId": ["dynamodb.amazonaws.com"]}}`.
 
 ## DynamoDB Local backend
 
@@ -128,6 +208,11 @@ region is rejected.
   `memory` storage they are lost when Floci restarts while the tables stay in DynamoDB Local.
 - **Stream consumers.** Lambda event source mappings, EventBridge Pipes and other Floci stream
   consumers read the DynamoDB Local streams through the Streams API.
+- **Time to live deletions.** DynamoDB Local deletes expired items itself and writes each deletion
+  to the stream with the event name `UNKNOWN_TO_SDK_VERSION` and no `userIdentity`. Floci's
+  `GetRecords` returns it as AWS writes it, a `REMOVE` record with the DynamoDB service
+  `userIdentity` (see [Time to Live](#time-to-live)), so every stream consumer and event filter
+  sees the AWS shape.
 
 ### Limits
 
@@ -159,8 +244,11 @@ region is rejected.
 | `FLOCI_SERVICES_DYNAMODB_ENABLED` | `true` | Enable or disable the service |
 | `FLOCI_STORAGE_SERVICES_DYNAMODB_MODE` | *(global default)* | Storage mode override for DynamoDB (`memory`, `persistent`, `hybrid`, `wal`) |
 | `FLOCI_STORAGE_SERVICES_DYNAMODB_FLUSH_INTERVAL_MS` | `5000` | Flush interval for `hybrid`/`wal` storage modes (milliseconds) |
+| `FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_LAYOUT` | `single-file` | How items are laid out on disk: `single-file` or `per-table`. See [Item layout on disk](#item-layout-on-disk) |
+| `FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_SHARDS` | `1` | With the `per-table` layout, how many files each table is split into |
 | `FLOCI_SERVICES_DYNAMODB_VECTOR_INDEX_ALLOCATION_SECONDS` | `4` | Seconds a vector index added by `UpdateTable` spends in resource allocation |
 | `FLOCI_SERVICES_DYNAMODB_VECTOR_INDEX_BACKFILL_SECONDS` | `10` | Seconds that index then spends backfilling before it goes `ACTIVE` |
+| `FLOCI_SERVICES_DYNAMODB_LATEST_RESTORABLE_LAG_SECONDS` | `300` | Seconds `LatestRestorableDateTime` of point-in-time recovery trails the current time. Set `0` to restore the latest writes with `UseLatestRestorableTime` |
 | `FLOCI_SERVICES_DYNAMODB_BACKEND` | `native` | Engine behind the DynamoDB API: `native` or `local`, case-insensitive. Any other value fails startup. See [DynamoDB Local backend](#dynamodb-local-backend) |
 | `FLOCI_SERVICES_DYNAMODB_LOCAL_ENDPOINT` | *(none)* | Base URL of DynamoDB Local, for example `http://dynamodb-local:8000`. Required when the backend is `local`. Must be `http` or `https` with a host. AWS endpoints (hosts under `amazonaws.com`, `amazonaws.com.cn` or `api.aws`) are rejected |
 | `FLOCI_SERVICES_DYNAMODB_LOCAL_CONNECT_TIMEOUT_SECONDS` | `2` | Seconds to wait for a connection to DynamoDB Local |
@@ -173,6 +261,22 @@ Under `persistent` storage mode, single-item writes (`PutItem`, `UpdateItem`, `D
 For write-heavy workloads under persistent setups, configuring `FLOCI_STORAGE_SERVICES_DYNAMODB_MODE=wal` or `hybrid` is recommended to avoid full-file rewrites on each write operation:
 - `wal`: Uses an append-only write-ahead log with background compaction.
 - `hybrid`: Keeps data in memory with periodic asynchronous disk flushes controlled by `FLOCI_STORAGE_SERVICES_DYNAMODB_FLUSH_INTERVAL_MS`.
+
+### Item layout on disk
+
+In `memory` mode, item writes update the live concurrent table map without copying the table, with either layout.
+
+With the default `single-file` layout and a durable storage mode, every table's items live in one `dynamodb-items.json`, and any item write saves all of them: `persistent` rewrites the file on the write, `hybrid` on the next flush, and `wal` appends the whole table to its log and rewrites the whole snapshot on compaction. A small table that changes often, such as a heartbeat table, then keeps rewriting every large table beside it.
+
+`FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_LAYOUT=per-table` stores items under `dynamodb-items/` instead, as `FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_SHARDS` files per table (one by default). An item belongs to the file chosen by a hash of its key, and a write saves only the items it touched:
+
+| Mode | What an item write costs on disk |
+|---|---|
+| `persistent` | Rewrites the one file that holds the item |
+| `hybrid` | Marks that file dirty; dirty files are rewritten on the flush interval |
+| `wal` | Appends one record for the item to `dynamodb-items/journal.wal`; dirty files are rewritten and the journal emptied on `FLOCI_STORAGE_WAL_COMPACTION_INTERVAL_MS` |
+
+On first start with `per-table`, in any storage mode, an existing `dynamodb-items.json` or a `wal`-mode `dynamodb-items-snapshot.json` and `dynamodb-items.wal` is migrated into the directory, and those files are renamed with a `.migrated` suffix. When both kinds exist, the one written last is migrated. The migration is written to a staging directory and moved in place in one step, so a crash leaves either no directory or a complete one. If it cannot be written, Floci fails to start and the old files stay untouched. Once the directory holds data, old files are ignored. Switching back to `single-file` does not read the directory. A write that cannot be saved where its mode promises fails with an error, instead of only being logged: in `persistent` mode the shard file must be written, and in `wal` mode a change the journal cannot take is written to its shard file at once. The change stays in memory and is written by the next flush. Changing the shard count rewrites the files on the next start. Starting `per-table` in `persistent` or `hybrid` mode after a `wal` run that ended without compacting writes the changes left in `journal.wal` into the shard files and removes it. If `journal.wal` cannot be read, Floci fails to start and leaves it untouched. The other DynamoDB stores (tables, backups, point-in-time recovery history, exports, imports) keep their single files.
 
 ## Examples
 
@@ -321,11 +425,15 @@ Deviations from AWS:
 
 ## Export to S3
 
-Export table data to an S3 bucket as gzip-compressed NDJSON (DynamoDB JSON format):
+Export table data to an S3 bucket as gzip-compressed lines of DynamoDB JSON (`DYNAMODB_JSON`, the default) or Amazon Ion text (`ION`). As on AWS, the table needs point-in-time recovery:
 
 ```bash
 # Create a bucket to receive the export
 aws s3 mb s3://my-exports --endpoint-url $AWS_ENDPOINT_URL
+
+# Turn on point-in-time recovery
+aws dynamodb update-continuous-backups --table-name Users \
+  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true --endpoint-url $AWS_ENDPOINT_URL
 
 # Start an export
 EXPORT_ARN=$(aws dynamodb export-table-to-point-in-time \
@@ -348,7 +456,22 @@ aws dynamodb list-exports \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
 
-The export writes to `s3://<bucket>/<prefix>/AWSDynamoDB/<exportId>/data/` as one or more `.json.gz` files, along with `manifest-summary.json` and `manifest-files.json`, the same layout as real AWS DynamoDB exports.
+The export writes `_started`, `manifest-summary.json`, `manifest-files.json` and an `.md5` file for each manifest to `s3://<bucket>/<prefix>/AWSDynamoDB/<exportId>/`, and the items to a `.json.gz` or `.ion.gz` file in its `data/` folder, the layout AWS uses. AWS writes one data file per partition. Floci writes one. An Ion line is `$ion_1_0 {Item:{...}}`, with sets annotated as `$dynamodb_SS`, `$dynamodb_NS` and `$dynamodb_BS`, and numbers as Ion decimals. As on AWS, every file is a multipart upload of one part, so its ETag ends in `-1`. As on AWS, an `S3Prefix` shorter than 3 characters or longer than 948 UTF-8 bytes is refused, and no slash is added after a prefix that ends with one.
+
+The export holds the items as they were at `ExportTime`, or at the request time when `ExportTime` is not set. As on AWS, `ExportTime` must not be before `EarliestRestorableDateTime` or the table creation, and must not be in the future. A time after `LatestRestorableDateTime` is accepted.
+
+An incremental export writes the items that changed in a period:
+
+```bash
+aws dynamodb export-table-to-point-in-time \
+  --table-arn arn:aws:dynamodb:us-east-1:000000000000:table/Users \
+  --s3-bucket my-exports \
+  --export-type INCREMENTAL_EXPORT \
+  --incremental-export-specification ExportFromTime=2026-01-01T00:00:00Z,ExportToTime=2026-01-01T01:00:00Z,ExportViewType=NEW_AND_OLD_IMAGES \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+The period starts at `ExportFromTime` and ends just before `ExportToTime`, or at the request time when `ExportToTime` is not set. Each line is a record with `Metadata.WriteTimestampMicros`, `Keys`, and the `OldImage` and `NewImage` of the item. `ExportViewType` `NEW_IMAGE` leaves out `OldImage`. An item that ends the period as it started it, such as one inserted and then deleted, gets no record. As on AWS, the images list attribute names and set members in sorted order, and the data files go to the shared `<prefix>/AWSDynamoDB/data/` folder. As on AWS, the period must be at least 15 minutes and at most 24 hours, must not start before the table creation or `EarliestRestorableDateTime`, and must not end in the future. Floci keeps the time of a write in milliseconds, so `WriteTimestampMicros` always ends in `000`.
 
 ## Import from S3
 
@@ -382,6 +505,40 @@ The import reads every object under the key prefix. Point it at the `data/` pref
 
 Deviations from AWS: only `InputFormat` `DYNAMODB_JSON` with `InputCompressionType` `NONE` or `GZIP` is accepted. `CSV`, `ION` and `ZSTD` are rejected with a `ValidationException`.
 
+## On-demand backups
+
+`CreateBackup` copies the items and settings of a table at the time of the call. The answer says `CREATING`, and the backup is `AVAILABLE` at once. A backup outlives its table. `ListBackups` returns backups in creation order and sets `LastEvaluatedBackupArn` only when more backups remain.
+
+```bash
+BACKUP_ARN=$(aws dynamodb create-backup --table-name Users --backup-name nightly \
+  --query BackupDetails.BackupArn --output text --endpoint-url $AWS_ENDPOINT_URL)
+
+aws dynamodb restore-table-from-backup --backup-arn $BACKUP_ARN \
+  --target-table-name UsersRestored --endpoint-url $AWS_ENDPOINT_URL
+```
+
+`RestoreTableFromBackup` creates a new table with the keys, indexes, billing mode, throughput and encryption of the backup. As on AWS, the new table has no stream, TTL, point-in-time recovery, tags or deletion protection, and its table class is `STANDARD`. The overrides follow AWS. A GSI or LSI override must match a source index by key schema and projection, and a vector index override must match one by name. `BillingModeOverride` `PROVISIONED` needs throughput for the table and for every GSI that is kept. To restore a backup into another region, call `RestoreTableFromBackup` in that region with `SSESpecificationOverride`.
+
+Deviations from AWS: a restore is done before the response is sent. The response still says `CREATING` with `RestoreInProgress: true`, as on AWS, but the table is `ACTIVE` right away. So `BackupInUseException` and `TableInUseException` for a restore in progress never happen. `BackupSizeBytes` is always 0. Backups made by AWS Backup (`BackupType` `AWS_BACKUP`) are not emulated.
+
+## Point-in-time recovery
+
+While point-in-time recovery is enabled, Floci keeps every item change of the table. `RestoreTableToPointInTime` creates a new table with the items as they were at `RestoreDateTime`, or at `LatestRestorableDateTime` with `UseLatestRestorableTime`. As on AWS, the new table takes the current settings of the source table, not the settings at that time. The overrides are the same as for `RestoreTableFromBackup`, and a source in another region needs `SSESpecificationOverride`.
+
+```bash
+aws dynamodb update-continuous-backups --table-name Users \
+  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true --endpoint-url $AWS_ENDPOINT_URL
+
+aws dynamodb restore-table-to-point-in-time --source-table-name Users \
+  --target-table-name UsersAnHourAgo --restore-date-time $(($(date +%s) - 3600)) --endpoint-url $AWS_ENDPOINT_URL
+```
+
+`EarliestRestorableDateTime` is the time point-in-time recovery was enabled, or the start of the recovery period once that has passed. `LatestRestorableDateTime` trails the current time by `FLOCI_SERVICES_DYNAMODB_LATEST_RESTORABLE_LAG_SECONDS`, 5 minutes by default like AWS. As on AWS, a `RestoreDateTime` after it is still accepted up to the current time. Disabling point-in-time recovery drops the change history. The history survives a restart in the persistent storage modes.
+
+Deleting a table with point-in-time recovery enabled leaves a `SYSTEM` backup named `<table>$DeletedTableBackup`. It holds the table as it was at deletion, cannot be deleted, and expires after 35 days. `ListBackups` shows it with `BackupType` `SYSTEM` or `ALL`, and `RestoreTableFromBackup` restores it.
+
+Deviations from AWS: enabling point-in-time recovery right after `CreateTable` is accepted at once. AWS sometimes refuses it for a few seconds with `ContinuousBackupsUnavailableException`. `EarliestRestorableDateTime` is rounded down to the second, as on AWS. A restore or an export at that time on AWS leaves out the writes made earlier in that second, before point-in-time recovery was enabled. Floci keeps changes only from the moment it is enabled, so it includes those writes.
+
 
 ## Kinesis change data capture (CDC)
 
@@ -392,12 +549,17 @@ AWS CDC envelope (`eventName`, `dynamodb.Keys`, `NewImage`/`OldImage`, `Approxim
 
 `ApproximateCreationDateTime` follows the destination's
 `EnableKinesisStreamingConfiguration.ApproximateCreationDateTimePrecision`: epoch milliseconds for
-`MILLISECOND` (the default) and epoch microseconds for `MICROSECOND`. The precision is returned by
-`DescribeKinesisStreamingDestination` and stamped on each record as
-`dynamodb.ApproximateCreationDateTimePrecision`.
+`MILLISECOND` (the default) and epoch microseconds for `MICROSECOND`. The precision is stamped on each
+record as `dynamodb.ApproximateCreationDateTimePrecision`, and reported by
+`DescribeKinesisStreamingDestination` as well as in the `EnableKinesisStreamingConfiguration` member of
+the `EnableKinesisStreamingDestination` and `DisableKinesisStreamingDestination` responses.
 
 Enabling a Kinesis streaming destination does not change the table's DynamoDB Streams setting.
 Kinesis forwarding works whether or not `StreamSpecification.StreamEnabled` is set.
+
+Both calls take effect at once, so `EnableKinesisStreamingDestination` answers `ACTIVE` and
+`DisableKinesisStreamingDestination` answers `DISABLED`. AWS reports the transitional `ENABLING` and
+`DISABLING` first, because it enables and disables the destination in the background.
 
 ### Delivery contract
 
@@ -425,3 +587,11 @@ are not durable and are lost on restart (this is an emulator, not an at-least-on
 or overflow) are counted and logged, and per-destination delivery health (forwarded/retried/dropped
 counts, queue depth, last error, and current health) is tracked for inspection.
 ```
+
+### Single-statement PartiQL IAM actions
+
+With IAM enforcement enabled, `ExecuteStatement` checks `dynamodb:PartiQLSelect`,
+`dynamodb:PartiQLInsert`, `dynamodb:PartiQLUpdate` or `dynamodb:PartiQLDelete` according to the
+statement's operation. A policy can grant that action on the specific table ARN; a wildcard
+resource or a `dynamodb:ExecuteStatement` permission is not required. This mapping covers the
+single-statement API; batch and transaction authorization are separate paths.

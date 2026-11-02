@@ -1,15 +1,16 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackInstance;
 import io.github.hectorvent.floci.services.cloudformation.model.StackSetOperation;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.List;
 import java.util.Map;
@@ -91,7 +92,7 @@ class StackSetServiceDeleteFailureTest {
         assertTrue(service.listStackInstances(SET, null, null).isEmpty(),
                 "RetainStacks detaches the instance from the StackSet");
         // RetainStacks=true must never invoke the underlying stack delete.
-        org.mockito.Mockito.verify(cfnService, org.mockito.Mockito.never())
+        Mockito.verify(cfnService, Mockito.never())
                 .deleteStack(anyString(), anyString(), anyString());
     }
 

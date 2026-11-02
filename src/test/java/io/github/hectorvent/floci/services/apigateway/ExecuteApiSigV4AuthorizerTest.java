@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.apigateway;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
@@ -13,8 +14,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -193,7 +197,7 @@ class ExecuteApiSigV4AuthorizerTest {
         ExecuteApiSigV4Authorizer.Result result = authorizer.authorize(
                 "GET", headers(signed), uriInfo(PATH, null), null, null);
 
-        assertEquals(ExecuteApiSigV4Authorizer.Failure.UNKNOWN_KEY, result.failure());
+        assertEquals(ExecuteApiSigV4Authorizer.Failure.INVALID_TOKEN, result.failure());
     }
 
     @Test
@@ -210,9 +214,48 @@ class ExecuteApiSigV4AuthorizerTest {
         String forged = ExecuteApiRequestSigner.presignedQueryString(
                 "GET", PATH, HOST, "ASIAPRESIGNED", "session-secret", REGION,
                 Instant.now(), 900, "forged-session-token");
-        assertEquals(ExecuteApiSigV4Authorizer.Failure.UNKNOWN_KEY,
+        assertEquals(ExecuteApiSigV4Authorizer.Failure.INVALID_TOKEN,
                 authorizer.authorize("GET", headers(Map.of()), uriInfo(PATH, forged), null, null)
                         .failure());
+    }
+
+    @Test
+    void longTermKeyWithASessionTokenIsRejectedWhereverTheTokenRides() throws Exception {
+        when(iamService.findSecretKey("AKIALONGTERM")).thenReturn(Optional.of("s3cr3t"));
+        when(iamService.resolveAccountId("AKIALONGTERM")).thenReturn(Optional.of("111122223333"));
+
+        Map<String, String> signed = new LinkedHashMap<>(ExecuteApiRequestSigner.signedHeaders(
+                "GET", PATH, Map.of(), HOST, null, "AKIALONGTERM", "s3cr3t", REGION, Instant.now()));
+        assertTrue(authorizer.authorize("GET", headers(signed), uriInfo(PATH, null), null, null).authorized());
+        signed.put("X-Amz-Security-Token", "bogus");
+        assertEquals(ExecuteApiSigV4Authorizer.Failure.INVALID_TOKEN,
+                authorizer.authorize("GET", headers(signed), uriInfo(PATH, null), null, null).failure());
+
+        signed.put("X-Amz-Security-Token", "");
+        assertEquals(ExecuteApiSigV4Authorizer.Failure.UNKNOWN_KEY,
+                authorizer.authorize("GET", headers(signed), uriInfo(PATH, null), null, null).failure());
+
+        String presigned = ExecuteApiRequestSigner.presignedQueryString(
+                "GET", PATH, HOST, "AKIALONGTERM", "s3cr3t", REGION, Instant.now(), 900, "bogus");
+        assertEquals(ExecuteApiSigV4Authorizer.Failure.INVALID_TOKEN,
+                authorizer.authorize("GET", headers(Map.of()), uriInfo(PATH, presigned), null, null).failure());
+    }
+
+    @Test
+    void theTokenIsReadOnlyFromWhereTheSignatureIs() throws Exception {
+        when(iamService.findSecretKey("AKIALONGTERM")).thenReturn(Optional.of("s3cr3t"));
+        when(iamService.resolveAccountId("AKIALONGTERM")).thenReturn(Optional.of("111122223333"));
+
+        Map<String, String> query = Map.of("X-Amz-Security-Token", "bogus");
+        Map<String, String> signed = ExecuteApiRequestSigner.signedHeaders(
+                "GET", PATH, query, HOST, null, "AKIALONGTERM", "s3cr3t", REGION, Instant.now());
+        assertTrue(authorizer.authorize("GET", headers(signed),
+                uriInfo(PATH, "X-Amz-Security-Token=bogus"), null, null).authorized());
+
+        String presigned = ExecuteApiRequestSigner.presignedQueryString(
+                "GET", PATH, HOST, "AKIALONGTERM", "s3cr3t", REGION, Instant.now(), 900);
+        assertTrue(authorizer.authorize("GET", headers(Map.of("X-Amz-Security-Token", "bogus")),
+                uriInfo(PATH, presigned), null, null).authorized());
     }
 
     private void liveSession(String accessKeyId, String issuedToken) {
@@ -228,7 +271,7 @@ class ExecuteApiSigV4AuthorizerTest {
      */
     private static Map<String, String> signedWithSessionToken(String accessKeyId, String sessionToken)
             throws Exception {
-        Map<String, String> signed = new java.util.LinkedHashMap<>(ExecuteApiRequestSigner.signedHeaders(
+        Map<String, String> signed = new LinkedHashMap<>(ExecuteApiRequestSigner.signedHeaders(
                 "GET", PATH, Map.of(), HOST, null, accessKeyId, "session-secret", REGION, Instant.now()));
         signed.put("X-Amz-Security-Token", sessionToken);
         return signed;
@@ -292,9 +335,9 @@ class ExecuteApiSigV4AuthorizerTest {
         // x-amz-content-sha256 header alongside a replaced body must not restore the match:
         // the header is not in SignedHeaders, and a literal hash is never taken on trust.
         byte[] signedBody = "{\"amount\":1}".getBytes();
-        Map<String, String> signed = new java.util.LinkedHashMap<>(ExecuteApiRequestSigner.signedHeaders(
+        Map<String, String> signed = new LinkedHashMap<>(ExecuteApiRequestSigner.signedHeaders(
                 "POST", PATH, Map.of(), HOST, signedBody, "test", "test", REGION, Instant.now()));
-        signed.put("x-amz-content-sha256", sha256Hex(signedBody));
+        signed.put("x-amz-content-sha256", Digests.sha256Hex(signedBody));
 
         ExecuteApiSigV4Authorizer.Result result = authorizer.authorize(
                 "POST", headers(signed), uriInfo(PATH, null), "{\"amount\":9999}".getBytes(), null);
@@ -331,15 +374,6 @@ class ExecuteApiSigV4AuthorizerTest {
         assertTrue(result.authorized(), String.valueOf(result.detail()));
     }
 
-    private static String sha256Hex(byte[] input) throws Exception {
-        byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(input);
-        StringBuilder hex = new StringBuilder(digest.length * 2);
-        for (byte b : digest) {
-            hex.append(String.format("%02x", b));
-        }
-        return hex.toString();
-    }
-
     private static HttpHeaders headers(Map<String, String> values) {
         return headers(values, HOST);
     }
@@ -369,8 +403,8 @@ class ExecuteApiSigV4AuthorizerTest {
             for (String pair : rawQuery.split("&")) {
                 int equals = pair.indexOf('=');
                 queryParameters.add(equals >= 0 ? pair.substring(0, equals) : pair,
-                        equals >= 0 ? java.net.URLDecoder.decode(pair.substring(equals + 1),
-                                java.nio.charset.StandardCharsets.UTF_8) : "");
+                        equals >= 0 ? URLDecoder.decode(pair.substring(equals + 1),
+                                StandardCharsets.UTF_8) : "");
             }
         }
         when(uriInfo.getQueryParameters()).thenReturn(queryParameters);

@@ -2,16 +2,20 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -50,6 +54,61 @@ class ProvisionContextTest {
         }
     }
 
+    private ProvisionContext contextWithPriorProperties(String priorProperties) {
+        return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", "prior-id",
+                event -> { }, priorProperties == null ? null : props(priorProperties));
+    }
+
+    @Test
+    void previouslyDeclaredReadsThePreviousTemplatesProperties() {
+        ProvisionContext ctx = contextWithPriorProperties("""
+                {"Declared": {"Fn::GetAtt": ["Other", "Arn"]}, "ExplicitNull": null}
+                """);
+
+        assertTrue(ctx.previouslyDeclared("Declared"), "declared, whatever it resolved to");
+        assertFalse(ctx.previouslyDeclared("ExplicitNull"), "null is how a template omits a property");
+        assertFalse(ctx.previouslyDeclared("Absent"));
+    }
+
+    @Test
+    void droppedPropertiesAreTheOnesThePreviousTemplateDeclaredAndThisOneLacks() {
+        ProvisionContext ctx = contextWithPriorProperties("""
+                {"Kept": "a", "Dropped": "b", "DroppedIf": {"Fn::If": ["C", "x", "y"]}, "ExplicitNull": null}
+                """);
+
+        assertEquals(Set.of("Dropped", "DroppedIf"),
+                ctx.droppedProperties(props("{\"Kept\": \"a\", \"NewOne\": \"c\"}")),
+                "a property the stack never declared, or declared as null, is not dropped");
+        assertEquals(Set.of("Kept", "Dropped", "DroppedIf"), ctx.droppedProperties(props("{}")));
+        assertEquals(Set.of("Kept", "Dropped", "DroppedIf"), ctx.droppedProperties(null));
+    }
+
+    @Test
+    void nothingIsDroppedOnACreateOrWithoutAPreviousTemplate() {
+        ProvisionContext create = new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", null,
+                event -> { }, props("{\"Declared\": \"value\"}"));
+
+        assertTrue(create.droppedProperties(props("{}")).isEmpty());
+        assertTrue(contextWithPriorProperties(null).droppedProperties(props("{}")).isEmpty());
+        assertTrue(context("prior-id").droppedProperties(props("{}")).isEmpty());
+    }
+
+    /** A resource the previous deployment never provisioned, such as one its Condition kept out, declared nothing. */
+    @Test
+    void aResourceWithoutAPriorPhysicalIdDeclaredNothing() {
+        ProvisionContext ctx = new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", null,
+                event -> { }, props("{\"Declared\": \"value\"}"));
+
+        assertFalse(ctx.previouslyDeclared("Declared"));
+    }
+
+    @Test
+    void nothingIsPreviouslyDeclaredWithoutAPreviousTemplate() {
+        assertFalse(contextWithPriorProperties(null).previouslyDeclared("Declared"));
+        assertFalse(context("prior-id").previouslyDeclared("Declared"),
+                "the constructors without prior properties have none");
+    }
+
     @Test
     void isUpdateReflectsWhetherAPriorPhysicalIdExists() {
         assertFalse(context(null).isUpdate(), "a first-time create has no prior physical id");
@@ -78,6 +137,29 @@ class ProvisionContextTest {
         assertEquals("WEBSOCKET", ctx.resolveOrDefault(props("{\"ProtocolType\":\"\"}"), "ProtocolType", "WEBSOCKET"),
                 "blank falls back");
         assertEquals("WEBSOCKET", ctx.resolveOrDefault(null, "ProtocolType", "WEBSOCKET"), "null props falls back");
+    }
+
+    @Test
+    void resolveOptionalIntReadsAnIntegerAndLeavesWhatTheTemplateOmitsUnset() {
+        ProvisionContext ctx = context(null);
+        JsonNode size = props("{\"Ref\": \"Size\"}");
+        when(engine.resolve(size)).thenReturn("3");
+
+        assertEquals(42, ctx.resolveOptionalInt(props("{\"Port\": 42}"), "Port"), "a number");
+        assertEquals(42, ctx.resolveOptionalInt(props("{\"Port\": \"42\"}"), "Port"), "a numeric string");
+        assertEquals(7, ctx.resolveOptionalInt(props("{\"Port\": \" 7 \"}"), "Port"), "surrounding blanks are trimmed");
+        assertEquals(3, ctx.resolveOptionalInt(props("{\"Port\": {\"Ref\": \"Size\"}}"), "Port"), "an intrinsic's result");
+        assertNull(ctx.resolveOptionalInt(props("{}"), "Port"), "absent");
+        assertNull(ctx.resolveOptionalInt(props("{\"Port\": null}"), "Port"), "explicitly null");
+        assertNull(ctx.resolveOptionalInt(null, "Port"), "no properties at all");
+        assertNull(ctx.resolveOptionalInt(props("{\"Port\": {\"Ref\": \"AWS::NoValue\"}}"), "Port"),
+                "an intrinsic that resolves to blank, as AWS::NoValue does");
+        for (String literal : List.of("\"\"", "\"ten\"", "\"4.5\"", "4.5", "true")) {
+            AwsException e = assertThrows(AwsException.class,
+                    () -> ctx.resolveOptionalInt(props("{\"Port\": " + literal + "}"), "Port"), literal);
+            assertEquals("ValidationError", e.getErrorCode(), literal);
+            assertEquals("Value of property Port must be an integer.", e.getMessage(), literal);
+        }
     }
 
     @Test
@@ -205,6 +287,27 @@ class ProvisionContextTest {
                 "a replacing update derives a different name and must still create");
     }
 
+    @Test
+    void isGeneratedPhysicalNameRecognisesOnlyWhatGeneratePhysicalNameProducesForTheLogicalId() {
+        ProvisionContext ctx = context(null);
+        String generated = ctx.generatePhysicalName("AdminGroup", 128, false);
+        assertTrue(ctx.isGeneratedPhysicalName(generated, "AdminGroup", 128, false), generated);
+
+        ProvisionContext longStack = new ProvisionContext(engine, "us-east-1", "000000000000",
+                "a-stack-name-long-enough-to-force-truncation", null);
+        String longLogicalId = "AVeryLongLogicalIdThatPushesTheGeneratedNamePastItsLimit";
+        String truncated = longStack.generatePhysicalName(longLogicalId, 64, false);
+        assertEquals(64, truncated.length(), truncated);
+        assertTrue(longStack.isGeneratedPhysicalName(truncated, longLogicalId, 64, false), truncated);
+
+        assertFalse(ctx.isGeneratedPhysicalName("admin", "AdminGroup", 128, false), "an explicit name");
+        assertFalse(ctx.isGeneratedPhysicalName(ctx.generatePhysicalName("OtherGroup", 128, false),
+                "AdminGroup", 128, false), "another logical id's name");
+        assertFalse(ctx.isGeneratedPhysicalName("my-stack-AdminGroup-0123456789zz", "AdminGroup", 128, false),
+                "a suffix that is not hex");
+        assertFalse(ctx.isGeneratedPhysicalName(null, "AdminGroup", 128, false));
+    }
+
 
     /**
      * The whole property node is handed to {@code engine.resolveStringList}, so a list-valued
@@ -239,7 +342,7 @@ class ProvisionContextTest {
 
     @Test
     void staleTagKeysListsTheCurrentKeysTheTemplateDropped() {
-        Map<String, String> current = new java.util.LinkedHashMap<>();
+        Map<String, String> current = new LinkedHashMap<>();
         current.put("Keep", "same");
         current.put("Old", "value");
         current.put("Gone", "too");

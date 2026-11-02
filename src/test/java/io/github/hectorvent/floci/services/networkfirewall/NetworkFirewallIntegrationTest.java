@@ -1,5 +1,11 @@
 package io.github.hectorvent.floci.services.networkfirewall;
 
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.aMapWithSize;
 import static org.hamcrest.Matchers.anEmptyMap;
@@ -7,19 +13,13 @@ import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.emptyOrNullString;
 import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasItems;
+import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.matchesPattern;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
-
-import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
-import io.quarkus.test.junit.QuarkusTest;
-import io.restassured.response.ValidatableResponse;
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
 
 @QuarkusTest
 class NetworkFirewallIntegrationTest {
@@ -497,6 +497,64 @@ class NetworkFirewallIntegrationTest {
             .statusCode(400)
             .body("__type", equalTo("InvalidRequestException"))
             .body("message", equalTo("RuleGroup already exists: duplicate-rule-group"));
+    }
+
+    @Test
+    void dryRunRuleGroupCreateAndUpdate_validateButDoNotPersist() {
+        String name = "dry-run-rule-group";
+        String create = "{\"RuleGroupName\":\"" + name + "\",\"Type\":\"STATEFUL\","
+                + "\"Capacity\":100,\"RuleGroup\":{\"RulesSource\":{\"RulesString\":\"pass ip any any\"}}}";
+        call("CreateRuleGroup", create.substring(0, create.length() - 1) + ",\"DryRun\":true}")
+            .statusCode(200)
+            .body("RuleGroupResponse.RuleGroupName", equalTo(name))
+            .body("RuleGroupResponse.DryRun", nullValue());
+        call("DescribeRuleGroup", "{\"RuleGroupName\":\"" + name + "\"}")
+            .statusCode(400)
+            .body("__type", equalTo("ResourceNotFoundException"));
+
+        String token = call("CreateRuleGroup", create).statusCode(200).extract().path("UpdateToken");
+        String arn = "arn:aws:network-firewall:us-east-1:723679240095:stateful-rulegroup/" + name;
+        String update = "{\"RuleGroupArn\":\"" + arn + "\",\"UpdateToken\":\"" + token + "\","
+                + "\"RuleGroup\":{\"RulesSource\":{\"RulesString\":\"drop ip any any\"}},\"DryRun\":true}";
+        call("UpdateRuleGroup", update).statusCode(200)
+            .body("RuleGroup.RulesSource.RulesString", equalTo("drop ip any any"))
+            .body("UpdateToken", equalTo(token));
+        call("DescribeRuleGroup", "{\"RuleGroupArn\":\"" + arn + "\"}").statusCode(200)
+            .body("RuleGroup.RulesSource.RulesString", equalTo("pass ip any any"))
+            .body("UpdateToken", equalTo(token));
+        call("UpdateRuleGroup", update.replace(token, "stale-token"))
+            .statusCode(400)
+            .body("__type", equalTo("InvalidTokenException"));
+    }
+
+    @Test
+    void dryRunFirewallPolicyCreateAndUpdate_validateButDoNotPersist() {
+        String name = "dry-run-firewall-policy";
+        String create = "{\"FirewallPolicyName\":\"" + name + "\",\"FirewallPolicy\":{"
+                + "\"StatelessDefaultActions\":[\"aws:pass\"],"
+                + "\"StatelessFragmentDefaultActions\":[\"aws:pass\"]}}";
+        call("CreateFirewallPolicy", create.substring(0, create.length() - 1) + ",\"DryRun\":true}")
+            .statusCode(200)
+            .body("FirewallPolicyResponse.FirewallPolicyName", equalTo(name))
+            .body("FirewallPolicyResponse.DryRun", nullValue());
+        call("DescribeFirewallPolicy", "{\"FirewallPolicyName\":\"" + name + "\"}")
+            .statusCode(400)
+            .body("__type", equalTo("ResourceNotFoundException"));
+
+        String token = call("CreateFirewallPolicy", create).statusCode(200).extract().path("UpdateToken");
+        String arn = "arn:aws:network-firewall:us-east-1:723679240095:firewall-policy/" + name;
+        String update = "{\"FirewallPolicyArn\":\"" + arn + "\",\"UpdateToken\":\"" + token + "\","
+                + "\"FirewallPolicy\":{\"StatelessDefaultActions\":[\"aws:drop\"],"
+                + "\"StatelessFragmentDefaultActions\":[\"aws:drop\"]},\"DryRun\":true}";
+        call("UpdateFirewallPolicy", update).statusCode(200)
+            .body("FirewallPolicy.StatelessDefaultActions[0]", equalTo("aws:drop"))
+            .body("UpdateToken", equalTo(token));
+        call("DescribeFirewallPolicy", "{\"FirewallPolicyArn\":\"" + arn + "\"}").statusCode(200)
+            .body("FirewallPolicy.StatelessDefaultActions[0]", equalTo("aws:pass"))
+            .body("UpdateToken", equalTo(token));
+        call("UpdateFirewallPolicy", update.replace(token, "stale-token"))
+            .statusCode(400)
+            .body("__type", equalTo("InvalidTokenException"));
     }
 
     @Test

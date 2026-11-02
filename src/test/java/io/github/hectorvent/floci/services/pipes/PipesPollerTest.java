@@ -130,6 +130,15 @@ class PipesPollerTest {
     }
 
     @Test
+    void aSourceWithoutAnArnRegionPollsInTheDeploymentDefaultRegion() {
+        when(config.defaultRegion()).thenReturn("cn-north-1");
+        PipesPoller chinaPoller = pollerOver(streams);
+
+        assertEquals("cn-north-1", chinaPoller.extractRegionFromArn("smk://broker.internal:9092"));
+        assertEquals("eu-west-1", chinaPoller.extractRegionFromArn("arn:aws:sqs:eu-west-1:000000000000:orders"));
+    }
+
+    @Test
     void asEventArrayWrapsSingleObjectInBatchArray() throws Exception {
         // Pipes delivers events to a target as a batch array; a single-object enrichment response
         // must become a one-element array so a target like "InputPath": "$.[0]" can unwrap it.
@@ -156,6 +165,18 @@ class PipesPollerTest {
         assertTrue(node.isArray());
         assertEquals(1, node.size());
         assertEquals("not-json", node.get(0).asText());
+    }
+
+    @Test
+    void sqsPollingKeepsConfiguredLargeBatchesWithinTheReceiveLimit() throws Exception {
+        Pipe pipe = new Pipe();
+        pipe.setName("large-sqs-batch");
+        pipe.setSource("arn:aws:sqs:us-east-1:000000000000:src-queue");
+        pipe.setSourceParameters(MAPPER.readTree("{\"SqsQueueParameters\":{\"BatchSize\":25}}"));
+        when(sqsService.receiveMessage(anyString(), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
+                .thenReturn(List.of());
+        poller.pollSqs(pipe, "us-east-1");
+        verify(sqsService).receiveMessage(anyString(), eq(10), anyInt(), anyInt(), eq("us-east-1"));
     }
 
     @Test
@@ -217,9 +238,9 @@ class PipesPollerTest {
     @Test
     void pollKafka_filtersUsingDecodedPayloadButDeliversOriginalRecord() throws Exception {
         Pipe pipe = selfManagedKafkaPipe();
-        byte[] key = "customer-123".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        byte[] value = "{\"status\":\"active\",\"id\":\"order-1\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        byte[] traceId = "abc123".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] key = "customer-123".getBytes(StandardCharsets.UTF_8);
+        byte[] value = "{\"status\":\"active\",\"id\":\"order-1\"}".getBytes(StandardCharsets.UTF_8);
+        byte[] traceId = "abc123".getBytes(StandardCharsets.UTF_8);
         KafkaRecordDto record = kafkaRecord("orders", 0, 42L, key, value, new KafkaHeaderDto("traceId", traceId));
 
         when(kafkaConsumerManager.poll(pipe)).thenReturn(List.of(record));
@@ -541,6 +562,29 @@ class PipesPollerTest {
     }
 
     @Test
+    void userIdentityFilterDeliversOnlyTheTtlDeletionWithTheEventRecordIdentity() throws Exception {
+        Pipe pipe = dynamoDbPipe("{}");
+        pipe.setSourceParameters(MAPPER.readTree("""
+                {"DynamoDBStreamParameters":{"StartingPosition":"TRIM_HORIZON"},
+                 "FilterCriteria":{"Filters":[{"Pattern":
+                   "{\\"userIdentity\\":{\\"type\\":[\\"Service\\"],\\"principalId\\":[\\"dynamodb.amazonaws.com\\"]}}"}]}}"""));
+        streams.shard.add(ddbRemoval("001", false));
+        DynamoDbStreamReader.Record ttlRemoval = ddbRemoval("002", true);
+        JsonNode original = ttlRemoval.awsRecord().deepCopy();
+        streams.shard.add(ttlRemoval);
+
+        poller.startPolling(pipe);
+        poller.pollDynamoDbStreams(pipe, "us-east-1");
+
+        assertEquals(List.of(List.of("002")), deliveredSequences(pipe));
+        ArgumentCaptor<String> payload = ArgumentCaptor.forClass(String.class);
+        verify(targetInvoker).invoke(eq(pipe), payload.capture(), eq("us-east-1"));
+        assertEquals(MAPPER.createObjectNode().put("type", "Service").put("principalId", "dynamodb.amazonaws.com"),
+                MAPPER.readTree(payload.getValue()).path("Records").path(0).path("userIdentity"));
+        assertEquals(original, ttlRemoval.awsRecord(), "the reader's record is never mutated");
+    }
+
+    @Test
     void trimmedDynamoDbCheckpointRestartsAtTheTrimHorizon() throws Exception {
         Pipe pipe = dynamoDbPipe("{}");
         streams.shard.add(ddbRecord("001", "active"));
@@ -632,6 +676,22 @@ class PipesPollerTest {
         return new DynamoDbStreamReader.Record(sequenceNumber, awsRecord);
     }
 
+    /**
+     * A REMOVE record as GetRecords returns it. One that time to live made carries the DynamoDB service
+     * identity with the Streams API's capitalised member names, as AWS writes it.
+     */
+    private static DynamoDbStreamReader.Record ddbRemoval(String sequenceNumber, boolean byTtl) {
+        DynamoDbStreamReader.Record record = ddbRecord(sequenceNumber, "expired");
+        ObjectNode awsRecord = (ObjectNode) record.awsRecord();
+        awsRecord.put("eventName", "REMOVE");
+        ObjectNode dynamodb = (ObjectNode) awsRecord.path("dynamodb");
+        dynamodb.set("OldImage", dynamodb.remove("NewImage"));
+        if (byTtl) {
+            awsRecord.putObject("userIdentity").put("PrincipalId", "dynamodb.amazonaws.com").put("Type", "Service");
+        }
+        return record;
+    }
+
     /** The sequence numbers of each batch the Lambda target was invoked with, in invocation order. */
     private List<List<String>> deliveredSequences(Pipe pipe) throws Exception {
         ArgumentCaptor<String> payloads = ArgumentCaptor.forClass(String.class);
@@ -681,7 +741,7 @@ class PipesPollerTest {
                   },
                   "FilterCriteria": {
                     "Filters": [
-                      {"Pattern": "{\\\"key\\\": [{\\\"exists\\\": false}]}"}
+                      {"Pattern": "{\\\"key\\\": [null]}"}
                     ]
                   }
                 }
@@ -707,5 +767,13 @@ class PipesPollerTest {
                 .mapToLong(KafkaOffsetDto::offset)
                 .findFirst()
                 .orElseThrow();
+    }
+
+    @Test
+    void kinesisStreamNameReadsTheStreamOfAStreamOrConsumerArn() {
+        assertEquals("orders", PipesPoller.kinesisStreamName("arn:aws:kinesis:us-east-1:111111111111:stream/orders"));
+        assertEquals("orders", PipesPoller.kinesisStreamName(
+                "arn:aws-cn:kinesis:cn-north-1:111111111111:stream/orders/consumer/reader:1700000000"));
+        assertEquals("orders", PipesPoller.kinesisStreamName("orders"));
     }
 }

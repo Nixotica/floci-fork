@@ -8,6 +8,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.DeadlineCharSequence;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -25,8 +27,8 @@ import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
-import jakarta.annotation.PreDestroy;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
@@ -52,6 +54,7 @@ import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -66,6 +69,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 import java.util.zip.Inflater;
 import java.util.zip.InflaterInputStream;
@@ -77,7 +81,7 @@ public class CodePipelineService {
     private static final String DEFAULT_EXECUTION_MODE = "SUPERSEDED";
     private static final String DEFAULT_PIPELINE_TYPE = "V1";
     private static final int MAX_ACTIVE_EXECUTIONS = 50;
-    private static final long POLL_INTERVAL_MS = 100L;
+    private static final long DEFAULT_WORKER_POLL_INTERVAL_MS = 100L;
     private static final String SOURCE_POLL_TYPE = "source-poll";
     private static final String MISSING_SOURCE_REVISION = "missing";
     private static final long MAX_ARCHIVE_BYTES = 128L << 20;
@@ -109,10 +113,12 @@ public class CodePipelineService {
     private final CodeDeployService codeDeployService;
     private final LambdaService lambdaService;
     private final S3Service s3Service;
+    private final CodePipelineEventPublisher eventPublisher;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private final ScheduledExecutorService sourcePoller = Executors.newSingleThreadScheduledExecutor();
     private final KeyedLockPool pipelineLocks = new KeyedLockPool();
     private final KeyedLockPool sourcePollLocks = new KeyedLockPool();
+    private static final String MANUAL_TRIGGER_DETAIL = "manual";
     // Admission is serialized per pipeline on its own lock. A QUEUED worker holds the pipelineLocks
     // monitor for its whole run, so counting under that monitor would block StartPipelineExecution
     // until the running execution finished.
@@ -120,8 +126,19 @@ public class CodePipelineService {
     private final Map<String, byte[]> runtimeArtifacts = new ConcurrentHashMap<>();
     // An execution's status turns Failed as soon as one action fails, while its runner is still waiting
     // on sibling actions. Retries check this set so they never overlap a runner that has not finished.
-    private final Set<String> activeRuns = ConcurrentHashMap.newKeySet();
-    private final long sourcePollIntervalMs;
+    final Set<String> activeRuns = ConcurrentHashMap.newKeySet();
+    // Package-private so tests can assert the resolved intervals instead of timing schedules and sleeps.
+    final long sourcePollIntervalMs;
+    final long workerPollIntervalMs;
+    // Test hooks, set only through the package-private constructor: a shortened wait, and a probe
+    // for the gap before the override timeout cleanup.
+    private final long runFinishWaitNanos;
+    private final Runnable beforeOverrideTimeoutCleanup;
+
+    /** Internal override type: a rollback pins a GitHub source action to the target's commit. */
+    private static final String GITHUB_COMMIT_ID = "GITHUB_COMMIT_ID";
+
+    private static final long DEFAULT_RUN_FINISH_WAIT_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     /** Matches the {@code source-poll-interval-ms} default in application.yml. */
     private static final long DEFAULT_SOURCE_POLL_INTERVAL_MS = 500L;
@@ -134,16 +151,36 @@ public class CodePipelineService {
                         CodeBuildService codeBuildService, CodeDeployService codeDeployService,
                         LambdaService lambdaService, S3Service s3Service) {
         this(storageFactory, mapper, codeBuildService, codeDeployService, lambdaService, s3Service,
-                DEFAULT_SOURCE_POLL_INTERVAL_MS);
+                detachedEventPublisher(mapper), DEFAULT_SOURCE_POLL_INTERVAL_MS, DEFAULT_WORKER_POLL_INTERVAL_MS,
+                DEFAULT_RUN_FINISH_WAIT_NANOS, () -> { });
+    }
+
+    public CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
+                               CodeBuildService codeBuildService, CodeDeployService codeDeployService,
+                               LambdaService lambdaService, S3Service s3Service,
+                               EmulatorConfig config) {
+        this(storageFactory, mapper, codeBuildService, codeDeployService, lambdaService, s3Service,
+                config, detachedEventPublisher(mapper));
     }
 
     @Inject
     public CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
                                CodeBuildService codeBuildService, CodeDeployService codeDeployService,
                                LambdaService lambdaService, S3Service s3Service,
-                               EmulatorConfig config) {
+                               EmulatorConfig config, CodePipelineEventPublisher eventPublisher) {
         this(storageFactory, mapper, codeBuildService, codeDeployService, lambdaService, s3Service,
-                resolveSourcePollInterval(config.services().codepipeline().sourcePollIntervalMs()));
+                eventPublisher,
+                config.services().codepipeline().sourcePollIntervalMs(),
+                config.services().codepipeline().workerPollIntervalMs(),
+                DEFAULT_RUN_FINISH_WAIT_NANOS, () -> { });
+    }
+
+    /**
+     * A publisher with no EventBridge or SNS behind it, for the constructors built without CDI.
+     * Publishing is best-effort, so each event is logged as undeliverable and dropped.
+     */
+    private static CodePipelineEventPublisher detachedEventPublisher(ObjectMapper mapper) {
+        return new CodePipelineEventPublisher(null, null, mapper);
     }
 
     /**
@@ -151,20 +188,21 @@ public class CodePipelineService {
      * observer and stop the whole emulator becoming ready. A misconfigured value is not worth
      * failing every other service for, so it falls back with a warning.
      */
-    private static long resolveSourcePollInterval(long configured) {
+    static long resolvePollInterval(String kind, long configured, long fallback) {
         if (configured > 0) {
             return configured;
         }
-        LOG.warnv("Ignoring CodePipeline source poll interval {0}ms: must be a positive number of "
-                + "milliseconds, falling back to {1}ms", configured, DEFAULT_SOURCE_POLL_INTERVAL_MS);
-        return DEFAULT_SOURCE_POLL_INTERVAL_MS;
+        LOG.warnv("Ignoring CodePipeline {0} poll interval {1}ms: must be a positive number of "
+                + "milliseconds, falling back to {2}ms", kind, configured, fallback);
+        return fallback;
     }
 
     @SuppressWarnings("unchecked")
-    private CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
-                                CodeBuildService codeBuildService, CodeDeployService codeDeployService,
-                                LambdaService lambdaService, S3Service s3Service,
-                                long sourcePollIntervalMs) {
+    CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
+                        CodeBuildService codeBuildService, CodeDeployService codeDeployService,
+                        LambdaService lambdaService, S3Service s3Service,
+                        CodePipelineEventPublisher eventPublisher, long sourcePollIntervalMs, long workerPollIntervalMs,
+                        long runFinishWaitNanos, Runnable beforeOverrideTimeoutCleanup) {
         this.pipelineStore = storageFactory.create(
                 "codepipeline", "codepipeline-pipelines.json", new TypeReference<Map<String, CodePipelinePipeline>>() {});
         this.executionStore = storageFactory.create(
@@ -176,7 +214,13 @@ public class CodePipelineService {
         this.codeDeployService = codeDeployService;
         this.lambdaService = lambdaService;
         this.s3Service = s3Service;
-        this.sourcePollIntervalMs = sourcePollIntervalMs;
+        this.eventPublisher = eventPublisher;
+        this.sourcePollIntervalMs = resolvePollInterval("source", sourcePollIntervalMs,
+                DEFAULT_SOURCE_POLL_INTERVAL_MS);
+        this.workerPollIntervalMs = resolvePollInterval("worker", workerPollIntervalMs,
+                DEFAULT_WORKER_POLL_INTERVAL_MS);
+        this.runFinishWaitNanos = runFinishWaitNanos;
+        this.beforeOverrideTimeoutCleanup = beforeOverrideTimeoutCleanup;
     }
 
     public JsonNode handle(String action, JsonNode request, String region, String account) {
@@ -205,7 +249,7 @@ public class CodePipelineService {
             case "GetActionType" -> getActionType(request, region, account);
             case "DeleteCustomActionType" -> deleteCustomActionType(request, region, account);
             case "ListActionTypes" -> listActionTypes(request, region, account);
-            case "ListRuleTypes" -> emptyPage("ruleTypes");
+            case "ListRuleTypes" -> listRuleTypes();
             case "PollForJobs" -> pollForJobs(request, region, account, false);
             case "PollForThirdPartyJobs" -> pollForJobs(request, region, account, true);
             case "AcknowledgeJob", "AcknowledgeThirdPartyJob" -> acknowledgeJob(request, region, account);
@@ -240,9 +284,11 @@ public class CodePipelineService {
                         execution.setStatusSummary("Pipeline execution resumed after restart.");
                         execution.setStopRequested(false);
                         execution.setAbandon(false);
+                        execution.setWaitingStage(null);
                         execution.setActionExecutions(new ArrayList<>());
                         execution.setStageExecutionStatuses(new LinkedHashMap<>());
                         putExecution(execution);
+                        eventPublisher.pipelineStateChange(execution, "RESUMED");
                         executor.submit(() -> runExecution(pipeline, execution));
                     }, () -> {
                         execution.setStatus("Failed");
@@ -518,7 +564,7 @@ public class CodePipelineService {
     }
 
     private ObjectNode startPipelineExecution(JsonNode request, String region, String account) {
-        return startPipelineExecution(request, region, account, "StartPipelineExecution", "manual");
+        return startPipelineExecution(request, region, account, "StartPipelineExecution", MANUAL_TRIGGER_DETAIL);
     }
 
     private ObjectNode startPipelineExecution(JsonNode request, String region, String account,
@@ -548,7 +594,7 @@ public class CodePipelineService {
         execution.setLastUpdateTime(execution.getStartTime());
         execution.setSourceRevisions(new ArrayList<>());
         execution.setSourceRevisionOverrides(sourceRevisionOverrides(request, pipeline));
-        execution.setVariables(variableList(request.path("variables")));
+        execution.setVariables(variableList(request.path("variables"), pipeline.getDeclaration().path("variables")));
         Map<String, String> trigger = new LinkedHashMap<>();
         trigger.put("triggerType", triggerType);
         trigger.put("triggerDetail", triggerDetail);
@@ -560,7 +606,7 @@ public class CodePipelineService {
             throw new AwsException("ConcurrentPipelineExecutionsLimitExceededException",
                     "The pipeline has reached the limit for concurrent pipeline executions", 400);
         }
-        applyExecutionMode(execution);
+        eventPublisher.pipelineStateChange(execution, "STARTED");
         try {
             executor.submit(() -> runExecution(pipeline, execution));
         } catch (RejectedExecutionException exception) {
@@ -568,22 +614,22 @@ public class CodePipelineService {
             execution.setStatusSummary("Pipeline execution could not be scheduled.");
             execution.setLastUpdateTime(now());
             putExecution(execution);
-            throw new AwsException("ConflictException",
-                    "Your request cannot be handled because the pipeline is busy handling ongoing activities. "
-                            + "Try again later.", 400);
+            eventPublisher.pipelineStateChange(execution, "FAILED");
+            throw pipelineBusy();
         }
         return mapper.createObjectNode().put("pipelineExecutionId", execution.getPipelineExecutionId());
     }
 
     private boolean persistExecutionIfSlotAvailable(CodePipelineExecution execution) {
-        if (!List.of("QUEUED", "PARALLEL").contains(execution.getExecutionMode())) {
-            putExecution(execution);
-            return true;
-        }
         return startLocks.withLock(lockKey(execution), () -> {
-            if (activeExecutionCount(execution) >= MAX_ACTIVE_EXECUTIONS) {
+            if (List.of("QUEUED", "PARALLEL").contains(execution.getExecutionMode())
+                    && activeExecutionCount(execution) >= MAX_ACTIVE_EXECUTIONS) {
                 return false;
             }
+            long lastOrdinal = executions(execution.getAccountId(), execution.getRegion(), execution.getPipelineName())
+                    .stream().map(CodePipelineExecution::getAdmissionOrdinal)
+                    .filter(Objects::nonNull).mapToLong(Long::longValue).max().orElse(0L);
+            execution.setAdmissionOrdinal(Math.incrementExact(lastOrdinal));
             putExecution(execution);
             return true;
         });
@@ -622,6 +668,7 @@ public class CodePipelineService {
                     });
         }
         putExecution(execution);
+        eventPublisher.pipelineStateChange(execution, "STOPPING");
         return mapper.createObjectNode().put("pipelineExecutionId", execution.getPipelineExecutionId());
     }
 
@@ -852,11 +899,15 @@ public class CodePipelineService {
             execution.setStatusSummary("Stage retry could not be scheduled.");
             execution.setLastUpdateTime(now());
             putExecution(execution);
-            throw new AwsException("ConflictException",
-                    "Your request cannot be handled because the pipeline is busy handling ongoing activities. "
-                            + "Try again later.", 400);
+            throw pipelineBusy();
         }
         return mapper.createObjectNode().put("pipelineExecutionId", executionId);
+    }
+
+    private static AwsException pipelineBusy() {
+        return new AwsException("ConflictException",
+                "Your request cannot be handled because the pipeline is busy handling ongoing activities. "
+                        + "Try again later.", 400);
     }
 
     // Runs under startLocks so two concurrent retries cannot both pass the status checks,
@@ -910,39 +961,339 @@ public class CodePipelineService {
         return latestStatuses;
     }
 
-    private ObjectNode startExecutionFrom(CodePipelineExecution source, String region, String account) {
-        ObjectNode start = mapper.createObjectNode();
-        start.put("name", source.getPipelineName());
-        synchronized (source) {
-            start.set("sourceRevisions", mapper.valueToTree(source.getSourceRevisionOverrides()));
+    private ObjectNode rollbackStage(JsonNode request, String region, String account) {
+        String pipelineName = text(request, "pipelineName");
+        String stageName = text(request, "stageName");
+        CodePipelinePipeline pipeline = requirePipeline(account, region, pipelineName);
+        // CodePipeline User Guide, execution modes: stage rollback is not available on PARALLEL pipelines.
+        if ("PARALLEL".equals(pipeline.getDeclaration().path("executionMode").asText(DEFAULT_EXECUTION_MODE))) {
+            throw new AwsException("ValidationException",
+                    "Stage rollback is not supported on PARALLEL pipelines.", 400);
         }
-        ArrayNode vars = start.putArray("variables");
-        source.getVariables().forEach(v -> vars.addObject()
-                .put("name", v.get("name"))
-                .put("value", v.get("resolvedValue")));
-        return startPipelineExecution(start, region, account);
+        JsonNode stage = stageByName(pipeline, stageName);
+        // CodePipeline User Guide, "Considerations for rollbacks": a source stage cannot be rolled back.
+        for (JsonNode action : stage.path("actions")) {
+            if (isSourceAction(action)) {
+                throw new AwsException("UnableToRollbackStageException",
+                        "A source stage cannot be rolled back.", 400);
+            }
+        }
+        CodePipelineExecution target = requireExecution(
+                account, region, pipelineName, text(request, "targetPipelineExecutionId"));
+        if ("ROLLBACK".equals(target.getExecutionType())) {
+            throw new AwsException("UnableToRollbackStageException",
+                    "The target execution is a rollback execution.", 400);
+        }
+        if (!Objects.equals(target.getPipelineVersion(), pipeline.getVersion())) {
+            throw new AwsException("UnableToRollbackStageException",
+                    "The pipeline structure changed after the target execution ran.", 400);
+        }
+        // The stage status, not the action statuses: a stage whose onSuccess condition failed has
+        // only Succeeded actions but is itself Failed.
+        boolean stageSucceededInTarget = !latestActionStatuses(target, stageName).isEmpty()
+                && "Succeeded".equals(stageExecutionStatus(target, stageName));
+        if (!stageSucceededInTarget) {
+            throw new AwsException("UnableToRollbackStageException",
+                    "The stage did not complete successfully in the target execution.", 400);
+        }
+        // Checked and registered under the start lock so two concurrent rollbacks of one stage cannot both pass.
+        CodePipelineExecution rollback = startLocks.withLock(pipelineLockKey(account, region, pipelineName), () -> {
+            if (stageRunning(account, region, pipelineName, stageName)) {
+                throw new AwsException("UnableToRollbackStageException",
+                        "The stage is currently running.", 400);
+            }
+            return startRollback(pipeline, account, region, stageName, target);
+        });
+        return mapper.createObjectNode().put("pipelineExecutionId", rollback.getPipelineExecutionId());
     }
 
-    private ObjectNode rollbackStage(JsonNode request, String region, String account) {
-        CodePipelineExecution target = requireExecution(
-                account, region, text(request, "pipelineName"), text(request, "targetPipelineExecutionId"));
-        ObjectNode started = startExecutionFrom(target, region, account);
-        CodePipelineExecution rollback = requireExecution(
-                account, region, target.getPipelineName(), started.path("pipelineExecutionId").asText());
+    // A rollback still fetching its sources has no stage status yet, so it is matched by its target stage.
+    private boolean stageRunning(String account, String region, String pipelineName, String stageName) {
+        return executions(account, region, pipelineName).stream()
+                .anyMatch(candidate -> "InProgress".equals(candidate.getStatus())
+                        && ("InProgress".equals(candidate.getStageExecutionStatuses().get(stageName))
+                        || ("ROLLBACK".equals(candidate.getExecutionType())
+                        && stageName.equals(candidate.getRollbackStageName()))));
+    }
+
+    private static boolean isSourceAction(JsonNode action) {
+        return "Source".equals(action.path("actionTypeId").path("category").asText());
+    }
+
+    /**
+     * Starts a ROLLBACK execution for one stage. Source-only stages before the target stage re-run
+     * to seed the input artifacts, pinned to the target execution's source revisions, then only
+     * the target stage itself runs; intermediate build/deploy stages are skipped.
+     */
+    private CodePipelineExecution startRollback(CodePipelinePipeline pipeline, String account,
+                                                String region, String stageName,
+                                                CodePipelineExecution target) {
+        CodePipelineExecution rollback = new CodePipelineExecution();
+        rollback.setAccountId(account);
+        rollback.setRegion(region);
+        rollback.setPipelineExecutionId(UUID.randomUUID().toString());
+        rollback.setPipelineName(pipeline.getName());
+        rollback.setPipelineVersion(pipeline.getVersion());
+        rollback.setExecutionMode(pipeline.getDeclaration().path("executionMode").asText(DEFAULT_EXECUTION_MODE));
+        rollback.setStatus("InProgress");
+        rollback.setStatusSummary("Rolling back stage " + stageName + " to execution "
+                + target.getPipelineExecutionId() + ".");
         rollback.setExecutionType("ROLLBACK");
         rollback.setRollbackTargetPipelineExecutionId(target.getPipelineExecutionId());
-        putExecution(rollback);
-        return started;
+        rollback.setRollbackStageName(stageName);
+        rollback.setStartTime(now());
+        rollback.setLastUpdateTime(rollback.getStartTime());
+        rollback.setSourceRevisions(new ArrayList<>());
+        synchronized (target) {
+            // The target pinned the S3 object version each source action resolved, so re-running
+            // the sources with these overrides reproduces the target's artifacts.
+            rollback.setSourceRevisionOverrides(new ArrayList<>(target.getSourceRevisionOverrides()));
+        }
+        pinGitHubCommits(pipeline, rollback, target);
+        rollback.setVariables(new ArrayList<>(target.getVariables()));
+        Map<String, String> trigger = new LinkedHashMap<>();
+        trigger.put("triggerType", "ManualRollback");
+        trigger.put("triggerDetail", MANUAL_TRIGGER_DETAIL);
+        rollback.setTrigger(trigger);
+        if (!persistExecutionIfSlotAvailable(rollback)) {
+            throw pipelineBusy();
+        }
+        eventPublisher.pipelineStateChange(rollback, "STARTED");
+        try {
+            executor.submit(() -> runExecution(pipeline, rollback));
+        } catch (RejectedExecutionException exception) {
+            rollback.setStatus("Failed");
+            rollback.setStatusSummary("Pipeline execution could not be scheduled.");
+            rollback.setLastUpdateTime(now());
+            putExecution(rollback);
+            eventPublisher.pipelineStateChange(rollback, "FAILED");
+            throw pipelineBusy();
+        }
+        return rollback;
+    }
+
+    /**
+     * Pins each GitHub source action of a rollback to the commit the target execution resolved, so
+     * the source re-run reproduces the target's artifact instead of the branch head.
+     */
+    private void pinGitHubCommits(CodePipelinePipeline pipeline, CodePipelineExecution rollback,
+                                  CodePipelineExecution target) {
+        Set<String> githubActions = new HashSet<>();
+        for (JsonNode stage : pipeline.getDeclaration().path("stages")) {
+            for (JsonNode action : stage.path("actions")) {
+                JsonNode type = action.path("actionTypeId");
+                if ("Source".equals(type.path("category").asText())
+                        && "GitHub".equals(type.path("provider").asText())) {
+                    githubActions.add(action.path("name").asText());
+                }
+            }
+        }
+        synchronized (target) {
+            for (Map<String, Object> revision : target.getSourceRevisions()) {
+                Object actionName = revision.get("actionName");
+                Object commit = revision.get("revisionId");
+                if (actionName == null || commit == null || !githubActions.contains(actionName.toString())) {
+                    continue;
+                }
+                Map<String, Object> pin = new LinkedHashMap<>();
+                pin.put("actionName", actionName);
+                pin.put("revisionType", GITHUB_COMMIT_ID);
+                pin.put("revisionValue", commit);
+                rollback.getSourceRevisionOverrides().add(pin);
+            }
+        }
     }
 
     private ObjectNode overrideStageCondition(JsonNode request, String region, String account) {
-        requireExecution(account, region, text(request, "pipelineName"), text(request, "pipelineExecutionId"));
+        String pipelineName = text(request, "pipelineName");
+        String stageName = text(request, "stageName");
+        String conditionType = text(request, "conditionType");
+        if (!"BEFORE_ENTRY".equals(conditionType) && !"ON_SUCCESS".equals(conditionType)) {
+            throw new AwsException("ValidationException",
+                    "conditionType must be BEFORE_ENTRY or ON_SUCCESS", 400);
+        }
+        CodePipelinePipeline pipeline = requirePipeline(account, region, pipelineName);
+        JsonNode stage = stageByName(pipeline, stageName);
+        CodePipelineExecution execution = requireExecution(
+                account, region, pipelineName, text(request, "pipelineExecutionId"));
+        if (!Objects.equals(execution.getPipelineVersion(), pipeline.getVersion())) {
+            throw new AwsException("ConditionNotOverridableException",
+                    "The pipeline structure changed after this execution started", 400);
+        }
+        // A run that failed on this very condition resumes from the overridden stage, skipping the
+        // stage's already-succeeded actions; admission shares the retry path's lock and run tracking.
+        // The run marks itself Failed slightly before it leaves activeRuns; an override landing in that
+        // window waits (outside the lock, which finishExecutionRun needs) for the run to finish, so it
+        // resumes instead of storing a flag nothing will read.
+        String conditionFailedSummary = "Condition " + conditionType + " failed in stage " + stageName + ".";
+        boolean[] runStillFinishing = new boolean[1];
+        Map<String, String> resumed = null;
+        long finishDeadline = System.nanoTime() + runFinishWaitNanos;
+        do {
+            runStillFinishing[0] = false;
+            resumed = startLocks.withLock(lockKey(execution), () -> {
+                synchronized (execution) {
+                    execution.getConditionOverrides().put(stageName + "/" + conditionType, true);
+                }
+                boolean failedOnThisCondition = "Failed".equals(execution.getStatus())
+                        && conditionFailedSummary.equals(execution.getStatusSummary());
+                if (failedOnThisCondition && activeRuns.contains(runKey(execution))) {
+                    runStillFinishing[0] = true;
+                    return null;
+                }
+                if (!failedOnThisCondition) {
+                    putExecution(execution);
+                    return null;
+                }
+                execution.setStatus("InProgress");
+                execution.setStatusSummary("Condition " + conditionType + " overridden in stage "
+                        + stageName + ".");
+                execution.setStopRequested(false);
+                execution.setAbandon(false);
+                execution.setLastUpdateTime(now());
+                putExecution(execution);
+                activeRuns.add(runKey(execution));
+                return latestActionStatuses(execution, stageName);
+            });
+            if (runStillFinishing[0]) {
+                try {
+                    TimeUnit.MILLISECONDS.sleep(10);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        } while (runStillFinishing[0] && System.nanoTime() - finishDeadline < 0);
+        if (runStillFinishing[0]) {
+            beforeOverrideTimeoutCleanup.run();
+            // Another override may have resumed the run since this waiter's last check; clear the flag
+            // only under the resume lock and only while the run is still failed on this condition.
+            startLocks.withLock(lockKey(execution), () -> {
+                synchronized (execution) {
+                    if ("Failed".equals(execution.getStatus())
+                            && conditionFailedSummary.equals(execution.getStatusSummary())) {
+                        execution.getConditionOverrides().remove(stageName + "/" + conditionType);
+                        putExecution(execution);
+                    }
+                }
+                return null;
+            });
+            throw pipelineBusy();
+        }
+        Map<String, String> resumeStatuses = resumed;
+        if (resumeStatuses != null) {
+            try {
+                executor.submit(() -> runRetriedStage(pipeline, execution, stage, "FAILED_ACTIONS",
+                        resumeStatuses));
+            } catch (RejectedExecutionException exception) {
+                activeRuns.remove(runKey(execution));
+                execution.setStatus("Failed");
+                execution.setStatusSummary("Stage resume could not be scheduled.");
+                execution.setLastUpdateTime(now());
+                putExecution(execution);
+                throw pipelineBusy();
+            }
+        }
         return mapper.createObjectNode();
     }
 
     private ObjectNode listRuleExecutions(JsonNode request, String region, String account) {
-        requirePipeline(account, region, text(request, "pipelineName"));
-        return emptyPage("ruleExecutionDetails");
+        String pipelineName = text(request, "pipelineName");
+        requirePipeline(account, region, pipelineName);
+        String executionFilter = request.path("filter").path("pipelineExecutionId").asText(null);
+        List<ObjectNode> details = new ArrayList<>();
+        for (CodePipelineExecution execution : executions(account, region, pipelineName)) {
+            if (executionFilter != null
+                    && !executionFilter.equals(execution.getPipelineExecutionId())) {
+                continue;
+            }
+            List<Map<String, Object>> ruleSnapshot = new ArrayList<>();
+            synchronized (execution) {
+                for (Map<String, Object> rule : execution.getRuleExecutions()) {
+                    ruleSnapshot.add(new LinkedHashMap<>(rule));
+                }
+            }
+            for (Map<String, Object> rule : ruleSnapshot) {
+                ObjectNode detail = mapper.createObjectNode();
+                detail.put("pipelineExecutionId", execution.getPipelineExecutionId());
+                detail.put("ruleExecutionId", Objects.toString(rule.get("ruleExecutionId"), null));
+                if (execution.getPipelineVersion() != null) {
+                    detail.put("pipelineVersion", execution.getPipelineVersion());
+                }
+                detail.put("stageName", Objects.toString(rule.get("stageName"), null));
+                detail.put("ruleName", Objects.toString(rule.get("ruleName"), null));
+                detail.put("status", Objects.toString(rule.get("status"), null));
+                if (rule.get("startTime") instanceof Number start) {
+                    detail.put("startTime", start.doubleValue());
+                }
+                if (rule.get("lastUpdateTime") instanceof Number updated) {
+                    detail.put("lastUpdateTime", updated.doubleValue());
+                }
+                ObjectNode input = detail.putObject("input");
+                input.putObject("ruleTypeId")
+                        .put("category", "Rule")
+                        .put("owner", "AWS")
+                        .put("provider", Objects.toString(rule.get("ruleProvider"), ""))
+                        .put("version", "1");
+                detail.putObject("output").putObject("executionResult")
+                        .put("externalExecutionSummary", Objects.toString(rule.get("summary"), ""));
+                details.add(detail);
+            }
+        }
+        Page page = page(request, details.size(), 100);
+        ObjectNode response = mapper.createObjectNode();
+        ArrayNode array = response.putArray("ruleExecutionDetails");
+        for (int i = page.start(); i < page.end(); i++) {
+            array.add(details.get(i));
+        }
+        addNextToken(response, page, details.size());
+        return response;
+    }
+
+    /** The AWS-owned rule types available for V2 stage conditions. */
+    private ObjectNode listRuleTypes() {
+        ObjectNode response = mapper.createObjectNode();
+        ArrayNode ruleTypes = response.putArray("ruleTypes");
+        ruleTypes.add(ruleTypeNode("LambdaInvoke",
+                "Invokes a Lambda function and passes when the invocation succeeds",
+                List.of("FunctionName")));
+        ruleTypes.add(ruleTypeNode("VariableCheck",
+                "Compares a pipeline variable against a value with EQ, NE, CONTAINS or MATCHES",
+                List.of("Variable", "Value", "Operator")));
+        ruleTypes.add(ruleTypeNode("Commands",
+                "Runs shell commands (accepted but not evaluated by the emulator)",
+                List.of("Commands")));
+        ruleTypes.add(ruleTypeNode("DeploymentWindow",
+                "Restricts deployments to a time window (accepted but not evaluated by the emulator)",
+                List.of("Cron", "TimeZone")));
+        ruleTypes.add(ruleTypeNode("CloudWatchAlarm",
+                "Passes when a CloudWatch alarm is in the expected state (accepted but not evaluated by the emulator)",
+                List.of("AlarmName", "AlarmStates")));
+        return response;
+    }
+
+    private ObjectNode ruleTypeNode(String provider, String description, List<String> properties) {
+        ObjectNode node = mapper.createObjectNode();
+        node.putObject("id")
+                .put("category", "Rule")
+                .put("owner", "AWS")
+                .put("provider", provider)
+                .put("version", "1");
+        ObjectNode settings = node.putObject("settings");
+        settings.put("thirdPartyConfigurationUrl", "");
+        ArrayNode props = node.putArray("ruleConfigurationProperties");
+        for (String property : properties) {
+            props.addObject()
+                    .put("name", property)
+                    .put("required", true)
+                    .put("key", true)
+                    .put("secret", false)
+                    .put("description", description);
+        }
+        node.putObject("inputArtifactDetails")
+                .put("minimumCount", 0)
+                .put("maximumCount", 1);
+        return node;
     }
 
     private ObjectNode createCustomActionType(JsonNode request, String region, String account) {
@@ -1087,7 +1438,7 @@ public class CodePipelineService {
         ObjectNode item = mapper.createObjectNode();
         item.set("definition", webhook.deepCopy());
         item.put("url", "http://localhost:4566/codepipeline/webhooks/" + name);
-        item.put("arn", AwsArnUtils.Arn.of("codepipeline", region, account, "webhook/" + name).toString());
+        item.put("arn", AwsArnUtils.Arn.of("codepipeline", region, account, "webhook:" + name).toString());
         if (request.path("tags").isArray() && !request.path("tags").isEmpty()) {
             item.set("tags", request.path("tags").deepCopy());
         }
@@ -1139,17 +1490,51 @@ public class CodePipelineService {
         return mapper.createObjectNode().set("tags", tagsNode(pipeline.getTags()));
     }
 
+    /**
+     * The stage names a run may execute, or {@code null} for all stages. A ROLLBACK execution runs
+     * only the source stages before the rolled-back stage plus that stage. Derived from persisted
+     * state so start, restart-resume and retry all agree.
+     */
+    private Set<String> includeStagesFor(CodePipelinePipeline pipeline, CodePipelineExecution execution) {
+        if (!"ROLLBACK".equals(execution.getExecutionType())) {
+            return null;
+        }
+        String stageName = execution.getRollbackStageName();
+        Set<String> include = new LinkedHashSet<>();
+        boolean targetFound = false;
+        for (JsonNode stage : pipeline.getDeclaration().path("stages")) {
+            String name = stage.path("name").asText();
+            if (name.equals(stageName)) {
+                include.add(name);
+                targetFound = true;
+                break;
+            }
+            boolean sourceOnly = stage.path("actions").size() > 0;
+            for (JsonNode action : stage.path("actions")) {
+                if (!isSourceAction(action)) {
+                    sourceOnly = false;
+                    break;
+                }
+            }
+            if (sourceOnly) {
+                include.add(name);
+            }
+        }
+        if (!targetFound) {
+            // Running only the sources would end the rollback Succeeded without rolling anything back.
+            throw new AwsException("StageNotFoundException",
+                    "Rollback target stage " + stageName + " is not in the pipeline.", 400);
+        }
+        return include;
+    }
+
     private void runExecution(CodePipelinePipeline pipeline, CodePipelineExecution execution) {
         activeRuns.add(runKey(execution));
         Runnable work = () -> {
             try {
-                runStagesFrom(pipeline, execution, 0);
+                runStagesFrom(pipeline, execution, 0, includeStagesFor(pipeline, execution));
             } catch (Exception e) {
-                if (execution.getCurrentStage() != null) {
-                    execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Failed");
-                }
-                execution.setStatus("Failed");
-                execution.setStatusSummary(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                failExecutionRun(execution, e);
                 LOG.errorf(e, "CodePipeline execution %s failed", execution.getPipelineExecutionId());
             } finally {
                 finishExecutionRun(execution);
@@ -1177,70 +1562,284 @@ public class CodePipelineService {
         String stageName = stage.path("name").asText();
         try {
             int stageIndex = stageIndex(pipeline, stageName);
-            execution.setCurrentStage(stageName);
-            execution.getStageExecutionStatuses().put(stageName, "InProgress");
-            execution.setLastUpdateTime(now());
-            putExecution(execution);
-            runStage(pipeline, execution, stage, retryMode, previousStatuses);
-            if ("Failed".equals(execution.getStatus())) {
-                execution.getStageExecutionStatuses().put(stageName, "Failed");
+            if (!runStageInRun(pipeline, execution, stage, retryMode, previousStatuses)) {
                 return;
             }
-            if (finishIfStopped(execution)) {
-                return;
-            }
-            execution.getStageExecutionStatuses().put(stageName, "Succeeded");
-            execution.setCurrentStage(null);
-            execution.setLastUpdateTime(now());
-            putExecution(execution);
-            runStagesFrom(pipeline, execution, stageIndex + 1);
+            runStagesFrom(pipeline, execution, stageIndex + 1, includeStagesFor(pipeline, execution));
         } catch (Exception e) {
-            if (execution.getCurrentStage() != null) {
-                execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Failed");
-            }
-            execution.setStatus("Failed");
-            execution.setStatusSummary(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            failExecutionRun(execution, e);
             LOG.errorf(e, "CodePipeline retry for execution %s failed", execution.getPipelineExecutionId());
         } finally {
             finishExecutionRun(execution);
         }
     }
 
-    private void runStagesFrom(CodePipelinePipeline pipeline, CodePipelineExecution execution, int startIndex)
-            throws InterruptedException {
+    private void failExecutionRun(CodePipelineExecution execution, Exception exception) {
+        synchronized (execution) {
+            execution.setWaitingStage(null);
+            if (!isTerminal(execution.getStatus())) {
+                if (execution.getCurrentStage() != null) {
+                    execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Failed");
+                }
+                execution.setStatus("Failed");
+                execution.setStatusSummary(exception.getMessage() == null
+                        ? exception.getClass().getSimpleName() : exception.getMessage());
+            }
+        }
+    }
+
+    private void runStagesFrom(CodePipelinePipeline pipeline, CodePipelineExecution execution, int startIndex,
+                               Set<String> includeStages) throws InterruptedException {
         JsonNode stages = pipeline.getDeclaration().path("stages");
         for (int i = startIndex; i < stages.size(); i++) {
             JsonNode stage = stages.get(i);
             String stageName = stage.path("name").asText();
+            if (includeStages != null && !includeStages.contains(stageName)) {
+                continue;
+            }
             waitForTransition(pipeline, execution, stageName);
-            if (finishIfStopped(execution)) {
+            if (isTerminal(execution.getStatus()) || finishIfStopped(execution)) {
                 return;
+            }
+            if (!runStageInRun(pipeline, execution, stage, "ALL_ACTIONS", Map.of())) {
+                return;
+            }
+        }
+        synchronized (execution) {
+            if (!isTerminal(execution.getStatus())) {
+                execution.setStatus("Succeeded");
+                execution.setStatusSummary("Pipeline execution succeeded.");
+            }
+        }
+    }
+
+    /**
+     * Runs one stage of an execution, between its V2 {@code beforeEntry} and {@code onSuccess}
+     * conditions.
+     *
+     * @return {@code false} when the execution must not continue to the next stage
+     */
+    private boolean runStageInRun(CodePipelinePipeline pipeline, CodePipelineExecution execution, JsonNode stage,
+                                  String retryMode, Map<String, String> previousStatuses) {
+        String stageName = stage.path("name").asText();
+        synchronized (execution) {
+            // Wait clearing and stage entry share the supersession monitor: a newer arrival
+            // either supersedes this waiter first, or sees an active stage and leaves it alone.
+            execution.setWaitingStage(null);
+            if (isTerminal(execution.getStatus())) {
+                return false;
             }
             execution.setCurrentStage(stageName);
             execution.getStageExecutionStatuses().put(stageName, "InProgress");
             execution.setLastUpdateTime(now());
             putExecution(execution);
-            runStage(pipeline, execution, stage);
-            if ("Failed".equals(execution.getStatus())) {
-                execution.getStageExecutionStatuses().put(stageName, "Failed");
-                return;
-            }
-            if (finishIfStopped(execution)) {
-                return;
-            }
-            execution.getStageExecutionStatuses().put(stageName, "Succeeded");
+        }
+
+        // Evaluated before STARTED is published: AWS documents no skipped-stage event, so a stage
+        // skipped by its beforeEntry condition emits no stage events at all.
+        ConditionOutcome entry = evaluateConditions(execution, stage, "BEFORE_ENTRY");
+        if (entry == ConditionOutcome.SKIP_STAGE) {
+            execution.getStageExecutionStatuses().put(stageName, "Skipped");
             execution.setCurrentStage(null);
             execution.setLastUpdateTime(now());
             putExecution(execution);
+            return true;
         }
-        execution.setStatus("Succeeded");
-        execution.setStatusSummary("Pipeline execution succeeded.");
+        eventPublisher.stageStateChange(execution, stageName, "STARTED");
+        if (entry == ConditionOutcome.FAIL) {
+            failForCondition(execution, stageName, "BEFORE_ENTRY");
+            execution.getStageExecutionStatuses().put(stageName, "Failed");
+            eventPublisher.stageStateChange(execution, stageName, "FAILED");
+            return false;
+        }
+
+        runStage(pipeline, execution, stage, retryMode, previousStatuses);
+        if ("Failed".equals(execution.getStatus())) {
+            execution.getStageExecutionStatuses().put(stageName, "Failed");
+            eventPublisher.stageStateChange(execution, stageName, "FAILED");
+            return false;
+        }
+        if (finishIfStopped(execution)) {
+            eventPublisher.stageStateChange(execution, stageName, "STOPPED");
+            return false;
+        }
+
+        // A SKIP result only makes sense before entry; after the stage ran it cannot be skipped, so a
+        // failed onSuccess condition fails the stage whatever its declared result.
+        if (evaluateConditions(execution, stage, "ON_SUCCESS") != ConditionOutcome.PASS) {
+            failForCondition(execution, stageName, "ON_SUCCESS");
+            execution.getStageExecutionStatuses().put(stageName, "Failed");
+            eventPublisher.stageStateChange(execution, stageName, "FAILED");
+            return false;
+        }
+        execution.getStageExecutionStatuses().put(stageName, "Succeeded");
+        execution.setCurrentStage(null);
+        execution.setLastUpdateTime(now());
+        putExecution(execution);
+        eventPublisher.stageStateChange(execution, stageName, "SUCCEEDED");
+        return true;
+    }
+
+    // ---------------------------------------------------------------- V2 stage conditions
+
+    private enum ConditionOutcome { PASS, FAIL, SKIP_STAGE }
+
+    /**
+     * Evaluates the stage's {@code beforeEntry}/{@code onSuccess} condition block. Rules run
+     * through the AWS rule providers we emulate: {@code LambdaInvoke} (real invocation via the
+     * Lambda service) and {@code VariableCheck} (pipeline-variable comparison); other providers
+     * pass permissively. A condition overridden via OverrideStageCondition always passes.
+     */
+    private ConditionOutcome evaluateConditions(CodePipelineExecution execution, JsonNode stage,
+                                                String conditionType) {
+        JsonNode block = stage.path(conditionBlockField(conditionType));
+        if (block.isMissingNode() || !block.has("conditions")) {
+            return ConditionOutcome.PASS;
+        }
+        if (Boolean.TRUE.equals(execution.getConditionOverrides()
+                .get(stage.path("name").asText() + "/" + conditionType))) {
+            return ConditionOutcome.PASS;
+        }
+        for (JsonNode condition : block.path("conditions")) {
+            boolean passed = true;
+            for (JsonNode rule : condition.path("rules")) {
+                if (!evaluateRule(execution, stage.path("name").asText(), conditionType, rule)) {
+                    passed = false;
+                }
+            }
+            if (!passed) {
+                return "SKIP".equals(condition.path("result").asText("FAIL")) && "BEFORE_ENTRY".equals(conditionType)
+                        ? ConditionOutcome.SKIP_STAGE : ConditionOutcome.FAIL;
+            }
+        }
+        return ConditionOutcome.PASS;
+    }
+
+    private static String conditionBlockField(String conditionType) {
+        return switch (conditionType) {
+            case "BEFORE_ENTRY" -> "beforeEntry";
+            case "ON_SUCCESS" -> "onSuccess";
+            case "ON_FAILURE" -> "onFailure";
+            default -> throw new AwsException("ValidationException",
+                    "Unknown condition type " + conditionType, 400);
+        };
+    }
+
+    private boolean evaluateRule(CodePipelineExecution execution, String stageName,
+                                 String conditionType, JsonNode rule) {
+        Map<String, Object> record = new LinkedHashMap<>();
+        record.put("ruleExecutionId", UUID.randomUUID().toString());
+        record.put("ruleName", rule.path("name").asText());
+        record.put("stageName", stageName);
+        record.put("conditionType", conditionType);
+        record.put("ruleProvider", rule.path("ruleTypeId").path("provider").asText());
+        record.put("startTime", now());
+        record.put("status", "InProgress");
+        synchronized (execution) {
+            execution.getRuleExecutions().add(record);
+            putExecution(execution);
+        }
+        boolean passed;
+        String summary;
+        try {
+            String provider = rule.path("ruleTypeId").path("provider").asText();
+            passed = switch (provider) {
+                case "LambdaInvoke" -> lambdaRulePasses(execution, rule);
+                case "VariableCheck" -> variableCheckPasses(execution, rule);
+                // Commands / DeploymentWindow / CloudWatchAlarm and unknown providers pass permissively.
+                default -> true;
+            };
+            summary = passed ? "Rule passed." : "Rule condition was not met.";
+        } catch (Exception e) {
+            passed = false;
+            summary = Objects.toString(e.getMessage(), "Rule evaluation failed");
+        }
+        synchronized (execution) {
+            record.put("status", passed ? "Succeeded" : "Failed");
+            record.put("summary", summary);
+            record.put("lastUpdateTime", now());
+            putExecution(execution);
+        }
+        return passed;
+    }
+
+    private boolean lambdaRulePasses(CodePipelineExecution execution, JsonNode rule) {
+        String functionName = rule.path("configuration").path("FunctionName").asText(null);
+        if (functionName == null) {
+            throw new AwsException("ValidationException",
+                    "LambdaInvoke rules require configuration.FunctionName", 400);
+        }
+        ObjectNode event = mapper.createObjectNode();
+        event.put("ruleName", rule.path("name").asText());
+        event.put("pipelineName", execution.getPipelineName());
+        event.put("pipelineExecutionId", execution.getPipelineExecutionId());
+        InvokeResult result = lambdaService.invoke(execution.getRegion(), functionName,
+                event.toString().getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
+        return result.getFunctionError() == null && result.getStatusCode() < 400;
+    }
+
+    /** Above this length, a MATCHES pattern or subject is rejected rather than risking
+     * catastrophic regex backtracking on pipeline-declared input. */
+    private static final int MAX_VARIABLE_CHECK_MATCH_LENGTH = 256;
+
+    private static final long MATCHES_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(1);
+
+    private boolean variableCheckPasses(CodePipelineExecution execution, JsonNode rule) {
+        JsonNode config = rule.path("configuration");
+        String variable = resolveVariableReference(execution, config.path("Variable").asText(""));
+        String value = config.path("Value").asText("");
+        return switch (config.path("Operator").asText("EQ")) {
+            case "EQ" -> variable.equals(value);
+            case "NE" -> !variable.equals(value);
+            case "CONTAINS" -> variable.contains(value);
+            case "MATCHES" -> {
+                if (value.length() > MAX_VARIABLE_CHECK_MATCH_LENGTH
+                        || variable.length() > MAX_VARIABLE_CHECK_MATCH_LENGTH) {
+                    throw new AwsException("ValidationException",
+                            "VariableCheck MATCHES pattern or value exceeds "
+                                    + MAX_VARIABLE_CHECK_MATCH_LENGTH + " characters", 400);
+                }
+                yield Pattern.compile(value).matcher(new DeadlineCharSequence(variable,
+                        System.nanoTime() + MATCHES_TIMEOUT_NANOS, "MATCHES pattern evaluation timed out")).matches();
+            }
+            default -> throw new AwsException("ValidationException",
+                    "Unknown VariableCheck operator", 400);
+        };
+    }
+
+    /** Resolves {@code #{variables.name}} references against the execution's variables. */
+    private String resolveVariableReference(CodePipelineExecution execution, String reference) {
+        String name = reference;
+        if (reference.startsWith("#{") && reference.endsWith("}")) {
+            name = reference.substring(2, reference.length() - 1);
+            if (name.startsWith("variables.")) {
+                name = name.substring("variables.".length());
+            }
+        }
+        for (Map<String, String> variable : execution.getVariables()) {
+            if (variable.get("name").equals(name)) {
+                return variable.getOrDefault("resolvedValue", "");
+            }
+        }
+        // An unresolved reference must fail the rule, not compare as its own placeholder text.
+        throw new AwsException("ValidationException",
+                "VariableCheck variable " + reference + " could not be resolved", 400);
+    }
+
+    private void failForCondition(CodePipelineExecution execution, String stageName, String conditionType) {
+        execution.setStatus("Failed");
+        execution.setStatusSummary(
+                "Condition " + conditionType + " failed in stage " + stageName + ".");
+        putExecution(execution);
     }
 
     private void finishExecutionRun(CodePipelineExecution execution) {
         startLocks.withLock(lockKey(execution), () -> {
             try {
-                execution.setCurrentStage(null);
+                synchronized (execution) {
+                    execution.setWaitingStage(null);
+                    execution.setCurrentStage(null);
+                }
                 execution.setLastUpdateTime(now());
                 putExecution(execution);
                 boolean pipelineDeleted = pipelineStore.getForAccount(execution.getAccountId(),
@@ -1259,6 +1858,15 @@ public class CodePipelineService {
                 activeRuns.remove(runKey(execution));
             }
         });
+        String terminalState = switch (execution.getStatus()) {
+            case "Succeeded" -> "SUCCEEDED";
+            case "Failed" -> "FAILED";
+            case "Stopped" -> "STOPPED";
+            default -> null;
+        };
+        if (terminalState != null) {
+            eventPublisher.pipelineStateChange(execution, terminalState);
+        }
     }
 
     // Failed and stopped executions keep their artifacts so a stage retry can reuse them. Once a newer
@@ -1349,6 +1957,7 @@ public class CodePipelineService {
             execution.getActionExecutions().add(state);
             putExecution(execution);
         }
+        eventPublisher.actionStateChange(execution, state, "STARTED");
         try {
             executeProvider(pipeline, execution, action, state);
             if ("InProgress".equals(state.getStatus())) {
@@ -1368,6 +1977,15 @@ public class CodePipelineService {
         } finally {
             state.setLastUpdateTime(now());
             putExecution(execution);
+            String terminalState = switch (state.getStatus()) {
+                case "Succeeded" -> "SUCCEEDED";
+                case "Failed" -> "FAILED";
+                case "Abandoned" -> "ABANDONED";
+                default -> null;
+            };
+            if (terminalState != null) {
+                eventPublisher.actionStateChange(execution, state, terminalState);
+            }
         }
     }
 
@@ -1377,7 +1995,7 @@ public class CodePipelineService {
         String owner = state.getOwner();
         String provider = state.getProvider();
         if ("Approval".equals(category) && "Manual".equals(provider)) {
-            waitForApproval(execution, state);
+            waitForApproval(execution, action, state);
             return;
         }
         if ("Source".equals(category) && "GitHub".equals(provider) && "ThirdParty".equals(owner)
@@ -1420,7 +2038,7 @@ public class CodePipelineService {
                 revision.put("revisionChangeIdentifier", unquoteETag(object.getETag()));
                 revision.put("revisionSummary", bucket + "/" + key);
                 revision.put("revisionUrl", "s3://" + bucket + "/" + key);
-                revision.put("created", object.getLastModified().toEpochMilli() / 1000.0);
+                revision.put("created", EpochSeconds.fromInstant(object.getLastModified()));
                 execution.getArtifactRevisions().add(revision);
                 upsertSourceRevision(execution, state.getActionName(), revisionId, bucket, key, object);
                 pinResolvedS3Version(execution, state.getActionName(), object.getVersionId());
@@ -1460,9 +2078,11 @@ public class CodePipelineService {
                     "GitHub source Owner and Repo must be non-empty and contain no '/' or '..', "
                             + "and Branch must be non-empty with no leading '/', '..' or whitespace", 400);
         }
+        String pinnedCommit = sourceRevisionOverride(execution, state.getActionName(), GITHUB_COMMIT_ID);
+        String archiveRef = pinnedCommit != null
+                ? pinnedCommit : "refs/heads/" + encodeRefPath(branch);
         byte[] archive = fetchGitHubArchive(URI.create(
-                githubArchiveBaseUrl() + "/" + repoOwner + "/" + repo
-                        + "/zip/refs/heads/" + encodeRefPath(branch)));
+                githubArchiveBaseUrl() + "/" + repoOwner + "/" + repo + "/zip/" + archiveRef));
         if (archive.length > maxArchiveBytes()) {
             throw archiveDownloadTooLarge();
         }
@@ -1737,7 +2357,7 @@ public class CodePipelineService {
             if (abandonExternalActionIfRequested(execution, state)) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
             build = codeBuildService.getBuild(execution.getRegion(), execution.getAccountId(), build.getId());
         }
         if (abandonExternalActionIfRequested(execution, state)) {
@@ -1770,7 +2390,7 @@ public class CodePipelineService {
             if (abandonExternalActionIfRequested(execution, state)) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
             deployment = codeDeployService.getDeployment(execution.getRegion(), deploymentId);
         }
         if (abandonExternalActionIfRequested(execution, state)) {
@@ -1827,12 +2447,20 @@ public class CodePipelineService {
         state.setExternalExecutionId(result.path("pipelineExecutionId").asText());
     }
 
-    private void waitForApproval(CodePipelineExecution execution, ActionExecution state) throws InterruptedException {
+    private void waitForApproval(CodePipelineExecution execution, JsonNode action,
+                                 ActionExecution state) throws InterruptedException {
         state.setToken(UUID.randomUUID().toString());
         state.setSummary("Waiting for approval.");
         putExecution(execution);
+        String notificationArn = action.path("configuration").path("NotificationArn").asText(null);
+        if (notificationArn != null && !notificationArn.isBlank()) {
+            eventPublisher.approvalNeeded(execution, state, notificationArn,
+                    action.path("configuration").path("CustomData").asText(null),
+                    action.path("configuration").path("ExternalEntityLink").asText(null),
+                    now() + TimeUnit.DAYS.toSeconds(7));
+        }
         while ("InProgress".equals(state.getStatus()) && !execution.isStopRequested()) {
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
         }
         if (execution.isStopRequested()) {
             state.setStatus(execution.isAbandon() ? "Abandoned" : "Stopped");
@@ -1887,34 +2515,69 @@ public class CodePipelineService {
                 }
                 throw new AwsException("ActionExecutionFailed", message, 400);
             }
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
         }
         state.setStatus("Abandoned");
         state.setSummary("Action abandoned.");
     }
 
-    private void applyExecutionMode(CodePipelineExecution execution) {
-        if (!"SUPERSEDED".equals(execution.getExecutionMode())) {
+    private void supersedeOlderWaiters(CodePipelineExecution execution, String stageName) {
+        if (!"SUPERSEDED".equals(execution.getExecutionMode())
+                || !"InProgress".equals(execution.getStatus()) || execution.getStartTime() == null) {
             return;
         }
+        // Do not hold the arriving execution's monitor while acquiring another execution's monitor.
         executions(execution.getAccountId(), execution.getRegion(), execution.getPipelineName()).stream()
-                .filter(e -> !e.getPipelineExecutionId().equals(execution.getPipelineExecutionId()))
-                .filter(e -> "InProgress".equals(e.getStatus()) && e.getCurrentStage() == null)
+                .filter(e -> isOlderExecution(e, execution))
                 .forEach(e -> {
-                    e.setStatus("Superseded");
-                    e.setStatusSummary("Superseded by " + execution.getPipelineExecutionId());
-                    e.setLastUpdateTime(now());
-                    putExecution(e);
+                    synchronized (e) {
+                        if ("SUPERSEDED".equals(e.getExecutionMode())
+                                && "InProgress".equals(e.getStatus()) && e.getCurrentStage() == null
+                                && stageName.equals(e.getWaitingStage())) {
+                            e.setStatus("Superseded");
+                            e.setWaitingStage(null);
+                            e.setStatusSummary("Superseded by " + execution.getPipelineExecutionId());
+                            e.setLastUpdateTime(now());
+                            putExecution(e);
+                        }
+                    }
                 });
     }
 
-    private void waitForTransition(CodePipelinePipeline pipeline, CodePipelineExecution execution,
+    private boolean isOlderExecution(CodePipelineExecution candidate, CodePipelineExecution execution) {
+        if (candidate.getStartTime() == null || execution.getStartTime() == null) {
+            return false;
+        }
+        int timeOrder = Double.compare(candidate.getStartTime(), execution.getStartTime());
+        if (timeOrder != 0) {
+            return timeOrder < 0;
+        }
+        // Legacy equal-time executions have no reliable ordering. Do not guess from UUIDs or
+        // treat equality as older: either could otherwise supersede the other on worker arrival.
+        return candidate.getAdmissionOrdinal() != null && execution.getAdmissionOrdinal() != null
+                && candidate.getAdmissionOrdinal() < execution.getAdmissionOrdinal();
+    }
+
+    void waitForTransition(CodePipelinePipeline pipeline, CodePipelineExecution execution,
                                    String stageName) throws InterruptedException {
-        while (!pipeline.getTransitions().getOrDefault(stageName, enabledTransition()).isEnabled()) {
-            if (execution.isStopRequested()) {
+        while (true) {
+            boolean enabled = pipeline.getTransitions().getOrDefault(stageName, enabledTransition()).isEnabled();
+            synchronized (execution) {
+                if (isTerminal(execution.getStatus()) || execution.isStopRequested()) {
+                    execution.setWaitingStage(null);
+                    return;
+                }
+                if (!enabled && !stageName.equals(execution.getWaitingStage())) {
+                    execution.setWaitingStage(stageName);
+                    putExecution(execution);
+                }
+            }
+            // Arrival matters even when enabled: an older worker may still be polling its wait.
+            supersedeOlderWaiters(execution, stageName);
+            if (enabled) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
             pipeline = requirePipeline(execution.getAccountId(), execution.getRegion(), execution.getPipelineName());
         }
     }
@@ -1984,9 +2647,12 @@ public class CodePipelineService {
     }
 
     private void putExecution(CodePipelineExecution execution) {
-        executionStore.putForAccount(execution.getAccountId(),
-                executionKey(execution.getRegion(), execution.getPipelineName(),
-                        execution.getPipelineExecutionId()), execution);
+        // Serializing the execution walks its rule records, which evaluateRule mutates under this lock.
+        synchronized (execution) {
+            executionStore.putForAccount(execution.getAccountId(),
+                    executionKey(execution.getRegion(), execution.getPipelineName(),
+                            execution.getPipelineExecutionId()), execution);
+        }
     }
 
     private void storeItem(String account, String region, String type, String id,
@@ -2151,9 +2817,10 @@ public class CodePipelineService {
             node = mapper.valueToTree(execution);
         }
         node.remove(List.of("accountId", "region", "startTime", "lastUpdateTime",
-                "sourceRevisions", "sourceRevisionOverrides", "actionExecutions", "currentStage",
-                "stopRequested", "abandon", "rollbackTargetPipelineExecutionId", "stageExecutionStatuses",
-                "artifactsReleased"));
+                "sourceRevisions", "sourceRevisionOverrides", "actionExecutions", "currentStage", "waitingStage",
+                "admissionOrdinal",
+                "stopRequested", "abandon", "rollbackTargetPipelineExecutionId", "rollbackStageName",
+                "stageExecutionStatuses", "artifactsReleased", "ruleExecutions", "conditionOverrides"));
         if (execution.getRollbackTargetPipelineExecutionId() != null) {
             node.putObject("rollbackMetadata").put(
                     "rollbackTargetPipelineExecutionId", execution.getRollbackTargetPipelineExecutionId());
@@ -2368,13 +3035,24 @@ public class CodePipelineService {
         execution.getSourceRevisions().add(sourceRevision);
     }
 
-    private List<Map<String, String>> variableList(JsonNode node) {
+    /** The request's variables, plus the declared default of every pipeline variable it omits. */
+    private List<Map<String, String>> variableList(JsonNode node, JsonNode declared) {
         List<Map<String, String>> result = new ArrayList<>();
+        Set<String> supplied = new HashSet<>();
         if (node != null && node.isArray()) {
             for (JsonNode variable : node) {
+                supplied.add(variable.path("name").asText());
                 result.add(Map.of(
                         "name", variable.path("name").asText(),
                         "resolvedValue", variable.path("value").asText()));
+            }
+        }
+        if (declared != null && declared.isArray()) {
+            for (JsonNode variable : declared) {
+                String name = variable.path("name").asText();
+                if (!supplied.contains(name) && variable.hasNonNull("defaultValue")) {
+                    result.add(Map.of("name", name, "resolvedValue", variable.path("defaultValue").asText()));
+                }
             }
         }
         return result;
@@ -2487,7 +3165,7 @@ public class CodePipelineService {
     }
 
     private static double now() {
-        return Instant.now().toEpochMilli() / 1000.0;
+        return EpochSeconds.fromInstant(Instant.now());
     }
 
     private static void putIfNotNull(ObjectNode node, String field, Object value) {

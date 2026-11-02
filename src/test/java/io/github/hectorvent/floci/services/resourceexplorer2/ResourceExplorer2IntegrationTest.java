@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.MethodOrderer;
@@ -480,27 +481,33 @@ class ResourceExplorer2IntegrationTest {
         }
 
         @Test
-        void searchWithEmptyQueryReturnsAllResources() {
-            var response = given()
+        void searchWithEmptyQueryReturnsEveryResourceInItsView() {
+            String bucketArn = Arn.global(AwsRegions.partitionFor("us-east-1"), "s3", "", "re2-test-bucket")
+                    .toString();
+            String viewArn = trackView(given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("""
-                    {"QueryString": ""}
-                    """)
+                .body(Map.of("ViewName", "empty-query-fixture-view",
+                        "Filters", Map.of("FilterString", "id:" + bucketArn)))
+            .when()
+                .post("/CreateView")
+            .then()
+                .statusCode(200)
+                .extract().path("View.ViewArn"));
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body(Map.of("QueryString", "", "ViewArn", viewArn))
             .when()
                 .post("/Search")
             .then()
                 .statusCode(200)
-                .body("Count.TotalResources", greaterThanOrEqualTo(0))
-                .body("Resources", notNullValue())
-                .extract().response();
-
-            // Unscoped, so how many resources the shared emulator holds is not knowable here.
-            // Complete says whether the 1000-result cap bit, which is exactly what TotalResources
-            // reaching the cap means — assert that relationship rather than a fixed value.
-            int total = response.path("Count.TotalResources");
-            boolean complete = response.path("Count.Complete");
-            assertEquals(total < 1000, complete);
+                .body("Count.TotalResources", equalTo(1))
+                .body("Count.Complete", equalTo(true))
+                .body("Resources.size()", equalTo(1))
+                .body("Resources[0].Arn", equalTo(bucketArn))
+                .body("ViewArn", equalTo(viewArn));
         }
     }
 
@@ -1308,7 +1315,7 @@ class ResourceExplorer2IntegrationTest {
                         : "{\"MaxResults\": 1, \"NextToken\": \"" + nextToken
                                 + "\", \"Filters\": {\"FilterString\": \"" + BOUNDED_SCOPE + "\"}}";
 
-                var response = given()
+                Response response = given()
                     .header("Authorization", AUTH)
                     .contentType("application/json")
                     .body(body)
@@ -1446,7 +1453,7 @@ class ResourceExplorer2IntegrationTest {
                 .statusCode(200)
                 .extract().path("Resources");
 
-            for (var resource : resources) {
+            for (Map<String, Object> resource : resources) {
                 assertNotNull(resource.get("Arn"), "Resource missing Arn: " + resource);
                 assertNotNull(resource.get("ResourceType"), "Resource missing ResourceType: " + resource);
                 assertNotNull(resource.get("Service"), "Resource missing Service: " + resource);
@@ -1484,7 +1491,7 @@ class ResourceExplorer2IntegrationTest {
             .then()
                 .extract().path("Resources");
 
-            for (var resource : resources) {
+            for (Map<String, Object> resource : resources) {
                 String service = (String) resource.get("Service");
                 String resourceType = (String) resource.get("ResourceType");
                 assertTrue(
@@ -1504,7 +1511,7 @@ class ResourceExplorer2IntegrationTest {
             .then()
                 .extract().path("Resources");
 
-            for (var resource : resources) {
+            for (Map<String, Object> resource : resources) {
                 String arn = (String) resource.get("Arn");
                 String service = (String) resource.get("Service");
                 Arn parsed = AwsArnUtils.parse(arn);

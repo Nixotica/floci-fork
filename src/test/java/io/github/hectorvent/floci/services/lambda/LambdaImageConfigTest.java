@@ -1,12 +1,14 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
-import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
@@ -14,13 +16,12 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerLauncher;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageResolver;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionRoleCredentials;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -30,6 +31,8 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
@@ -239,18 +242,20 @@ class LambdaImageConfigTest {
             when(config.docker()).thenReturn(docker);
             when(docker.logMaxSize()).thenReturn("10m");
             when(docker.logMaxFile()).thenReturn("3");
-            when(config.baseUrl()).thenReturn("http://localhost:4566");
+            lenient().when(config.baseUrl()).thenReturn("http://localhost:4566");
+            lenient().when(config.port()).thenReturn(4566);
+            lenient().when(config.tls()).thenReturn(mock(EmulatorConfig.TlsConfig.class));
             lenient().when(config.hostname()).thenReturn(Optional.empty());
             when(embeddedDnsServer.getServerIp()).thenReturn(Optional.empty());
 
             ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
             ContainerReachableEndpoint reachableEndpoint =
-                    new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer);
+                    new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566);
             LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
             launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
                     runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
-                    mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv,
-                    mock(io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionRoleCredentials.class));
+                    mock(LambdaLayerService.class), awsEnv,
+                    mock(LambdaExecutionRoleCredentials.class));
 
             when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
             when(runtimeApiServer.getPort()).thenReturn(9000);
@@ -262,7 +267,7 @@ class LambdaImageConfigTest {
 
             lenient().when(dockerClient.copyArchiveToContainerCmd(any())).thenAnswer(inv -> {
                 CopyArchiveToContainerCmd cmd = mock(CopyArchiveToContainerCmd.class);
-                final java.io.InputStream[] captured = {null};
+                final InputStream[] captured = {null};
                 when(cmd.withRemotePath(any())).thenReturn(cmd);
                 when(cmd.withTarInputStream(any())).thenAnswer(streamInv -> {
                     captured[0] = streamInv.getArgument(0);
@@ -270,7 +275,7 @@ class LambdaImageConfigTest {
                 });
                 doAnswer(execInv -> {
                     if (captured[0] != null) {
-                        try { captured[0].transferTo(java.io.OutputStream.nullOutputStream()); }
+                        try { captured[0].transferTo(OutputStream.nullOutputStream()); }
                         catch (Exception ignored) {}
                     }
                     return null;
@@ -358,7 +363,7 @@ class LambdaImageConfigTest {
             // of starting an empty container. This test covers cmd construction, so any real
             // directory will do.
             fn.setCodeLocalPath(codeDir.toString());
-            when(imageResolver.resolve("nodejs20.x")).thenReturn("public.ecr.aws/lambda/nodejs:20");
+            when(imageResolver.resolve("nodejs20.x", null)).thenReturn("public.ecr.aws/lambda/nodejs:20");
 
             launcher.launch(fn);
 

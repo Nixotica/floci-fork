@@ -15,8 +15,8 @@ import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService.LaunchImage;
-import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -64,9 +64,9 @@ class EcsContainerManagerAwsBaselineTest {
         when(containerBuilder.resolveImage(anyString())).thenAnswer(invocation -> invocation.getArgument(0));
 
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
-        when(lifecycleManager.resolveImageForLaunch(any(), any()))
+        when(lifecycleManager.resolveImageForLaunch(any(), any(), any()))
                 .thenAnswer(invocation -> new LaunchImage(invocation.getArgument(0), null));
-        when(lifecycleManager.createAndStart(any()))
+        when(lifecycleManager.createAndStartEphemeral(any(), any()))
                 .thenReturn(new ContainerInfo("docker-id", Map.of()));
 
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
@@ -125,6 +125,19 @@ class EcsContainerManagerAwsBaselineTest {
                 "overridden baseline value should not remain");
         // Task-def-only entries are preserved.
         assertTrue(env.contains("APP_ONLY=1"));
+    }
+
+    @Test
+    void aTaskContainersJvmsTrustFlocisCa() {
+        TaskDefinition taskDef = new TaskDefinition();
+        taskDef.setFamily("test-family");
+        taskDef.setContainerDefinitions(List.of(containerDef("app", "app:latest", List.of())));
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/test-cluster/abc123");
+
+        manager.startTask(task, taskDef, null, "us-east-1");
+
+        verify(builder).withJavaTrustStore();
     }
 
     @Test

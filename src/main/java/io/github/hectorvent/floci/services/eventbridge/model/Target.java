@@ -11,14 +11,17 @@ public class Target {
 
     private String id;
     private String arn;
+    private String roleArn;
     private String input;
     private String inputPath;
     private InputTransformer inputTransformer;
     private SqsParameters sqsParameters;
     private BatchParameters batchParameters;
     private EcsParameters ecsParameters;
+    private RedshiftDataParameters redshiftDataParameters;
     private RetryPolicy retryPolicy;
     private DeadLetterConfig deadLetterConfig;
+    private HttpParameters httpParameters;
 
     public Target() {}
 
@@ -34,6 +37,9 @@ public class Target {
 
     public String getArn() { return arn; }
     public void setArn(String arn) { this.arn = arn; }
+
+    public String getRoleArn() { return roleArn; }
+    public void setRoleArn(String roleArn) { this.roleArn = roleArn; }
 
     public String getInput() { return input; }
     public void setInput(String input) { this.input = input; }
@@ -53,11 +59,19 @@ public class Target {
     public EcsParameters getEcsParameters() { return ecsParameters; }
     public void setEcsParameters(EcsParameters ecsParameters) { this.ecsParameters = ecsParameters; }
 
+    public RedshiftDataParameters getRedshiftDataParameters() { return redshiftDataParameters; }
+    public void setRedshiftDataParameters(RedshiftDataParameters redshiftDataParameters) {
+        this.redshiftDataParameters = redshiftDataParameters;
+    }
+
     public RetryPolicy getRetryPolicy() { return retryPolicy; }
     public void setRetryPolicy(RetryPolicy retryPolicy) { this.retryPolicy = retryPolicy; }
 
     public DeadLetterConfig getDeadLetterConfig() { return deadLetterConfig; }
     public void setDeadLetterConfig(DeadLetterConfig deadLetterConfig) { this.deadLetterConfig = deadLetterConfig; }
+
+    public HttpParameters getHttpParameters() { return httpParameters; }
+    public void setHttpParameters(HttpParameters httpParameters) { this.httpParameters = httpParameters; }
 
     @RegisterForReflection
     @JsonIgnoreProperties(ignoreUnknown = true)

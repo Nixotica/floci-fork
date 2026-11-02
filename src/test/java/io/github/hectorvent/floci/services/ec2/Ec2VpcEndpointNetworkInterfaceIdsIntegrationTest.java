@@ -7,11 +7,13 @@ import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.List;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.everyItem;
 import static org.hamcrest.Matchers.matchesPattern;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -72,6 +74,25 @@ class Ec2VpcEndpointNetworkInterfaceIdsIntegrationTest {
                 "VpcId", vpcId, "CidrBlock", cidr, "AvailabilityZone", availabilityZone);
     }
 
+    private String associateIpv6Block(String vpcId) {
+        return ec2Value("AssociateVpcCidrBlock", "AssociateVpcCidrBlockResponse.ipv6CidrBlockAssociation.ipv6CidrBlock",
+                "VpcId", vpcId, "AmazonProvidedIpv6CidrBlock", "true");
+    }
+
+    /**
+     * The /64 at {@code offset} inside the VPC's /56. It is worked out from the address bytes
+     * rather than the text, because compressed text drops a zero fourth group.
+     */
+    private String ipv6SubnetCidr(String block, int offset) {
+        byte[] address = InetAddress.ofLiteral(block.substring(0, block.indexOf('/'))).getAddress();
+        address[7] = (byte) (address[7] + offset);
+        StringBuilder cidr = new StringBuilder();
+        for (int i = 0; i < 8; i += 2) {
+            cidr.append(Integer.toHexString(((address[i] & 0xff) << 8) | (address[i + 1] & 0xff))).append(':');
+        }
+        return cidr.append(":/64").toString();
+    }
+
     private XmlPath describeEndpoint(String endpointId) {
         return given()
             .formParam("Action", "DescribeVpcEndpoints")
@@ -109,16 +130,11 @@ class Ec2VpcEndpointNetworkInterfaceIdsIntegrationTest {
     }
 
     @Test
-    void theWireIdsAreTheInterfacesFlowLogAttributionReads() {
-        // THE PROPERTY THE DESIGN RESTS ON, and the one the other tests do not reach.
-        // They pin count, shape, distinctness and stability -- all of which an
-        // implementation deriving ids from the subnet id alone would satisfy while
-        // reporting interfaces that endpointNetworkInterfaces() denies exist. That is
-        // not hypothetical: an earlier version of endpointNetworkInterfaceIds called
-        // endpointEniId itself, lacked this method's skip of a vanished subnet, and the
-        // two were measured reporting different sets after a subnet was deleted out from
-        // under a live endpoint. Flow-log attribution reads the service side; Terraform
-        // reads the wire side; they have to be the same list.
+    void aSubnetUnderALiveEndpointCannotBeDeletedAndTheWireIdsStayTheServiceIds() {
+        // The interface an endpoint holds in a subnet pins that subnet, as on AWS: DeleteSubnet
+        // answers DependencyViolation until the endpoint is gone. Flow-log attribution reads
+        // the service side and Terraform reads the wire side, so after the refused delete both
+        // must still report the same two interfaces, in the same order.
         String vpcId = createVpc("10.77.0.0/16");
         String subnetA = createSubnet(vpcId, "10.77.1.0/24", "us-east-1a");
         String subnetB = createSubnet(vpcId, "10.77.2.0/24", "us-east-1b");
@@ -127,15 +143,12 @@ class Ec2VpcEndpointNetworkInterfaceIdsIntegrationTest {
                 "CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId",
                 "VpcId", vpcId, "ServiceName", "com.amazonaws.us-east-1.ec2",
                 "VpcEndpointType", "Interface", "SubnetId.1", subnetA, "SubnetId.2", subnetB);
+        List<String> before = eniIdsOf(endpointId);
 
-        // DELETE A SUBNET OUT FROM UNDER THE LIVE ENDPOINT. Without this the test is
-        // decorative: both derivations agree whenever every subnet still exists, so a
-        // version that skipped the vanished-subnet filter passed this assertion happily.
-        // Measured -- the first draft of this test did exactly that. Real AWS answers
-        // DependencyViolation here and Terraform's graph destroys the endpoint first, so
-        // the state is reachable only in an emulator; that is precisely why the emulator
-        // has to stay self-consistent in it rather than report two different answers.
-        ec2Value("DeleteSubnet", "DeleteSubnetResponse.return", "SubnetId", subnetB);
+        given().formParam("Action", "DeleteSubnet").formParam("SubnetId", subnetB)
+                .header("Authorization", AUTH_HEADER)
+                .when().post("/").then().statusCode(400)
+                .body("Response.Errors.Error.Code", equalTo("DependencyViolation"));
 
         List<String> onTheWire = eniIdsOf(endpointId);
 
@@ -148,26 +161,21 @@ class Ec2VpcEndpointNetworkInterfaceIdsIntegrationTest {
             }
         }
 
+        assertEquals(before, onTheWire, "a refused delete changes nothing about the endpoint");
         assertEquals(fromTheService, onTheWire,
                 "the ids DescribeVpcEndpoints publishes must be the interfaces the "
                 + "service reports, in the same order");
-        assertEquals(1, onTheWire.size(),
-                "the endpoint has one surviving subnet, so it reports one interface");
+        assertEquals(2, onTheWire.size(), "both subnets survive, so both interfaces are reported");
     }
 
     @Test
     void anEndpointOnASubnetWithoutIpv4StillAnswers() {
-        // REGRESSION GUARD for the request path this change created. Deriving the
-        // interfaces now happens while rendering CreateVpcEndpoint and
-        // DescribeVpcEndpoints, and that derivation computes a private IP by splitting
-        // the subnet's CidrBlock on dots. CreateSubnet stores whatever CidrBlock it is
-        // given without validating the family, so the value is not guaranteed to be
-        // dotted IPv4 -- and before the guard, parts[1] threw, turning an odd subnet into
-        // a FAILED EC2 response instead of a degraded address. Previously the same
-        // calculation ran only on the flow-log scheduler, where a throw was contained.
+        // Endpoint rendering must also work for IPv6-only subnets, whose IPv4 CIDR is absent.
+        // Use the IPv6 API field rather than placing an IPv6 value in the IPv4 CidrBlock field.
         String vpcId = createVpc("10.78.0.0/16");
+        String ipv6Block = associateIpv6Block(vpcId);
         String subnetId = ec2Value("CreateSubnet", "CreateSubnetResponse.subnet.subnetId",
-                "VpcId", vpcId, "CidrBlock", "2001:db8::/56",
+                "VpcId", vpcId, "Ipv6CidrBlock", ipv6SubnetCidr(ipv6Block, 0), "Ipv6Native", "true",
                 "AvailabilityZone", "us-east-1a");
 
         String endpointId = ec2Value("CreateVpcEndpoint",
@@ -193,11 +201,12 @@ class Ec2VpcEndpointNetworkInterfaceIdsIntegrationTest {
         // Caught in review, not by the test above, which uses a single subnet and so
         // cannot see a collision at all.
         String vpcId = createVpc("10.79.0.0/16");
+        String ipv6Block = associateIpv6Block(vpcId);
         String subnetA = ec2Value("CreateSubnet", "CreateSubnetResponse.subnet.subnetId",
-                "VpcId", vpcId, "CidrBlock", "2001:db8:1::/64",
+                "VpcId", vpcId, "Ipv6CidrBlock", ipv6SubnetCidr(ipv6Block, 0), "Ipv6Native", "true",
                 "AvailabilityZone", "us-east-1a");
         String subnetB = ec2Value("CreateSubnet", "CreateSubnetResponse.subnet.subnetId",
-                "VpcId", vpcId, "CidrBlock", "2001:db8:2::/64",
+                "VpcId", vpcId, "Ipv6CidrBlock", ipv6SubnetCidr(ipv6Block, 1), "Ipv6Native", "true",
                 "AvailabilityZone", "us-east-1b");
 
         String endpointId = ec2Value("CreateVpcEndpoint",

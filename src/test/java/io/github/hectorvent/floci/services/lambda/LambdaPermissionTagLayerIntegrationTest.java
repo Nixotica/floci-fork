@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.MethodOrderer;
@@ -8,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import java.io.ByteArrayOutputStream;
+import java.util.Base64;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -43,7 +45,7 @@ class LambdaPermissionTagLayerIntegrationTest {
     @Order(1)
     void createFunction() throws Exception {
         byte[] zip = minimalZip();
-        String zipBase64 = java.util.Base64.getEncoder().encodeToString(zip);
+        String zipBase64 = Base64.getEncoder().encodeToString(zip);
 
         given()
             .contentType("application/json")
@@ -139,7 +141,7 @@ class LambdaPermissionTagLayerIntegrationTest {
         // Policy is a JSON string — parse it and verify statements
         ObjectMapper om = new ObjectMapper();
         String policyJson = om.readTree(response).get("Policy").asText();
-        var policy = om.readTree(policyJson);
+        JsonNode policy = om.readTree(policyJson);
         assert policy.get("Statement").size() == 2;
     }
 
@@ -177,7 +179,7 @@ class LambdaPermissionTagLayerIntegrationTest {
 
         ObjectMapper om = new ObjectMapper();
         String policyJson = om.readTree(response).get("Policy").asText();
-        var policy = om.readTree(policyJson);
+        JsonNode policy = om.readTree(policyJson);
         assert policy.get("Statement").size() == 1;
     }
 

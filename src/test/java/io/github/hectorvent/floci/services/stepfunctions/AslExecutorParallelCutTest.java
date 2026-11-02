@@ -1,21 +1,6 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
-import io.github.hectorvent.floci.services.ec2.Ec2Service;
-import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
-import io.github.hectorvent.floci.services.ecs.EcsService;
-import io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler;
-import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
-import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
-import io.github.hectorvent.floci.services.s3.S3Service;
-import io.github.hectorvent.floci.services.scheduler.SchedulerController;
-import io.github.hectorvent.floci.services.scheduler.SchedulerService;
-import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
-import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
@@ -24,7 +9,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -62,6 +46,7 @@ import static org.mockito.Mockito.when;
  * <p>The failing branch pauses in a Wait that the sleeper holds until every other branch is
  * parked on its own wait, so the cut always lands while the others are mid-state.
  */
+@Timeout(20)
 class AslExecutorParallelCutTest {
 
     private static final String REGION = "us-east-2";
@@ -121,6 +106,7 @@ class AslExecutorParallelCutTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private StepFunctionsService sfnService;
     private List<HistoryEvent> history;
+    private Runnable nestedWaitStarted = () -> { };
 
     @BeforeEach
     void setUp() {
@@ -392,20 +378,23 @@ class AslExecutorParallelCutTest {
 
     /**
      * The failing branch's one-second Pause is held until {@code waitingBranches} other branch
-     * threads have started a sleep of their own (a {@code .sync} poll, or a longer Wait); every
+     * threads have entered a nested status wait or a longer Wait; every
      * other sleep is real, so the cut interrupts it.
      */
-    private static AslExecutor.Sleeper sleeper(int waitingBranches) {
+    private AslExecutor.Sleeper sleeper(int waitingBranches) {
         CountDownLatch othersWaiting = new CountDownLatch(waitingBranches);
         Set<Thread> seen = ConcurrentHashMap.newKeySet();
-        return nanos -> {
-            if (nanos == PAUSE_NANOS) {
-                othersWaiting.await();
-                return;
-            }
+        nestedWaitStarted = () -> {
             if (seen.add(Thread.currentThread())) {
                 othersWaiting.countDown();
             }
+        };
+        return nanos -> {
+            if (nanos == PAUSE_NANOS) {
+                assertTrue(othersWaiting.await(5, TimeUnit.SECONDS), "other branches must enter their waits");
+                return;
+            }
+            nestedWaitStarted.run();
             TimeUnit.NANOSECONDS.sleep(nanos);
         };
     }
@@ -414,29 +403,17 @@ class AslExecutorParallelCutTest {
     private AslExecutor newExecutor(AslExecutor.Sleeper sleeper) {
         Instance<StepFunctionsService> instance = mock(Instance.class);
         when(instance.get()).thenReturn(sfnService);
-        return new AslExecutor(
-                mock(LambdaExecutorService.class),
-                mock(LambdaFunctionStore.class),
-                mock(DynamoDbFacade.class),
-                mock(DynamoDbJsonHandler.class),
-                mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
-                mock(CloudFormationQueryHandler.class),
-                mock(Ec2Service.class),
-                mock(S3Service.class),
-                mock(EcsService.class),
-                mock(EcsJsonHandler.class),
-                mock(EventBridgeHandler.class),
-                mock(SchedulerService.class),
-                mock(SchedulerController.class),
-                objectMapper,
-                new JsonataEvaluator(objectMapper),
-                instance,
-                mock(EmulatorConfig.class),
-                null,
-                null,
-                Clock.systemUTC(),
-                sleeper,
-                30);
+        return AslExecutorFixture.builder()
+                .objectMapper(objectMapper)
+                .sfnService(instance)
+                .customResourceLiveness(null)
+                .sleeper(sleeper)
+                .nestedWaiter((subscription, observed, nanos) -> {
+                    nestedWaitStarted.run();
+                    subscription.awaitChange(observed, nanos);
+                })
+                .maxWaitSeconds(30)
+                .build();
     }
 
     private Execution run(String parallelState, int waitingBranches, int executionTimeoutSeconds) {

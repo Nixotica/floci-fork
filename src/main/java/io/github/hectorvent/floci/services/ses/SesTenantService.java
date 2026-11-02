@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ses.model.Tag;
@@ -19,8 +20,9 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.List;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -46,7 +48,7 @@ import java.util.regex.Pattern;
  * {@code DeleteTenant} callback. Tenant-scoped sending is a separate follow-up.
  */
 @ApplicationScoped
-public class SesTenantService {
+public class SesTenantService implements SesTaggable {
 
     private static final Logger LOG = Logger.getLogger(SesTenantService.class);
 
@@ -112,7 +114,7 @@ public class SesTenantService {
         String tenantId = generateTenantId();
         String tenantArn = AwsArnUtils.Arn.of("ses", region, accountId, "tenant/" + tenantName + "/" + tenantId).toString();
         Tenant tenant = new Tenant(tenantName, tenantId, tenantArn, Instant.now(clock), tags,
-                "ENABLED", attrs);
+                "ENABLED", attrs, null, null);
         // Only the check-then-put needs to be atomic, so two concurrent creates for the same name can't
         // both observe the key as absent; the id/ARN/record are built outside the lock.
         synchronized (tenantMutationLock) {
@@ -146,6 +148,50 @@ public class SesTenantService {
         return tenantStore.scan(k -> k.startsWith(prefix)).stream()
                 .sorted(Comparator.comparing(Tenant::tenantName))
                 .toList();
+    }
+
+    /**
+     * ListTenants with a {@code Filter}, probed 2026-10-03. The controller has already checked the
+     * filter's keys and values; SES then checks the page size and an empty token, the filter's
+     * values, and last the token. The name is not trimmed and is found anywhere in a tenant's name
+     * without regard to case, the keys combine, and a token is bound to the filter it came from.
+     * Whether SES checks the name or the status first could not be observed.
+     */
+    public PaginatedResult<Tenant> listTenants(String region, Map<String, String> filter, Integer pageSize,
+                                               String nextToken) {
+        SesListPaging paging = SesListPaging.V2_LIST_TENANTS;
+        paging.checkRequest(pageSize, nextToken);
+        String name = filterName(filter.get("TENANT_NAME_CONTAINS"));
+        String status = filterSendingStatus(filter.get("SENDING_STATUS"));
+        List<Tenant> matching = listTenants(region).stream()
+                .filter(t -> name == null || t.tenantName().toLowerCase(Locale.ROOT).contains(name))
+                .filter(t -> status == null || status.equals(t.sendingStatus()))
+                .toList();
+        // The status goes first: its values never hold the separator, so no name can pass for
+        // another filter.
+        String scope = filter.isEmpty() ? "" : Objects.toString(status, "") + "/" + Objects.toString(name, "");
+        return paging.page(region, scope, matching, Tenant::tenantName, pageSize, nextToken);
+    }
+
+    /** SES sets no upper bound short of the name's own: 65 characters were accepted. */
+    private static String filterName(String value) {
+        if (value == null) {
+            return null;
+        }
+        if (value.codePointCount(0, value.length()) < 3) {
+            throw new AwsException("BadRequestException", "TENANT_NAME_CONTAINS must be at least 3 characters.", 400);
+        }
+        return value.toLowerCase(Locale.ROOT);
+    }
+
+    private static String filterSendingStatus(String value) {
+        if (value == null) {
+            return null;
+        }
+        return switch (value) {
+            case "ENABLED", "REINSTATED", "DISABLED" -> value;
+            default -> throw new AwsException("BadRequestException", "Invalid sending status <" + value + ">.", 400);
+        };
     }
 
     public void deleteTenant(String tenantName, String region) {
@@ -196,6 +242,33 @@ public class SesTenantService {
     }
 
     /**
+     * Resolves a tenant by its full ARN, for the reputation entity operations: unlike the tag
+     * operations, SES matches the whole ARN there, name and id both (probe-confirmed).
+     */
+    public Optional<Tenant> findByArn(String tenantArn, String region) {
+        String resource = AwsArnUtils.resourceIfArnFor(tenantArn, "ses").orElse("");
+        String[] segments = resource.split("/", -1);
+        if (segments.length != 3 || !"tenant".equals(segments[0])) {
+            return Optional.empty();
+        }
+        return tenantStore.get(tenantKey(region, segments[1]))
+                .filter(t -> t.tenantArn().equals(tenantArn));
+    }
+
+    /**
+     * Applies {@code mutation} to the tenant with this ARN under the shared lock, so a concurrent
+     * tag, suppression-attribute or reputation update is not overwritten by a stale copy. Returns
+     * the updated tenant, empty when no tenant has the ARN.
+     */
+    public Optional<Tenant> updateByArn(String tenantArn, String region, UnaryOperator<Tenant> mutation) {
+        synchronized (tenantMutationLock) {
+            Optional<Tenant> updated = findByArn(tenantArn, region).map(mutation);
+            updated.ifPresent(t -> tenantStore.put(tenantKey(region, t.tenantName()), t));
+            return updated;
+        }
+    }
+
+    /**
      * The name/id decomposition of a tenant tag ARN's resource remainder ({@code <name>/<tenantId>}
      * after the generic dispatch split off the {@code tenant/} type segment). AWS parses a remainder
      * without a slash as a null name with the whole segment as the id, and resolves by the id alone
@@ -210,6 +283,7 @@ public class SesTenantService {
     }
 
     /** The ARN-dispatched tag operations; {@code resourceRemainder} is the ARN's {@code <name>/<tenantId>} part. */
+    @Override
     public List<Tag> listTags(String resourceRemainder, String region) {
         Tenant tenant = tenantForTagArn(resourceRemainder, region);
         // AWS returns a tenant's tags ordered by key (probe-confirmed).
@@ -218,12 +292,14 @@ public class SesTenantService {
                 .toList();
     }
 
+    @Override
     public void tag(String resourceRemainder, String region, List<Tag> newTags) {
         mutateTags(resourceRemainder, region, tags -> SesTags.merge(tags, newTags));
         LOG.infov("Tagged SES tenant <{0}> (region {1}, +{2} tags)",
                 resourceRemainder, region, newTags.size());
     }
 
+    @Override
     public void untag(String resourceRemainder, String region, List<String> tagKeys) {
         Set<String> toRemove = new HashSet<>(tagKeys);
         mutateTags(resourceRemainder, region, tags -> {
@@ -330,20 +406,19 @@ public class SesTenantService {
      */
     public static AssociationResource parseResourceArn(String resourceArn, String accountId, String region) {
         if (resourceArn == null) {
-            throw new AwsException("BadRequestException",
-                    "1 validation error detected: Value at 'resourceArn' failed to satisfy constraint: "
-                            + "Member must not be null", 400);
+            throw SmithyValidationErrors.badRequest(
+                    SmithyValidationErrors.notNullWithoutValue("resourceArn"));
         }
-        String[] parts = resourceArn.split(":", 6);
-        if (parts.length < 6 || !"arn".equals(parts[0])) {
+        if (!AwsArnUtils.isArn(resourceArn)) {
             throw new AwsException("BadRequestException",
                     "Provided resource identifier is not an SES resource", 400);
         }
-        if (!"ses".equals(parts[2])) {
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(resourceArn);
+        if (!"ses".equals(parsed.service())) {
             throw new AwsException("BadRequestException",
                     "Provided ARN is not in SES resource ARN format", 400);
         }
-        String resource = parts[5];
+        String resource = parsed.resource();
         int slash = resource.indexOf('/');
         String type = slash < 0 ? resource : resource.substring(0, slash);
         if (!SUPPORTED_RESOURCE_TYPES.contains(type)) {
@@ -355,11 +430,11 @@ public class SesTenantService {
             throw new AwsException("BadRequestException",
                     "Provided resource identifier is not an SES resource", 400);
         }
-        if (!region.equals(parts[3])) {
+        if (!region.equals(parsed.region())) {
             throw new AwsException("BadRequestException",
                     "Resource <" + resourceArn + "> must be in the same region", 400);
         }
-        if (!accountId.equals(parts[4])) {
+        if (!accountId.equals(parsed.accountId())) {
             throw new AwsException("BadRequestException",
                     "Resource <" + resourceArn + "> must be in the same account", 400);
         }
@@ -419,9 +494,13 @@ public class SesTenantService {
                 ref.arn(), tenant.tenantName(), region);
     }
 
-    public PaginatedResult<TenantResourceAssociation> listTenantResources(Tenant tenant, String typeFilter,
+    // Probe-confirmed order: the tenant is resolved first and the filter is checked next, so a bad page
+    // on a missing tenant is the 404; the page size and token come last.
+    public PaginatedResult<TenantResourceAssociation> listTenantResources(String tenantName, String typeFilter,
                                                                           String region, SesListPaging paging,
                                                                           Integer pageSize, String nextToken) {
+        Tenant tenant = tenantForAssociation(tenantName, region);
+        validateResourceTypeFilter(typeFilter);
         return paging.page(region, tenant.tenantId() + "/" + Objects.toString(typeFilter, ""),
                 listTenantResources(tenant, typeFilter, region), TenantResourceAssociation::resourceArn,
                 pageSize, nextToken);
@@ -481,7 +560,7 @@ public class SesTenantService {
 
     // Stored ARNs were validated by parseResourceArn, so the resource part always has a name segment.
     private static String resourceNameFromArn(String arn) {
-        String resource = arn.split(":", 6)[5];
+        String resource = AwsArnUtils.parse(arn).resource();
         return resource.substring(resource.indexOf('/') + 1);
     }
 
@@ -561,9 +640,9 @@ public class SesTenantService {
         }
         if (suppressionScope != null && !"TENANT".equals(suppressionScope)
                 && !"ACCOUNT".equals(suppressionScope)) {
-            throw new AwsException("BadRequestException",
-                    "1 validation error detected: Value at 'suppressionScope' failed to satisfy "
-                            + "constraint: Member must satisfy enum value set: [TENANT, ACCOUNT]", 400);
+            throw SmithyValidationErrors.badRequest(
+                    "Value at 'suppressionScope' failed to satisfy "
+                            + "constraint: Member must satisfy enum value set: [TENANT, ACCOUNT]");
         }
         if (suppressedReasons != null) {
             Set<String> seen = new HashSet<>();
@@ -597,17 +676,16 @@ public class SesTenantService {
     private static void validateTenantName(String name, boolean createTenantSmithyVariants) {
         if (name == null) {
             if (createTenantSmithyVariants) {
-                throw new AwsException("BadRequestException",
-                        "1 validation error detected: Value at 'tenantName' failed to satisfy "
-                                + "constraint: Member must not be null", 400);
+                throw SmithyValidationErrors.badRequest(
+                        SmithyValidationErrors.notNullWithoutValue("tenantName"));
             }
             throw new AwsException("BadRequestException", "TenantName cannot be empty", 400);
         }
         if (name.isEmpty()) {
             if (createTenantSmithyVariants) {
-                throw new AwsException("BadRequestException",
-                        "1 validation error detected: Value at 'tenantName' failed to satisfy "
-                                + "constraint: Member must have length greater than or equal to 1", 400);
+                throw SmithyValidationErrors.badRequest(
+                        "Value at 'tenantName' failed to satisfy "
+                                + "constraint: Member must have length greater than or equal to 1");
             }
             throw new AwsException("BadRequestException", "TenantName cannot be empty", 400);
         }

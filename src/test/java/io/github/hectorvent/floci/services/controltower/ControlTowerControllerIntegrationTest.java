@@ -4,9 +4,9 @@ import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.organizations.model.OrganizationalUnit;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
-import jakarta.inject.Inject;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -70,6 +70,23 @@ class ControlTowerControllerIntegrationTest {
                 .statusCode(200)
                 .body("arn", containsString(":landingzone/"))
                 .body("operationIdentifier", containsString("-"));
+    }
+
+    @Test
+    void getLandingZoneAcceptsLandingZoneIdLikeTheTerraformProvider() {
+        String authorization = auth("000000000250", EAST);
+        String arn = listLandingZonesArn(authorization);
+        String id = arn.substring(arn.lastIndexOf('/') + 1);
+
+        given()
+                .contentType("application/json")
+                .header("Authorization", authorization)
+                .body("{\"landingZoneIdentifier\":\"" + id + "\"}")
+                .when()
+                .post("/get-landingzone")
+                .then()
+                .statusCode(200)
+                .body("landingZone.arn", equalTo(arn));
     }
 
     @Test

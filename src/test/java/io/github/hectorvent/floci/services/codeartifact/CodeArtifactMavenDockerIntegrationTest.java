@@ -1,10 +1,12 @@
 package io.github.hectorvent.floci.services.codeartifact;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.github.hectorvent.floci.testing.SidecarContainersProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.path.json.JsonPath;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -18,6 +20,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -25,6 +31,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -88,6 +95,13 @@ class CodeArtifactMavenDockerIntegrationTest {
         given().header("Authorization", "Bearer " + bearerToken)
                 .head("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + GAV)
                 .then().statusCode(200);
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike")
+                .then().statusCode(200).body("package.name", equalTo("spike"))
+                .body("package.namespace", equalTo("com.example"))
+                .body("package.originConfiguration.restrictions.publish", equalTo("ALLOW"));
     }
 
     /**
@@ -146,6 +160,11 @@ class CodeArtifactMavenDockerIntegrationTest {
         given().header("Authorization", "Bearer " + bearerToken)
                 .get("/codeartifact/maven/" + DOMAIN + "/no-such-repo/does/not/exist.jar")
                 .then().statusCode(404);
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=does-not-exist")
+                .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
     }
 
     @Test
@@ -356,6 +375,463 @@ class CodeArtifactMavenDockerIntegrationTest {
         // entry, specifically, is what disappeared from the real shared instance's own settings
         // list, not just that Floci stopped tracking the CodeArtifact-side metadata.
         assertEquals(repositoryCountBeforeDelete - 1, reposiliteSettingsRepositoryCount());
+    }
+
+    /**
+     * The real-world gap this closes: {@code GetPackageVersionAsset} used to 404 for every
+     * Maven-deployed artifact since Floci's generic-format package-version store never had a
+     * record for it (Maven publishing goes straight to Reposilite, bypassing it entirely). Proves
+     * the JSON API now bridges to the same artifact {@link #deployThenFetchRoundTripsTheExactBytes}
+     * already confirmed is really there, through the real sidecar, not a mock.
+     */
+    @Test
+    @Order(12)
+    void getPackageVersionAssetBridgesToTheRealReposiliteSidecar() {
+        byte[] fetched = given().header("Authorization", AUTH)
+                .get("/v1/package/version/asset?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=1.0.0&asset=spike-1.0.0.jar")
+                .then().statusCode(200)
+                .header("X-AssetName", equalTo("spike-1.0.0.jar"))
+                .header("X-PackageVersion", equalTo("1.0.0"))
+                .extract().asByteArray();
+        assertEquals("real-jar-bytes", new String(fetched, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    @Order(12)
+    void getPackageVersionAssetRequiresANamespaceForMaven() {
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/asset?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&package=spike&version=1.0.0&asset=spike-1.0.0.jar")
+                .then().statusCode(400);
+    }
+
+    @Test
+    @Order(12)
+    void getPackageVersionAssetReturns404ForAMavenAssetThatWasNeverDeployed() {
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version/asset?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=1.0.0&asset=does-not-exist.jar")
+                .then().statusCode(404);
+    }
+
+    /**
+     * The real-world gap this closes: {@code DescribePackageVersion} used to 404 for every
+     * Maven-deployed version the same reason {@code GetPackageVersionAsset} did. Confirms the
+     * bridge asks the real Reposilite sidecar (via its details API, not a mock) whether the
+     * version directory itself exists, and that the synthesized revision matches what {@link
+     * #getPackageVersionAssetBridgesToTheRealReposiliteSidecar} already got for the same
+     * coordinates.
+     */
+    @Test
+    @Order(12)
+    void describePackageVersionBridgesToTheRealReposiliteSidecar() {
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=1.0.0")
+                .then().statusCode(200)
+                .body("packageVersion.status", equalTo("Published"))
+                .body("packageVersion.namespace", equalTo("com.example"))
+                .body("packageVersion.packageName", equalTo("spike"))
+                .body("packageVersion.version", equalTo("1.0.0"));
+
+        String assetRevision = given().header("Authorization", AUTH)
+                .get("/v1/package/version/asset?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=1.0.0&asset=spike-1.0.0.jar")
+                .then().statusCode(200)
+                .extract().header("X-PackageVersionRevision");
+        String describeRevision = given().header("Authorization", AUTH)
+                .get("/v1/package/version?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=1.0.0")
+                .then().statusCode(200)
+                .extract().jsonPath().getString("packageVersion.revision");
+        assertEquals(assetRevision, describeRevision);
+    }
+
+    @Test
+    @Order(16)
+    void describePackageVersionRequiresANamespaceForMaven() {
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&package=spike&version=1.0.0")
+                .then().statusCode(400);
+    }
+
+    @Test
+    @Order(17)
+    void describePackageVersionReturns404ForAMavenVersionThatWasNeverDeployed() {
+        given().header("Authorization", AUTH)
+                .get("/v1/package/version?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=9.9.9")
+                .then().statusCode(404);
+    }
+
+    /**
+     * The real-world gap this closes: {@code CopyPackageVersions} used to only support the
+     * generic format, since Maven, npm, pypi, and nuget all keep their published assets straight
+     * in their own sidecar rather than a {@code packageVersions} record. Confirms the bridge
+     * reads every asset from the real Reposilite sidecar (not a mock) and writes them to the
+     * destination repository's own Reposilite path, byte for byte. {@code other-repo} is the
+     * empty repository {@link #repositoriesAreIsolatedFromEachOther} already created and never
+     * published to.
+     */
+    @Test
+    @Order(18)
+    void copyPackageVersionsBridgesToTheRealReposiliteSidecar() {
+        byte[] jarBytes = "copy-me-jar-bytes".getBytes(StandardCharsets.UTF_8);
+        byte[] pomBytes = "copy-me-pom-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(jarBytes)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/copyme/1.0.0/copyme-1.0.0.jar")
+                .then().statusCode(200);
+        given().header("Authorization", "Bearer " + bearerToken).body(pomBytes)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/copyme/1.0.0/copyme-1.0.0.pom")
+                .then().statusCode(200);
+
+        String revision = given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"]}")
+                .post("/v1/package/versions/copy?domain=" + DOMAIN + "&source-repository=" + REPO
+                        + "&destination-repository=other-repo&format=maven&namespace=com.example&package=copyme")
+                .then().statusCode(200)
+                .body("successfulVersions.'1.0.0'.status", equalTo("Published"))
+                .body("failedVersions.size()", equalTo(0))
+                .extract().jsonPath().getString("successfulVersions.'1.0.0'.revision");
+        assertTrue(revision != null && !revision.isBlank());
+
+        byte[] copiedJar = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/other-repo/com/example/copyme/1.0.0/copyme-1.0.0.jar")
+                .then().statusCode(200)
+                .extract().asByteArray();
+        byte[] copiedPom = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/other-repo/com/example/copyme/1.0.0/copyme-1.0.0.pom")
+                .then().statusCode(200)
+                .extract().asByteArray();
+        assertEquals("copy-me-jar-bytes", new String(copiedJar, StandardCharsets.UTF_8));
+        assertEquals("copy-me-pom-bytes", new String(copiedPom, StandardCharsets.UTF_8));
+
+        String metadata = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/other-repo/com/example/copyme/maven-metadata.xml")
+                .then().statusCode(200)
+                .extract().asString();
+        assertTrue(metadata.contains("<version>1.0.0</version>"), metadata);
+        assertTrue(metadata.contains("<latest>1.0.0</latest>"), metadata);
+        assertTrue(metadata.contains("<release>1.0.0</release>"), metadata);
+    }
+
+    /**
+     * The real-world bug this closes: the destination already had {@code copyme-overwrite-1.0.0.jar}
+     * under the exact same name with different bytes, and Reposilite's own {@code
+     * redeployment: false} setting (confirmed live against this same container earlier in this
+     * class) rejects a plain PUT over it. Without deleting the old one first, this copy's PUT
+     * would come back {@code 409} even though {@code allowOverwrite} was set.
+     */
+    @Test
+    @Order(19)
+    void copyPackageVersionsOverwritesASameNamedAssetWithDifferentContentAtTheRealSidecar() {
+        byte[] oldJarBytes = "old-overwrite-jar-bytes".getBytes(StandardCharsets.UTF_8);
+        byte[] newJarBytes = "new-overwrite-jar-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(oldJarBytes)
+                .put("/codeartifact/maven/" + DOMAIN + "/other-repo/com/example/copyover/1.0.0/copyover-1.0.0.jar")
+                .then().statusCode(200);
+        given().header("Authorization", "Bearer " + bearerToken).body(newJarBytes)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/copyover/1.0.0/copyover-1.0.0.jar")
+                .then().statusCode(200);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"],\"allowOverwrite\":true}")
+                .post("/v1/package/versions/copy?domain=" + DOMAIN + "&source-repository=" + REPO
+                        + "&destination-repository=other-repo&format=maven&namespace=com.example&package=copyover")
+                .then().statusCode(200)
+                .body("successfulVersions.'1.0.0'.status", equalTo("Published"))
+                .body("failedVersions.size()", equalTo(0));
+
+        byte[] copied = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/other-repo/com/example/copyover/1.0.0/copyover-1.0.0.jar")
+                .then().statusCode(200)
+                .extract().asByteArray();
+        assertEquals("new-overwrite-jar-bytes", new String(copied, StandardCharsets.UTF_8));
+    }
+
+    /**
+     * The real-world gap this closes: {@code ListPackageVersionAssets} used to not exist at all.
+     * Confirms the bridge enumerates {@link #GAV}'s own version directory against the real
+     * Reposilite sidecar (not a mock) and reports the exact byte size and hash of the asset
+     * already deployed to it in {@link #deployThenFetchRoundTripsTheExactBytes}.
+     */
+    @Test
+    @Order(20)
+    void listPackageVersionAssetsBridgesToTheRealReposiliteSidecar() {
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/package/version/assets?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike&version=1.0.0")
+                .then().statusCode(200)
+                .body("package", equalTo("spike"))
+                .body("assets.size()", equalTo(1))
+                .body("assets[0].name", equalTo("spike-1.0.0.jar"))
+                .body("assets[0].size", equalTo("real-jar-bytes".getBytes(StandardCharsets.UTF_8).length))
+                .extract().jsonPath();
+        Map<String, String> hashes = body.getMap("assets[0].hashes");
+        assertEquals(Digests.sha256Hex("real-jar-bytes".getBytes(StandardCharsets.UTF_8)), hashes.get("SHA-256"));
+    }
+
+    /**
+     * Bridges to the same real Reposilite sidecar {@link #listPackageVersionAssetsBridgesToTheRealReposiliteSidecar}
+     * already confirmed holds {@code spike}'s {@code 1.0.0}, walking the artifact-level directory
+     * listing one level up from that test's own version directory.
+     */
+    @Test
+    @Order(21)
+    void listPackageVersionsBridgesToTheRealReposiliteSidecar() {
+        given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=spike")
+                .then().statusCode(200)
+                .body("package", equalTo("spike"))
+                .body("defaultDisplayVersion", equalTo("1.0.0"))
+                .body("versions.size()", equalTo(1))
+                .body("versions[0].version", equalTo("1.0.0"))
+                .body("versions[0].status", equalTo("Published"))
+                .body("versions[0].origin.originType", equalTo("INTERNAL"));
+    }
+
+    /**
+     * The real-world gap this guards against: {@code ReposiliteSidecarClient#listPackageVersions}
+     * used to fetch every version's publish-time details page one at a time, so a package with
+     * many versions still answered no faster than its slowest version's own round trip, times the
+     * version count. This deploys enough versions that a broken fan-out (dropped, duplicated, or
+     * silently empty results from the bounded executor) would show up as something other than
+     * exactly this set of versions, against the real Reposilite sidecar, not a mock.
+     */
+    @Test
+    @Order(22)
+    void listPackageVersionsFetchesManyVersionsPublishTimesCorrectly() {
+        String packageName = "manyversions";
+        int versionCount = 12;
+        Set<String> expectedVersions = new HashSet<>();
+        for (int i = 1; i <= versionCount; i++) {
+            String version = "1.0." + i;
+            expectedVersions.add(version);
+            byte[] content = ("many-versions-bytes-" + i).getBytes(StandardCharsets.UTF_8);
+            given().header("Authorization", "Bearer " + bearerToken).body(content)
+                    .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/" + packageName + "/" + version
+                            + "/" + packageName + "-" + version + ".jar")
+                    .then().statusCode(200);
+        }
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=" + packageName)
+                .then().statusCode(200)
+                .body("package", equalTo(packageName))
+                .body("versions.size()", equalTo(versionCount))
+                .extract().jsonPath();
+        List<String> actualVersions = body.getList("versions.version", String.class);
+        assertEquals(expectedVersions, new HashSet<>(actualVersions));
+        String defaultDisplayVersion = body.getString("defaultDisplayVersion");
+        assertTrue(expectedVersions.contains(defaultDisplayVersion),
+                "expected defaultDisplayVersion to be one of the deployed versions, got "
+                        + defaultDisplayVersion);
+    }
+
+    /**
+     * A throwaway groupId/artifactId, not {@link #GAV}: disposing it is destructive (the real
+     * assets are gone afterward), and must not disturb the artifact every other test in this class
+     * shares. Confirms the whole real round trip: {@code DisposePackageVersions} deletes the real
+     * jar/pom through Reposilite's own asset-delete endpoint, a subsequent fetch 404s, and
+     * {@code ListPackageVersions} still reports the version, by status {@code Disposed} alone,
+     * since the real sidecar listing no longer names it at all once its content is gone.
+     */
+    @Test
+    @Order(23)
+    void disposePackageVersionsDeletesTheRealReposiliteAssetsAndKeepsListingTheVersionAsDisposed() {
+        byte[] content = "dispose-me-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/disposeme/1.0.0/disposeme-1.0.0.jar")
+                .then().statusCode(200);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"]}")
+                .post("/v1/package/versions/dispose?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=disposeme")
+                .then().statusCode(200)
+                .body("successfulVersions['1.0.0'].status", equalTo("Disposed"))
+                .body("failedVersions.size()", equalTo(0));
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/disposeme/1.0.0/disposeme-1.0.0.jar")
+                .then().statusCode(404);
+
+        given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=disposeme&status=Disposed")
+                .then().statusCode(200)
+                .body("versions.size()", equalTo(1))
+                .body("versions[0].version", equalTo("1.0.0"))
+                .body("versions[0].status", equalTo("Disposed"));
+    }
+
+    /**
+     * A throwaway groupId/artifactId, not {@link #GAV}: {@code ListPackages} walks Reposilite's
+     * whole directory tree repository-wide, so publishing its own package here (rather than
+     * reusing one another test already created) keeps this test's own expected set independent of
+     * whatever else this class's shared repository happens to hold by the time it runs.
+     */
+    @Test
+    @Order(24)
+    void listPackagesWalksTheRealReposiliteDirectoryTreeToFindTheGroupAndArtifact() {
+        byte[] content = "list-packages-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO
+                        + "/com/example/nested/listpkgsprobe/1.0.0/listpkgsprobe-1.0.0.jar")
+                .then().statusCode(200);
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/packages?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example.nested")
+                .then().statusCode(200)
+                .extract().jsonPath();
+        List<String> names = body.getList("packages.package", String.class);
+        List<String> namespaces = body.getList("packages.namespace", String.class);
+        assertTrue(names.contains("listpkgsprobe"), "expected listpkgsprobe among " + names);
+        assertEquals("com.example.nested", namespaces.get(names.indexOf("listpkgsprobe")));
+    }
+
+    /**
+     * Closes 10-NATIVE-STATUS for Maven: a plain {@code mvn dependency:get} fetch of an Archived
+     * version's real GAV path must 404 against the real Reposilite sidecar, even though the jar's
+     * own bytes are still sitting there untouched (unlike {@link
+     * #disposePackageVersionsDeletesTheRealReposiliteAssetsAndKeepsListingTheVersionAsDisposed}'s
+     * own 404, which comes from Reposilite genuinely no longer having the file).
+     */
+    @Test
+    @Order(24)
+    void deployThenArchiveBlocksBothGetAndHeadAgainstTheRealReposiliteSidecarWhileLeavingTheBytesInPlace() {
+        byte[] content = "archive-me-bytes".getBytes(StandardCharsets.UTF_8);
+        String gav = "com/example/archiveme/1.0.0/archiveme-1.0.0.jar";
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + gav)
+                .then().statusCode(200);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"],\"targetStatus\":\"Archived\"}")
+                .post("/v1/package/versions/update_status?domain=" + DOMAIN + "&repository=" + REPO
+                        + "&format=maven&namespace=com.example&package=archiveme")
+                .then().statusCode(200)
+                .body("successfulVersions['1.0.0'].status", equalTo("Archived"));
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + gav)
+                .then().statusCode(404);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .head("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + gav)
+                .then().statusCode(404);
+
+        given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=archiveme&status=Archived")
+                .then().statusCode(200)
+                .body("versions[0].version", equalTo("1.0.0"))
+                .body("versions[0].status", equalTo("Archived"));
+
+        // Proves the block above is this check's own override, not Reposilite having genuinely
+        // lost the file the way the dispose test's 404 does: un-archiving must make the exact
+        // same bytes fetchable again, with nothing re-deployed in between.
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"],\"targetStatus\":\"Published\"}")
+                .post("/v1/package/versions/update_status?domain=" + DOMAIN + "&repository=" + REPO
+                        + "&format=maven&namespace=com.example&package=archiveme")
+                .then().statusCode(200)
+                .body("successfulVersions['1.0.0'].status", equalTo("Published"));
+        byte[] fetchedAfterUnarchive = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + gav)
+                .then().statusCode(200)
+                .extract().asByteArray();
+        assertEquals(new String(content, StandardCharsets.UTF_8),
+                new String(fetchedAfterUnarchive, StandardCharsets.UTF_8));
+    }
+
+    /**
+     * A throwaway groupId/artifactId, not {@link #GAV}: deleting it exercises Reposilite's real
+     * directory delete (confirmed live before this was built: a single {@code DELETE} on the
+     * group/artifact path removes everything beneath it), and must not disturb the artifact every
+     * other test in this class shares.
+     */
+    @Test
+    @Order(13)
+    void deletePackageRemovesTheWholeReposiliteArtifactDirectory() {
+        byte[] content = "delete-me-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/deleteme/1.0.0/deleteme-1.0.0.jar")
+                .then().statusCode(200);
+
+        given().header("Authorization", AUTH)
+                .delete("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=deleteme")
+                .then().statusCode(200).body("deletedPackage.package", equalTo("deleteme"));
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/deleteme/1.0.0/deleteme-1.0.0.jar")
+                .then().statusCode(404);
+
+        given().header("Authorization", AUTH)
+                .get("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=deleteme")
+                .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
+    }
+
+    /**
+     * Asserts the delta rather than an absolute total: this class shares one domain across every
+     * ordered test, so other artifacts already contribute to the running total by this point.
+     * {@code assetSizeBytes} used to be hardcoded to {@code 0} regardless of what was actually
+     * published; this is the real Reposilite round trip proving a Maven deploy now counts.
+     */
+    @Test
+    @Order(14)
+    void describeDomainAssetSizeBytesIncreasesByExactlyWhatWasDeployed() {
+        long before = given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
+
+        byte[] content = "asset-size-accounting-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/sizecheck/1.0.0/sizecheck-1.0.0.jar")
+                .then().statusCode(200);
+
+        long after = given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
+
+        assertEquals(before + content.length, after);
+    }
+
+    /**
+     * {@code mvn deploy} always PUTs a {@code maven-metadata.xml} straight to the group/artifact
+     * directory too, with no version segment: {@code com/example/metacheck/maven-metadata.xml} is
+     * only one segment shorter than a real versioned asset path, the same four segments as the
+     * shortest real GAV ({@code group/artifact/version/filename}). It must not be mistaken for
+     * one and misattributed one groupId component too shallow; it is still a real, successful
+     * write, so its bytes still belong in the total.
+     */
+    @Test
+    @Order(15)
+    void describeDomainAssetSizeBytesCountsAGroupLevelMavenMetadataUpload() {
+        long before = given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
+
+        byte[] metadata = "<metadata><groupId>com.example</groupId></metadata>".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(metadata)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/metacheck/maven-metadata.xml")
+                .then().statusCode(200);
+
+        long after = given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
+
+        assertEquals(before + metadata.length, after);
     }
 
     /**

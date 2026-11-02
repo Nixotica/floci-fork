@@ -20,7 +20,9 @@ public class SessionCredential {
     private String sessionPolicyDocument;
     /**
      * Account of the caller that minted this session, captured at mint time. Used to route
-     * temporary credentials that carry no role ARN (e.g. GetSessionToken) back to the caller.
+     * temporary credentials that carry no role ARN (e.g. GetSessionToken) back to the caller. A
+     * delegated session holds the customer's account here instead of the partner's that redeemed
+     * the token, that being the account the credentials act in.
      */
     private String originAccountId;
     /** True when this session belongs to a Floci-launched Lambda container. */
@@ -32,6 +34,24 @@ public class SessionCredential {
     /** Exact object action and ARN for an internally generated S3 presigned URL. */
     private String presignedAction;
     private String presignedResourceArn;
+    /** Exact scratch object ARN permitted for an internal Redshift Spectrum transfer session. */
+    private String spectrumScratchResourceArn;
+    /**
+     * The long-term identity whose key minted this session through GetSessionToken or
+     * GetFederationToken: an IAM user's ARN, or the account root's. Null for every other session.
+     */
+    private String issuerArn;
+    /** The unique ID of the IAM user named by {@link #issuerArn}, so a same-named replacement is not it. */
+    private String issuerUserId;
+    /**
+     * The identity that approved the delegation request these credentials were exchanged for, which
+     * AcceptDelegationRequest records as the one "that gets mapped to the delegated credential" and
+     * GetDelegatedAccessToken reports as its {@code AssumedPrincipal}. Null for every other
+     * session. It is held apart from {@link #roleArn} because it is whatever identity approved the
+     * request, an IAM user or the account root as much as a role, and reading it as a role would
+     * resolve it by name.
+     */
+    private String delegatedApproverArn;
 
     public SessionCredential() {}
 
@@ -121,6 +141,20 @@ public class SessionCredential {
     public String getPresignedResourceArn() { return presignedResourceArn; }
     public void setPresignedResourceArn(String presignedResourceArn) { this.presignedResourceArn = presignedResourceArn; }
 
+    public String getSpectrumScratchResourceArn() { return spectrumScratchResourceArn; }
+    public void setSpectrumScratchResourceArn(String spectrumScratchResourceArn) {
+        this.spectrumScratchResourceArn = spectrumScratchResourceArn;
+    }
+
     public boolean isLambdaExecutionRole() { return lambdaExecutionRole; }
     public void setLambdaExecutionRole(boolean lambdaExecutionRole) { this.lambdaExecutionRole = lambdaExecutionRole; }
+
+    public String getIssuerArn() { return issuerArn; }
+    public void setIssuerArn(String issuerArn) { this.issuerArn = issuerArn; }
+
+    public String getIssuerUserId() { return issuerUserId; }
+    public void setIssuerUserId(String issuerUserId) { this.issuerUserId = issuerUserId; }
+
+    public String getDelegatedApproverArn() { return delegatedApproverArn; }
+    public void setDelegatedApproverArn(String arn) { this.delegatedApproverArn = arn; }
 }

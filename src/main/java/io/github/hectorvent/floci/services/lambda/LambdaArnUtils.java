@@ -2,7 +2,10 @@ package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 
+import java.util.Arrays;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -22,12 +25,24 @@ public final class LambdaArnUtils {
     private static final Pattern NAME_PATTERN = Pattern.compile("[a-zA-Z0-9-_]+");
     private static final int MAX_NAME_LENGTH = 64;
     private static final int MAX_TOTAL_LENGTH = 140;
-    private static final String NAME_REGEX = "(arn:(aws[a-zA-Z-]*)?:lambda:)?([a-z]{2}(-gov)?-[a-z]+-\\d{1}:)?"
+    /** The NamespacedFunctionName shape used by Lambda's attachment and mapping APIs. */
+    public static final Pattern NAMESPACED_FUNCTION_NAME_PATTERN = Pattern.compile(
+            "^(arn:(aws[a-zA-Z-]*)?:lambda:)?(?<region>(eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"
+                    + "(?<account>\\d{12}:)?(function:)?(?<name>[a-zA-Z0-9-_\\.]+)"
+                    + "(?::(?<qualifier>\\$LATEST(\\.PUBLISHED)?|[a-zA-Z0-9-_]+))?$");
+    /** The model's {@code FunctionName} pattern, quoted in the ValidationException a bad name gets. */
+    private static final String NAME_REGEX = "(arn:(aws[a-zA-Z-]*)?:lambda:)?"
+            + "((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"
             + "(\\d{12}:)?(function:)?([a-zA-Z0-9-_]+)(:(\\$LATEST|[a-zA-Z0-9-_]+))?";
     private static final Pattern ACCOUNT_PATTERN = Pattern.compile("\\d{12}");
     private static final Pattern QUALIFIER_PATTERN = Pattern.compile("\\$LATEST|[a-zA-Z0-9-_]+");
 
     private static final String EVENT_SOURCE_MAPPING_PREFIX = "event-source-mapping:";
+
+    /** The pattern AWS validates a durable execution ARN with, and quotes in its ValidationException. */
+    public static final Pattern DURABLE_EXECUTION_ARN = Pattern.compile(
+            "arn:([a-zA-Z0-9-]+):lambda:([a-zA-Z0-9-]+):(\\d{12}):function:([a-zA-Z0-9_-]+):"
+                    + "(\\$LATEST(?:\\.PUBLISHED)?|[0-9]+)/durable-execution/([a-zA-Z0-9_-]+)/([a-zA-Z0-9_-]+)");
 
     private LambdaArnUtils() {}
 
@@ -47,6 +62,11 @@ public final class LambdaArnUtils {
         return arn.resource().substring(EVENT_SOURCE_MAPPING_PREFIX.length());
     }
 
+    /** {@code arn:<partition>:lambda:<region>:<account>:network-connector:<id>:<version>}. */
+    public static String networkConnectorVersionArn(String connectorArn, long version) {
+        return connectorArn + ":" + version;
+    }
+
     /**
      * The full function ARN a {@code FunctionName} reference names, the way an IAM policy's
      * {@code Resource} names it. The reference is read as {@link #resolve} reads it, so a malformed
@@ -56,7 +76,7 @@ public final class LambdaArnUtils {
      */
     public static String functionArn(String reference, String partition, String region, String defaultAccount) {
         ResolvedFunctionRef ref = resolve(reference);
-        if (reference.startsWith("arn:")) {
+        if (AwsArnUtils.looksLikeArn(reference)) {
             return reference;
         }
         String resource = ref.qualifier() == null
@@ -78,6 +98,50 @@ public final class LambdaArnUtils {
     public record ResolvedFunctionRef(String name, String qualifier, String region, String account) {}
 
     /**
+     * Parses Lambda's broader {@code NamespacedFunctionName} shape. Unlike {@link #resolve}, this
+     * accepts dotted names, optional region/account prefixes without {@code function:}, and the
+     * {@code function:NAME} namespace used by the code-signing attachment APIs.
+     */
+    public static ResolvedFunctionRef resolveNamespacedFunctionName(String input) {
+        if (input == null || input.isEmpty() || input.length() > 256) {
+            throw namespacedValidationFailure(input);
+        }
+        Matcher matcher = NAMESPACED_FUNCTION_NAME_PATTERN.matcher(input);
+        if (!matcher.matches()) {
+            throw namespacedValidationFailure(input);
+        }
+        if (matcher.group(1) != null) {
+            if (!AwsArnUtils.isArn(input)) {
+                throw invalid("Invalid ARN: " + input);
+            }
+            AwsArnUtils.Arn arn;
+            try {
+                arn = AwsArnUtils.parse(input);
+            } catch (IllegalArgumentException e) {
+                throw invalid("Invalid ARN: " + input);
+            }
+            if (!"lambda".equals(arn.service())) {
+                throw invalid("Invalid ARN: " + input);
+            }
+            return new ResolvedFunctionRef(matcher.group("name"), matcher.group("qualifier"),
+                    arn.region(), arn.accountId());
+        }
+        return new ResolvedFunctionRef(matcher.group("name"), matcher.group("qualifier"),
+                stripTrailingColon(matcher.group("region")), stripTrailingColon(matcher.group("account")));
+    }
+
+    private static String stripTrailingColon(String value) {
+        return value == null ? null : value.substring(0, value.length() - 1);
+    }
+
+    private static AwsException namespacedValidationFailure(String input) {
+        return SmithyValidationErrors.validationException(
+                "Value '" + input + "' at 'functionName' failed to satisfy constraint: "
+                        + "Member must satisfy regular expression pattern: "
+                        + NAMESPACED_FUNCTION_NAME_PATTERN.pattern());
+    }
+
+    /**
      * Parses a {@code FunctionName} path parameter. Throws {@link AwsException}, HTTP 400,
      * on any malformed input: {@code ValidationException} when the name fails the
      * {@code FunctionName} pattern or length constraint, {@code InvalidParameterValueException}
@@ -92,7 +156,7 @@ public final class LambdaArnUtils {
                     "Member must have length less than or equal to " + MAX_TOTAL_LENGTH);
         }
 
-        if (input.startsWith("arn:")) {
+        if (AwsArnUtils.looksLikeArn(input)) {
             return parseFullArn(input);
         }
         if (input.contains(":function:")) {
@@ -119,6 +183,19 @@ public final class LambdaArnUtils {
             throw invalid("Invalid qualifier: " + effective);
         }
         return new ResolvedFunctionRef(ref.name(), effective, ref.region(), ref.account());
+    }
+
+    /** Resolves the qualifier and requires a full ARN to name the request region. */
+    public static ResolvedFunctionRef resolveWithRegion(String region, String input, String queryQualifier) {
+        ResolvedFunctionRef ref = resolveWithQualifier(input, queryQualifier);
+        enforceRegion(region, ref);
+        return ref;
+    }
+
+    static void enforceRegion(String region, ResolvedFunctionRef ref) {
+        if (ref.region() != null && !ref.region().equals(region)) {
+            throw invalid("Region '" + ref.region() + "' in ARN does not match request region '" + region + "'");
+        }
     }
 
     private static ResolvedFunctionRef parseFullArn(String input) {
@@ -223,59 +300,25 @@ public final class LambdaArnUtils {
     }
 
     private static AwsException validationFailure(String value, String constraint) {
-        return new AwsException("ValidationException",
-                "1 validation error detected: Value '" + value + "' at 'functionName' failed to satisfy "
-                        + "constraint: " + constraint, 400);
+        return SmithyValidationErrors.validationException(
+                "Value '" + value + "' at 'functionName' failed to satisfy "
+                        + "constraint: " + constraint);
     }
 
-    /**
-     * Extracts the Lambda function reference from an API Gateway integration URI.
-     * Handles formats like:
-     * <ul>
-     *   <li>{@code arn:aws:lambda:us-east-1:000000000000:function:myFn/invocations}</li>
-     *   <li>{@code arn:aws:lambda:us-east-1:000000000000:function:myFn}</li>
-     *   <li>{@code arn:aws:lambda:us-east-1:000000000000:function:myFn:PROD/invocations} (alias/version)</li>
-     *   <li>{@code myFn} (bare function name)</li>
-     * </ul>
-     *
-     * <p>Any trailing {@code :qualifier} (alias or version) is preserved in the returned
-     * value (e.g. {@code myFn:PROD}) so downstream {@code invoke} calls, which resolve the
-     * reference via {@link #resolve(String)}, target the configured alias/version rather
-     * than reducing to the bare function name and invoking {@code $LATEST}.
-     *
-     * @param uri the integration URI (may be null)
-     * @return the extracted function reference (name, optionally with {@code :qualifier}),
-     *         or null if the URI is null or unparseable
-     */
-    public static String extractFunctionNameFromUri(String uri) {
+    /** Unwraps an API Gateway invocation URI without discarding the target ARN's owner, region or qualifier. */
+    public static String extractFunctionReferenceFromUri(String uri) {
         if (uri == null) {
             return null;
         }
         try {
-            // Parse as a full ARN — resource is "function:myFn" or "function:myFn/invocations"
             String resource = AwsArnUtils.parse(uri).resource();
             String[] parts = resource.split("/");
-            // API Gateway v1 style: resource is "path/2015-03-31/functions/{lambdaArn}/invocations"
-            // In this case recurse on the embedded Lambda ARN
             if (parts.length >= 4 && "path".equals(parts[0]) && "functions".equals(parts[2])) {
-                // parts[3] onwards is the embedded Lambda ARN
-                String embeddedArn = String.join("/", java.util.Arrays.copyOfRange(parts, 3, parts.length));
-                return extractFunctionNameFromUri(embeddedArn);
+                return extractFunctionReferenceFromUri(String.join("/", Arrays.copyOfRange(parts, 3, parts.length)));
             }
-            // Standard Lambda ARN: parts[0] is "function:myFn" or "function:myFn:qualifier".
-            // Strip only the leading "function:" resource-type prefix, preserving any
-            // trailing :qualifier (alias/version) so the invoke target is not lost.
-            String functionPart = parts[0];
-            String functionPrefix = "function:";
-            if (functionPart.startsWith(functionPrefix)) {
-                return functionPart.substring(functionPrefix.length());
-            }
-            // Fallback for malformed/non-standard resources: every real Lambda ARN resource
-            // starts with "function:" and is handled above, so this only fires on unexpected input.
-            int colon = functionPart.lastIndexOf(':');
-            return colon >= 0 ? functionPart.substring(colon + 1) : functionPart;
+            return uri.split("/", 2)[0];
         } catch (IllegalArgumentException e) {
-            // Not a valid ARN — treat the entire URI as the function name
+            // Bare and partial function references are validated by the Lambda service.
             return uri;
         }
     }

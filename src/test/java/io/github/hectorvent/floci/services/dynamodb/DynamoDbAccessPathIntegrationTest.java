@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.dynamodb;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -223,17 +225,34 @@ class DynamoDbAccessPathIntegrationTest {
                 """.formatted(TABLE);
         request("DynamoDB_20120810.Query", query)
             .statusCode(400)
-            .body("__type", equalTo("ValidationException"));
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("One or more parameter values were invalid: "
+                    + "Global secondary index status-index does not project [details]"));
 
         request("DynamoDB_20120810.Scan", """
                 {
                   "TableName":"%s",
                   "IndexName":"status-index",
-                  "ProjectionExpression":"details"
+                  "ProjectionExpression":"zeta.a, details, zeta.b"
                 }
                 """.formatted(TABLE))
             .statusCode(400)
-            .body("__type", equalTo("ValidationException"));
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("One or more parameter values were invalid: "
+                    + "Global secondary index status-index does not project [zeta, details]"));
+
+        request("DynamoDB_20120810.Scan", """
+                {
+                  "TableName":"%s",
+                  "IndexName":"status-index",
+                  "Select":"ALL_ATTRIBUTES"
+                }
+                """.formatted(TABLE))
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("One or more parameter values were invalid: "
+                    + "Select type ALL_ATTRIBUTES is not supported for global secondary index status-index "
+                    + "because its projection type is not ALL"));
     }
 
     @Test
@@ -341,8 +360,8 @@ class DynamoDbAccessPathIntegrationTest {
                 """.formatted(TABLE))
             .statusCode(400)
             .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("The provided starting key is invalid: "
-                    + "The provided key element does not match the schema"));
+            .body("message", equalTo("One or more parameter values were invalid: Type mismatch for Index Key sk "
+                    + "Expected: S Actual: BOOL IndexName: alternate-index"));
 
         request("DynamoDB_20120810.Query", """
                 {
@@ -633,7 +652,7 @@ class DynamoDbAccessPathIntegrationTest {
                     {"Statement":"SELECT * FROM \\"%s\\" WHERE status = 'partiql-page'",
                       "Limit":1%s}
                     """.formatted(TABLE, scanToken == null ? "" : ",\"NextToken\":\"" + scanToken + "\"");
-            io.restassured.response.ValidatableResponse page =
+            ValidatableResponse page =
                 request("DynamoDB_20120810.ExecuteStatement", pageBody).statusCode(200);
             page.body("Items.size()", lessThanOrEqualTo(1));
             List<String> pagePks = page.extract().jsonPath().getList("Items.pk.S");
@@ -642,7 +661,7 @@ class DynamoDbAccessPathIntegrationTest {
             scanPages++;
         } while (scanToken != null && scanPages < 10);
 
-        org.junit.jupiter.api.Assertions.assertEquals(Set.of("partiql-page-1", "partiql-page-2"), scannedPks);
+        Assertions.assertEquals(Set.of("partiql-page-1", "partiql-page-2"), scannedPks);
 
         // Query branch (partition-key equality): same pagination contract.
         String queryToken = request("DynamoDB_20120810.ExecuteStatement", """
@@ -891,7 +910,7 @@ class DynamoDbAccessPathIntegrationTest {
             .statusCode(200);
     }
 
-    private static io.restassured.response.ValidatableResponse request(String target, String body) {
+    private static ValidatableResponse request(String target, String body) {
         return given()
                 .header("X-Amz-Target", target)
                 .contentType(CONTENT_TYPE)

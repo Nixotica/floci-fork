@@ -1,9 +1,14 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
-import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.LongNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
+import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
@@ -21,7 +26,45 @@ public interface CfnResourceProvisioner {
 
     Set<String> resourceTypes();
 
+    /** GetAtt attributes the registry schema types as integers, by resource type. */
+    default Map<String, Set<String>> integerAttributes() {
+        return Map.of();
+    }
+
+    /** GetAtt attributes the registry schema types as objects or arrays, stored as JSON text, by resource type. */
+    default Map<String, Set<String>> jsonAttributes() {
+        return Map.of();
+    }
+
+    /** The JSON type of a stored GetAtt value; most resource attributes are strings. */
+    default JsonNode attributeValue(String resourceType, String attributeName, String value) {
+        if (integerAttributes().getOrDefault(resourceType, Set.of()).contains(attributeName)) {
+            return LongNode.valueOf(Long.parseLong(value));
+        }
+        if (jsonAttributes().getOrDefault(resourceType, Set.of()).contains(attributeName)) {
+            try {
+                return StoredJson.MAPPER.readTree(value);
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("Invalid stored " + resourceType + " attribute " + attributeName, e);
+            }
+        }
+        return TextNode.valueOf(value);
+    }
+
     void provision(StackResource resource, JsonNode properties, ProvisionContext ctx);
+
+    /**
+     * True when the service this provisioner wraps is turned off. {@link CloudFormationResourceRegistry}
+     * then serves none of its types, so the dispatcher stubs them instead of provisioning them.
+     */
+    default boolean serviceDisabled() {
+        return false;
+    }
+
+    /** The config property that turns this provisioner's service on, named in messages about it being off. */
+    default String serviceEnabledFlag() {
+        return null;
+    }
 
     /** Most implementations delegate to {@code service.deleteX(physicalId, region)}. */
     default void delete(String resourceType, String physicalId, String region) {
@@ -59,6 +102,11 @@ public interface CfnResourceProvisioner {
         return false;
     }
 
+    /** Whether a prior failed rollback must be retried before even an outputs-only update commits. */
+    default boolean requiresUpdateRecovery(StackResource resource) {
+        return false;
+    }
+
     /**
      * The physical id of the entity this update's replacement displaced, or null when this type
      * owes no replacement cleanup. {@code CloudFormationService} announces it as DELETE_IN_PROGRESS
@@ -79,11 +127,39 @@ public interface CfnResourceProvisioner {
     }
 
     /**
+     * Deletes entities displaced by an unfinished update before the stack itself is deleted.
+     * The default uses normal replacement cleanup. A provisioner may distinguish this operation
+     * from committing an update when it still carries configuration needed for rollback.
+     */
+    default UpdateCleanupResult completeDeleteCleanup(StackResource resource) {
+        return completeUpdate(resource);
+    }
+
+    /**
      * Whether this update replaced the physical entity, so the stack has cleanup pending and enters
      * UPDATE_COMPLETE_CLEANUP_IN_PROGRESS. The default reports no replacement.
      */
     default boolean hasReplacementUpdate(StackResource resource) {
         return false;
+    }
+
+    /**
+     * Whether a resource of {@code resourceType} takes the physical id of the resource it depends
+     * on as its own, as a bucket policy takes its bucket's name. The stack then deletes one left
+     * behind before whatever else holds that id. The default is no.
+     */
+    default boolean takesParentPhysicalId(String resourceType) {
+        return false;
+    }
+
+    /**
+     * Whether a prefix of a {@code resourceType} physical id, up to a {@code /}, {@code :} or
+     * {@code |}, can be the physical id of the resource it belongs to, as {@code function|sid} is
+     * a Lambda permission's. The stack then deletes one left behind before that resource. The
+     * default is yes; a type whose id only joins parts of its own identity says no.
+     */
+    default boolean idPrefixCanNameParent(String resourceType) {
+        return true;
     }
 
     /**
@@ -95,12 +171,32 @@ public interface CfnResourceProvisioner {
     }
 
     /**
-     * Carries additive ownership tracking a failed update discovered onto the last known-good
-     * resource metadata CloudFormation restores, so entities the failed attempt created but could
-     * not remove are not orphaned. Only additive tracking belongs here; committed resource state
-     * must not be overwritten. The default has none to carry.
+     * Drops completed replacement cleanup during stack deletion. The default preserves the normal
+     * cleanup behavior; an override may keep rollback configuration until the managed entity is
+     * successfully deleted.
+     */
+    default void clearDeleteCleanup(StackResource resource) {
+        clearUpdate(resource);
+    }
+
+    /**
+     * Carries additive tracking a failed update discovered onto the last known-good resource
+     * metadata CloudFormation restores: entities the failed attempt created but could not remove,
+     * so they are not orphaned, and the snapshot of an undo the attempt could not complete, so a
+     * ContinueUpdateRollback can try it again, or report again that it cannot. Only additive
+     * tracking belongs here; committed resource state must not be overwritten. The default has
+     * none to carry.
      */
     default void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
-        // no-op by default: only a provisioner that tracks generated sub-resources needs this
+        // no-op by default: only a provisioner with tracking of its own to carry (generated
+        // sub-resources, cleanup entries, an undo snapshot) needs this
+    }
+
+    /** Keeps the mapper private, which an interface field cannot be. */
+    final class StoredJson {
+        private static final ObjectMapper MAPPER = new ObjectMapper();
+
+        private StoredJson() {
+        }
     }
 }

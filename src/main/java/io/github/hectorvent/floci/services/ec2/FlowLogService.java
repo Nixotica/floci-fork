@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AvailabilityZoneIds;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -25,6 +27,7 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -153,12 +156,23 @@ public class FlowLogService {
                                  String trafficType, String logDestinationType,
                                  String logDestination, String deliverLogsPermissionArn,
                                  String logFormat, int maxAggregationInterval) {
+        return createFlowLog(region, resourceId, resourceType, trafficType, logDestinationType,
+                logDestination, null, deliverLogsPermissionArn, logFormat, maxAggregationInterval);
+    }
+
+    public FlowLog createFlowLog(String region, String resourceId, String resourceType,
+                                 String trafficType, String logDestinationType,
+                                 String logDestination, String logGroupName,
+                                 String deliverLogsPermissionArn,
+                                 String logFormat, int maxAggregationInterval) {
+        String groupName = logGroupName != null ? logGroupName : logGroupFromArn(logDestination);
         FlowLog fl = new FlowLog();
         fl.setFlowLogId("fl-" + randomHex(17));
         fl.setResourceId(resourceId);
         fl.setResourceType(resourceType != null ? resourceType : "VPC");
         fl.setTrafficType(trafficType != null ? trafficType : "ALL");
-        fl.setLogDestinationType(logDestinationType != null ? logDestinationType : "s3");
+        fl.setLogDestinationType(effectiveLogDestinationType(logDestinationType, logDestination, logGroupName));
+        fl.setLogGroupName(groupName);
         fl.setLogDestination(logDestination);
         fl.setDeliverLogsPermissionArn(deliverLogsPermissionArn);
         fl.setBucketName(bucketFromArn(logDestination));
@@ -267,7 +281,7 @@ public class FlowLogService {
         // endpoint — which is how traffic to an AWS service over PrivateLink shows
         // up in flow logs. The endpoint's service is recorded in pkt-dst-aws-service.
         List<String> endpointIps = new ArrayList<>();
-        Map<String, String> endpointService = new java.util.HashMap<>(); // ip -> service short name (e.g. S3)
+        Map<String, String> endpointService = new HashMap<>(); // ip -> service short name (e.g. S3)
         String resourceVpc = vpcOfFlowLogResource(fl);
         for (NetworkInterface ni : ec2Service.endpointNetworkInterfaces(fl.getRegion())) {
             if (ni.getPrivateIpAddress() == null || ni.getPrivateIpAddress().isBlank()) {
@@ -566,12 +580,41 @@ public class FlowLogService {
         }
     }
 
-    private static String bucketFromArn(String arn) {
+    /**
+     * The LogDestinationType a flow log gets: the requested one, else cloud-watch-logs when a log
+     * group is named directly or by a CloudWatch Logs ARN, else s3. CloudFormation compares an
+     * update against this, so create and compare cannot drift apart.
+     */
+    public static String effectiveLogDestinationType(String logDestinationType, String logDestination,
+                                                     String logGroupName) {
+        if (logDestinationType != null && !logDestinationType.isBlank()) {
+            return logDestinationType;
+        }
+        return logGroupName != null || logGroupFromArn(logDestination) != null ? "cloud-watch-logs" : "s3";
+    }
+
+    /**
+     * The group named by a CloudWatch Logs ARN ({@code arn:aws:logs:r:a:log-group:name[:*]}), or
+     * null for anything else. Only a {@code logs} ARN counts: an S3 prefix may itself contain
+     * {@code :log-group:}.
+     */
+    static String logGroupFromArn(String arn) {
+        String resource = AwsArnUtils.resourceIfArnFor(arn, "logs").orElse("");
+        if (!resource.startsWith("log-group:")) {
+            return null;
+        }
+        String name = resource.substring("log-group:".length());
+        name = name.endsWith(":*") ? name.substring(0, name.length() - 2) : name;
+        return name.isBlank() ? null : name;
+    }
+
+    static String bucketFromArn(String arn) {
         if (arn == null) {
             return null;
         }
-        // arn:aws:s3:::bucket-name[/optional/prefix]  OR a bare bucket name.
-        String name = arn.startsWith("arn:") ? arn.substring(arn.lastIndexOf(':') + 1) : arn;
+        // arn:aws:s3:::bucket-name[/optional/prefix] OR a bare bucket name. The prefix may itself
+        // contain ':', so the resource is everything after the ARN's fifth ':', not its last.
+        String name = AwsArnUtils.resourceIfArnFor(arn, "s3").orElse(arn);
         int slash = name.indexOf('/');
         return slash >= 0 ? name.substring(0, slash) : name;
     }
@@ -593,27 +636,13 @@ public class FlowLogService {
         return ports[ThreadLocalRandom.current().nextInt(ports.length)];
     }
 
-    /** Map a region + az letter to a plausible AWS az-id (e.g. us-east-1a -> use1-az1). */
+    /**
+     * The zone id of the ENI's zone, derived exactly as subnets and DescribeAvailabilityZones
+     * derive it ({@link AvailabilityZoneIds}), so a record's {@code az-id} matches the
+     * {@code AvailabilityZoneId} of the subnet it came from, in every region and partition.
+     */
     private static String azId(String region, String az) {
-        String code = switch (region == null ? "" : region) {
-            case "us-east-1" -> "use1";
-            case "us-east-2" -> "use2";
-            case "us-west-1" -> "usw1";
-            case "us-west-2" -> "usw2";
-            case "eu-west-1" -> "euw1";
-            case "eu-central-1" -> "euc1";
-            case "ap-southeast-1" -> "apse1";
-            case "ap-southeast-2" -> "apse2";
-            default -> region == null ? "use1" : region.replaceAll("[^a-z0-9]", "");
-        };
-        int n = 1;
-        if (az != null && !az.isEmpty()) {
-            char last = az.charAt(az.length() - 1);
-            if (last >= 'a' && last <= 'f') {
-                n = (last - 'a') + 1;
-            }
-        }
-        return code + "-az" + n;
+        return region == null ? null : AvailabilityZoneIds.forZoneName(region, az);
     }
 
     private static String nz(String s) {

@@ -17,13 +17,15 @@ import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.Secret;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService.LaunchImage;
-import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.List;
@@ -57,9 +59,9 @@ class EcsContainerManagerSecretsTest {
         when(containerBuilder.resolveImage(anyString())).thenAnswer(invocation -> invocation.getArgument(0));
 
         lifecycleManager = mock(ContainerLifecycleManager.class);
-        when(lifecycleManager.resolveImageForLaunch(any(), any()))
+        when(lifecycleManager.resolveImageForLaunch(any(), any(), any()))
                 .thenAnswer(invocation -> new LaunchImage(invocation.getArgument(0), null));
-        when(lifecycleManager.createAndStart(any()))
+        when(lifecycleManager.createAndStartEphemeral(any(), any()))
                 .thenReturn(new ContainerInfo("docker-id", Map.of()));
 
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
@@ -107,32 +109,31 @@ class EcsContainerManagerSecretsTest {
     }
 
     @Test
-    void ssmArnKeepsLeadingSlashInParameterName() {
+    void ssmArnIsPassedWholeForSsmToResolve() {
         String ssmArn = "arn:aws:ssm:us-east-1:000000000000:parameter/foo/bar";
-        when(ssmService.getParameter("/foo/bar", "us-east-1"))
+        when(ssmService.getParameter(ssmArn, "us-east-1"))
                 .thenReturn(new Parameter("/foo/bar", "path-value", "String"));
 
         manager.startTask(task(), taskDef(containerDef("app", List.of(new Secret("PATH_VALUE", ssmArn)))),
                 List.of(), "us-east-1");
 
-        verify(ssmService).getParameter("/foo/bar", "us-east-1");
+        verify(ssmService).getParameter(ssmArn, "us-east-1");
     }
 
     /**
      * Both {@code valueFrom} guards required a literal {@code arn:aws:}. Outside the commercial
-     * partition a Secrets Manager ARN fell through to the SSM branch and a parameter ARN was
-     * passed along whole as a parameter name, so the task died at launch with ParameterNotFound
-     * rather than reading its own configuration.
+     * partition a Secrets Manager ARN fell through to the SSM branch, so the task died at launch
+     * with ParameterNotFound rather than reading its own configuration.
      */
-    @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.CsvSource({
+    @ParameterizedTest
+    @CsvSource({
             "us-gov-west-1, aws-us-gov",
             "cn-north-1,    aws-cn",
             "us-isob-east-1, aws-iso-b"})
     void resolvesSecretsAndParametersInAnyPartition(String region, String partition) {
         String ssmArn = "arn:" + partition + ":ssm:" + region + ":000000000000:parameter/app/token";
         String secretArn = "arn:" + partition + ":secretsmanager:" + region + ":000000000000:secret:db-AbCdEf";
-        when(ssmService.getParameter("/app/token", region))
+        when(ssmService.getParameter(ssmArn, region))
                 .thenReturn(new Parameter("/app/token", "ssm-value", "String"));
         when(secretsManagerService.getSecretValue(secretArn, null, null, region))
                 .thenReturn(secretVersion("sm-value"));
@@ -156,7 +157,7 @@ class EcsContainerManagerSecretsTest {
     void crossRegionArnResolvesAgainstArnRegionNotTaskRegion() {
         String ssmArn = "arn:aws:ssm:eu-west-1:000000000000:parameter/app/token";
         String secretArn = "arn:aws:secretsmanager:eu-west-1:000000000000:secret:db-AbCdEf";
-        when(ssmService.getParameter("/app/token", "eu-west-1"))
+        when(ssmService.getParameter(ssmArn, "eu-west-1"))
                 .thenReturn(new Parameter("/app/token", "ssm-eu", "String"));
         when(secretsManagerService.getSecretValue(secretArn, null, null, "eu-west-1"))
                 .thenReturn(secretVersion("sm-eu"));
@@ -167,7 +168,7 @@ class EcsContainerManagerSecretsTest {
                 new Secret("PASSWORD", secretArn)))),
                 List.of(), "us-east-1");
 
-        verify(ssmService).getParameter("/app/token", "eu-west-1");
+        verify(ssmService).getParameter(ssmArn, "eu-west-1");
         verify(secretsManagerService).getSecretValue(secretArn, null, null, "eu-west-1");
     }
 
@@ -186,7 +187,7 @@ class EcsContainerManagerSecretsTest {
         assertTrue(thrown.getMessage().contains("ResourceInitializationError"));
         assertTrue(thrown.getMessage().contains("/missing"));
         verify(containerBuilder, never()).newContainer(anyString());
-        verify(lifecycleManager, never()).createAndStart(any());
+        verify(lifecycleManager, never()).createAndStartEphemeral(any(), any());
     }
 
     @Test
@@ -206,7 +207,7 @@ class EcsContainerManagerSecretsTest {
         assertTrue(thrown.getMessage().contains("ResourceInitializationError"));
         assertTrue(thrown.getMessage().contains(secretArn));
         verify(containerBuilder, never()).newContainer(anyString());
-        verify(lifecycleManager, never()).createAndStart(any());
+        verify(lifecycleManager, never()).createAndStartEphemeral(any(), any());
     }
 
     @Test
@@ -272,7 +273,7 @@ class EcsContainerManagerSecretsTest {
 
         assertTrue(thrown.getMessage().contains("ResourceInitializationError"));
         assertTrue(thrown.getMessage().contains("did not contain json key token"));
-        verify(lifecycleManager, never()).createAndStart(any());
+        verify(lifecycleManager, never()).createAndStartEphemeral(any(), any());
     }
 
     @Test
@@ -304,7 +305,7 @@ class EcsContainerManagerSecretsTest {
         assertTrue(thrown.getMessage().contains("ResourceInitializationError"));
         assertTrue(thrown.getMessage().contains(
                 "an invalid ARN format for the AWS Secrets Manager secret was specified"));
-        verify(lifecycleManager, never()).createAndStart(any());
+        verify(lifecycleManager, never()).createAndStartEphemeral(any(), any());
     }
 
     private static ContainerDefinition containerDef(String name, List<Secret> secrets) {

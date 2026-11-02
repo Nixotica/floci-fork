@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.StreamSupport;
 
 /** Evaluates the federated principal and SAML action in a role trust policy. */
 @ApplicationScoped
@@ -54,21 +56,21 @@ public class SAMLTrustPolicyEvaluator {
         if (!condition.isObject()) {
             return false;
         }
-        var operators = condition.fields();
+        Iterator<Map.Entry<String, JsonNode>> operators = condition.fields();
         while (operators.hasNext()) {
-            var operator = operators.next();
+            Map.Entry<String, JsonNode> operator = operators.next();
             if (!operator.getValue().isObject()) {
                 return false;
             }
-            var entries = operator.getValue().fields();
+            Iterator<Map.Entry<String, JsonNode>> entries = operator.getValue().fields();
             while (entries.hasNext()) {
-                var entry = entries.next();
+                Map.Entry<String, JsonNode> entry = entries.next();
                 String key = entry.getKey();
                 int colon = key.indexOf(':');
                 String claimName = colon < 0 ? key : key.substring(colon + 1);
                 List<String> actual = claims.getOrDefault(claimName, List.of());
                 List<String> expected = entry.getValue().isArray()
-                        ? java.util.stream.StreamSupport.stream(entry.getValue().spliterator(), false)
+                        ? StreamSupport.stream(entry.getValue().spliterator(), false)
                                 .filter(JsonNode::isTextual).map(JsonNode::asText).toList()
                         : entry.getValue().isTextual() ? List.of(entry.getValue().asText()) : List.of();
                 if (expected.isEmpty() || actual.isEmpty()) {

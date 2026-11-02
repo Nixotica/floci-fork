@@ -24,9 +24,9 @@ import java.util.regex.Pattern;
  *
  * <p>Everything is best effort. Whatever cannot be determined is simply absent from the
  * result: an unresolvable leading key produces an empty list, the condition key is then
- * omitted from the request context, and a policy that scopes access through it fails closed.
- * Note that this "fail closed" behavior applies to {@code dynamodb:LeadingKeys}; for
- * {@code dynamodb:Attributes} evaluated under {@code ForAllValues}, under-reporting is the
+ * omitted from the request context. A {@code ForAllValues} policy must include a
+ * {@code Null:false} guard to require a resolved leading key.
+ * For {@code dynamodb:Attributes} evaluated under {@code ForAllValues}, under-reporting is the
  * unsafe direction because omitting a referenced attribute could allow an unauthorized
  * operation to pass.
  */
@@ -49,7 +49,8 @@ public final class DynamoDbConditionKeys {
         Set<String> attributes = new LinkedHashSet<>();
 
         switch (action == null ? "" : action) {
-            case "dynamodb:GetItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem" -> {
+            case "dynamodb:GetItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem",
+                    "dynamodb:ConditionCheckItem" -> {
                 JsonNode key = body.get("Key");
                 addAttributeNames(attributes, key);
                 addLeadingKey(leadingKeys, key, pkName);
@@ -113,6 +114,7 @@ public final class DynamoDbConditionKeys {
             }
         }
 
+        addPartiQLAttributes(action, body, attributes);
         addAttributesToGet(attributes, body.get("AttributesToGet"));
         addProjectionAttributes(attributes, textOrNull(body.get("ProjectionExpression")),
                 body.get("ExpressionAttributeNames"));
@@ -133,14 +135,157 @@ public final class DynamoDbConditionKeys {
         addAttributeNames(attributes, body.get("Expected"));
         addAttributeNames(attributes, body.get("ScanFilter"));
 
-        return new Result(List.copyOf(leadingKeys), List.copyOf(attributes),
-                textOrNull(body.get("Select")));
+        return result(action, leadingKeys, attributes, effectiveSelect(action, body));
+    }
+
+    /** Condition keys for the separately routed 2011-12-05 JSON requests. */
+    public static Result extractLegacy(String action, JsonNode body, TableDefinition table) {
+        if (body == null || !body.isObject()) {
+            return new Result(List.of(), List.of(), null);
+        }
+        String pkName = partitionKeyName(table);
+        List<String> leadingKeys = new ArrayList<>();
+        Set<String> attributes = new LinkedHashSet<>();
+        if ("dynamodb:Query".equals(action)) {
+            addLegacyKey(leadingKeys, attributes, body.get("HashKeyValue"), pkName);
+            if (body.hasNonNull("RangeKeyCondition") && table != null && table.getKeySchema() != null) {
+                table.getKeySchema().stream().filter(key -> "RANGE".equals(key.getKeyType()))
+                        .map(KeySchemaElement::getAttributeName).forEach(attributes::add);
+            }
+            addAttributesToGet(attributes, body.get("AttributesToGet"));
+        } else if ("dynamodb:BatchWriteItem".equals(action)) {
+            for (JsonNode tableRequest : requestItemsFor(body, table)) {
+                if (!tableRequest.isArray()) {
+                    continue;
+                }
+                for (JsonNode write : tableRequest) {
+                    JsonNode put = write.path("PutRequest").get("Item");
+                    addAttributeNames(attributes, put);
+                    addLeadingKey(leadingKeys, put, pkName);
+                    JsonNode key = write.path("DeleteRequest").path("Key");
+                    addLegacyKey(leadingKeys, attributes, key.get("HashKeyElement"), pkName);
+                    if (key.hasNonNull("RangeKeyElement") && table != null && table.getKeySchema() != null) {
+                        table.getKeySchema().stream().filter(element -> "RANGE".equals(element.getKeyType()))
+                                .map(KeySchemaElement::getAttributeName).forEach(attributes::add);
+                    }
+                }
+            }
+        }
+        return result(action, leadingKeys, attributes, legacySelect(action, body));
+    }
+
+    private static Result result(String action, List<String> leadingKeys, Set<String> attributes, String select) {
+        return new Result(DynamoDbConditionKeyMembers.supports(action, "dynamodb:LeadingKeys")
+                ? List.copyOf(leadingKeys) : List.of(),
+                DynamoDbConditionKeyMembers.supports(action, "dynamodb:Attributes")
+                        ? List.copyOf(attributes) : List.of(), select);
+    }
+
+    /** Transaction Get uses its modeled member paths while IAM authorizes the GetItem action. */
+    public static Result extractTransactionGet(JsonNode body, TableDefinition table) {
+        return extract("dynamodb:GetItem", DynamoDbConditionKeyMembers.itemBody(
+                "TransactGetItems", "TransactItems.*.Get.", body), table);
+    }
+
+    private static String effectiveSelect(String action, JsonNode body) {
+        if (!DynamoDbConditionKeyMembers.supports(action, "dynamodb:Select")) {
+            return null;
+        }
+        if ("dynamodb:PartiQLSelect".equals(action)) {
+            DynamoDbPartiQLParser.Stmt.Select select = partiQLSelect(body, "dynamodb:Select");
+            return select == null ? null : !select.columns().isEmpty() ? "SPECIFIC_ATTRIBUTES"
+                    : select.index() == null ? "ALL_ATTRIBUTES" : "ALL_PROJECTED_ATTRIBUTES";
+        }
+
+        String operation = action.substring("dynamodb:".length());
+        for (JsonNode select : DynamoDbConditionKeyMembers.values(
+                operation, "dynamodb:Select", "Select", body)) {
+            String value = textOrNull(select);
+            if (value != null) {
+                return value;
+            }
+        }
+        for (JsonNode projection : DynamoDbConditionKeyMembers.values(
+                operation, "dynamodb:Select", "ProjectionExpression", body)) {
+            if (ProjectionEvaluator.hasProjection(textOrNull(projection))) {
+                return "SPECIFIC_ATTRIBUTES";
+            }
+        }
+        for (JsonNode attributes : DynamoDbConditionKeyMembers.values(
+                operation, "dynamodb:Select", "AttributesToGet", body)) {
+            if (attributes.isArray() && !attributes.isEmpty()) {
+                return "SPECIFIC_ATTRIBUTES";
+            }
+        }
+        return DynamoDbConditionKeyMembers.values(operation, "dynamodb:Select", "IndexName", body)
+                .stream().anyMatch(index -> textOrNull(index) != null)
+                ? "ALL_PROJECTED_ATTRIBUTES" : "ALL_ATTRIBUTES";
+    }
+
+    private static void addPartiQLAttributes(String action, JsonNode body, Set<String> attributes) {
+        if (!"dynamodb:PartiQLSelect".equals(action)) {
+            return;
+        }
+        DynamoDbPartiQLParser.Stmt.Select select = partiQLSelect(body, "dynamodb:Attributes");
+        if (select != null) {
+            select.columns().forEach(path -> attributes.add(path.root()));
+            select.where().stream().flatMap(DynamoDbPartiQLParser::leaves)
+                    .forEach(condition -> attributes.add(condition.path().root()));
+            select.orderBy().forEach(order -> attributes.add(order.attribute()));
+        }
+    }
+
+    private static DynamoDbPartiQLParser.Stmt.Select partiQLSelect(JsonNode body, String conditionKey) {
+        String statement = DynamoDbConditionKeyMembers.values(
+                "ExecuteStatement", conditionKey, "Statement", body).stream()
+                .map(DynamoDbConditionKeys::textOrNull).filter(value -> value != null).findFirst().orElse(null);
+        if (statement == null) {
+            return null;
+        }
+        try {
+            List<JsonNode> parameters = new ArrayList<>();
+            body.path("Parameters").forEach(parameter ->
+                    parameters.add(DynamoDbAttributeValueValidator.dropNullMembers(parameter.deepCopy())));
+            return DynamoDbPartiQLParser.parse(statement, parameters)
+                    instanceof DynamoDbPartiQLParser.Stmt.Select select ? select : null;
+        } catch (RuntimeException ignored) {
+            // Execution reports an invalid statement; do not invent condition values.
+            return null;
+        }
+    }
+
+    private static String legacySelect(String action, JsonNode body) {
+        if (!"dynamodb:Query".equals(action)) {
+            return null;
+        }
+        if (body.path("Count").isBoolean() && body.path("Count").booleanValue()) {
+            return "COUNT";
+        }
+        // The legacy adapter only forwards AttributesToGet, not modern selection members.
+        return hasProjectedAttributes(body) ? "SPECIFIC_ATTRIBUTES" : "ALL_ATTRIBUTES";
+    }
+
+    private static boolean hasProjectedAttributes(JsonNode body) {
+        JsonNode attributes = body.get("AttributesToGet");
+        return attributes != null && attributes.isArray() && !attributes.isEmpty();
+    }
+
+    private static void addLegacyKey(List<String> leadingKeys, Set<String> attributes, JsonNode value, String name) {
+        if (value != null) {
+            if (name != null) {
+                attributes.add(name);
+            }
+            String scalar = scalarValue(value);
+            if (scalar != null) {
+                leadingKeys.add(scalar);
+            }
+        }
     }
 
     /**
      * The extracted keys. {@code leadingKeys} holds partition-key values in request order
      * (duplicates preserved), {@code attributes} holds attribute names in first-seen order
-     * with duplicates removed, {@code select} is the raw Select value or {@code null}.
+     * with duplicates removed, {@code select} includes Query/Scan defaults, and is otherwise the raw value or {@code null}.
      */
     public record Result(List<String> leadingKeys, List<String> attributes, String select) {}
 
@@ -307,7 +452,7 @@ public final class DynamoDbConditionKeys {
      * Top-level attribute names a DynamoDB expression references: a FilterExpression,
      * ConditionExpression or KeyConditionExpression. Walks the parsed tree so a literal name
      * such as {@code ssn} in {@code "ssn = :x"} is captured, not only {@code #alias}es.
-     * A malformed expression yields nothing, which only ever denies.
+     * A malformed expression yields no attribute names; normal absent-key condition rules apply.
      */
     private static void addExpressionAttributes(Set<String> attributes, String expression,
                                                 JsonNode exprAttrNames) {

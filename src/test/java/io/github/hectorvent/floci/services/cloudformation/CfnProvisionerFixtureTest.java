@@ -7,7 +7,9 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudForm
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ProvisionContext;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.scheduler.SchedulerService;
 import io.github.hectorvent.floci.services.sns.SnsService;
+import io.github.hectorvent.floci.testing.MainSources;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
@@ -17,6 +19,7 @@ import java.nio.file.Path;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -58,6 +61,15 @@ class CfnProvisionerFixtureTest {
                 .logs(mock(CloudWatchLogsService.class));
 
         assertTrue(serves(fixture, "AWS::Logs::LogGroup"));
+    }
+
+    @Test
+    void schedulerWiresBothSchedulesAndGroups() {
+        CfnProvisionerFixture.Builder fixture = CfnProvisionerFixture.builder()
+                .scheduler(mock(SchedulerService.class));
+
+        assertTrue(serves(fixture, "AWS::Scheduler::Schedule"));
+        assertTrue(serves(fixture, "AWS::Scheduler::ScheduleGroup"));
     }
 
     @Test
@@ -103,10 +115,9 @@ class CfnProvisionerFixtureTest {
      */
     @Test
     void everyProvisionerIsReachableThroughThePublicBuilderOrExplicitlyExempt() throws Exception {
-        Path provisioners = Path.of(
-                "src/main/java/io/github/hectorvent/floci/services/cloudformation/provisioners");
+        Path provisioners = MainSources.packageDir(CfnResourceProvisioner.class);
         Set<String> onDisk;
-        try (var files = Files.list(provisioners)) {
+        try (Stream<Path> files = Files.list(provisioners)) {
             onDisk = files.map(f -> f.getFileName().toString())
                     .filter(n -> n.endsWith("CfnProvisioner.java"))
                     .map(n -> n.replace(".java", ""))

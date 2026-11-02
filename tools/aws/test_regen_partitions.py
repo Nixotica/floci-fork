@@ -224,7 +224,7 @@ def test_build_without_cdk_carries_flags_from_the_previous_file():
 
 
 def test_build_without_cdk_refuses_a_region_it_cannot_carry():
-    with pytest.raises(ValueError, match="no aws-cdk checkout"):
+    with pytest.raises(ValueError, match="nothing to carry over"):
         r.build(PARTITIONS, ENDPOINTS, None, {"partitions": []}, "test")
 
 
@@ -267,6 +267,134 @@ def test_collect_signing_names_reads_the_gzipped_models_the_botocore_wheel_ships
         json.dump({"metadata": {"endpointPrefix": "api.ecr", "signingName": "ecr"}}, handle)
 
     assert r.collect_signing_names(tmp_path) == {"ecr": ["api.ecr"]}
+
+
+def partition_is(partition_id):
+    return {"fn": "stringEquals",
+            "argv": [{"fn": "getAttr", "argv": [{"ref": "PartitionResult"}, "name"]}, partition_id]}
+
+
+def endpoint_rule(conditions, url="https://example"):
+    return {"type": "endpoint", "conditions": conditions, "endpoint": {"url": url}}
+
+
+def test_ruleset_partitions_counts_only_explicit_branches_that_resolve_to_an_endpoint():
+    rules = [
+        {"type": "tree", "conditions": [partition_is("aws-eusc")],
+         "rules": [endpoint_rule([], "https://iam.eusc-de-east-1.amazonaws.eu")]},
+        endpoint_rule([partition_is("aws-iso-e")]),
+        {"type": "error", "conditions": [partition_is("aws-iso-f")], "error": "not here"},
+        {"type": "tree", "conditions": [partition_is("aws-iso-b")],
+         "rules": [{"type": "error", "conditions": [], "error": "FIPS is not supported"}]},
+        endpoint_rule([{"fn": "not", "argv": [partition_is("aws-cn")]}]),
+        endpoint_rule([], "https://iam.{Region}.{PartitionResult#dnsSuffix}"),
+    ]
+
+    assert r.ruleset_partitions(rules) == {"aws-eusc", "aws-iso-e"}
+
+
+def write_service(root, service, version, metadata, rules=None, gzipped=False):
+    directory = root / service / version
+    directory.mkdir(parents=True)
+    (directory / "service-2.json").write_text(json.dumps({"metadata": metadata}))
+    if rules is not None:
+        document = {"version": "1.0", "parameters": {}, "rules": rules}
+        if gzipped:
+            with gzip.open(directory / "endpoint-rule-set-1.json.gz", "wt", encoding="utf-8") as handle:
+                json.dump(document, handle)
+        else:
+            (directory / "endpoint-rule-set-1.json").write_text(json.dumps(document))
+
+
+def test_collect_ruleset_partitions_keys_by_endpoint_prefix_and_reads_gzipped_rulesets(tmp_path):
+    write_service(tmp_path, "iam", "2010-05-08", {"endpointPrefix": "iam"},
+                  [endpoint_rule([partition_is("aws-eusc")])], gzipped=True)
+    write_service(tmp_path, "sqs", "2012-11-05", {"endpointPrefix": "sqs"}, [endpoint_rule([])])
+    write_service(tmp_path, "nomodel", "2020-01-01", {"endpointPrefix": "nomodel"})
+
+    assert r.collect_ruleset_partitions(tmp_path) == {"iam": ["aws-eusc"]}
+
+
+def test_build_adds_ruleset_partitions_only_for_services_endpoints_json_lists_somewhere():
+    document = r.build(PARTITIONS, ENDPOINTS, r.parse_cdk_entities(ENTITIES), None, "test", {},
+                       {"iam": ["aws-eusc"], "fis": ["aws-eusc"], "sqs": ["aws-eusc"]})
+    eusc = by_id(document, "aws-eusc")
+
+    assert eusc["services"] == ["iam", "sqs"]
+    assert eusc["servicesFromRulesets"] == ["iam"]
+    assert by_id(document, "aws")["servicesFromRulesets"] == []
+
+
+def flag_is(parameter, value):
+    return {"fn": "booleanEquals", "argv": [{"ref": parameter}, value]}
+
+
+PLAIN = [flag_is("UseFIPS", False), flag_is("UseDualStack", False)]
+
+
+def test_signin_hosts_reads_only_the_plain_data_plane_branches():
+    rules = [
+        {"type": "tree", "conditions": [flag_is("IsControlPlane", True)],
+         "rules": [endpoint_rule([partition_is("aws")], "https://signin.{Region}.api.aws")]},
+        endpoint_rule([flag_is("IsOAuthEndpoint", True), partition_is("aws")], "https://{Region}.oauth.signin.aws"),
+        endpoint_rule(PLAIN + [partition_is("aws")], "https://{Region}.signin.aws.amazon.com"),
+        endpoint_rule(PLAIN + [partition_is("aws-cn")], "https://{Region}.signin.amazonaws.cn"),
+        endpoint_rule([flag_is("UseFIPS", True), flag_is("UseDualStack", False), partition_is("aws-us-gov")],
+                      "https://{Region}.signin-fips.amazonaws-us-gov.com"),
+        endpoint_rule(PLAIN, "https://{Region}.signin.{PartitionResult#dnsSuffix}"),
+        {"type": "error", "conditions": PLAIN + [partition_is("aws-iso")], "error": "not here"},
+        {"type": "tree", "conditions": [],
+         "rules": [{"type": "tree", "conditions": [partition_is("aws-eusc")],
+                    "rules": [endpoint_rule(PLAIN, "https://{Region}.signin.amazonaws-eusc.eu"),
+                              endpoint_rule([partition_is("aws")] + PLAIN, "https://{Region}.signin.aws.amazon.com")]}]},
+    ]
+
+    assert r.signin_hosts(rules) == {
+        "aws": "{region}.signin.aws.amazon.com",
+        "aws-cn": "{region}.signin.amazonaws.cn",
+        "aws-eusc": "{region}.signin.amazonaws-eusc.eu",
+    }
+
+
+def test_signin_hosts_refuses_two_hosts_for_one_partition():
+    rules = [endpoint_rule(PLAIN + [partition_is("aws")], "https://{Region}.signin.aws.amazon.com"),
+             endpoint_rule(PLAIN + [partition_is("aws")], "https://{Region}.signin.example.com")]
+
+    with pytest.raises(ValueError, match="aws resolves to both"):
+        r.signin_hosts(rules)
+
+
+def test_collect_signin_hosts_reads_the_newest_gzipped_ruleset_or_nothing(tmp_path):
+    assert r.collect_signin_hosts(tmp_path) == {}
+    write_service(tmp_path, "signin", "2023-01-01", {"endpointPrefix": "signin"},
+                  [endpoint_rule(PLAIN + [partition_is("aws-cn")], "https://{Region}.signin.amazonaws.cn")],
+                  gzipped=True)
+
+    assert r.collect_signin_hosts(tmp_path) == {"aws-cn": "{region}.signin.amazonaws.cn"}
+
+
+def test_build_adds_the_signin_host_only_where_one_is_known():
+    document = r.build(PARTITIONS, ENDPOINTS, r.parse_cdk_entities(ENTITIES), None, "test",
+                       signin={"aws-cn": "{region}.signin.amazonaws.cn"})
+
+    assert by_id(document, "aws-cn")["signinHost"] == "{region}.signin.amazonaws.cn"
+    assert "signinHost" not in by_id(document, "aws")
+
+
+def test_build_drops_a_signing_name_whose_own_prefix_service_is_listed_nowhere():
+    signing_names = {"execute-api": ["participant.connect"], "ecr": ["api.ecr"], "iam": ["iam-toolbox"]}
+    document = r.build(PARTITIONS, ENDPOINTS, r.parse_cdk_entities(ENTITIES), None, "test",
+                       signing_names, None, {"execute-api", "iam", "sqs"})
+
+    assert document["signingNames"] == {"ecr": ["api.ecr"], "iam": ["iam-toolbox"]}
+
+
+def test_collect_self_signed_prefixes_lists_services_signing_with_their_own_prefix(tmp_path):
+    write_service(tmp_path, "apigatewaymanagementapi", "2018-11-29", {"endpointPrefix": "execute-api"})
+    write_service(tmp_path, "connectparticipant", "2018-09-07",
+                  {"endpointPrefix": "participant.connect", "signingName": "execute-api"})
+
+    assert r.collect_self_signed_prefixes(tmp_path) == {"execute-api"}
 
 
 def test_build_refuses_a_partition_missing_from_endpoints_json():
@@ -314,6 +442,40 @@ def test_cli_writes_then_reports_up_to_date_then_detects_drift(tmp_path, capsys)
     }))
     assert r.main(["--check"] + common) == 1
     assert "make aws-data-sync" in capsys.readouterr().out
+
+
+def test_cli_carry_region_flags_ignores_a_cdk_checkout_that_moved(tmp_path, capsys):
+    data, cdk = write_sources(tmp_path)
+    output = tmp_path / "partitions.json"
+    common = ["--botocore-data", str(data), "--cdk", str(cdk), "--output", str(output)]
+    assert r.main(common) == 0
+    written = output.read_text()
+
+    entities = cdk / r.CDK_ENTITIES
+    moved = ENTITIES.replace("  RULE_CLASSIC_PARTITION_BECOMES_OPT_IN,\n", "")
+    moved = moved.replace("];", "  RULE_CLASSIC_PARTITION_BECOMES_OPT_IN,\n];")
+    assert moved != ENTITIES
+    entities.write_text(moved)
+    assert r.main(["--check"] + common) == 1
+    capsys.readouterr()
+
+    assert r.main(["--check", "--carry-region-flags"] + common) == 0
+    assert r.main(["--carry-region-flags"] + common) == 0
+    assert output.read_text() == written
+
+
+def test_cli_carry_region_flags_refuses_a_new_region(tmp_path):
+    data, cdk = write_sources(tmp_path)
+    output = tmp_path / "partitions.json"
+    common = ["--botocore-data", str(data), "--cdk", str(cdk), "--output", str(output)]
+    assert r.main(common) == 0
+
+    partitions = json.loads(json.dumps(PARTITIONS))
+    partitions["partitions"][0]["regions"]["eu-new-1"] = {"description": "New"}
+    (data / "partitions.json").write_text(json.dumps(partitions))
+    with pytest.raises(ValueError, match="eu-new-1.*nothing to carry over"):
+        r.main(["--carry-region-flags"] + common)
+    assert r.main(common) == 0
 
 
 def test_cli_check_ignores_provenance_differences(tmp_path):

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.ecs.container.HostVolumePolicy;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.RegisterTaskDefinitionRequest;
@@ -12,13 +13,12 @@ import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +50,19 @@ class EcsJsonHandlerVolumesTest {
     private ObjectMapper objectMapper;
     private EmulatorConfig config;
     private EcsJsonHandler handler;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{}", "{\"fileSystemId\":\"\"}", "{\"fileSystemId\":\" \"}", "\"invalid\""})
+    void registerTaskDefinitionRejectsMalformedEfsVolume(String efs) throws Exception {
+        JsonNode request = objectMapper.readTree("""
+                {"family":"invalid-efs","containerDefinitions":[{"name":"app","image":"busybox:stable",
+                 "mountPoints":[{"sourceVolume":"shared","containerPath":"/data"}]}],
+                 "volumes":[{"name":"shared","efsVolumeConfiguration":%s}]}
+                """.formatted(efs));
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("RegisterTaskDefinition", request, "us-east-1"));
+        assertEquals("InvalidParameterException", error.getErrorCode());
+    }
 
     @BeforeEach
     void setUp() {
@@ -144,6 +157,87 @@ class EcsJsonHandlerVolumesTest {
         assertEquals("aws-vol", mps.get(1).path("sourceVolume").asText());
         assertEquals("/root/.aws", mps.get(1).path("containerPath").asText());
         assertFalse(mps.get(1).path("readOnly").asBoolean(), "aws mount is read-write");
+    }
+
+    @Test
+    void registerTaskDefinitionOmitsReadOnlyFromMountPointsAndVolumesFromThatNeverSentIt() throws Exception {
+        String requestJson = """
+                {
+                  "family": "td",
+                  "containerDefinitions": [
+                    {
+                      "name": "a",
+                      "image": "nginx",
+                      "memory": 128,
+                      "essential": true,
+                      "mountPoints": [
+                        {"sourceVolume": "v", "containerPath": "/a"}
+                      ]
+                    },
+                    {
+                      "name": "b",
+                      "image": "nginx",
+                      "memory": 128,
+                      "essential": false,
+                      "volumesFrom": [
+                        {"sourceContainer": "a"}
+                      ]
+                    }
+                  ],
+                  "volumes": [{"name": "v"}]
+                }
+                """;
+        JsonNode request = objectMapper.readTree(requestJson);
+
+        Response response = handler.handle("RegisterTaskDefinition", request, "us-east-1");
+        JsonNode td = objectMapper.valueToTree(response.getEntity()).path("taskDefinition");
+        JsonNode containerA = td.path("containerDefinitions").get(0);
+        JsonNode containerB = td.path("containerDefinitions").get(1);
+
+        assertTrue(containerA.path("mountPoints").get(0).path("readOnly").isMissingNode(),
+                "a mountPoint registered without readOnly must not gain one");
+        assertTrue(containerB.path("volumesFrom").get(0).path("readOnly").isMissingNode(),
+                "a volumesFrom entry registered without readOnly must not gain one");
+    }
+
+    @Test
+    void registerTaskDefinitionEchoesAnExplicitReadOnlyOnMountPointsAndVolumesFrom() throws Exception {
+        String requestJson = """
+                {
+                  "family": "td-explicit-readonly",
+                  "containerDefinitions": [
+                    {
+                      "name": "app",
+                      "image": "nginx",
+                      "memory": 128,
+                      "essential": true,
+                      "mountPoints": [
+                        {"sourceVolume": "v", "containerPath": "/ro", "readOnly": true},
+                        {"sourceVolume": "v", "containerPath": "/rw", "readOnly": false}
+                      ],
+                      "volumesFrom": [
+                        {"sourceContainer": "other", "readOnly": true},
+                        {"sourceContainer": "other2", "readOnly": false}
+                      ]
+                    }
+                  ],
+                  "volumes": [{"name": "v"}]
+                }
+                """;
+        JsonNode request = objectMapper.readTree(requestJson);
+
+        Response response = handler.handle("RegisterTaskDefinition", request, "us-east-1");
+        JsonNode td = objectMapper.valueToTree(response.getEntity()).path("taskDefinition");
+        JsonNode definition = td.path("containerDefinitions").get(0);
+        JsonNode mps = definition.path("mountPoints");
+        JsonNode volumesFrom = definition.path("volumesFrom");
+
+        assertTrue(mps.get(0).path("readOnly").asBoolean(), "explicit readOnly true must round-trip");
+        assertFalse(mps.get(1).path("readOnly").asBoolean(), "explicit readOnly false must round-trip");
+        assertTrue(volumesFrom.get(0).path("readOnly").asBoolean(),
+                "explicit volumesFrom readOnly true must round-trip");
+        assertFalse(volumesFrom.get(1).path("readOnly").asBoolean(),
+                "explicit volumesFrom readOnly false must round-trip");
     }
 
     @Test
@@ -463,8 +557,7 @@ class EcsJsonHandlerVolumesTest {
     private static void writeContextFixture(Path dockerConfigDir, String contextName, String host) throws Exception {
         Files.createDirectories(dockerConfigDir);
         Files.writeString(dockerConfigDir.resolve("config.json"), "{\"currentContext\":\"" + contextName + "\"}");
-        byte[] nameHash = MessageDigest.getInstance("SHA-256").digest(contextName.getBytes(StandardCharsets.UTF_8));
-        Path metaDir = dockerConfigDir.resolve("contexts").resolve("meta").resolve(HexFormat.of().formatHex(nameHash));
+        Path metaDir = dockerConfigDir.resolve("contexts").resolve("meta").resolve(Digests.sha256Hex(contextName));
         Files.createDirectories(metaDir);
         Files.writeString(metaDir.resolve("meta.json"),
                 "{\"Name\":\"" + contextName + "\",\"Metadata\":{},"

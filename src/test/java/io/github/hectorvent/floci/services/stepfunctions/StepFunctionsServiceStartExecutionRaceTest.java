@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -7,7 +8,6 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -23,6 +23,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntConsumer;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -135,7 +136,8 @@ class StepFunctionsServiceStartExecutionRaceTest {
 
         AslExecutor executor = mock(AslExecutor.class);
         StepFunctionsService service =
-                new StepFunctionsService(factory, region, executor, new ObjectMapper(), mock(SfnMockLoader.class));
+                new StepFunctionsService(factory, region, executor, new ObjectMapper(), mock(SfnMockLoader.class),
+                mock(StepFunctionsEventPublisher.class));
 
         StateMachine sm = new StateMachine();
         sm.setStateMachineArn(SM_ARN);
@@ -147,7 +149,7 @@ class StepFunctionsServiceStartExecutionRaceTest {
         return new Fixture(service, executor);
     }
 
-    private void runConcurrently(java.util.function.IntConsumer body) throws Exception {
+    private void runConcurrently(IntConsumer body) throws Exception {
         CyclicBarrier barrier = new CyclicBarrier(N);
         ExecutorService pool = Executors.newFixedThreadPool(N);
         List<Future<?>> futures = new ArrayList<>();

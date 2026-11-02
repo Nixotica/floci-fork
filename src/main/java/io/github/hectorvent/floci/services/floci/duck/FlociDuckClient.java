@@ -3,8 +3,7 @@ package io.github.hectorvent.floci.services.floci.duck;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
-import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -29,21 +28,18 @@ public class FlociDuckClient {
 
     private final FlociDuckManager duckManager;
     private final EmulatorConfig config;
-    private final EmbeddedDnsServer embeddedDnsServer;
-    private final DockerHostResolver dockerHostResolver;
+    private final ContainerReachableEndpoint containerEndpoint;
     private final ObjectMapper mapper;
     private final HttpClient httpClient;
 
     @Inject
     public FlociDuckClient(FlociDuckManager duckManager,
                            EmulatorConfig config,
-                           EmbeddedDnsServer embeddedDnsServer,
-                           DockerHostResolver dockerHostResolver,
+                           ContainerReachableEndpoint containerEndpoint,
                            ObjectMapper mapper) {
         this.duckManager = duckManager;
         this.config = config;
-        this.embeddedDnsServer = embeddedDnsServer;
-        this.dockerHostResolver = dockerHostResolver;
+        this.containerEndpoint = containerEndpoint;
         this.mapper = mapper;
         this.httpClient = HttpClient.newHttpClient();
     }
@@ -77,9 +73,19 @@ public class FlociDuckClient {
      * default account.
      */
     public void execute(String sql, String setupDdl, String outputS3Path, String accessKeyId) {
+        execute(sql, setupDdl, outputS3Path, accessKeyId, null, null);
+    }
+
+    /**
+     * Variant of {@link #execute(String, String, String, String)} that passes
+     * explicit credentials (including session token for SigV4 authentication).
+     */
+    public void execute(String sql, String setupDdl, String outputS3Path,
+                        String accessKeyId, String secretAccessKey, String sessionToken) {
         String duckUrl = duckManager.ensureReady();
 
-        Map<String, Object> body = buildBaseBody(sql, setupDdl, accessKeyId);
+        String effectiveSetup = injectSessionToken(setupDdl, sessionToken);
+        Map<String, Object> body = buildBaseBody(sql, effectiveSetup, accessKeyId, secretAccessKey);
         if (outputS3Path != null) {
             body.put("output_s3_path", outputS3Path);
         }
@@ -105,48 +111,57 @@ public class FlociDuckClient {
      * {@link #execute(String, String, String, String)} for details.
      */
     public List<Map<String, Object>> query(String sql, String setupDdl, String accessKeyId) {
+        return query(sql, setupDdl, accessKeyId, null, null);
+    }
+
+    /**
+     * Variant of {@link #query(String, String, String)} that passes
+     * explicit credentials (including session token for SigV4 authentication).
+     */
+    public List<Map<String, Object>> query(String sql, String setupDdl,
+                                           String accessKeyId, String secretAccessKey, String sessionToken) {
         String duckUrl = duckManager.ensureReady();
 
-        Map<String, Object> body = buildBaseBody(sql, setupDdl, accessKeyId);
+        String effectiveSetup = injectSessionToken(setupDdl, sessionToken);
+        Map<String, Object> body = buildBaseBody(sql, effectiveSetup, accessKeyId, secretAccessKey);
 
         String responseBody = post(duckUrl + "/query", body, "query");
         return parseQueryRows(responseBody);
     }
 
+    static String injectSessionToken(String setupDdl, String sessionToken) {
+        if (sessionToken == null || sessionToken.isBlank()) {
+            return setupDdl;
+        }
+        String setToken = "SET s3_session_token = '" + sessionToken.replace("'", "''") + "';\n";
+        return setupDdl == null || setupDdl.isBlank() ? setToken : setToken + setupDdl;
+    }
+
     // ── internals ─────────────────────────────────────────────────────────────
 
     private Map<String, Object> buildBaseBody(String sql, String setupDdl) {
-        return buildBaseBody(sql, setupDdl, null);
+        return buildBaseBody(sql, setupDdl, null, null);
     }
 
     private Map<String, Object> buildBaseBody(String sql, String setupDdl, String accessKeyId) {
+        return buildBaseBody(sql, setupDdl, accessKeyId, null);
+    }
+
+    private Map<String, Object> buildBaseBody(String sql, String setupDdl, String accessKeyId, String secretAccessKey) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("sql", sql);
         if (setupDdl != null && !setupDdl.isBlank()) {
             body.put("setup_sql", setupDdl);
         }
-        body.put("s3_endpoint", resolveFlociEndpoint());
+        body.put("s3_endpoint", containerEndpoint.baseUrl());
         body.put("s3_region", config.defaultRegion());
         // A 12-digit access key flows through AccountResolver and selects the
         // matching account partition for any S3 read/write the SQL performs.
         // Anything else falls back to the configured default account.
         body.put("s3_access_key", accessKeyId == null || accessKeyId.isEmpty() ? "test" : accessKeyId);
-        body.put("s3_secret_key", "test");
+        body.put("s3_secret_key", secretAccessKey == null || secretAccessKey.isEmpty() ? "test" : secretAccessKey);
         body.put("s3_url_style", "path");
         return body;
-    }
-
-    /**
-     * Returns the Floci S3 endpoint URL as reachable from inside a floci-duck container.
-     * Uses the embedded DNS hostname when the DNS server is active, falls back to the
-     * raw Docker host IP for local dev mode.
-     */
-    private String resolveFlociEndpoint() {
-        int port = URI.create(config.baseUrl()).getPort();
-        String hostname = embeddedDnsServer.getServerIp().isPresent()
-                ? config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX)
-                : dockerHostResolver.resolve();
-        return "http://" + hostname + ":" + port;
     }
 
     private String post(String url, Map<String, Object> body, String operation) {

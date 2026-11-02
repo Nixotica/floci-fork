@@ -117,6 +117,7 @@ class S3BlockPublicAccessEnforcementIntegrationTest {
     @Test
     void ignorePublicAclsWithholdsAnonymousListBucketOnAPublicBucketAcl() {
         String bucket = createBucket();
+        deleteBucketPublicAccessBlock(bucket);
         putObject(bucket, "object.txt");
         given().filter(OWNER).header("x-amz-acl", "public-read")
                 .when().put("/" + bucket + "?acl")
@@ -142,6 +143,7 @@ class S3BlockPublicAccessEnforcementIntegrationTest {
 
     private static String bucketWithPublicPolicy() {
         String bucket = createBucket();
+        deleteBucketPublicAccessBlock(bucket);
         putObject(bucket, "object.txt");
         putBucketPolicy(bucket, PUBLIC_READ_POLICY.formatted(bucket));
         return bucket;
@@ -149,6 +151,7 @@ class S3BlockPublicAccessEnforcementIntegrationTest {
 
     private static String bucketWithPublicObjectAcl() {
         String bucket = createBucket();
+        deleteBucketPublicAccessBlock(bucket);
         putObject(bucket, "object.txt");
         given().filter(OWNER).header("x-amz-acl", "public-read")
                 .when().put("/" + bucket + "/object.txt?acl")
@@ -159,6 +162,9 @@ class S3BlockPublicAccessEnforcementIntegrationTest {
     private static String createBucket() {
         String bucket = "bpa-enforce-" + UUID.randomUUID();
         given().filter(OWNER).when().put("/" + bucket).then().statusCode(200);
+        given().filter(OWNER)
+                .body("<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>")
+                .when().put("/" + bucket + "?ownershipControls").then().statusCode(200);
         return bucket;
     }
 
@@ -172,6 +178,10 @@ class S3BlockPublicAccessEnforcementIntegrationTest {
         given().filter(OWNER).body(policy)
                 .when().put("/" + bucket + "?policy")
                 .then().statusCode(200);
+    }
+
+    private static void deleteBucketPublicAccessBlock(String bucket) {
+        given().filter(OWNER).when().delete("/" + bucket + "?publicAccessBlock").then().statusCode(204);
     }
 
     private static void putBucketPublicAccessBlock(String bucket, boolean blockPublicAcls,

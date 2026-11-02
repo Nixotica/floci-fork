@@ -4,10 +4,13 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -18,11 +21,13 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -36,7 +41,9 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -45,6 +52,46 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class S3CopySimulatorTest {
+
+    @Test
+    void quotedDefaultIsValidatedAsAnArnForCopyAndUnload() {
+        IamService iamService = mock(IamService.class);
+        for (String defaultRole : new String[]{null, ROLE_ARN}) {
+            for (String authorization : List.of("IAM_ROLE 'default'", "IAM_ROLE \"default\"",
+                    "CREDENTIALS 'aws_iam_role=default'")) {
+                CopyStatementParser.S3CopyFrom copy = (CopyStatementParser.S3CopyFrom) CopyStatementParser.parse(
+                        "COPY people FROM 's3://bucket/data' " + authorization, defaultRole);
+                CopyStatementParser.S3Unload unload = (CopyStatementParser.S3Unload) CopyStatementParser.parse(
+                        "UNLOAD ('SELECT 1') TO 's3://bucket/out/' " + authorization, defaultRole);
+                S3CopySimulator.S3TransferException copyError = assertThrows(S3CopySimulator.S3TransferException.class,
+                        () -> S3CopySimulator.prepareCopy(copy, s3, iamService, "000000000000", List.of(ROLE_ARN)));
+                S3CopySimulator.S3TransferException unloadError = assertThrows(S3CopySimulator.S3TransferException.class,
+                        () -> S3CopySimulator.prepareUnload(unload, s3, iamService, "000000000000", List.of(ROLE_ARN)));
+                assertEquals("42501", copyError.sqlState());
+                assertEquals("42501", unloadError.sqlState());
+                assertTrue(copyError.getMessage().contains("malformed ARN"), copyError.getMessage());
+                assertTrue(unloadError.getMessage().contains("malformed ARN"), unloadError.getMessage());
+            }
+        }
+        verifyNoInteractions(s3, iamService);
+    }
+
+    @Test
+    void missingDefaultRoleFailsCopyAndUnloadBeforeTouchingS3() {
+        CopyStatementParser.S3CopyFrom copy = (CopyStatementParser.S3CopyFrom) CopyStatementParser.parse(
+                "COPY people FROM 's3://bucket/data' IAM_ROLE default");
+        CopyStatementParser.S3Unload unload = (CopyStatementParser.S3Unload) CopyStatementParser.parse(
+                "UNLOAD ('SELECT 1') TO 's3://bucket/out/' IAM_ROLE default");
+        S3CopySimulator.S3TransferException copyError = assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> S3CopySimulator.prepareCopy(copy, s3, null, "000000000000", List.of()));
+        S3CopySimulator.S3TransferException unloadError = assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> S3CopySimulator.prepareUnload(unload, s3, null, "000000000000", List.of()));
+        assertEquals("42501", copyError.sqlState());
+        assertEquals("42501", unloadError.sqlState());
+        assertTrue(copyError.getMessage().contains("No default IAM role"));
+        assertTrue(unloadError.getMessage().contains("No default IAM role"));
+        verifyNoInteractions(s3);
+    }
 
     private ServerSocket listener;
     private Socket simClient;   // simulator's "client" end
@@ -185,6 +232,13 @@ class S3CopySimulatorTest {
 
     private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/CopyRole";
 
+    /** A role IAM holds under {@code arn}, which is the only ARN Redshift takes it under. */
+    private static IamRole heldRole(String arn) {
+        IamRole role = mock(IamRole.class);
+        when(role.getArn()).thenReturn(arn);
+        return role;
+    }
+
     @Test
     void prepareCopyWithMalformedIamRoleArnFailsBeforeTouchingS3() {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
@@ -251,7 +305,7 @@ class S3CopySimulatorTest {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
                 "t", List.of(), "b", "k", "|", 0, false, false, null, ROLE_ARN);
         IamService iamService = mock(IamService.class);
-        IamRole role = mock(IamRole.class);
+        IamRole role = heldRole(ROLE_ARN);
         when(iamService.findRole("000000000000", "CopyRole"))
                 .thenReturn(Optional.of(role));
         when(role.getAssumeRolePolicyDocument()).thenReturn(""
@@ -274,8 +328,9 @@ class S3CopySimulatorTest {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
                 "t", List.of(), "b", "k", "|", 0, false, false, null, ROLE_ARN);
         IamService iamService = mock(IamService.class);
+        IamRole role = heldRole(ROLE_ARN);
         when(iamService.findRole(any(), any()))
-                .thenReturn(Optional.of(mock(IamRole.class)));
+                .thenReturn(Optional.of(role));
 
         S3CopySimulator.CopyInput input = S3CopySimulator.prepareCopy(spec, s3, iamService);
 
@@ -296,8 +351,9 @@ class S3CopySimulatorTest {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
                 "t", List.of(), "b", "k", "|", 0, false, false, null, ROLE_ARN);
         IamService iamService = mock(IamService.class);
+        IamRole role = heldRole(ROLE_ARN);
         when(iamService.findRole(any(), any()))
-                .thenReturn(Optional.of(mock(IamRole.class)));
+                .thenReturn(Optional.of(role));
 
         S3CopySimulator.CopyInput input = S3CopySimulator.prepareCopy(spec, s3, iamService);
         S3CopySimulator.streamCopyInput(input, new ByteArrayOutputStream());
@@ -324,6 +380,152 @@ class S3CopySimulatorTest {
         assertEquals(0, written.get("out/000").length);
         assertEquals("COPY (select a,b from t) TO STDOUT WITH (FORMAT text, DELIMITER '|')",
                 S3CopySimulator.unloadBackendSql(spec));
+    }
+
+    private CopyStatementParser.S3Unload unloadSpecWithExtension(boolean gzip, boolean manifest, String extension) {
+        return new CopyStatementParser.S3Unload("select a,b from t", "wh", "out/",
+                "|", false, gzip, false, false, null, manifest, true, true, 0, null, extension);
+    }
+
+    private CopyStatementParser.S3Unload unloadSpecWithOptions(
+            boolean manifest, boolean cleanPath, boolean encrypted, String kmsKeyId) {
+        return new CopyStatementParser.S3Unload("select a,b from t", "wh", "out/", "|", false, false, false,
+                false, null, manifest, false, true, 0, null, null, false, cleanPath, encrypted, kmsKeyId);
+    }
+
+    @Test
+    void cleanPathDeletesOnlyObjectsUnderThePrefixBeforeWriting() throws Exception {
+        S3Object old1 = new S3Object("wh", "out/old1", new byte[0], "text/plain");
+        S3Object old2 = new S3Object("wh", "out/old2", new byte[0], "text/plain");
+        when(s3.listObjectsWithPrefixes(eq("wh"), eq("out/"), isNull(), anyInt(), any(), any()))
+                .thenReturn(new S3Service.ListObjectsResult(List.of(old1, old2), List.of(), false, null));
+        Map<String, byte[]> written = new ConcurrentHashMap<>();
+        when(s3.putObject(eq("wh"), any(), any(), any(), any())).thenAnswer(inv -> {
+            written.put(inv.getArgument(1), inv.getArgument(2));
+            return null;
+        });
+
+        Thread backend = backendThread(() -> playUnloadBackend("1|alice\n"));
+        S3CopySimulator.runUnload(simClient, simBackend, unloadSpecWithOptions(false, true, false, null),
+                s3, null, 'I');
+        joinBackend(backend);
+
+        verify(s3).deleteObjectsWithPrefix(eq("wh"), eq("out/"), any());
+        assertTrue(written.containsKey("out/0000_part_00"), written.keySet().toString());
+    }
+
+    @Test
+    void cleanPathDeletesNothingUntilOutputArrivesAndDeletesBeforeTheFirstWrite() throws Exception {
+        S3Object old1 = new S3Object("wh", "out/old1", new byte[0], "text/plain");
+        when(s3.listObjectsWithPrefixes(eq("wh"), eq("out/"), isNull(), anyInt(), any(), any()))
+                .thenReturn(new S3Service.ListObjectsResult(List.of(old1), List.of(), false, null));
+
+        try (S3CopySimulator.UnloadCollector collector =
+                     S3CopySimulator.prepareUnload(unloadSpecWithOptions(false, true, false, null), s3, null)) {
+            verify(s3, never()).deleteObjectsWithPrefix(any(), any(), any());
+            collector.complete();
+        }
+
+        InOrder order = inOrder(s3);
+        order.verify(s3).deleteObjectsWithPrefix(eq("wh"), eq("out/"), any());
+        order.verify(s3).putObject(eq("wh"), eq("out/0000_part_00"), any(), any(), any());
+    }
+
+    @Test
+    void cleanPathAuthorizesEachDeleteThroughTheCallbackItHandsToS3() throws Exception {
+        doAnswer(inv -> {
+            Consumer<String> authorize = inv.getArgument(2);
+            authorize.accept("out/late");
+            return 1;
+        }).when(s3).deleteObjectsWithPrefix(eq("wh"), eq("out/"), any());
+
+        try (S3CopySimulator.UnloadCollector collector =
+                     S3CopySimulator.prepareUnload(unloadSpecWithOptions(false, true, false, null), s3, null)) {
+            collector.complete();
+        }
+
+        verify(s3).authorizeAnonymousDeleteObject("wh", "out/late");
+    }
+
+    @Test
+    void cleanPathKeepsObjectsWhenTheQueryNeverProducesOutput() throws Exception {
+        S3Object old1 = new S3Object("wh", "out/old1", new byte[0], "text/plain");
+        when(s3.listObjectsWithPrefixes(eq("wh"), eq("out/"), isNull(), anyInt(), any(), any()))
+                .thenReturn(new S3Service.ListObjectsResult(List.of(old1), List.of(), false, null));
+
+        // Closed without complete(): the backend rejected the query, e.g. an unknown column.
+        try (S3CopySimulator.UnloadCollector collector =
+                     S3CopySimulator.prepareUnload(unloadSpecWithOptions(false, true, false, null), s3, null)) {
+            assertNotNull(collector);
+        }
+
+        verify(s3, never()).deleteObjectsWithPrefix(any(), any(), any());
+    }
+
+    @Test
+    void cleanPathDeniedDeleteFailsBeforeAnythingIsWritten() {
+        S3Object old1 = new S3Object("wh", "out/old1", new byte[0], "text/plain");
+        when(s3.listObjectsWithPrefixes(eq("wh"), eq("out/"), isNull(), anyInt(), any(), any()))
+                .thenReturn(new S3Service.ListObjectsResult(List.of(old1), List.of(), false, null));
+        doThrow(new AwsException("AccessDenied", "denied", 403))
+                .when(s3).authorizeAnonymousDeleteObject("wh", "out/old1");
+
+        assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> S3CopySimulator.prepareUnload(unloadSpecWithOptions(false, true, false, null), s3, null));
+
+        verify(s3, never()).deleteObjectsWithPrefix(any(), any(), any());
+        verify(s3, never()).putObject(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void kmsKeyIdIsStoredOnDataAndManifestObjects() throws Exception {
+        ArgumentCaptor<PutObjectOptions> options = ArgumentCaptor.forClass(PutObjectOptions.class);
+        when(s3.putObject(eq("wh"), any(), any(), any(), any(), options.capture())).thenReturn(null);
+
+        Thread backend = backendThread(() -> playUnloadBackend("1|alice\n"));
+        S3CopySimulator.runUnload(simClient, simBackend, unloadSpecWithOptions(true, false, true, "key-1"),
+                s3, null, 'I');
+        joinBackend(backend);
+
+        assertEquals(2, options.getAllValues().size());
+        for (PutObjectOptions captured : options.getAllValues()) {
+            assertEquals("aws:kms", captured.getServerSideEncryption());
+            assertEquals("key-1", captured.getSseKmsKeyId());
+        }
+    }
+
+    @Test
+    void unloadAppendsExtensionToDataKeys() throws Exception {
+        Map<String, byte[]> written = new ConcurrentHashMap<>();
+        when(s3.putObject(eq("wh"), any(), any(), any(), any())).thenAnswer(inv -> {
+            written.put(inv.getArgument(1), inv.getArgument(2));
+            return null;
+        });
+
+        Thread backend = backendThread(() -> playUnloadBackend("1|alice\n"));
+        S3CopySimulator.runUnload(simClient, simBackend, unloadSpecWithExtension(false, false, ".csv"),
+                s3, null, 'I');
+        joinBackend(backend);
+
+        assertTrue(written.containsKey("out/0000_part_00.csv"), written.keySet().toString());
+    }
+
+    @Test
+    void unloadWithExtensionDoesNotAddAGzipSuffixAndListsTheNameInManifest() throws Exception {
+        Map<String, byte[]> written = new ConcurrentHashMap<>();
+        when(s3.putObject(eq("wh"), any(), any(), any(), any())).thenAnswer(inv -> {
+            written.put(inv.getArgument(1), inv.getArgument(2));
+            return null;
+        });
+
+        Thread backend = backendThread(() -> playUnloadBackend("1|alice\n"));
+        S3CopySimulator.runUnload(simClient, simBackend, unloadSpecWithExtension(true, true, "txt.gz"),
+                s3, null, 'I');
+        joinBackend(backend);
+
+        assertTrue(written.containsKey("out/0000_part_00.txt.gz"), written.keySet().toString());
+        String manifest = new String(written.get("out/manifest"), StandardCharsets.UTF_8);
+        assertTrue(manifest.contains("s3://wh/out/0000_part_00.txt.gz"), manifest);
     }
 
     @Test
@@ -1016,17 +1218,17 @@ class S3CopySimulatorTest {
     }
 
     @Test
-    void concatenatesPrefixObjectsInKeyOrderAndSkipsHeaderOnFirstOnly() throws Exception {
+    void concatenatesPrefixObjectsInKeyOrderAndSkipsTheHeaderOfEachObject() throws Exception {
         when(s3.objectExists("wh", "p/")).thenReturn(false);
         when(s3.listObjectsWithPrefixes(eq("wh"), eq("p/"), isNull(), anyInt(), any(), any())).thenReturn(
                 new S3Service.ListObjectsResult(List.of(
                         new S3Object("wh", "p/1", "h1|h2\n1|a\n".getBytes(StandardCharsets.US_ASCII), "text/plain"),
-                        new S3Object("wh", "p/2", "2|b\n".getBytes(StandardCharsets.US_ASCII), "text/plain")),
+                        new S3Object("wh", "p/2", "h1|h2\n2|b\n".getBytes(StandardCharsets.US_ASCII), "text/plain")),
                         List.of(), false, null));
         when(s3.getObject("wh", "p/1")).thenReturn(
                 new S3Object("wh", "p/1", "h1|h2\n1|a\n".getBytes(StandardCharsets.US_ASCII), "text/plain"));
         when(s3.getObject("wh", "p/2")).thenReturn(
-                new S3Object("wh", "p/2", "2|b\n".getBytes(StandardCharsets.US_ASCII), "text/plain"));
+                new S3Object("wh", "p/2", "h1|h2\n2|b\n".getBytes(StandardCharsets.US_ASCII), "text/plain"));
 
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
                 "t", List.of(), "wh", "p/", "|", 1, false, false, null, null);
@@ -1364,6 +1566,284 @@ class S3CopySimulatorTest {
         assertEquals('d', rawBytes[0]);
     }
 
+    private static String copyDataPayload(byte[] frames) {
+        ByteArrayOutputStream payload = new ByteArrayOutputStream();
+        int i = 0;
+        while (i < frames.length) {
+            int length = ((frames[i + 1] & 0xFF) << 24) | ((frames[i + 2] & 0xFF) << 16)
+                    | ((frames[i + 3] & 0xFF) << 8) | (frames[i + 4] & 0xFF);
+            payload.write(frames, i + 5, length - 4);
+            i += 1 + length;
+        }
+        return payload.toString(StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void streamCopyInput_appliesFieldTransforms() throws Exception {
+        CopyStatementParser.CopyTransforms transforms =
+                new CopyStatementParser.CopyTransforms(true, true, false, false, null);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "people", List.of(), "wh", "p.txt", "|", 0, false, false, null, null,
+                false, false, false, transforms);
+        S3Object dataObj = new S3Object("wh", "p.txt",
+                "1|  \n2||x\n".getBytes(StandardCharsets.UTF_8), "text/plain");
+        when(s3.getObject("wh", "p.txt")).thenReturn(dataObj);
+
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("p.txt"), s3, null, null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        S3CopySimulator.streamCopyInput(input, out);
+
+        assertEquals("1|\\N\n2|\\N|x\n", copyDataPayload(out.toByteArray()));
+    }
+
+    @Test
+    void streamCopyInput_skipsTheHeaderOfEveryObject() throws Exception {
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "people", List.of(), "wh", "p/", "|", 1, false, false, null, null);
+        when(s3.getObject("wh", "p/a.txt")).thenReturn(new S3Object("wh", "p/a.txt",
+                "id|name\n1|a\n".getBytes(StandardCharsets.UTF_8), "text/plain"));
+        when(s3.getObject("wh", "p/b.txt")).thenReturn(new S3Object("wh", "p/b.txt",
+                "id|name\n2|b\n".getBytes(StandardCharsets.UTF_8), "text/plain"));
+        S3CopySimulator.CopyInput input =
+                new S3CopySimulator.CopyInput(spec, List.of("p/a.txt", "p/b.txt"), s3, null, null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        S3CopySimulator.streamCopyInput(input, out);
+
+        assertEquals("1|a\n2|b\n", copyDataPayload(out.toByteArray()));
+    }
+
+    @Test
+    void streamCopyInput_transformsAfterGzipDecodeAndHeaderSkip() throws Exception {
+        CopyStatementParser.CopyTransforms transforms =
+                new CopyStatementParser.CopyTransforms(false, true, false, false, null);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "people", List.of(), "wh", "p.gz", "|", 1, true, false, null, null,
+                false, false, false, transforms);
+        ByteArrayOutputStream gz = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzip = new GZIPOutputStream(gz)) {
+            gzip.write("id|name\n1|\n".getBytes(StandardCharsets.UTF_8));
+        }
+        when(s3.getObject("wh", "p.gz")).thenReturn(new S3Object("wh", "p.gz", gz.toByteArray(), "application/gzip"));
+
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("p.gz"), s3, null, null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        S3CopySimulator.streamCopyInput(input, out);
+
+        assertEquals("1|\\N\n", copyDataPayload(out.toByteArray()));
+    }
+
+    @Test
+    void alignMaxBytes_followsExplicitColumnListAndFoldsUnquotedNames() {
+        List<S3CopySimulator.ColumnInfo> catalog = List.of(
+                new S3CopySimulator.ColumnInfo("id", null),
+                new S3CopySimulator.ColumnInfo("name", 3),
+                new S3CopySimulator.ColumnInfo("Note", 5));
+        CopyStatementParser.S3CopyFrom explicit = new CopyStatementParser.S3CopyFrom(
+                "t", List.of("NAME", "\"Note\""), "wh", "k", "|", 0, false, false, null, null);
+        assertEquals(Arrays.asList(3, 5), S3CopySimulator.alignMaxBytes(explicit, catalog));
+
+        CopyStatementParser.S3CopyFrom all = new CopyStatementParser.S3CopyFrom(
+                "t", List.of(), "wh", "k", "|", 0, false, false, null, null);
+        assertEquals(Arrays.asList(null, 3, 5), S3CopySimulator.alignMaxBytes(all, catalog));
+    }
+
+    @Test
+    void alignKinds_followsExplicitColumnListAndTreatsUnknownNamesAsOrdinary() {
+        List<S3CopySimulator.ColumnInfo> catalog = List.of(
+                new S3CopySimulator.ColumnInfo("id", null, CopyRecordTransformer.ColumnKind.OTHER),
+                new S3CopySimulator.ColumnInfo("born", null, CopyRecordTransformer.ColumnKind.DATE),
+                new S3CopySimulator.ColumnInfo("Seen", null, CopyRecordTransformer.ColumnKind.TIMESTAMP));
+        CopyStatementParser.S3CopyFrom explicit = new CopyStatementParser.S3CopyFrom(
+                "t", List.of("SEEN", "missing", "\"Seen\"", "born"), "wh", "k", "|", 0, false, false, null, null);
+
+        assertEquals(List.of(CopyRecordTransformer.ColumnKind.OTHER, CopyRecordTransformer.ColumnKind.OTHER,
+                        CopyRecordTransformer.ColumnKind.TIMESTAMP, CopyRecordTransformer.ColumnKind.DATE),
+                S3CopySimulator.alignKinds(explicit, catalog));
+    }
+
+    @Test
+    void kindOf_mapsTheCatalogTypeOids() {
+        assertEquals(CopyRecordTransformer.ColumnKind.DATE, S3CopySimulator.kindOf("1082"));
+        assertEquals(CopyRecordTransformer.ColumnKind.TIMESTAMP, S3CopySimulator.kindOf("1114"));
+        assertEquals(CopyRecordTransformer.ColumnKind.TEXT, S3CopySimulator.kindOf("25"));
+        assertEquals(CopyRecordTransformer.ColumnKind.OTHER, S3CopySimulator.kindOf("1042"));
+        assertEquals(CopyRecordTransformer.ColumnKind.TEXT, S3CopySimulator.kindOf("1043"));
+        assertEquals(CopyRecordTransformer.ColumnKind.OTHER, S3CopySimulator.kindOf("1184"));
+        assertEquals(CopyRecordTransformer.ColumnKind.OTHER, S3CopySimulator.kindOf("23"));
+        assertEquals(CopyRecordTransformer.ColumnKind.OTHER, S3CopySimulator.kindOf(null));
+    }
+
+    @Test
+    void alignKinds_sizesTheResultToTheColumnListNotTheTable() {
+        List<S3CopySimulator.ColumnInfo> catalog = List.of(
+                new S3CopySimulator.ColumnInfo("id", null, CopyRecordTransformer.ColumnKind.OTHER),
+                new S3CopySimulator.ColumnInfo("name", 10, CopyRecordTransformer.ColumnKind.TEXT),
+                new S3CopySimulator.ColumnInfo("born", null, CopyRecordTransformer.ColumnKind.DATE));
+        CopyStatementParser.S3CopyFrom shortList = new CopyStatementParser.S3CopyFrom(
+                "t", List.of("id", "name"), "wh", "k", "|", 0, false, false, null, null);
+
+        assertEquals(List.of(CopyRecordTransformer.ColumnKind.OTHER, CopyRecordTransformer.ColumnKind.TEXT),
+                S3CopySimulator.alignKinds(shortList, catalog));
+    }
+
+    @Test
+    void streamCopyInput_rewritesDatesWithTheColumnKindsOfTheCatalog() throws Exception {
+        CopyStatementParser.CopyTransforms transforms = new CopyStatementParser.CopyTransforms(
+                false, false, false, false, null, CopyTemporalFormat.parse("MM/DD/YYYY", false), null, false);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "people", List.of(), "wh", "p.txt", "|", 0, false, false, null, null,
+                false, false, false, transforms);
+        when(s3.getObject("wh", "p.txt")).thenReturn(new S3Object("wh", "p.txt",
+                "1|03/31/2003\n".getBytes(StandardCharsets.UTF_8), "text/plain"));
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("p.txt"), s3, null, null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        S3CopySimulator.streamCopyInput(input, null, null,
+                List.of(CopyRecordTransformer.ColumnKind.OTHER, CopyRecordTransformer.ColumnKind.DATE), out);
+
+        assertEquals("1|2003-03-31\n", copyDataPayload(out.toByteArray()));
+    }
+
+    @Test
+    void streamCopyInput_fillsShortRecordsWithTheColumnKindsOfTheCatalog() throws Exception {
+        CopyStatementParser.CopyTransforms transforms = new CopyStatementParser.CopyTransforms(
+                false, false, false, false, null, null, null, false, true);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "people", List.of(), "wh", "p.txt", "|", 0, false, false, null, null,
+                false, false, false, transforms);
+        when(s3.getObject("wh", "p.txt")).thenReturn(new S3Object("wh", "p.txt",
+                "1\n2|b|7\n".getBytes(StandardCharsets.UTF_8), "text/plain"));
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("p.txt"), s3, null, null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        S3CopySimulator.streamCopyInput(input, null, null, List.of(CopyRecordTransformer.ColumnKind.OTHER,
+                CopyRecordTransformer.ColumnKind.TEXT, CopyRecordTransformer.ColumnKind.OTHER), out);
+
+        assertEquals("1||\\N\n2|b|7\n", copyDataPayload(out.toByteArray()));
+    }
+
+    @Test
+    void streamCopyInput_withFillRecordAndNoCatalogFailsAndNamesSimpleQueryMode() {
+        CopyStatementParser.CopyTransforms transforms = new CopyStatementParser.CopyTransforms(
+                false, false, false, false, null, null, null, false, true);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "t", List.of(), "wh", "k", "|", 0, false, false, null, null, false, false, false, transforms);
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("k"), s3, null, null);
+
+        S3CopySimulator.S3TransferException failure = assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> S3CopySimulator.streamCopyInput(input, new ByteArrayOutputStream()));
+        assertTrue(failure.getMessage().contains("preferQueryMode=simple"), failure.getMessage());
+    }
+
+    @Test
+    void streamCopyInput_withDateFormatsAndNoCatalogFailsAndNamesSimpleQueryMode() {
+        CopyStatementParser.CopyTransforms transforms = new CopyStatementParser.CopyTransforms(
+                false, false, false, false, null, CopyTemporalFormat.parse("MM/DD/YYYY", false), null, false);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "t", List.of(), "wh", "k", "|", 0, false, false, null, null, false, false, false, transforms);
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("k"), s3, null, null);
+
+        S3CopySimulator.S3TransferException failure = assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> S3CopySimulator.streamCopyInput(input, new ByteArrayOutputStream()));
+        assertTrue(failure.getMessage().contains("preferQueryMode=simple"), failure.getMessage());
+    }
+
+    @Test
+    void streamCopyInput_withTruncateColumnsAndNoCatalogFailsAndNamesSimpleQueryMode() {
+        CopyStatementParser.CopyTransforms transforms =
+                new CopyStatementParser.CopyTransforms(false, false, false, true, null);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "t", List.of(), "wh", "k", "|", 0, false, false, null, null, false, false, false, transforms);
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("k"), s3, null, null);
+
+        S3CopySimulator.S3TransferException failure = assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> S3CopySimulator.streamCopyInput(input, new ByteArrayOutputStream()));
+        assertTrue(failure.getMessage().contains("preferQueryMode=simple"), failure.getMessage());
+    }
+
+    @Test
+    void streamCopyInput_withFieldTransformOverTheObjectLimitFailsTheStatementAndReleasesTheBudget() {
+        CopyStatementParser.CopyTransforms transforms =
+                new CopyStatementParser.CopyTransforms(true, false, false, false, null);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "t", List.of(), "wh", "k", "|", 0, false, false, null, null, false, false, false, transforms);
+        when(s3.getObject("wh", "k")).thenReturn(
+                new S3Object("wh", "k", "1||x\n1||x\n".getBytes(StandardCharsets.UTF_8), "text/plain"));
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("k"), s3, null, null);
+
+        long saved = S3CopySimulator.COPY_TRANSFORM_MAX_OBJECT_BYTES;
+        int availableBefore = S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.availablePermits();
+        S3CopySimulator.COPY_TRANSFORM_MAX_OBJECT_BYTES = 8;
+        try {
+            S3CopySimulator.S3TransferException failure = assertThrows(S3CopySimulator.S3TransferException.class,
+                    () -> S3CopySimulator.streamCopyInput(input, new ByteArrayOutputStream()));
+            assertTrue(failure.getMessage().contains("8-byte limit"), failure.getMessage());
+            assertEquals(availableBefore, S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.availablePermits());
+        } finally {
+            S3CopySimulator.COPY_TRANSFORM_MAX_OBJECT_BYTES = saved;
+        }
+    }
+
+    @Test
+    void streamCopyInput_withFillRecordOutputOverTheObjectLimitFailsTheStatementAndReleasesTheBudget() {
+        CopyStatementParser.CopyTransforms transforms = new CopyStatementParser.CopyTransforms(
+                false, false, false, false, null, null, null, false, true);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "t", List.of(), "wh", "k", "|", 0, false, false, null, null, false, false, false, transforms);
+        when(s3.getObject("wh", "k")).thenReturn(
+                new S3Object("wh", "k", "1\n2\n".getBytes(StandardCharsets.UTF_8), "text/plain"));
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("k"), s3, null, null);
+
+        long saved = S3CopySimulator.COPY_TRANSFORM_MAX_OBJECT_BYTES;
+        int availableBefore = S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.availablePermits();
+        S3CopySimulator.COPY_TRANSFORM_MAX_OBJECT_BYTES = 16;
+        List<CopyRecordTransformer.ColumnKind> kinds = List.of(
+                CopyRecordTransformer.ColumnKind.OTHER,
+                CopyRecordTransformer.ColumnKind.TEXT,
+                CopyRecordTransformer.ColumnKind.OTHER,
+                CopyRecordTransformer.ColumnKind.OTHER,
+                CopyRecordTransformer.ColumnKind.OTHER,
+                CopyRecordTransformer.ColumnKind.OTHER);
+        try {
+            S3CopySimulator.S3TransferException failure = assertThrows(S3CopySimulator.S3TransferException.class,
+                    () -> S3CopySimulator.streamCopyInput(input, null, null, kinds, new ByteArrayOutputStream()));
+            assertTrue(failure.getMessage().contains("16-byte limit"), failure.getMessage());
+            assertEquals(availableBefore, S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.availablePermits());
+        } finally {
+            S3CopySimulator.COPY_TRANSFORM_MAX_OBJECT_BYTES = saved;
+        }
+    }
+
+    @Test
+    void streamCopyInput_withFillRecordOutputExhaustingHeapBudgetFailsAndReleasesTheBudget() {
+        CopyStatementParser.CopyTransforms transforms = new CopyStatementParser.CopyTransforms(
+                false, false, false, false, null, null, null, false, true);
+        CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
+                "t", List.of(), "wh", "k", "|", 0, false, false, null, null, false, false, false, transforms);
+        String inputData = "1\n".repeat(2000);
+        when(s3.getObject("wh", "k")).thenReturn(
+                new S3Object("wh", "k", inputData.getBytes(StandardCharsets.UTF_8), "text/plain"));
+        S3CopySimulator.CopyInput input = new S3CopySimulator.CopyInput(spec, List.of("k"), s3, null, null);
+
+        List<CopyRecordTransformer.ColumnKind> kinds = new ArrayList<>();
+        for (int i = 0; i < 300; i++) {
+            kinds.add(CopyRecordTransformer.ColumnKind.OTHER);
+        }
+
+        int availableBefore = S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.availablePermits();
+        S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.acquireUninterruptibly(availableBefore - 1);
+        try {
+            S3CopySimulator.S3TransferException failure = assertThrows(S3CopySimulator.S3TransferException.class,
+                    () -> S3CopySimulator.streamCopyInput(input, null, null, kinds, new ByteArrayOutputStream()));
+            assertTrue(failure.getMessage().contains("memory budget exhausted"), failure.getMessage());
+            assertEquals(1, S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.availablePermits());
+        } finally {
+            S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.release(availableBefore - 1);
+        }
+        assertEquals(availableBefore, S3CopySimulator.COPY_TRANSFORM_HEAP_MIB.availablePermits());
+    }
+
     @Test
     void copyBackendSql_quotesDiscoveredColumnIdentifiers() {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
@@ -1535,7 +2015,7 @@ class S3CopySimulatorTest {
     void runCopyFrom_withJsonAuto_releasesIamSessionEvenWhenCatalogDiscoveryFails() throws Exception {
         when(s3.objectExists("wh", "data.json")).thenReturn(true);
         IamService iamService = mock(IamService.class);
-        IamRole role = mock(IamRole.class);
+        IamRole role = heldRole("arn:aws:iam::000000000000:role/Role");
         when(role.getAssumeRolePolicyDocument()).thenReturn(
                 "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"redshift.amazonaws.com\"}}]}");
         when(iamService.findRole("000000000000", "Role")).thenReturn(Optional.of(role));

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.auth.SigV4aSignature;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.context.ContextNotActiveException;
 import jakarta.enterprise.inject.Instance;
@@ -83,20 +84,43 @@ public class RegionResolver {
         if (headers == null) {
             return defaultRegion;
         }
-        return resolveRegionFromAuth(headers.getHeaderString("Authorization"));
+        String authorization = headers.getHeaderString("Authorization");
+        if (authorization != null
+                && authorization.trim().startsWith(SigV4aSignature.ALGORITHM + " ")) {
+            return resolveRegionFromRegionSet(headers.getHeaderString("X-Amz-Region-Set"));
+        }
+        return resolveRegionFromAuth(authorization);
     }
 
     /**
      * The region label the SigV4 credential scope names, unvalidated: {@code AccountContextFilter}
      * decides whether an unknown label is served or refused (see {@link #isKnownRegion}), and
-     * needs the raw label either way so the rejection can name it.
+     * needs the raw label either way so the rejection can name it. A {@code <partition>-global}
+     * pseudo-region is the one exception, see {@link #withoutPseudoRegion}.
      */
     public String resolveRegionFromAuth(String authorizationHeader) {
         if (authorizationHeader == null || authorizationHeader.isEmpty()) {
             return defaultRegion;
         }
         Matcher matcher = CREDENTIAL_REGION_PATTERN.matcher(authorizationHeader);
-        return matcher.find() ? matcher.group(1) : defaultRegion;
+        return matcher.find() ? withoutPseudoRegion(matcher.group(1)) : defaultRegion;
+    }
+
+    /**
+     * A {@code <partition>-global} pseudo-region named as a signing region becomes that
+     * partition's implicit global region ({@code aws-cn-global} is served as
+     * {@code cn-northwest-1}). AWS never signs with a pseudo-region: botocore's
+     * {@code endpoints.json} maps each to a real {@code credentialScope} region, so serving the
+     * label as-is would give a hand-rolled client a storage namespace and ARNs
+     * ({@code arn:aws-cn:sqs:aws-cn-global:...}) for a region that does not exist. Every other
+     * label, an unknown one included, is returned untouched.
+     */
+    static String withoutPseudoRegion(String label) {
+        if (label == null) {
+            return null;
+        }
+        String normalized = AwsPartitions.normalizeRegion(label);
+        return normalized.equals(label.trim().toLowerCase(Locale.ROOT)) ? label : normalized;
     }
 
     /**
@@ -107,6 +131,11 @@ public class RegionResolver {
      */
     public static boolean isKnownRegion(String region) {
         return AwsPartitions.forRegion(region).isPresent();
+    }
+
+    /** A colon separates ARN fields and cannot be part of a request's region label. */
+    public static boolean containsArnDelimiter(String region) {
+        return region != null && region.indexOf(':') >= 0;
     }
 
     /**
@@ -122,11 +151,32 @@ public class RegionResolver {
         }
         String[] parts = credentialValue.split("/");
         if (parts.length >= 3) {
-            return parts[2];
+            return withoutPseudoRegion(parts[2]);
         }
         return defaultRegion;
     }
 
+
+    /**
+     * The region a SigV4A ({@code AWS4-ECDSA-P256-SHA256}) request is served in. Its credential
+     * scope names no region; the signed {@code X-Amz-Region-Set} lists the ones the signature is
+     * good for. A set of exactly one concrete region selects it. A wildcard, a list, or no set
+     * leaves the choice to the server, which serves the default region.
+     */
+    public String resolveRegionFromRegionSet(String regionSet) {
+        if (regionSet == null || regionSet.isBlank()) {
+            return defaultRegion;
+        }
+        String[] regions = regionSet.split(",", -1);
+        if (regions.length != 1) {
+            return defaultRegion;
+        }
+        String only = regions[0].trim();
+        if (only.isEmpty() || only.contains("*")) {
+            return defaultRegion;
+        }
+        return withoutPseudoRegion(only);
+    }
 
     /**
      * Resolves the region from a SigV4 Authorization credential scope, or
@@ -139,7 +189,7 @@ public class RegionResolver {
             return null;
         }
         Matcher matcher = CREDENTIAL_REGION_PATTERN.matcher(authorizationHeader);
-        return matcher.find() ? matcher.group(1) : null;
+        return matcher.find() ? withoutPseudoRegion(matcher.group(1)) : null;
     }
 
     /**
@@ -249,15 +299,23 @@ public class RegionResolver {
     }
 
     /**
-     * Mints a regional ARN, deriving the partition from {@code region}. A blank region means a
-     * global service, whose partition is the request's rather than something the region can
-     * say, so it routes to {@link #buildGlobalArn(String, String)}.
+     * Mints a regional ARN, deriving the partition from {@code region} the same way
+     * {@link #partitionForRegion} scopes the request, so a region no partition publishes (served
+     * only with {@code floci.partitions.allow-unknown-regions}) gets the deployment's partition
+     * here too rather than {@code aws}. A blank region means a global service, whose partition is
+     * the request's rather than something the region can say, so it routes to
+     * {@link #buildGlobalArn(String, String)}.
      */
     public String buildArn(String service, String region, String resource) {
+        return buildArn(service, region, getAccountId(), resource);
+    }
+
+    /** Mints an ARN for an explicit owner, including during background restoration. */
+    public String buildArn(String service, String region, String accountId, String resource) {
         if (region == null || region.isBlank()) {
-            return buildGlobalArn(service, resource);
+            return buildGlobalArn(service, accountId, resource);
         }
-        return AwsArnUtils.Arn.of(service, region, getAccountId(), resource).toString();
+        return new AwsArnUtils.Arn(partitionForRegion(region), service, region, accountId, resource).toString();
     }
 
     /** Mints a regionless ARN ({@code arn:<partition>:iam::<account>:...}) in the request's partition. */

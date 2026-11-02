@@ -4,28 +4,40 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
+import io.github.hectorvent.floci.services.autoscaling.model.CapacityReservationSpecification;
+import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
+import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefreshLaunch;
+import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefreshReplacement;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
+import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfigurationBlockDeviceMapping;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.Ec2UserDataDecoder;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.ec2.model.Subnet;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
-import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
-import io.quarkus.runtime.StartupEvent;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +51,7 @@ import java.util.stream.Collectors;
 public class AutoScalingReconciler {
 
     private static final Logger LOG = Logger.getLogger(AutoScalingReconciler.class);
+    private static final String SCALE_OUT_CAUSE = "An instance was started in response to a desired capacity change.";
 
     /** The codes DescribeLaunchTemplates raises for an explicit name or id that does not exist. */
     private static final Set<String> LAUNCH_TEMPLATE_NOT_FOUND_CODES =
@@ -53,6 +66,9 @@ public class AutoScalingReconciler {
      * still needs terminating, so it is not one of them.
      */
     private static final Set<String> TERMINATED_STATES = Set.of("shutting-down", "terminated");
+
+    /** The error EC2 answers, rather than an empty list, for an instance id it has no record of. */
+    private static final String INSTANCE_NOT_FOUND = "InvalidInstanceID.NotFound";
 
     /** The Activity StatusMessage limit (XmlStringMaxLen255). */
     private static final int STATUS_MESSAGE_MAX_LENGTH = 255;
@@ -114,8 +130,8 @@ public class AutoScalingReconciler {
                 try {
                     reconcile(asg);
                 } catch (Exception e) {
-                    LOG.warnv("Reconcile failed for ASG {0} in account {1}: {2}",
-                            asg.getAutoScalingGroupName(), accountId, e.getMessage());
+                    LOG.warnv(e, "Reconcile failed for ASG {0} in account {1}",
+                            asg.getAutoScalingGroupName(), accountId);
                 }
             }
         } catch (Exception e) {
@@ -124,22 +140,133 @@ public class AutoScalingReconciler {
     }
 
     public void reconcile(AutoScalingGroup asg) {
-        removeTerminatingInstances(asg);
-        removeStaleInstances(asg);
-        removeOrphanedTargetRegistrations(asg);
-        promoteReadyInstances(asg);
+        asgService.reconcileIfPresent(asg, () -> {
+            settleStandbyMoves(asg);
+            removeTerminatingInstances(asg);
+            removeStaleInstances(asg);
+            promoteReadyInstances(asg);
+            reconcileRefreshReplacements(asg);
 
-        long activeCapacity = activeCapacity(asg);
-        int desired = asg.getDesiredCapacity();
+            long activeCapacity = activeCapacity(asg);
+            long reservedCapacity = reservedRefreshCapacity(asg);
+            int desired = asg.getDesiredCapacity();
+            if (activeCapacity + reservedCapacity < desired && !asg.getSuspendedProcesses().contains("Launch")) {
+                if (!scaleOut(asg, (int) (desired - activeCapacity - reservedCapacity))) {
+                    return;
+                }
+            } else if (activeCapacity > desired && !asg.getSuspendedProcesses().contains("Terminate")) {
+                scaleIn(asg, (int) (activeCapacity - desired));
+            }
+            if (asgService.saveAutoScalingGroupIfPresent(asg)) {
+                asgService.completeInstanceRefreshIfSettled(asg.getRegion(), asg.getAutoScalingGroupName());
+            }
+        });
+    }
 
-        if (activeCapacity < desired) {
-            scaleOut(asg, (int) (desired - activeCapacity));
-        } else if (activeCapacity > desired) {
-            scaleIn(asg, (int) (activeCapacity - desired));
+    private static boolean refreshPaused(AutoScalingGroup asg) {
+        return asg.getSuspendedProcesses().contains("InstanceRefresh")
+                || asg.getSuspendedProcesses().contains("Launch")
+                || asg.getSuspendedProcesses().contains("Terminate");
+    }
+
+    private boolean pausedRefreshOwns(AutoScalingGroup asg, String instanceId) {
+        InstanceRefresh refresh = asgService.activeInstanceRefresh(asg);
+        return refreshPaused(asg) && refresh != null && refresh.getReplacements() != null
+                && refresh.getReplacements().stream()
+                .anyMatch(replacement -> instanceId.equals(replacement.getOriginalInstanceId()));
+    }
+
+    private long reservedRefreshCapacity(AutoScalingGroup asg) {
+        InstanceRefresh refresh = asgService.activeInstanceRefresh(asg);
+        if (refresh == null || refresh.getReplacements() == null) {
+            return 0;
         }
-        if (asgService.saveAutoScalingGroupIfPresent(asg)) {
-            asgService.completeInstanceRefreshIfSettled(asg.getRegion(), asg.getAutoScalingGroupName());
+        return refresh.getReplacements().stream()
+                .filter(replacement -> !replacement.isComplete())
+                .filter(replacement -> asg.getInstances().stream().noneMatch(instance ->
+                        instance.getInstanceId().equals(replacement.getReplacementInstanceId())
+                                && isActiveLifecycleState(instance.getLifecycleState())))
+                .count();
+    }
+
+    private void reconcileRefreshReplacements(AutoScalingGroup asg) {
+        InstanceRefresh refresh = asgService.activeInstanceRefresh(asg);
+        if (refresh == null || refresh.getReplacements() == null || refreshPaused(asg)) {
+            return;
         }
+        Map<String, List<Instance>> acceptedLaunches = null;
+        for (InstanceRefreshReplacement replacement : refresh.getReplacements()) {
+            if (replacement.isComplete()) {
+                continue;
+            }
+            AsgInstance launchedInstance = asg.getInstances().stream()
+                    .filter(instance -> instance.getInstanceId().equals(replacement.getReplacementInstanceId()))
+                    .findFirst().orElse(null);
+            if (launchedInstance != null) {
+                if ("InService".equals(launchedInstance.getLifecycleState())) {
+                    replacement.setPhase("Complete");
+                    asgService.saveInstanceRefresh(refresh);
+                }
+                continue;
+            }
+            if (asg.getInstances().stream().anyMatch(instance ->
+                    instance.getInstanceId().equals(replacement.getOriginalInstanceId()))) {
+                continue;
+            }
+            if (acceptedLaunches == null) {
+                acceptedLaunches = refreshLaunches(asg);
+            }
+            List<Instance> existing = acceptedLaunches.getOrDefault(replacement.getLaunchClientToken(), List.of());
+            if (activeCapacity(asg) >= asg.getDesiredCapacity() && existing.isEmpty()) {
+                replacement.setPhase("NoLongerRequired");
+                asgService.saveInstanceRefresh(refresh);
+                continue;
+            }
+            replacement.setPhase("AwaitingReplacement");
+            asgService.saveInstanceRefresh(refresh);
+            List<String> launched = launchInstances(asg, refresh, replacement, existing, acceptedLaunches);
+            if (!launched.isEmpty()) {
+                replacement.setReplacementInstanceId(launched.getFirst());
+                replacement.setPhase("Warming");
+                asgService.saveInstanceRefresh(refresh);
+            }
+        }
+    }
+
+    /**
+     * Finishes each move into standby: the instance leaves the group's target groups and Classic load
+     * balancers, then becomes Standby. A move whose instance left its transient state some other way, such
+     * as being terminated or refreshed, is cancelled. A move out of standby is finished by
+     * {@link #promoteReadyInstances} once the instance is running.
+     */
+    private void settleStandbyMoves(AutoScalingGroup asg) {
+        List<AsgInstance> entering = new ArrayList<>();
+        List<AsgInstance> interrupted = new ArrayList<>();
+        for (AsgInstance instance : asg.getInstances()) {
+            if ("EnteringStandby".equals(instance.getLifecycleState())) {
+                entering.add(instance);
+            } else if (instance.getStandbyActivityId() != null && !"Pending".equals(instance.getLifecycleState())) {
+                interrupted.add(instance);
+            }
+        }
+        if (entering.isEmpty() && interrupted.isEmpty()) {
+            return;
+        }
+        if (!entering.isEmpty()) {
+            List<String> instanceIds = entering.stream().map(AsgInstance::getInstanceId).toList();
+            AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
+            AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
+            for (AsgInstance instance : entering) {
+                instance.setLifecycleState("Standby");
+                if (instance.getStandbyActivityId() != null) {
+                    asgService.completeActivity(instance.getStandbyActivityId(), "Successful", null);
+                    instance.setStandbyActivityId(null);
+                }
+            }
+            LOG.infov("ASG {0}: instance(s) {1} are now in Standby", asg.getAutoScalingGroupName(), instanceIds);
+        }
+        asgService.cancelStandbyMoves(interrupted);
+        asgService.saveAutoScalingGroupIfPresent(asg);
     }
 
     static long activeCapacity(AutoScalingGroup asg) {
@@ -166,15 +293,24 @@ public class AutoScalingReconciler {
                 }
                 String ec2State = ec2Instances.get(0).getState().getName();
                 if ("running".equals(ec2State)) {
+                    String standbyActivityId = asgInst.getStandbyActivityId();
+                    boolean returningFromStandby = standbyActivityId != null;
+                    registerWithTargetGroups(asg, asgInst, returningFromStandby);
+                    registerWithClassicLoadBalancers(asg, asgInst, returningFromStandby);
                     asgInst.setLifecycleState("InService");
-                    asgInst.setHealthStatus("Healthy");
-                    registerWithTargetGroups(asg, asgInst);
-                    registerWithClassicLoadBalancers(asg, asgInst);
                     changed = true;
-                    asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
-                            "Launching a new EC2 instance: " + asgInst.getInstanceId(),
-                            "An instance was started in response to a desired capacity change.",
-                            "Successful");
+                    if (standbyActivityId != null) {
+                        // An instance back from standby keeps the health it had there and completes its
+                        // ExitStandby activity; nothing was launched.
+                        asgInst.setStandbyActivityId(null);
+                        asgService.completeActivity(standbyActivityId, "Successful", null);
+                    } else {
+                        asgInst.setHealthStatus("Healthy");
+                        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                                "Launching a new EC2 instance: " + asgInst.getInstanceId(),
+                                SCALE_OUT_CAUSE,
+                                "Successful");
+                    }
                     LOG.infov("ASG {0}: instance {1} is now InService",
                             asg.getAutoScalingGroupName(), asgInst.getInstanceId());
                 }
@@ -192,6 +328,13 @@ public class AutoScalingReconciler {
         List<AsgInstance> staleInstances = asg.getInstances().stream()
                 .filter(instance -> isStaleInstance(asg, instance))
                 .collect(Collectors.toList());
+        List<AsgInstance> backFromStandby = staleInstances.stream()
+                .filter(instance -> instance.getStandbyActivityId() != null)
+                .toList();
+        if (!backFromStandby.isEmpty()) {
+            replaceUnhealthyReturns(asg, backFromStandby);
+            staleInstances.removeAll(backFromStandby);
+        }
         if (staleInstances.isEmpty()) {
             return;
         }
@@ -200,8 +343,8 @@ public class AutoScalingReconciler {
                 .map(AsgInstance::getInstanceId)
                 .collect(Collectors.toList());
         failActiveSsmInvocations(asg, instanceIds);
-        deregisterFromTargetGroups(asg, instanceIds);
-        deregisterFromClassicLoadBalancers(asg, instanceIds);
+        AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
+        AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
         asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
@@ -209,6 +352,44 @@ public class AutoScalingReconciler {
                 "Persisted Auto Scaling state referenced instance containers that are no longer running.",
                 "Successful");
         LOG.infov("ASG {0}: removed stale instance reference(s) {1}",
+                asg.getAutoScalingGroupName(), instanceIds);
+    }
+
+    /**
+     * Instances back from standby whose EC2 instance stopped or went away fail the health check AWS runs on their
+     * return: each is terminated, if EC2 still has it, and leaves the group with AWS's termination activity, and the
+     * group launches a replacement for the capacity ExitStandby restored. A termination EC2 refuses is retried on
+     * the next pass.
+     */
+    private void replaceUnhealthyReturns(AutoScalingGroup asg, List<AsgInstance> returning) {
+        List<String> instanceIds = returning.stream().map(AsgInstance::getInstanceId).toList();
+        List<String> stillThere = instanceIds.stream()
+                .filter(id -> !isMissingOrTerminalEc2Instance(asg, id, TERMINATED_STATES))
+                .toList();
+        if (!stillThere.isEmpty()) {
+            try {
+                ec2Service.terminateInstances(asg.getRegion(), stillThere);
+            } catch (Exception e) {
+                LOG.warnv("ASG {0}: could not terminate instance(s) {1} back from standby: {2}",
+                        asg.getAutoScalingGroupName(), stillThere, e.getMessage());
+                return;
+            }
+        }
+        failActiveSsmInvocations(asg, instanceIds);
+        AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
+        AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
+        asgService.cancelStandbyMoves(returning);
+        asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
+        asgService.saveAutoScalingGroupIfPresent(asg);
+        String now = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString();
+        for (String instanceId : instanceIds) {
+            asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                    "Terminating EC2 instance: " + instanceId,
+                    "At " + now + " an instance was taken out of service in response to an EC2 health check"
+                            + " indicating it has been terminated or stopped.",
+                    "Successful");
+        }
+        LOG.infov("ASG {0}: instance(s) {1} back from standby were not running and were replaced",
                 asg.getAutoScalingGroupName(), instanceIds);
     }
 
@@ -240,6 +421,14 @@ public class AutoScalingReconciler {
         return false;
     }
 
+    /**
+     * Whether EC2 has no record of the instance at all, whatever state a record would be in. Any EC2 error other than
+     * {@code InvalidInstanceID.NotFound} counts as a record, so the instance is not given up on.
+     */
+    private boolean hasNoEc2Record(AutoScalingGroup asg, String instanceId) {
+        return isMissingOrTerminalEc2Instance(asg, instanceId, Set.of());
+    }
+
     private boolean isMissingOrTerminalEc2Instance(AutoScalingGroup asg, String instanceId,
                                                    Set<String> terminalStates) {
         try {
@@ -257,62 +446,39 @@ public class AutoScalingReconciler {
             return state != null && terminalStates.contains(state);
         }
         catch (Exception e) {
+            if (e instanceof AwsException aws && INSTANCE_NOT_FOUND.equals(aws.getErrorCode())) {
+                return true;
+            }
             LOG.debugv("ASG {0}: keeping instance {1} during stale check: {2}",
                     asg.getAutoScalingGroupName(), instanceId, e.getMessage());
             return false;
         }
     }
 
-    private void removeOrphanedTargetRegistrations(AutoScalingGroup asg) {
-        if (asg.getTargetGroupARNs().isEmpty()) {
-            return;
-        }
-
-        Set<String> activeInstanceIds = asg.getInstances().stream()
-                .filter(instance -> isActiveLifecycleState(instance.getLifecycleState()))
-                .map(AsgInstance::getInstanceId)
-                .collect(Collectors.toSet());
-
-        for (String tgArn : asg.getTargetGroupARNs()) {
-            try {
-                List<TargetDescription> orphanedTargets = elbV2Service.describeTargetHealth(
-                                asg.getRegion(), tgArn, List.of()).stream()
-                        .map(TargetHealth::getTarget)
-                        .filter(target -> target != null && target.getId() != null)
-                        .filter(target -> !activeInstanceIds.contains(target.getId()))
-                        .collect(Collectors.toList());
-                if (!orphanedTargets.isEmpty()) {
-                    elbV2Service.deregisterTargets(asg.getRegion(), tgArn, orphanedTargets);
-                    LOG.infov("ASG {0}: deregistered orphaned target(s) {1} from TG {2}",
-                            asg.getAutoScalingGroupName(),
-                            orphanedTargets.stream().map(TargetDescription::getId).collect(Collectors.toList()),
-                            tgArn);
-                }
-            } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not reconcile TG {1}: {2}",
-                        asg.getAutoScalingGroupName(), tgArn, e.getMessage());
-            }
-        }
-    }
-
     private void removeTerminatingInstances(AutoScalingGroup asg) {
         List<AsgInstance> terminatingInstances = asg.getInstances().stream()
                 .filter(instance -> "Terminating".equals(instance.getLifecycleState()))
+                .filter(instance -> !pausedRefreshOwns(asg, instance.getInstanceId()))
                 .collect(Collectors.toList());
         if (terminatingInstances.isEmpty()) {
             return;
         }
 
+        // A terminating instance whose EC2 record is already gone is not a failure: it is pruned as stale by
+        // removeStaleInstances in this same pass. It stays out of the batch, which EC2 would stop at its id.
         List<String> instanceIds = terminatingInstances.stream()
                 .map(AsgInstance::getInstanceId)
+                .filter(id -> !hasNoEc2Record(asg, id))
                 .collect(Collectors.toList());
+        if (instanceIds.isEmpty()) {
+            return;
+        }
         try {
             ec2Service.terminateInstances(asg.getRegion(), instanceIds);
         } catch (Exception e) {
             LOG.warnv("ASG {0}: failed to terminate refreshing instances {1}: {2}",
                     asg.getAutoScalingGroupName(), instanceIds, e.getMessage());
-            // A terminating instance whose EC2 record is already gone is not a failure: it is pruned
-            // as stale by removeStaleInstances in this same pass. Only real failures are recorded.
+            // Only real failures are recorded, not an instance that is going away or has gone in the meantime.
             List<String> stillPresent = instanceIds.stream()
                     .filter(id -> !isMissingOrTerminalEc2Instance(asg, id, TERMINATED_STATES))
                     .toList();
@@ -323,8 +489,8 @@ public class AutoScalingReconciler {
             return;
         }
 
-        deregisterFromTargetGroups(asg, instanceIds);
-        deregisterFromClassicLoadBalancers(asg, instanceIds);
+        AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
+        AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
         asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
@@ -339,79 +505,297 @@ public class AutoScalingReconciler {
         return "Pending".equals(state) || "InService".equals(state);
     }
 
-    private void scaleOut(AutoScalingGroup asg, int count) {
+    private boolean scaleOut(AutoScalingGroup asg, int count) {
         LaunchSource launchSource = resolveLaunchSource(asg);
         if (launchSource == null) {
             LOG.warnv("ASG {0}: no launch source found, cannot scale out", asg.getAutoScalingGroupName());
-            return;
+            return true;
         }
         LOG.infov("ASG {0}: scaling out by {1}", asg.getAutoScalingGroupName(), count);
-        String az = asg.getAvailabilityZones().isEmpty()
-                ? asg.getRegion() + "a"
-                : asg.getAvailabilityZones().get(0);
-        String subnetId = asg.getSubnetIds().isEmpty() ? null : asg.getSubnetIds().get(0);
+        List<String> launchedInstanceIds = new ArrayList<>();
+        RuntimeException launchFailure = null;
         try {
-            Reservation reservation = ec2Service.runInstances(
-                    asg.getRegion(),
-                    launchSource.imageId(),
-                    launchSource.instanceType(),
-                    count, count,
-                    launchSource.keyName(),
-                    launchSource.securityGroupIds(),
-                    subnetId,
-                    null,
-                    propagatedInstanceTags(asg, launchSource),
-                    launchSource.userData(),
-                    launchSource.iamInstanceProfile(),
-                    launchSource.associatePublicIpAddress());
+            List<LaunchPlacement> placements = new ArrayList<>(launchPlacements(asg));
+            for (int index = 0; index < count; index++) {
+                LaunchPlacement placement = leastPopulatedPlacement(asg, placements);
+                List<Instance> launched = launchInstance(asg, launchSource, placement, null, null,
+                        List.of(), launchedInstanceIds, false);
+                if (placement.subnetId() != null) {
+                    placements.set(placements.indexOf(placement), new LaunchPlacement(placement.subnetId(),
+                            placement.availabilityZone(), Math.max(0,
+                                    placement.availableIpAddresses() - launched.size()),
+                            placement.requiresIpv4Address()));
+                }
+            }
+        } catch (RuntimeException e) {
+            launchFailure = e;
+        }
+        // Preserve successful allocations even if a later single-instance launch fails.
+        if (!launchedInstanceIds.isEmpty()) {
+            try {
+                preserveScaleOutAllocations(asg, launchedInstanceIds);
+            } catch (RuntimeException persistenceFailure) {
+                if (launchFailure != null) {
+                    launchFailure.addSuppressed(persistenceFailure);
+                    throw launchFailure;
+                }
+                throw persistenceFailure;
+            }
+        }
+        if (launchFailure instanceof AwsException) {
+            String description = "Launching a new EC2 instance.";
+            String message = statusMessage(launchFailure, " Launching EC2 instance failed.");
+            recordFailedActivity(asg, description + "  Status Reason: " + message,
+                    SCALE_OUT_CAUSE, message, description);
+            return false;
+        }
+        if (launchFailure != null) {
+            throw launchFailure;
+        }
+        return true;
+    }
 
-            List<String> launchedInstanceIds = new ArrayList<>();
-            for (Instance ec2Inst : reservation.getInstances()) {
-                AsgInstance asgInst = new AsgInstance();
-                asgInst.setInstanceId(ec2Inst.getInstanceId());
-                asgInst.setAvailabilityZone(az);
-                asgInst.setLifecycleState("Pending");
-                asgInst.setHealthStatus("Healthy");
+    private void preserveScaleOutAllocations(AutoScalingGroup asg, List<String> launchedInstanceIds) {
+        RuntimeException saveFailure = null;
+        try {
+            if (asgService.saveAutoScalingGroupIfPresent(asg)) {
+                return;
+            }
+        } catch (RuntimeException e) {
+            saveFailure = e;
+        }
+        try {
+            ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
+            asg.getInstances().removeIf(instance -> launchedInstanceIds.contains(instance.getInstanceId()));
+        } catch (RuntimeException cleanupFailure) {
+            if (saveFailure == null) {
+                throw cleanupFailure;
+            }
+            saveFailure.addSuppressed(cleanupFailure);
+        }
+        if (saveFailure != null) {
+            throw saveFailure;
+        }
+    }
+
+    private Map<String, List<Instance>> refreshLaunches(AutoScalingGroup asg) {
+        return ec2Service.describeInstances(asg.getRegion(), List.of(), null).stream()
+                .flatMap(result -> result.getInstances().stream())
+                .filter(instance -> instance.getClientToken() != null)
+                .filter(instance -> instance.getState() != null
+                        && !ABANDONED_LAUNCH_STATES.contains(instance.getState().getName()))
+                .collect(Collectors.groupingBy(Instance::getClientToken));
+    }
+
+    private List<String> launchInstances(AutoScalingGroup asg, InstanceRefresh refresh,
+                                         InstanceRefreshReplacement replacement, List<Instance> existing,
+                                         Map<String, List<Instance>> acceptedLaunches) {
+        String clientToken = replacement.getLaunchClientToken();
+        LaunchSource launchSource = existing.isEmpty() ? resolveLaunchSource(asg) : null;
+        if (existing.isEmpty() && launchSource == null) {
+            LOG.warnv("ASG {0}: no launch source found, cannot scale out", asg.getAutoScalingGroupName());
+            return List.of();
+        }
+        List<String> launchedInstanceIds = new ArrayList<>();
+        LaunchPlacement placement = existing.isEmpty() ? leastPopulatedPlacement(asg, launchPlacements(asg)) : null;
+        InstanceRefreshLaunch metadata = replacement.getLaunch();
+        if (existing.isEmpty()) {
+            metadata = new InstanceRefreshLaunch(launchSource.launchConfigurationName(),
+                    launchSource.launchTemplateId(), launchSource.launchTemplateName(),
+                    launchSource.launchTemplateVersion(), launchSource.instanceType(), placement.availabilityZone());
+            replacement.setLaunch(metadata);
+            asgService.saveInstanceRefresh(refresh);
+        }
+        List<Instance> launched = launchInstance(asg, launchSource, placement, clientToken, metadata,
+                existing, launchedInstanceIds, true);
+        if (!launched.isEmpty()) {
+            acceptedLaunches.put(clientToken, launched);
+            preserveScaleOutAllocations(asg, launchedInstanceIds);
+        }
+        // Cleanup after a removed group releases these allocations rather than publishing ownership.
+        launchedInstanceIds.removeIf(id -> asg.getInstances().stream()
+                .noneMatch(instance -> id.equals(instance.getInstanceId())));
+        return launchedInstanceIds;
+    }
+
+    private Reservation launchWithGroupCapacity(AutoScalingGroup asg, LaunchSource launchSource,
+                                                 LaunchPlacement placement, String clientToken) {
+        CapacityReservationSpecification groupSpecification = asg.getCapacityReservationSpecification();
+        AutoScalingService.validateCapacityReservationSpecification(groupSpecification);
+        String preference = groupSpecification == null ? null
+                : groupSpecification.getCapacityReservationPreference();
+        if (preference == null || "default".equals(preference)) {
+            return launchWithCapacity(asg, launchSource, placement, clientToken,
+                    launchSource.capacityReservationSpecification());
+        }
+        LaunchTemplateData.CapacityReservationSpecification specification =
+                new LaunchTemplateData.CapacityReservationSpecification();
+        if (!"none".equals(preference)) {
+            specification.setCapacityReservationTarget(capacityTarget(groupSpecification,
+                    launchSource.capacityReservationSpecification()));
+        }
+        boolean fallback = "capacity-reservations-first".equals(preference);
+        specification.setCapacityReservationPreference(fallback
+                ? specification.getCapacityReservationTarget() == null ? "open" : "capacity-reservations-only"
+                : preference);
+        try {
+            return launchWithCapacity(asg, launchSource, placement, clientToken, specification);
+        } catch (AwsException failure) {
+            if (!fallback || !Set.of("InsufficientInstanceCapacity", "ReservationCapacityExceeded")
+                    .contains(failure.getErrorCode())) {
+                throw failure;
+            }
+            specification.setCapacityReservationPreference("none");
+            specification.setCapacityReservationTarget(null);
+            return launchWithCapacity(asg, launchSource, placement, clientToken, specification);
+        }
+    }
+
+    private static LaunchTemplateData.CapacityReservationTarget capacityTarget(
+            CapacityReservationSpecification groupSpecification,
+            LaunchTemplateData.CapacityReservationSpecification templateSpecification) {
+        if (!groupSpecification.hasTarget()) {
+            return templateSpecification == null ? null : templateSpecification.getCapacityReservationTarget();
+        }
+        LaunchTemplateData.CapacityReservationTarget target = new LaunchTemplateData.CapacityReservationTarget();
+        if (!groupSpecification.getCapacityReservationIds().isEmpty()) {
+            target.setCapacityReservationId(groupSpecification.getCapacityReservationIds().getFirst());
+        } else {
+            target.setCapacityReservationResourceGroupArn(
+                    groupSpecification.getCapacityReservationResourceGroupArns().getFirst());
+        }
+        return target;
+    }
+
+    private Reservation launchWithCapacity(AutoScalingGroup asg, LaunchSource launchSource,
+                                           LaunchPlacement placement, String clientToken,
+                                           LaunchTemplateData.CapacityReservationSpecification capacitySpecification) {
+        String launchZone = Ec2Service.isModelledAvailabilityZone(asg.getRegion(), placement.availabilityZone())
+                ? placement.availabilityZone() : null;
+        return ec2Service.runInstances(
+                asg.getRegion(), launchSource.imageId(), launchSource.instanceType(), 1, 1,
+                launchSource.keyName(), launchSource.securityGroupIds(), placement.subnetId(), clientToken,
+                AutoScalingService.propagatedInstanceTags(asg, launchSource.instanceTags()), launchSource.userData(),
+                launchSource.launchConfigurationName() == null ? launchSource.iamInstanceProfile()
+                        : asgService.resolveLaunchConfigurationProfile(launchSource.iamInstanceProfile()),
+                launchSource.associatePublicIpAddress(), null, 0, launchZone, launchSource.metadataOptions(), null,
+                launchSource.encodedUserData() != null ? launchSource.encodedUserData()
+                        : encodeLegacyUserData(launchSource.userData()),
+                false, null, null, launchSource.blockDeviceMappings(), false, null,
+                capacitySpecification);
+    }
+
+    private List<Instance> launchInstance(AutoScalingGroup asg, LaunchSource launchSource,
+                                          LaunchPlacement placement, String clientToken,
+                                          InstanceRefreshLaunch metadata, List<Instance> existing,
+                                          List<String> launchedInstanceIds, boolean refreshLaunch) {
+        List<Instance> instances = existing;
+        if (instances.isEmpty()) {
+            Reservation reservation;
+            try {
+                reservation = launchWithGroupCapacity(asg, launchSource, placement, clientToken);
+            } catch (RuntimeException launchFailure) {
+                if (!refreshLaunch) {
+                    throw launchFailure;
+                }
+                recordFailedActivity(asg, "Launching a replacement EC2 instance.",
+                        "An instance refresh requested replacement of active instances.", launchFailure);
+                return List.of();
+            }
+            instances = reservation.getInstances();
+        }
+        for (Instance instance : instances) {
+            launchedInstanceIds.add(instance.getInstanceId());
+        }
+        for (Instance ec2Inst : instances) {
+            if (asg.getInstances().stream().anyMatch(instance ->
+                    instance.getInstanceId().equals(ec2Inst.getInstanceId()))) {
+                continue;
+            }
+            AsgInstance asgInst = new AsgInstance();
+            asgInst.setInstanceId(ec2Inst.getInstanceId());
+            asgInst.setLifecycleState("Pending");
+            asgInst.setHealthStatus("Healthy");
+            if (metadata != null) {
+                asgInst.setAvailabilityZone(metadata.availabilityZone() != null ? metadata.availabilityZone()
+                        : ec2Inst.getPlacement() != null ? ec2Inst.getPlacement().getAvailabilityZone() : null);
+                asgInst.setLaunchConfigurationName(metadata.launchConfigurationName());
+                asgInst.setLaunchTemplateId(metadata.launchTemplateId());
+                asgInst.setLaunchTemplateName(metadata.launchTemplateName());
+                asgInst.setLaunchTemplateVersion(metadata.launchTemplateVersion());
+                asgInst.setInstanceType(metadata.instanceType());
+            } else if (launchSource != null) {
+                asgInst.setAvailabilityZone(placement.subnetId() == null && placement.availabilityZone() != null
+                        ? placement.availabilityZone() : ec2Inst.getPlacement() != null
+                        ? ec2Inst.getPlacement().getAvailabilityZone() : placement.availabilityZone());
                 asgInst.setLaunchConfigurationName(launchSource.launchConfigurationName());
                 asgInst.setLaunchTemplateId(launchSource.launchTemplateId());
                 asgInst.setLaunchTemplateName(launchSource.launchTemplateName());
                 asgInst.setLaunchTemplateVersion(launchSource.launchTemplateVersion());
                 asgInst.setInstanceType(launchSource.instanceType());
-                asg.getInstances().add(asgInst);
-                launchedInstanceIds.add(ec2Inst.getInstanceId());
-                LOG.infov("ASG {0}: launched instance {1} (Pending)",
-                        asg.getAutoScalingGroupName(), ec2Inst.getInstanceId());
-            }
-            if (!asgService.saveAutoScalingGroupIfPresent(asg) && !launchedInstanceIds.isEmpty()) {
-                try {
-                    ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
-                } catch (Exception e) {
-                    LOG.warnv("ASG {0}: failed to clean up instances {1} after group deletion: {2}",
-                            asg.getAutoScalingGroupName(), launchedInstanceIds, e.getMessage());
+            } else {
+                // Older accepted attempts have no saved source identity; retain actual EC2 metadata.
+                asgInst.setInstanceType(ec2Inst.getInstanceType());
+                if (ec2Inst.getPlacement() != null) {
+                    asgInst.setAvailabilityZone(ec2Inst.getPlacement().getAvailabilityZone());
                 }
             }
-        } catch (Exception e) {
-            LOG.warnv("ASG {0}: failed to launch instances: {1}",
-                    asg.getAutoScalingGroupName(), e.getMessage());
+            asg.getInstances().add(asgInst);
+            LOG.infov("ASG {0}: launched instance {1} (Pending)", asg.getAutoScalingGroupName(), ec2Inst.getInstanceId());
         }
+        return instances;
     }
 
-    private static List<io.github.hectorvent.floci.services.ec2.model.Tag> propagatedInstanceTags(
-            AutoScalingGroup asg,
-            LaunchSource launchSource) {
-        Map<String, String> tags = new LinkedHashMap<>();
-        for (io.github.hectorvent.floci.services.ec2.model.Tag tag : launchSource.instanceTags()) {
-            tags.put(tag.getKey(), tag.getValue());
-        }
-        asg.getTags().forEach((key, value) -> {
-            if (asg.getTagPropagateAtLaunch().getOrDefault(key, false)) {
-                tags.put(key, value);
+    private List<LaunchPlacement> launchPlacements(AutoScalingGroup asg) {
+        if (!asg.getSubnetIds().isEmpty()) {
+            Map<String, Subnet> subnets = ec2Service.describeSubnets(asg.getRegion(), asg.getSubnetIds(), Map.of())
+                    .stream().collect(Collectors.toMap(Subnet::getSubnetId, subnet -> subnet));
+            List<LaunchPlacement> placements = new ArrayList<>();
+            for (String id : asg.getSubnetIds()) {
+                Subnet subnet = subnets.get(id);
+                if (subnet == null) {
+                    throw new AwsException("InvalidSubnetID.NotFound", "The subnet ID '" + id + "' does not exist", 400);
+                }
+                // Subnets remain authoritative when an update leaves older zone metadata behind.
+                placements.add(new LaunchPlacement(id, subnet.getAvailabilityZone(), subnet.getAvailableIpAddressCount(),
+                        subnet.getCidrBlock() != null && !subnet.getCidrBlock().isBlank()));
             }
-        });
-        return tags.entrySet().stream()
-                .map(entry -> new io.github.hectorvent.floci.services.ec2.model.Tag(entry.getKey(), entry.getValue()))
-                .toList();
+            return placements;
+        }
+        if (!asg.getAvailabilityZones().isEmpty()) {
+            return asg.getAvailabilityZones().stream().map(zone -> new LaunchPlacement(null, zone, 0, false)).toList();
+        }
+        return List.of(new LaunchPlacement(null, null, 0, false));
     }
+
+    private LaunchPlacement leastPopulatedPlacement(AutoScalingGroup asg, List<LaunchPlacement> placements) {
+        Map<String, Long> zoneCounts = new LinkedHashMap<>();
+        for (LaunchPlacement placement : placements) {
+            zoneCounts.putIfAbsent(placement.availabilityZone(), 0L);
+        }
+        for (AsgInstance instance : asg.getInstances()) {
+            if (!isActiveLifecycleState(instance.getLifecycleState())) {
+                continue;
+            }
+            Instance actual = asg.getSubnetIds().isEmpty() ? null
+                    : ec2Service.getInstance(asg.getRegion(), instance.getInstanceId()).orElse(null);
+            String zone = actual != null && actual.getPlacement() != null
+                    ? actual.getPlacement().getAvailabilityZone() : instance.getAvailabilityZone();
+            if (zoneCounts.containsKey(zone)) {
+                zoneCounts.compute(zone, (ignored, count) -> count + 1);
+            }
+        }
+        Comparator<LaunchPlacement> preference = Comparator
+                .comparingLong((LaunchPlacement placement) -> zoneCounts.get(placement.availabilityZone()))
+                .thenComparing(Comparator.comparingInt(LaunchPlacement::availableIpAddresses).reversed());
+        return placements.stream()
+                .filter(placement -> !placement.requiresIpv4Address() || placement.availableIpAddresses() > 0)
+                .min(preference)
+                .orElseGet(() -> placements.stream().min(preference).orElseThrow());
+    }
+
+    private record LaunchPlacement(String subnetId, String availabilityZone, int availableIpAddresses,
+                                   boolean requiresIpv4Address) {}
 
     private void scaleIn(AutoScalingGroup asg, int count) {
         List<AsgInstance> candidates = asg.getInstances().stream()
@@ -439,8 +823,8 @@ public class AutoScalingReconciler {
             return;
         }
 
-        deregisterFromTargetGroups(asg, instanceIds);
-        deregisterFromClassicLoadBalancers(asg, instanceIds);
+        AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
+        AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
 
         asg.getInstances().removeIf(i -> instanceIds.contains(i.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
@@ -453,15 +837,20 @@ public class AutoScalingReconciler {
     /**
      * Records a failed scaling activity with the error text, matching AWS (100% progress and a
      * {@code StatusMessage}). A failure that repeats on a later pass with the same error, because
-     * termination keeps failing, is not recorded again: the latest activity with the same
+     * scaling keeps failing, is not recorded again: the latest activity with the same
      * description already records it, whatever other activities were recorded after it. A
      * different error is recorded, so the history carries the current reason.
      */
     private void recordFailedActivity(AutoScalingGroup asg, String description, String cause, Exception failure) {
-        String statusMessage = statusMessage(failure);
+        recordFailedActivity(asg, description, cause, statusMessage(failure, ""), description);
+    }
+
+    private void recordFailedActivity(AutoScalingGroup asg, String description, String cause,
+                                      String statusMessage, String descriptionPrefix) {
         ScalingActivity previous = asgService.describeScalingActivities(asg.getRegion(), asg.getAutoScalingGroupName())
                 .stream()
-                .filter(activity -> description.equals(activity.getDescription()))
+                .filter(activity -> activity.getDescription() != null
+                        && activity.getDescription().startsWith(descriptionPrefix))
                 .findFirst()
                 .orElse(null);
         if (previous != null && "Failed".equals(previous.getStatusCode())
@@ -473,42 +862,29 @@ public class AutoScalingReconciler {
         asgService.completeActivity(activity.getActivityId(), "Failed", statusMessage);
     }
 
-    private static String statusMessage(Exception failure) {
+    private static String statusMessage(Exception failure, String suffix) {
         String message = failure.getMessage() != null && !failure.getMessage().isBlank()
                 ? failure.getMessage()
                 : failure.getClass().getSimpleName();
-        if (message.length() <= STATUS_MESSAGE_MAX_LENGTH) {
-            return message;
+        int maxLength = STATUS_MESSAGE_MAX_LENGTH - suffix.length();
+        if (message.length() <= maxLength) {
+            return message + suffix;
         }
-        int end = Character.isHighSurrogate(message.charAt(STATUS_MESSAGE_MAX_LENGTH - 1))
-                ? STATUS_MESSAGE_MAX_LENGTH - 1
-                : STATUS_MESSAGE_MAX_LENGTH;
-        return message.substring(0, end);
+        int end = Character.isHighSurrogate(message.charAt(maxLength - 1)) ? maxLength - 1 : maxLength;
+        return message.substring(0, end) + suffix;
     }
 
-    private void deregisterFromTargetGroups(AutoScalingGroup asg, List<String> instanceIds) {
-        for (String tgArn : asg.getTargetGroupARNs()) {
-            try {
-                List<TargetDescription> targets = instanceIds.stream()
-                        .map(id -> { TargetDescription td = new TargetDescription(); td.setId(id); return td; })
-                        .collect(Collectors.toList());
-                elbV2Service.deregisterTargets(asg.getRegion(), tgArn, targets);
-            } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not deregister from TG {1}: {2}",
-                        asg.getAutoScalingGroupName(), tgArn, e.getMessage());
-            }
-        }
-    }
 
     /**
-     * Registers a newly launched instance with every Classic load balancer the group names.
+     * Registers a newly launched or returning instance with every Classic load balancer the group names.
      *
      * <p>An ASG attached through {@code LoadBalancerNames} feeds a Classic load balancer, not a
-     * target group, and the two lists are independent — a group can carry either or both. Without
+     * target group, and the two lists are independent; a group can carry either or both. Without
      * this the Classic load balancer would stay empty, and a {@code min_elb_capacity} wait would
      * never be satisfied.
      */
-    private void registerWithClassicLoadBalancers(AutoScalingGroup asg, AsgInstance asgInst) {
+    private void registerWithClassicLoadBalancers(AutoScalingGroup asg, AsgInstance asgInst,
+                                                 boolean returningFromStandby) {
         if (elbClassicService == null) {
             return;
         }
@@ -519,27 +895,18 @@ public class AutoScalingReconciler {
                 LOG.debugv("ASG {0}: registered {1} with Classic ELB {2}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), lbName);
             } catch (Exception e) {
-                LOG.warnv("ASG {0}: could not register {1} with Classic ELB {2}: {3}",
+                LOG.warnv(e, "ASG {0}: could not register {1} with Classic ELB {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), lbName, e.getMessage());
+                if (returningFromStandby && !(e instanceof AwsException aws
+                        && "LoadBalancerNotFound".equals(aws.getErrorCode()))) {
+                    throw e;
+                }
             }
         }
     }
 
-    private void deregisterFromClassicLoadBalancers(AutoScalingGroup asg, List<String> instanceIds) {
-        if (elbClassicService == null) {
-            return;
-        }
-        for (String lbName : asg.getLoadBalancerNames()) {
-            try {
-                elbClassicService.deregisterInstances(asg.getRegion(), lbName, instanceIds);
-            } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not deregister from Classic ELB {1}: {2}",
-                        asg.getAutoScalingGroupName(), lbName, e.getMessage());
-            }
-        }
-    }
-
-    private void registerWithTargetGroups(AutoScalingGroup asg, AsgInstance asgInst) {
+    private void registerWithTargetGroups(AutoScalingGroup asg, AsgInstance asgInst,
+                                          boolean returningFromStandby) {
         for (String tgArn : asg.getTargetGroupARNs()) {
             try {
                 TargetDescription td = new TargetDescription();
@@ -548,8 +915,12 @@ public class AutoScalingReconciler {
                 LOG.debugv("ASG {0}: registered {1} with TG {2}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), tgArn);
             } catch (Exception e) {
-                LOG.warnv("ASG {0}: could not register {1} with TG {2}: {3}",
+                LOG.warnv(e, "ASG {0}: could not register {1} with TG {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), tgArn, e.getMessage());
+                if (returningFromStandby && !(e instanceof AwsException aws
+                        && "TargetGroupNotFound".equals(aws.getErrorCode()))) {
+                    throw e;
+                }
             }
         }
     }
@@ -557,6 +928,16 @@ public class AutoScalingReconciler {
     private LaunchSource resolveLaunchSource(AutoScalingGroup asg) {
         LaunchConfiguration lc = resolveLaunchConfiguration(asg);
         if (lc != null) {
+            String userData = lc.getUserData();
+            if (Boolean.TRUE.equals(lc.getUserDataBase64Encoded())) {
+                try {
+                    userData = Ec2UserDataDecoder.decode(userData);
+                } catch (AwsException e) {
+                    LOG.warnv("ASG {0}: cannot decode user data for launch configuration {1}: {2}",
+                            asg.getAutoScalingGroupName(), lc.getLaunchConfigurationName(), e.getMessage());
+                    return null;
+                }
+            }
             return new LaunchSource(
                     lc.getLaunchConfigurationName(),
                     lc.getImageId(),
@@ -564,7 +945,8 @@ public class AutoScalingReconciler {
                     lc.getKeyName(),
                     lc.getSecurityGroups(),
                     List.of(),
-                    lc.getUserData(),
+                    userData,
+                    Boolean.TRUE.equals(lc.getUserDataBase64Encoded()) ? lc.getUserData() : null,
                     lc.getIamInstanceProfile(),
                     null,
                     null,
@@ -572,7 +954,8 @@ public class AutoScalingReconciler {
                     // Forwarded as-is: an explicit false has to beat a public
                     // subnet's MapPublicIpOnLaunch, and only null means
                     // "fall back to the subnet default".
-                    lc.getAssociatePublicIpAddress());
+                    lc.getAssociatePublicIpAddress(),
+                    launchConfigurationBlockDevices(lc), lc.getMetadataOptions(), null);
         }
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
@@ -595,11 +978,14 @@ public class AutoScalingReconciler {
                     version.getData().getInstanceTags(),
                     Ec2UserDataDecoder.decodeIfMissing(
                             version.getData().getUserData(), version.getData().getEncodedUserData()),
+                    version.getData().getEncodedUserData(),
                     ec2Service.iamInstanceProfileArn(version.getData()),
                     asg.getLaunchTemplateId(),
                     asg.getLaunchTemplateName(),
                     resolvedVersion,
-                    null);
+                    version.getData().effectiveAssociatePublicIpAddress(),
+                    version.getData().getBlockDeviceMappings(), version.getData().getMetadataOptions(),
+                    version.getData().getCapacityReservationSpecification());
         }
 
         MixedInstancesPolicy.LaunchTemplateSpecification specification =
@@ -626,17 +1012,56 @@ public class AutoScalingReconciler {
                         version.getData().getInstanceTags(),
                         Ec2UserDataDecoder.decodeIfMissing(
                                 version.getData().getUserData(), version.getData().getEncodedUserData()),
+                        version.getData().getEncodedUserData(),
                         ec2Service.iamInstanceProfileArn(version.getData()),
                         specification.getLaunchTemplateId() == null
                                 ? mixedLaunchTemplate.getLaunchTemplateId()
                                 : specification.getLaunchTemplateId(),
                         specification.getLaunchTemplateName(),
                         resolvedVersion,
-                        null);
+                        version.getData().effectiveAssociatePublicIpAddress(),
+                        version.getData().getBlockDeviceMappings(), version.getData().getMetadataOptions(),
+                    version.getData().getCapacityReservationSpecification());
             }
         }
 
         return null;
+    }
+
+    /**
+     * A launch configuration's block device mappings in the shape RunInstances takes. Auto Scaling
+     * marks a suppressed device with a Boolean {@code NoDevice}, EC2 with an empty string.
+     */
+    private static List<LaunchTemplateData.BlockDeviceMapping> launchConfigurationBlockDevices(
+            LaunchConfiguration configuration) {
+        List<LaunchTemplateData.BlockDeviceMapping> mappings = new ArrayList<>();
+        if (configuration.getBlockDeviceMappings() == null) {
+            return mappings;
+        }
+        for (LaunchConfigurationBlockDeviceMapping source : configuration.getBlockDeviceMappings()) {
+            LaunchTemplateData.BlockDeviceMapping mapping = new LaunchTemplateData.BlockDeviceMapping();
+            mapping.setDeviceName(source.getDeviceName());
+            mapping.setVirtualName(source.getVirtualName());
+            mapping.setNoDevice(Boolean.TRUE.equals(source.getNoDevice()) ? "" : null);
+            LaunchConfigurationBlockDeviceMapping.Ebs sourceEbs = source.getEbs();
+            if (sourceEbs != null) {
+                LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+                ebs.setSnapshotId(sourceEbs.getSnapshotId());
+                ebs.setVolumeSize(sourceEbs.getVolumeSize());
+                ebs.setVolumeType(sourceEbs.getVolumeType());
+                ebs.setDeleteOnTermination(!Boolean.FALSE.equals(sourceEbs.getDeleteOnTermination()));
+                ebs.setIops(sourceEbs.getIops());
+                ebs.setThroughput(sourceEbs.getThroughput());
+                ebs.setEncrypted(sourceEbs.getEncrypted());
+                mapping.setEbs(ebs);
+            }
+            mappings.add(mapping);
+        }
+        return mappings;
+    }
+
+    private static String encodeLegacyUserData(String userData) {
+        return userData == null ? null : Base64.getEncoder().encodeToString(userData.getBytes(StandardCharsets.UTF_8));
     }
 
     private LaunchConfiguration resolveLaunchConfiguration(AutoScalingGroup asg) {
@@ -732,13 +1157,17 @@ public class AutoScalingReconciler {
             String instanceType,
             String keyName,
             List<String> securityGroupIds,
-            List<io.github.hectorvent.floci.services.ec2.model.Tag> instanceTags,
+            List<Tag> instanceTags,
             String userData,
+            String encodedUserData,
             String iamInstanceProfile,
             String launchTemplateId,
             String launchTemplateName,
             String launchTemplateVersion,
-            Boolean associatePublicIpAddress) {}
+            Boolean associatePublicIpAddress,
+            List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings,
+            LaunchTemplateData.MetadataOptions metadataOptions,
+            LaunchTemplateData.CapacityReservationSpecification capacityReservationSpecification) {}
 
     // Override for describeAutoScalingGroups with null region (all regions)
     // The service only filters by region when non-null; null means all.

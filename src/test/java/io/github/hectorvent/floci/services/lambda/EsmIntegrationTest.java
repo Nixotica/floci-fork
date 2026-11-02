@@ -16,7 +16,6 @@ import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -263,6 +262,187 @@ class EsmIntegrationTest {
                 .delete(LAMBDA_BASE + "/event-source-mappings/" + uuid)
                 .then()
                 .statusCode(202);
+    }
+
+    @Test
+    void parallelizationFactorPersistsAcrossCreateGetListAndUpdate() {
+        String streamArn = "arn:aws:dynamodb:us-east-1:000000000000:table/esm-parallel/stream/2026-01-01T00:00:00.000";
+
+        String uuid = given()
+                .contentType("application/json")
+                .body("""
+                        {
+                          "FunctionName": "%s",
+                          "EventSourceArn": "%s",
+                          "StartingPosition": "TRIM_HORIZON",
+                          "ParallelizationFactor": 10,
+                          "Enabled": false
+                        }
+                        """.formatted(FUNCTION_NAME, streamArn))
+                .when()
+                .post(LAMBDA_BASE + "/event-source-mappings/")
+                .then()
+                .statusCode(202)
+                .body("ParallelizationFactor", equalTo(10))
+                .extract()
+                .path("UUID");
+
+        try {
+            given()
+                    .when()
+                    .get(LAMBDA_BASE + "/event-source-mappings/" + uuid)
+                    .then()
+                    .statusCode(200)
+                    .body("ParallelizationFactor", equalTo(10));
+
+            given()
+                    .when()
+                    .get(LAMBDA_BASE + "/event-source-mappings?EventSourceArn=" + streamArn)
+                    .then()
+                    .statusCode(200)
+                    .body("EventSourceMappings.find { it.UUID == '%s' }.ParallelizationFactor".formatted(uuid),
+                            equalTo(10));
+
+            given()
+                    .contentType("application/json")
+                    .body("""
+                            { "ParallelizationFactor": 4 }
+                            """)
+                    .when()
+                    .put(LAMBDA_BASE + "/event-source-mappings/" + uuid)
+                    .then()
+                    .statusCode(202)
+                    .body("ParallelizationFactor", equalTo(4));
+
+            given()
+                    .when()
+                    .get(LAMBDA_BASE + "/event-source-mappings/" + uuid)
+                    .then()
+                    .statusCode(200)
+                    .body("ParallelizationFactor", equalTo(4));
+
+            given()
+                    .contentType("application/json")
+                    .body("""
+                            { "ParallelizationFactor": null, "BatchSize": 50 }
+                            """)
+                    .when()
+                    .put(LAMBDA_BASE + "/event-source-mappings/" + uuid)
+                    .then()
+                    .statusCode(202)
+                    .body("BatchSize", equalTo(50))
+                    .body("ParallelizationFactor", equalTo(4));
+        } finally {
+            given().delete(LAMBDA_BASE + "/event-source-mappings/" + uuid).then().statusCode(202);
+        }
+    }
+
+    @Test
+    void parallelizationFactorDefaultsToOneOnStreamMappingsOnly() {
+        String kinesisUuid = given()
+                .contentType("application/json")
+                .body("""
+                        {
+                          "FunctionName": "%s",
+                          "EventSourceArn": "%s",
+                          "StartingPosition": "LATEST",
+                          "Enabled": false
+                        }
+                        """.formatted(FUNCTION_NAME, STREAM_ARN))
+                .when()
+                .post(LAMBDA_BASE + "/event-source-mappings/")
+                .then()
+                .statusCode(202)
+                .body("ParallelizationFactor", equalTo(1))
+                .extract()
+                .path("UUID");
+        given().delete(LAMBDA_BASE + "/event-source-mappings/" + kinesisUuid).then().statusCode(202);
+
+        String sqsUuid = given()
+                .contentType("application/json")
+                .body("""
+                        {
+                          "FunctionName": "%s",
+                          "EventSourceArn": "%s",
+                          "Enabled": false
+                        }
+                        """.formatted(FUNCTION_NAME, QUEUE_ARN))
+                .when()
+                .post(LAMBDA_BASE + "/event-source-mappings/")
+                .then()
+                .statusCode(202)
+                .body("$", not(hasKey("ParallelizationFactor")))
+                .extract()
+                .path("UUID");
+        given().delete(LAMBDA_BASE + "/event-source-mappings/" + sqsUuid).then().statusCode(202);
+    }
+
+    @Test
+    void createEventSourceMappingRejectsParallelizationFactorOutOfRange() {
+        for (String factor : List.of("0", "11", "2.5", "18446744073709551617")) {
+            given()
+                    .contentType("application/json")
+                    .body("""
+                            {
+                              "FunctionName": "%s",
+                              "EventSourceArn": "%s",
+                              "StartingPosition": "LATEST",
+                              "ParallelizationFactor": %s,
+                              "Enabled": false
+                            }
+                            """.formatted(FUNCTION_NAME, STREAM_ARN, factor))
+                    .when()
+                    .post(LAMBDA_BASE + "/event-source-mappings")
+                    .then()
+                    .statusCode(400)
+                    .body("__type", equalTo("InvalidParameterValueException"));
+        }
+    }
+
+    /** 2^64 + 1 is a whole number that wraps to 1 when narrowed to long, so each range check must see it first. */
+    @Test
+    void createEventSourceMappingRejectsIntegerOptionsBeyondLong() {
+        String beyondLong = "18446744073709551617";
+        List<String[]> cases = List.of(
+                new String[] {QUEUE_ARN, "\"MaximumBatchingWindowInSeconds\": " + beyondLong},
+                new String[] {QUEUE_ARN, "\"ScalingConfig\": {\"MaximumConcurrency\": " + beyondLong + "}"},
+                new String[] {STREAM_ARN, "\"StartingPosition\": \"LATEST\", \"MaximumRetryAttempts\": " + beyondLong},
+                new String[] {STREAM_ARN, "\"StartingPosition\": \"LATEST\", \"MaximumRecordAgeInSeconds\": " + beyondLong});
+        for (String[] c : cases) {
+            given()
+                    .contentType("application/json")
+                    .body("""
+                            {
+                              "FunctionName": "%s",
+                              "EventSourceArn": "%s",
+                              "Enabled": false,
+                              %s
+                            }
+                            """.formatted(FUNCTION_NAME, c[0], c[1]))
+                    .when()
+                    .post(LAMBDA_BASE + "/event-source-mappings")
+                    .then()
+                    .statusCode(400)
+                    .body("message", containsString("(got " + beyondLong + ")"));
+        }
+    }
+
+    @Test
+    void createEventSourceMappingRejectsParallelizationFactorOnSqsSource() {
+        given()
+                .contentType("application/json")
+                .body("""
+                        {
+                          "FunctionName": "%s",
+                          "EventSourceArn": "%s",
+                          "ParallelizationFactor": 2
+                        }
+                        """.formatted(FUNCTION_NAME, QUEUE_ARN))
+                .when()
+                .post(LAMBDA_BASE + "/event-source-mappings")
+                .then()
+                .statusCode(400)
+                .body("message", containsString("only supported for Amazon Kinesis and Amazon DynamoDB Streams"));
     }
 
     @Test
@@ -1067,7 +1247,7 @@ class EsmIntegrationTest {
                             "KAFKA_BOOTSTRAP_SERVERS": ["b-1.example.com:9092", "b-2.example.com:9092"]
                         }
                     },
-                    "Topics": ["orders", "payments"],
+                    "Topics": ["orders"],
                     "StartingPosition": "TRIM_HORIZON"
                 }
                 """.formatted(FUNCTION_NAME))
@@ -1080,7 +1260,7 @@ class EsmIntegrationTest {
             .body("$", not(hasKey("EventSourceArn")))
             .body("SelfManagedEventSource.Endpoints.KAFKA_BOOTSTRAP_SERVERS",
                     hasItems("b-1.example.com:9092", "b-2.example.com:9092"))
-            .body("Topics", hasItems("orders", "payments"))
+            .body("Topics", hasItems("orders"))
             .body("StartingPosition", equalTo("TRIM_HORIZON"))
         .extract()
             .path("UUID");
@@ -1095,7 +1275,7 @@ class EsmIntegrationTest {
             .body("$", not(hasKey("EventSourceArn")))
             .body("SelfManagedEventSource.Endpoints.KAFKA_BOOTSTRAP_SERVERS",
                     hasItems("b-1.example.com:9092", "b-2.example.com:9092"))
-            .body("Topics", hasItems("orders", "payments"))
+            .body("Topics", hasItems("orders"))
             .body("StartingPosition", equalTo("TRIM_HORIZON"));
 
         // Verify DELETE by UUID
@@ -1844,5 +2024,27 @@ class EsmIntegrationTest {
         } finally {
             given().delete(LAMBDA_BASE + "/event-source-mappings/" + uuid);
         }
+    }
+    @Test
+    @Order(94)
+    void sqsEventSourceMappingWithoutBatchSizeDefaultsTo10() {
+        // Catches: the per-source BatchSize default also raising SQS mappings from 10 to 100
+        String uuid = given()
+            .contentType("application/json")
+            .body("""
+                {
+                    "FunctionName": "%s",
+                    "EventSourceArn": "%s"
+                }
+                """.formatted(FUNCTION_NAME, QUEUE_ARN))
+        .when()
+            .post(LAMBDA_BASE + "/event-source-mappings")
+        .then()
+            .statusCode(202)
+            .body("BatchSize", equalTo(10))
+        .extract()
+            .path("UUID");
+
+        given().delete(LAMBDA_BASE + "/event-source-mappings/" + uuid).then().statusCode(202);
     }
 }

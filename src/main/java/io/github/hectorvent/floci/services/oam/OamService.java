@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -14,10 +15,10 @@ import io.github.hectorvent.floci.services.oam.model.OamSink;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -81,7 +82,7 @@ public class OamService {
     public List<OamSink> listSinks(String region) {
         return sinks.scan(_ -> true).stream()
                 .filter(s -> region.equals(s.getRegion()))
-                .sorted(java.util.Comparator.comparing(OamSink::getArn)).toList();
+                .sorted(Comparator.comparing(OamSink::getArn)).toList();
     }
 
     public void putSinkPolicy(String sinkIdentifier, String policy) {
@@ -138,7 +139,7 @@ public class OamService {
 
     public List<OamLink> listLinks(String region) {
         return links.scan(_ -> true).stream().filter(l -> region.equals(l.getRegion()))
-                .sorted(java.util.Comparator.comparing(OamLink::getArn)).toList();
+                .sorted(Comparator.comparing(OamLink::getArn)).toList();
     }
 
     public List<OamLink> listAttachedLinks(String sinkIdentifier) {
@@ -152,7 +153,7 @@ public class OamService {
             all = links.scan(_ -> true);
         }
         return all.stream().filter(l -> sink.getArn().equals(l.getSinkArn()))
-                .sorted(java.util.Comparator.comparing(OamLink::getArn)).toList();
+                .sorted(Comparator.comparing(OamLink::getArn)).toList();
     }
 
     public OamLink updateLink(String identifier, List<String> resourceTypes,
@@ -301,14 +302,14 @@ public class OamService {
             return true;
         }
         List<String> allowed = new ArrayList<>();
-        var operators = condition.fields();
+        Iterator<Map.Entry<String, JsonNode>> operators = condition.fields();
         while (operators.hasNext()) {
             Map.Entry<String, JsonNode> operator = operators.next();
             JsonNode entries = operator.getValue();
             if (!entries.isObject()) {
                 return false;
             }
-            var conditions = entries.fields();
+            Iterator<Map.Entry<String, JsonNode>> conditions = entries.fields();
             while (conditions.hasNext()) {
                 Map.Entry<String, JsonNode> entry = conditions.next();
                 if (!"oam:ResourceTypes".equalsIgnoreCase(entry.getKey())) {
@@ -373,13 +374,13 @@ public class OamService {
     }
 
     public static String encodeToken(int offset) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(String.valueOf(offset).getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(String.valueOf(offset));
     }
 
     public static int decodeToken(String token) {
         if (token == null || token.isBlank()) return 0;
         try {
-            int offset = Integer.parseInt(new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8));
+            int offset = Integer.parseInt(Base64Url.decode(token));
             if (offset < 0) throw new NumberFormatException();
             return offset;
         } catch (Exception e) {

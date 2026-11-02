@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.connect.model.ConnectInstance;
 import io.github.hectorvent.floci.services.connect.model.ConnectStorageConfig;
+import io.github.hectorvent.floci.services.iam.ServiceLinkedRoles;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -18,6 +19,7 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -132,8 +134,9 @@ public class ConnectService implements TagHandler {
         instance.setDirectoryId(directoryId);
         instance.setCreatedTime(Instant.now());
         instance.setServiceRole(regionResolver.buildGlobalArn("iam",
-                "role/aws-service-role/" + ServicePrincipals.of("connect")
-                        + "/AWSServiceRoleForAmazonConnect_" + instanceId));
+                "role/aws-service-role/" + ServicePrincipals.of("connect") + "/"
+                        + ServiceLinkedRoles.roleName(ServicePrincipals.of("connect")).orElseThrow()
+                        + "_" + instanceId));
         instance.setInboundCallsEnabled(inboundCallsEnabled);
         instance.setOutboundCallsEnabled(outboundCallsEnabled);
         if (instanceAlias != null) {
@@ -193,7 +196,7 @@ public class ConnectService implements TagHandler {
             throw new AwsException("InvalidParameterException",
                     "Value must be 'true' or 'false' for attribute " + attributeType, 400);
         }
-        String canonical = value.toLowerCase(java.util.Locale.ROOT);
+        String canonical = value.toLowerCase(Locale.ROOT);
         ConnectInstance instance = describeInstance(instanceId, region);
         instance.getAttributes().put(attributeType, canonical);
         if ("INBOUND_CALLS".equals(attributeType)) {
@@ -330,7 +333,7 @@ public class ConnectService implements TagHandler {
         if (instanceId == null || instanceId.isBlank()) {
             throw new AwsException("InvalidRequestException", "InstanceId is required", 400);
         }
-        if (!instanceId.startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(instanceId)) {
             return instanceId;
         }
         String resource;

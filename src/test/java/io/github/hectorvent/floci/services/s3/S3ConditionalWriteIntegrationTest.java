@@ -12,11 +12,11 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.IntFunction;
 
+import static io.restassured.RestAssured.given;
 import static java.util.Collections.frequency;
 import static java.util.concurrent.TimeUnit.SECONDS;
-import static java.util.stream.Collectors.toList;
-import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
@@ -67,68 +67,81 @@ class S3ConditionalWriteIntegrationTest {
         String bucket = createBucket("put-if-none-concurrent");
         String key = "object.txt";
         int writers = 16;
-        CyclicBarrier barrier = new CyclicBarrier(writers);
-        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
-        try {
-            List<Future<Integer>> futures = java.util.stream.IntStream.range(0, writers)
-                    .mapToObj(writer -> executor.submit(() -> {
-                        barrier.await();
-                        return given()
-                            .header("If-None-Match", "*")
-                            .body("writer-" + writer)
-                        .when()
-                            .put("/" + bucket + "/" + key)
-                        .then()
-                            .extract()
-                            .statusCode();
-                    }))
-                    .collect(toList());
+        List<Integer> statusCodes = raceStatusCodes(writers, writer -> given()
+                .header("If-None-Match", "*")
+                .body("writer-" + writer)
+            .when()
+                .put("/" + bucket + "/" + key)
+            .then()
+                .extract()
+                .statusCode());
 
-            List<Integer> statusCodes = new ArrayList<>();
-            for (Future<Integer> future : futures) {
-                statusCodes.add(future.get(30, SECONDS));
-            }
-
-            assertEquals(1, frequency(statusCodes, 200));
-            assertEquals(writers - 1, frequency(statusCodes, 412));
-        }
-        finally {
-            executor.shutdownNow();
-        }
+        assertEquals(1, frequency(statusCodes, 200));
+        assertEquals(writers - 1, frequency(statusCodes, 412));
     }
 
     @Test
-    void putObject_ifNoneMatchEtag_succeedsWhenEtagDiffers() {
-        String bucket = createBucket("put-if-none-different");
-        putObject(bucket, "object.txt", "first");
-
-        given()
-            .header("If-None-Match", "\"not-the-current-etag\"")
-            .body("second")
-        .when()
-            .put("/" + bucket + "/object.txt")
-        .then()
-            .statusCode(200);
-
-        assertObjectBody(bucket, "object.txt", "second");
-    }
-
-    @Test
-    void putObject_ifNoneMatchEtag_412WhenEtagMatches() {
-        String bucket = createBucket("put-if-none-match");
+    void putObject_ifNoneMatchEtag_501AndDoesNotWrite() {
+        String bucket = createBucket("put-if-none-etag");
         String eTag = putObject(bucket, "object.txt", "first");
 
-        ValidatableResponse response = given()
-            .header("If-None-Match", eTag)
+        // S3 implements If-None-Match only as "*". A literal ETag, matching or not, is 501.
+        for (String ifNoneMatch : List.of(eTag, "\"not-the-current-etag\"", "*, " + eTag, ",")) {
+            assertNotImplemented(given()
+                .header("If-None-Match", ifNoneMatch)
+                .body("second")
+            .when()
+                .put("/" + bucket + "/object.txt")
+            .then());
+        }
+
+        assertObjectBody(bucket, "object.txt", "first");
+    }
+
+    @Test
+    void putObject_ifMatchStar_501AndDoesNotWrite() {
+        String bucket = createBucket("put-if-match-star");
+        putObject(bucket, "object.txt", "first");
+
+        for (String key : List.of("object.txt", "missing.txt")) {
+            for (String ifMatch : List.of("*", "\"*\"", STALE_ETAG + ", *")) {
+                assertNotImplemented(given()
+                    .header("If-Match", ifMatch)
+                    .body("second")
+                .when()
+                    .put("/" + bucket + "/" + key)
+                .then());
+            }
+        }
+
+        assertObjectBody(bucket, "object.txt", "first");
+        given().when().get("/" + bucket + "/missing.txt").then().statusCode(404);
+    }
+
+    @Test
+    void putObject_unimplementedCondition_isAnsweredBeforeTheBodyIsDecodedOrValidated() {
+        String bucket = createBucket("put-if-match-star-checksum");
+
+        assertNotImplemented(given()
+            .header("If-Match", "*")
+            .header("x-amz-checksum-crc32", "INVALID==")
             .body("second")
         .when()
             .put("/" + bucket + "/object.txt")
-        .then();
+        .then());
 
-        assertPreconditionFailed(response, "If-None-Match");
+        // A truncated aws-chunked body is 400 IncompleteBody without the header.
+        assertNotImplemented(given()
+            .header("If-Match", "*")
+            .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+            .header("Content-Encoding", "aws-chunked")
+            .body("5\r\nhello\r\n")
+        .when()
+            .put("/" + bucket + "/object.txt")
+        .then());
 
-        assertObjectBody(bucket, "object.txt", "first");
+        given().when().get("/" + bucket + "/object.txt").then().statusCode(404);
     }
 
     @Test
@@ -177,21 +190,15 @@ class S3ConditionalWriteIntegrationTest {
         .then()
             .statusCode(200);
 
-        String currentETag = given()
-            .when()
-                .head("/" + bucket + "/object.txt")
-            .then()
-                .statusCode(200)
-                .extract().header("ETag");
-
+        // The object changed above, so the original ETag is stale, quoted or not.
         ValidatableResponse response = given()
-            .header("If-None-Match", stripQuotes(currentETag))
+            .header("If-Match", stripQuotes(eTag))
             .body("third")
         .when()
             .put("/" + bucket + "/object.txt")
         .then();
 
-        assertPreconditionFailed(response, "If-None-Match");
+        assertPreconditionFailed(response, "If-Match");
 
         response = given()
             .header("If-None-Match", "\"*\"")
@@ -223,6 +230,34 @@ class S3ConditionalWriteIntegrationTest {
         assertPreconditionFailed(response, "If-None-Match");
 
         assertObjectBody(bucket, "object.txt", "first");
+    }
+
+    @Test
+    void concurrentCompleteMultipartUpload_ifNoneMatchStar_allowsOnlyOneWriter() throws Exception {
+        String bucket = createBucket("mpu-if-none-concurrent");
+        String key = "object.txt";
+        int writers = 16;
+        List<String> uploadIds = new ArrayList<>();
+        List<String> partETags = new ArrayList<>();
+        for (int writer = 0; writer < writers; writer++) {
+            String uploadId = initiateMultipartUpload(bucket, key);
+            uploadIds.add(uploadId);
+            partETags.add(uploadPart(bucket, key, uploadId, 1, "writer-" + writer));
+        }
+
+        List<Integer> statusCodes = raceStatusCodes(writers, writer -> given()
+                .contentType("application/xml")
+                .header("If-None-Match", "*")
+                .body(completeMultipartXml(1, partETags.get(writer)))
+            .when()
+                .post("/" + bucket + "/" + key + "?uploadId=" + uploadIds.get(writer))
+            .then()
+                .extract()
+                .statusCode());
+
+        assertEquals(1, frequency(statusCodes, 200));
+        assertEquals(writers - 1, frequency(statusCodes, 412));
+        assertObjectBody(bucket, key, "writer-" + statusCodes.indexOf(200));
     }
 
     @Test
@@ -508,6 +543,38 @@ class S3ConditionalWriteIntegrationTest {
         .then()
             .statusCode(200)
             .body(equalTo(body));
+    }
+
+    private static void assertNotImplemented(ValidatableResponse response) {
+        response.statusCode(501)
+                .body("Error.Code", equalTo("NotImplemented"));
+    }
+
+    /**
+     * Releases {@code writers} requests at once behind a barrier and returns each one's status
+     * code, in writer order.
+     */
+    private static List<Integer> raceStatusCodes(int writers, IntFunction<Integer> request) throws Exception {
+        CyclicBarrier barrier = new CyclicBarrier(writers);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            List<Future<Integer>> futures = new ArrayList<>();
+            for (int writer = 0; writer < writers; writer++) {
+                int current = writer;
+                futures.add(executor.submit(() -> {
+                    barrier.await();
+                    return request.apply(current);
+                }));
+            }
+            List<Integer> statusCodes = new ArrayList<>();
+            for (Future<Integer> future : futures) {
+                statusCodes.add(future.get(30, SECONDS));
+            }
+            return statusCodes;
+        }
+        finally {
+            executor.shutdownNow();
+        }
     }
 
     private static void assertPreconditionFailed(ValidatableResponse response, String condition) {

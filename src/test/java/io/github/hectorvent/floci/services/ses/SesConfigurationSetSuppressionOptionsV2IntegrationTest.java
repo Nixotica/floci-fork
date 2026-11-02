@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ses;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -150,8 +151,8 @@ class SesConfigurationSetSuppressionOptionsV2IntegrationTest {
                 .put("/v2/email/configuration-sets/" + CS + "/suppression-options")
         .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("BadRequestException"))
-                .body("message", org.hamcrest.Matchers.equalTo(
+                .body("__type", Matchers.equalTo("BadRequestException"))
+                .body("message", Matchers.equalTo(
                         "Reason INVALID is invalid, must be one of [BOUNCE, COMPLAINT]."));
     }
 
@@ -188,6 +189,30 @@ class SesConfigurationSetSuppressionOptionsV2IntegrationTest {
                 .contentType("application/json")
                 .header("Authorization", AUTH)
                 .body("{}")
+        .when()
+                .put("/v2/email/configuration-sets/" + CS + "/suppression-options")
+        .then()
+                .statusCode(200);
+
+        given()
+                .header("Authorization", AUTH)
+        .when()
+                .get("/v2/email/configuration-sets/" + CS)
+        .then()
+                .statusCode(200)
+                .body("SuppressionOptions.SuppressedReasons", empty());
+    }
+
+    @Test
+    @Order(11)
+    void putSuppressionOptions_nullSuppressedReasons_treatedAsEmptyList() {
+        // Start from a non-empty override so an ignored null would leave BOUNCE behind.
+        configSetService.putSuppressionOptions(CS, List.of("BOUNCE"), REGION);
+
+        given()
+                .contentType("application/json")
+                .header("Authorization", AUTH)
+                .body("{\"SuppressedReasons\":null}")
         .when()
                 .put("/v2/email/configuration-sets/" + CS + "/suppression-options")
         .then()

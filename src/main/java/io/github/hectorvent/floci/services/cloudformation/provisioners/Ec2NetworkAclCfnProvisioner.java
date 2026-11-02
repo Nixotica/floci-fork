@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.NetworkAcl;
+import io.github.hectorvent.floci.services.ec2.model.NetworkAclAssociation;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -69,7 +71,7 @@ public class Ec2NetworkAclCfnProvisioner implements CfnResourceProvisioner {
         // already made; only create when it is absent, meaning a first execution or one removed
         // out of band.
         String existingId = r.getPhysicalId();
-        var existing = existingId == null || existingId.isBlank() ? null
+        NetworkAcl existing = existingId == null || existingId.isBlank() ? null
                 : ec2Service.describeNetworkAcls(ctx.region(), List.of(existingId), Map.of())
                         .stream().findFirst().orElse(null);
         if (existing != null) {
@@ -83,27 +85,29 @@ public class Ec2NetworkAclCfnProvisioner implements CfnResourceProvisioner {
             r.getAttributes().put("Id", existingId);
             return;
         }
-        var acl = ec2Service.createNetworkAcl(ctx.region(), vpcId);
+        NetworkAcl acl = ec2Service.createNetworkAcl(ctx.region(), vpcId);
         r.setPhysicalId(acl.getNetworkAclId());
         r.getAttributes().put("Id", acl.getNetworkAclId());
     }
 
     private void provisionNetworkAclEntry(StackResource r, JsonNode props, ProvisionContext ctx) {
         String aclId = ctx.resolveOptional(props, "NetworkAclId");
-        String ruleNumberValue = ctx.resolveOptional(props, "RuleNumber");
-        int ruleNumber = ruleNumberValue != null ? Integer.parseInt(ruleNumberValue) : 100;
+        Integer ruleNumberValue = ctx.resolveOptionalInt(props, "RuleNumber");
+        int ruleNumber = ruleNumberValue != null ? ruleNumberValue : 100;
         boolean egress = Boolean.parseBoolean(ctx.resolveOptional(props, "Egress"));
         JsonNode portRange = props != null && props.hasNonNull("PortRange") ? props.get("PortRange") : null;
-        String fromValue = ctx.resolveOptional(portRange, "From");
-        String toValue = ctx.resolveOptional(portRange, "To");
-        Integer from = fromValue != null ? Integer.valueOf(fromValue) : null;
-        Integer to = toValue != null ? Integer.valueOf(toValue) : null;
+        Integer from = ctx.resolveOptionalInt(portRange, "From");
+        Integer to = ctx.resolveOptionalInt(portRange, "To");
+        JsonNode icmp = props != null && props.hasNonNull("Icmp") ? props.get("Icmp") : null;
         String protocol = ctx.resolveOptional(props, "Protocol");
         ec2Service.createNetworkAclEntry(ctx.region(), aclId, ruleNumber,
                 protocol != null ? protocol : "-1",
                 ctx.resolveOptional(props, "RuleAction"),
                 egress,
                 ctx.resolveOptional(props, "CidrBlock"),
+                ctx.resolveOptional(props, "Ipv6CidrBlock"),
+                ctx.resolveOptionalInt(icmp, "Type"),
+                ctx.resolveOptionalInt(icmp, "Code"),
                 // RuleNumber, Egress and NetworkAclId are the createOnly key, so re-provisioning
                 // the same key is an update. replace=false would raise NetworkAclEntryAlreadyExists
                 // on every stack update.
@@ -131,7 +135,7 @@ public class Ec2NetworkAclCfnProvisioner implements CfnResourceProvisioner {
             throw new IllegalStateException(
                     "No network ACL association found for subnet " + subnetId);
         }
-        var assoc = ec2Service.replaceNetworkAclAssociation(ctx.region(), associationId, aclId);
+        NetworkAclAssociation assoc = ec2Service.replaceNetworkAclAssociation(ctx.region(), associationId, aclId);
         r.setPhysicalId(assoc.getNetworkAclAssociationId());
         r.getAttributes().put("AssociationId", assoc.getNetworkAclAssociationId());
     }
@@ -152,7 +156,7 @@ public class Ec2NetworkAclCfnProvisioner implements CfnResourceProvisioner {
      * replace the association with the default ACL of the same VPC.
      */
     private void deleteSubnetNetworkAclAssociation(String physicalId, String region) {
-        var holder = ec2Service.describeNetworkAcls(region, List.of(),
+        NetworkAcl holder = ec2Service.describeNetworkAcls(region, List.of(),
                         Map.of("association.network-acl-association-id", List.of(physicalId)))
                 .stream().findFirst().orElse(null);
         if (holder == null) {
@@ -161,7 +165,7 @@ public class Ec2NetworkAclCfnProvisioner implements CfnResourceProvisioner {
         if (holder.isDefault()) {
             return; // already on the default ACL, nothing to revert
         }
-        var defaultAcl = ec2Service.describeNetworkAcls(region, List.of(),
+        NetworkAcl defaultAcl = ec2Service.describeNetworkAcls(region, List.of(),
                         Map.of("vpc-id", List.of(holder.getVpcId()), "default", List.of("true")))
                 .stream().findFirst().orElse(null);
         if (defaultAcl == null) {

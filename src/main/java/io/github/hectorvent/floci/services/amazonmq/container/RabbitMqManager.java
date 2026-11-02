@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.amazonmq.container;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -101,7 +102,7 @@ public class RabbitMqManager {
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "amazonmq", broker.getBrokerId(), regionResolver.getAccountId(),
-                        regionResolver.getDefaultRegion()));
+                        brokerRegion(broker)));
 
         // Seed the broker's admin user. RabbitMQ's built-in `guest` user is
         // loopback-only, so it cannot authenticate over the mapped host port; a user
@@ -167,7 +168,7 @@ public class RabbitMqManager {
                 "http://" + mgmt.host() + ":" + mgmt.port(),
                 List.of("amqp://" + amqp.host() + ":" + amqp.port()),
                 amqp.host());
-        broker.setBrokerInstances(new java.util.ArrayList<>(List.of(instance)));
+        broker.setBrokerInstances(new ArrayList<>(List.of(instance)));
         LOG.infov("RabbitMQ container {0} started for broker {1}: amqp={2} (host ports amqp={3}, console={4})",
                 info.containerId(), broker.getBrokerName(), instance.getEndpoints().get(0),
                 String.valueOf(ports.amqp()), String.valueOf(ports.console()));
@@ -175,14 +176,19 @@ public class RabbitMqManager {
         String shortId = info.containerId().length() >= 8
                 ? info.containerId().substring(0, 8)
                 : info.containerId();
-        String logGroup = "/aws/amazonmq/broker/" + broker.getBrokerId();
+        String logGroup = broker.generalLogGroup();
         String logStream = logStreamer.generateLogStreamName(shortId);
-        String region = regionResolver.getDefaultRegion();
+        String region = brokerRegion(broker);
         Closeable logHandle = logStreamer.attach(
                 info.containerId(), logGroup, logStream, region, "amazonmq:" + broker.getBrokerId());
         if (logHandle != null) {
             logStreams.put(broker.getBrokerId(), logHandle);
         }
+    }
+
+    /** The region in the broker's ARN; a broker recorded without one counts as the default region's. */
+    private String brokerRegion(Broker broker) {
+        return AwsArnUtils.regionOrDefault(broker.getBrokerArn(), regionResolver.getDefaultRegion());
     }
 
     /**

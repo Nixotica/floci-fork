@@ -1,11 +1,16 @@
 package io.github.hectorvent.floci.services.ses;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
+import io.github.hectorvent.floci.services.ses.address.SesAddressSyntax;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntry;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntryResult;
 import io.github.hectorvent.floci.services.ses.model.CloudWatchDestination;
@@ -26,19 +31,22 @@ import io.github.hectorvent.floci.services.ses.model.ReceiptRuleSet;
 import io.github.hectorvent.floci.services.ses.model.SendBulkEmailRequest;
 import io.github.hectorvent.floci.services.ses.model.SendEmailRequest;
 import io.github.hectorvent.floci.services.ses.model.SnsDestination;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * Query-protocol handler for SES actions.
@@ -158,7 +166,7 @@ public class SesQueryHandler {
                         handlePutConfigurationSetDeliveryOptions(params, region);
                 case "CreateReceiptRuleSet" -> handleCreateReceiptRuleSet(params, region);
                 case "DescribeReceiptRuleSet" -> handleDescribeReceiptRuleSet(params, region);
-                case "ListReceiptRuleSets" -> handleListReceiptRuleSets(region);
+                case "ListReceiptRuleSets" -> handleListReceiptRuleSets(params, region);
                 case "DeleteReceiptRuleSet" -> handleDeleteReceiptRuleSet(params, region);
                 case "SetActiveReceiptRuleSet" -> handleSetActiveReceiptRuleSet(params, region);
                 case "DescribeActiveReceiptRuleSet" -> handleDescribeActiveReceiptRuleSet(region);
@@ -224,7 +232,7 @@ public class SesQueryHandler {
     private Response handleGetIdentityVerificationAttributes(MultivaluedMap<String, String> params, String region) {
         List<String> identities = extractMembers(params, "Identities");
 
-        var xml = new XmlBuilder().start("VerificationAttributes");
+        XmlBuilder xml = new XmlBuilder().start("VerificationAttributes");
         for (String identityValue : identities) {
             Identity identity =
                     identityService.getIdentityVerificationAttributes(identityValue, region);
@@ -271,6 +279,8 @@ public class SesQueryHandler {
                 .bccAddresses(bccAddresses)
                 .replyToAddresses(replyToAddresses)
                 .returnPath(returnPath)
+                .sourceArn(getParam(params, "SourceArn"))
+                .returnPathArn(getParam(params, "ReturnPathArn"))
                 .configurationSetName(configurationSetName)
                 .emailTags(emailTags)
                 .region(region)
@@ -295,6 +305,9 @@ public class SesQueryHandler {
         String messageId = sesService.sendEmail(SendEmailRequest.builder()
                 .source(source)
                 .toAddresses(destinations)
+                .sourceArn(getParam(params, "SourceArn"))
+                .fromArn(getParam(params, "FromArn"))
+                .returnPathArn(getParam(params, "ReturnPathArn"))
                 .configurationSetName(configurationSetName)
                 .emailTags(emailTags)
                 .region(region)
@@ -306,7 +319,7 @@ public class SesQueryHandler {
     }
 
     private Response handleGetSendQuota(String region) {
-        var xml = new XmlBuilder()
+        XmlBuilder xml = new XmlBuilder()
                 .elem("Max24HourSend", "200.0")
                 .elem("MaxSendRate", "1.0")
                 .elem("SentLast24Hours",
@@ -316,14 +329,14 @@ public class SesQueryHandler {
 
     private Response handleGetSendStatistics(String region) {
         long sentCount = sentEmailService.countInRegion(region);
-        var xml = new XmlBuilder().start("SendDataPoints");
+        XmlBuilder xml = new XmlBuilder().start("SendDataPoints");
         if (sentCount > 0) {
             xml.start("member")
                .elem("DeliveryAttempts", String.valueOf(sentCount))
                .elem("Bounces", "0")
                .elem("Complaints", "0")
                .elem("Rejects", "0")
-               .elem("Timestamp", java.time.Instant.now().toString())
+               .elem("Timestamp", Instant.now().toString())
                .end("member");
         }
         xml.end("SendDataPoints");
@@ -344,7 +357,7 @@ public class SesQueryHandler {
 
     private Response handleListVerifiedEmailAddresses(String region) {
         List<String> emails = identityService.getVerifiedEmailAddresses(region);
-        var xml = new XmlBuilder().start("VerifiedEmailAddresses");
+        XmlBuilder xml = new XmlBuilder().start("VerifiedEmailAddresses");
         for (String email : emails) {
             xml.elem("member", email);
         }
@@ -370,7 +383,7 @@ public class SesQueryHandler {
     private Response handleGetIdentityNotificationAttributes(MultivaluedMap<String, String> params, String region) {
         List<String> identities = extractMembers(params, "Identities");
 
-        var xml = new XmlBuilder().start("NotificationAttributes");
+        XmlBuilder xml = new XmlBuilder().start("NotificationAttributes");
         for (String identityValue : identities) {
             Identity identity =
                     identityService.getIdentityNotificationAttributes(identityValue, region);
@@ -400,7 +413,7 @@ public class SesQueryHandler {
     private Response handleGetIdentityDkimAttributes(MultivaluedMap<String, String> params, String region) {
         List<String> identities = extractMembers(params, "Identities");
 
-        var xml = new XmlBuilder().start("DkimAttributes");
+        XmlBuilder xml = new XmlBuilder().start("DkimAttributes");
         for (String identityValue : identities) {
             Identity identity =
                     identityService.getIdentityVerificationAttributes(identityValue, region);
@@ -442,7 +455,7 @@ public class SesQueryHandler {
     private Response handleVerifyDomainDkim(MultivaluedMap<String, String> params, String region) {
         String domain = getParam(params, "Domain");
         List<String> tokens = identityService.verifyDomainDkim(domain, region);
-        var xml = new XmlBuilder().start("DkimTokens");
+        XmlBuilder xml = new XmlBuilder().start("DkimTokens");
         for (String token : tokens) {
             xml.elem("member", token);
         }
@@ -496,7 +509,7 @@ public class SesQueryHandler {
 
     private Response handleGetIdentityMailFromDomainAttributes(MultivaluedMap<String, String> params, String region) {
         List<String> identities = extractMembers(params, "Identities");
-        var xml = new XmlBuilder().start("MailFromDomainAttributes");
+        XmlBuilder xml = new XmlBuilder().start("MailFromDomainAttributes");
         for (String identityValue : identities) {
             Identity identity = identityService.getMailFromAttributes(identityValue, region);
             xml.start("entry");
@@ -529,7 +542,7 @@ public class SesQueryHandler {
         String identity = requireParam(params, "Identity");
         List<String> names = extractMembers(params, "PolicyNames");
         Map<String, String> policies = policyService.getIdentityPolicies(identity, names, region);
-        var xml = new XmlBuilder().start("Policies");
+        XmlBuilder xml = new XmlBuilder().start("Policies");
         policies.forEach((name, doc) -> xml.start("entry").elem("key", name).elem("value", doc).end("entry"));
         xml.end("Policies");
         return Response.ok(AwsQueryResponse.envelope("GetIdentityPolicies", AwsNamespaces.SES, xml.build())).build();
@@ -537,7 +550,7 @@ public class SesQueryHandler {
 
     private Response handleListIdentityPolicies(MultivaluedMap<String, String> params, String region) {
         String identity = requireParam(params, "Identity");
-        var xml = new XmlBuilder().start("PolicyNames");
+        XmlBuilder xml = new XmlBuilder().start("PolicyNames");
         for (String name : policyService.listIdentityPolicyNames(identity, region)) {
             xml.elem("member", name);
         }
@@ -569,7 +582,7 @@ public class SesQueryHandler {
     private Response handleGetTemplate(MultivaluedMap<String, String> params, String region) {
         String templateName = getParam(params, "TemplateName");
         EmailTemplate template = templateService.getTemplate(templateName, region);
-        var xml = new XmlBuilder().start("Template")
+        XmlBuilder xml = new XmlBuilder().start("Template")
                 .elem("TemplateName", template.getTemplateName());
         if (template.getSubject() != null) {
             xml.elem("SubjectPart", template.getSubject());
@@ -642,6 +655,8 @@ public class SesQueryHandler {
                 .bccAddresses(bccAddresses)
                 .replyToAddresses(replyToAddresses)
                 .returnPath(returnPath)
+                .sourceArn(getParam(params, "SourceArn"))
+                .returnPathArn(getParam(params, "ReturnPathArn"))
                 .configurationSetName(configurationSetName)
                 .emailTags(emailTags)
                 .region(region)
@@ -755,10 +770,37 @@ public class SesQueryHandler {
             throw new AwsException("AccountSendingPausedException",
                     "Account sending is disabled.", 400);
         }
-        String source = getParam(params, "Source");
-        List<String> replyToAddresses = extractMembers(params, "ReplyToAddresses");
         String templateName = getParam(params, "Template");
         String templateArn = getParam(params, "TemplateArn");
+        BulkDestinationIndexes destinations = bulkDestinationIndexes(params);
+        // The model validation answers ahead of every other check of the request. It lists the
+        // top-level members before the nested ones ('template' ahead of 'defaultTags.1.member.name'),
+        // each group in the model's member order (probe-confirmed).
+        List<String> violations = new ArrayList<>();
+        if (templateName == null && templateArn == null) {
+            violations.add(SmithyValidationErrors.notNullWithoutValue("template"));
+        }
+        if (!params.containsKey("Destinations") && !hasParamWithPrefix(params, "Destinations.")) {
+            violations.add(SmithyValidationErrors.notNullWithoutValue("destinations"));
+        }
+        addMessageTagViolations(params, "DefaultTags", "defaultTags", violations);
+        // A skipped index, like an entry without a Destination, is a null destination
+        // (probe-confirmed). An empty address list still sends its bare key.
+        for (int i = 1; i <= Math.min(destinations.last(), MAX_VALIDATED_DESTINATION_INDEX); i++) {
+            if (!destinations.withDestination().contains(i)) {
+                violations.add(SmithyValidationErrors.notNullWithoutValue("destinations." + i + ".member.destination"));
+            }
+            addMessageTagViolations(params, "Destinations.member." + i + ".ReplacementTags",
+                    "destinations." + i + ".member.replacementTags", violations);
+        }
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.validationError(violations);
+        }
+
+        String source = getParam(params, "Source");
+        SesAddressSyntax.requireBulkAddress(source);
+        SesAddressSyntax.requireBulkAddress(getParam(params, "ReturnPath"));
+        List<String> replyToAddresses = extractMembers(params, "ReplyToAddresses");
         String defaultDataRaw = getParam(params, "DefaultTemplateData");
 
         boolean hasName = templateName != null && !templateName.isBlank();
@@ -768,41 +810,60 @@ public class SesQueryHandler {
                     "Template or TemplateArn is required.", 400);
         }
         String resolvedName = hasName ? templateName : SesTemplateService.templateNameFromArn(templateArn);
-        EmailTemplate template = templateService.getTemplate(resolvedName, region);
-        JsonNode defaultTemplateData = parseTemplateData(defaultDataRaw);
 
+        int lastIndex = destinations.last();
+        if (lastIndex == 0) {
+            throw new AwsException("InvalidParameterValue",
+                    "At least one destination is required.", 400);
+        }
+        // AWS counts the destinations before it looks the template up (probe-confirmed). The list
+        // runs to its highest index, so counting that index first also bounds the scan below.
+        SesService.requireBulkDestinationCount(lastIndex);
+        // Probe-confirmed for an absent and an empty value; where it falls among the checks above
+        // is unprobed.
+        if (defaultDataRaw == null || defaultDataRaw.isEmpty()) {
+            throw new AwsException("InvalidParameterValue", "The default template data does not exist", 400);
+        }
+        JsonNode defaultTemplateData = templateDataObject(defaultDataRaw);
+        List<MessageTag> defaultEmailTags = readMessageTags(params, "DefaultTags");
         List<BulkEmailEntry> entries = new ArrayList<>();
-        for (int i = 1; ; i++) {
+        for (int i = 1; i <= lastIndex; i++) {
             String destPrefix = "Destinations.member." + i;
             List<String> to = extractMembers(params, destPrefix + ".Destination.ToAddresses");
             List<String> cc = extractMembers(params, destPrefix + ".Destination.CcAddresses");
             List<String> bcc = extractMembers(params, destPrefix + ".Destination.BccAddresses");
-            String replacementRaw = getParam(params, destPrefix + ".ReplacementTemplateData");
-            List<MessageTag> replacementTags = extractMessageTags(params, destPrefix + ".ReplacementTags");
-            if (to.isEmpty() && cc.isEmpty() && bcc.isEmpty()
-                    && replacementRaw == null && replacementTags.isEmpty()) {
-                break;
+            JsonNode replacementData = templateDataObject(getParam(params, destPrefix + ".ReplacementTemplateData"));
+            List<MessageTag> replacementTags = readMessageTags(params, destPrefix + ".ReplacementTags");
+            // Each of these fails its own entry, with a 200 for the call; invalid default data or a
+            // blank default tag name fails every entry. A blank tag name wins over invalid data and
+            // an address syntax error over both (probe-confirmed).
+            String rejection = null;
+            if (hasBlankName(defaultEmailTags) || hasBlankName(replacementTags)) {
+                rejection = "The tag name must be specified.";
+            } else if (defaultTemplateData == null || replacementData == null) {
+                rejection = "The template data is invalid";
             }
             entries.add(new BulkEmailEntry(to, cc, bcc,
-                    parseTemplateData(replacementRaw), replacementTags, List.of()));
+                    replacementData == null ? objectMapper.createObjectNode() : replacementData,
+                    replacementTags, List.of(), rejection));
         }
-        if (entries.isEmpty()) {
-            throw new AwsException("InvalidParameterValue",
-                    "At least one destination is required.", 400);
+        if (defaultTemplateData == null) {
+            defaultTemplateData = objectMapper.createObjectNode();
         }
 
         String configurationSetName = getParam(params, "ConfigurationSetName");
         String returnPath = getParam(params, "ReturnPath");
-        List<MessageTag> defaultEmailTags = extractMessageTags(params, "DefaultTags");
         List<BulkEmailEntryResult> results = sesService.sendBulkEmail(SendBulkEmailRequest.builder()
                 .source(source)
+                .sourceArn(getParam(params, "SourceArn"))
                 .replyToAddresses(replyToAddresses)
                 .returnPath(returnPath)
+                .returnPathArn(getParam(params, "ReturnPathArn"))
                 .configurationSetName(configurationSetName)
                 .defaultEmailTags(defaultEmailTags)
                 .region(region)
-                .defaultContent(new EmailContent.InlineTemplate(template.getSubject(), template.getTextPart(),
-                        template.getHtmlPart(), defaultTemplateData, List.of()))
+                .recipientLimitPerEntry(true)
+                .defaultContent(new EmailContent.Template(resolvedName, defaultTemplateData, List.of()))
                 .entries(entries)
                 .build());
 
@@ -822,10 +883,7 @@ public class SesQueryHandler {
     }
 
     private Response handleCreateConfigurationSet(MultivaluedMap<String, String> params, String region) {
-        String name = getParam(params, "ConfigurationSet.Name");
-        if (name == null || name.isBlank()) {
-            throw new AwsException("InvalidParameterValue", "ConfigurationSet.Name is required.", 400);
-        }
+        String name = requireConfigurationSetName(params, "ConfigurationSet.Name");
         ConfigurationSet configSet = new ConfigurationSet(name);
         configSet.setReputationMetricsEnabled(false);
         sesService.createConfigurationSet(configSet, region);
@@ -833,10 +891,7 @@ public class SesQueryHandler {
     }
 
     private Response handleDescribeConfigurationSet(MultivaluedMap<String, String> params, String region) {
-        String name = getParam(params, "ConfigurationSetName");
-        if (name == null || name.isBlank()) {
-            throw new AwsException("InvalidParameterValue", "ConfigurationSetName is required.", 400);
-        }
+        String name = requireConfigurationSetName(params, "ConfigurationSetName");
         ConfigurationSet cs = configSetService.get(name, region);
         List<String> attrs = extractMembers(params, "ConfigurationSetAttributeNames");
         XmlBuilder xml = new XmlBuilder()
@@ -951,17 +1006,14 @@ public class SesQueryHandler {
     }
 
     private Response handleDeleteConfigurationSet(MultivaluedMap<String, String> params, String region) {
-        String name = getParam(params, "ConfigurationSetName");
-        if (name == null || name.isBlank()) {
-            throw new AwsException("InvalidParameterValue", "ConfigurationSetName is required.", 400);
-        }
+        String name = requireConfigurationSetName(params, "ConfigurationSetName");
         sesService.deleteConfigurationSet(name, region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult("DeleteConfigurationSet", AwsNamespaces.SES)).build();
     }
 
     private Response handleCreateConfigurationSetEventDestination(MultivaluedMap<String, String> params,
                                                                   String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         String edName = requireParam(params, "EventDestination.Name");
         EventDestination dest = readEventDestination(params, "EventDestination");
         configSetService.createEventDestination(configSet, edName, dest, regionResolver.getAccountId(), region);
@@ -971,7 +1023,7 @@ public class SesQueryHandler {
 
     private Response handleUpdateConfigurationSetEventDestination(MultivaluedMap<String, String> params,
                                                                   String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         String edName = requireParam(params, "EventDestination.Name");
         EventDestination dest = readEventDestination(params, "EventDestination");
         configSetService.updateEventDestination(configSet, edName, dest, regionResolver.getAccountId(), region);
@@ -981,7 +1033,7 @@ public class SesQueryHandler {
 
     private Response handleDeleteConfigurationSetEventDestination(MultivaluedMap<String, String> params,
                                                                   String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         String edName = requireParam(params, "EventDestinationName");
         configSetService.deleteEventDestination(configSet, edName, region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult(
@@ -990,7 +1042,7 @@ public class SesQueryHandler {
 
     private Response handleUpdateConfigurationSetSendingEnabled(MultivaluedMap<String, String> params,
                                                                 String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         boolean enabled = parseXsdBoolean(params, "Enabled");
         configSetService.setSendingEnabled(configSet, enabled, region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult(
@@ -999,7 +1051,7 @@ public class SesQueryHandler {
 
     private Response handleCreateConfigurationSetTrackingOptions(MultivaluedMap<String, String> params,
                                                                  String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         String domain = getParam(params, "TrackingOptions.CustomRedirectDomain");
         sesService.createConfigurationSetTrackingOptions(configSet, domain, region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult(
@@ -1008,7 +1060,7 @@ public class SesQueryHandler {
 
     private Response handleUpdateConfigurationSetTrackingOptions(MultivaluedMap<String, String> params,
                                                                  String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         String domain = getParam(params, "TrackingOptions.CustomRedirectDomain");
         sesService.updateConfigurationSetTrackingOptions(configSet, domain, region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult(
@@ -1017,7 +1069,7 @@ public class SesQueryHandler {
 
     private Response handleDeleteConfigurationSetTrackingOptions(MultivaluedMap<String, String> params,
                                                                  String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         configSetService.deleteTrackingOptions(configSet, region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult(
                 "DeleteConfigurationSetTrackingOptions", AwsNamespaces.SES)).build();
@@ -1025,7 +1077,7 @@ public class SesQueryHandler {
 
     private Response handleUpdateConfigurationSetReputationMetricsEnabled(MultivaluedMap<String, String> params,
                                                                           String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         boolean enabled = parseXsdBoolean(params, "Enabled");
         configSetService.setReputationMetricsEnabled(configSet, enabled, region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult(
@@ -1034,16 +1086,15 @@ public class SesQueryHandler {
 
     private Response handlePutConfigurationSetDeliveryOptions(MultivaluedMap<String, String> params,
                                                               String region) {
-        String configSet = requireParam(params, "ConfigurationSetName");
+        String configSet = requireConfigurationSetName(params, "ConfigurationSetName");
         String tlsPolicy = getParam(params, "DeliveryOptions.TlsPolicy");
         // The V1 API accepts TlsPolicy Require/Optional (PascalCase, case-sensitive). Validate
         // here so an invalid enum value yields the v1 ValidationError AWS returns rather than the
         // shared service's v2-style BadRequestException. Message verified against real AWS.
         if (tlsPolicy != null && !"Require".equals(tlsPolicy) && !"Optional".equals(tlsPolicy)) {
-            throw new AwsException("ValidationError",
-                    "1 validation error detected: Value at 'deliveryOptions.tlsPolicy' failed to "
-                            + "satisfy constraint: Member must satisfy enum value set: [Optional, Require]",
-                    400);
+            throw SmithyValidationErrors.validationError(
+                    "Value at 'deliveryOptions.tlsPolicy' failed to "
+                            + "satisfy constraint: Member must satisfy enum value set: [Optional, Require]");
         }
         // Mirror the V2 path: an all-null DeliveryOptions clears the block rather than
         // persisting an empty object. Normalize the value to the V2 canonical REQUIRE/OPTIONAL
@@ -1087,14 +1138,17 @@ public class SesQueryHandler {
                 "DescribeReceiptRuleSet", AwsNamespaces.SES, xml.build())).build();
     }
 
-    private Response handleListReceiptRuleSets(String region) {
+    private Response handleListReceiptRuleSets(MultivaluedMap<String, String> params, String region) {
+        PaginatedResult<ReceiptRuleSet> page = receiptRuleService.listReceiptRuleSets(region,
+                SesListPaging.V1_LIST_RECEIPT_RULE_SETS, getParam(params, "NextToken"));
         XmlBuilder xml = new XmlBuilder().start("RuleSets");
-        for (ReceiptRuleSet rs : receiptRuleService.listReceiptRuleSets(region)) {
+        for (ReceiptRuleSet rs : page.items()) {
             xml.start("member");
             writeReceiptRuleSetMetadataFields(xml, rs);
             xml.end("member");
         }
         xml.end("RuleSets");
+        xml.elem("NextToken", page.nextToken());
         return Response.ok(AwsQueryResponse.envelope(
                 "ListReceiptRuleSets", AwsNamespaces.SES, xml.build())).build();
     }
@@ -1148,7 +1202,7 @@ public class SesQueryHandler {
      */
     private List<String> parseReorderRuleNames(MultivaluedMap<String, String> params) {
         String prefix = "RuleNames.member.";
-        Map<Integer, String> byIndex = new java.util.TreeMap<>();
+        Map<Integer, String> byIndex = new TreeMap<>();
         for (String key : params.keySet()) {
             if (!key.startsWith(prefix)) {
                 continue;
@@ -1174,7 +1228,7 @@ public class SesQueryHandler {
             int index = member.getKey();
             int skip = index - Math.max(previous, 1);
             if (skip > MAX_RULE_NAMES_INDEX_SKIP) {
-                throw new AwsException("MalformedInput", String.format(java.util.Locale.ROOT,
+                throw new AwsException("MalformedInput", String.format(Locale.ROOT,
                         "Excessively sparse input would skip %,d list elements", skip), 400);
             }
             while (names.size() < index - 1) {
@@ -1268,7 +1322,7 @@ public class SesQueryHandler {
 
     private List<String> receiptActionIndexTokens(MultivaluedMap<String, String> params) {
         String prefix = "Rule.Actions.member.";
-        Map<Integer, String> byValue = new java.util.HashMap<>();
+        Map<Integer, String> byValue = new HashMap<>();
         for (String key : params.keySet()) {
             if (!key.startsWith(prefix)) {
                 continue;
@@ -1429,26 +1483,26 @@ public class SesQueryHandler {
      * Floci stores the V2 canonical form internally, so the V1 handler translates
      * in both directions.
      */
-    private static final java.util.Map<String, String> V1_EVENT_TYPE_TO_INTERNAL =
-            java.util.Map.ofEntries(
-                    java.util.Map.entry("send", "SEND"),
-                    java.util.Map.entry("reject", "REJECT"),
-                    java.util.Map.entry("bounce", "BOUNCE"),
-                    java.util.Map.entry("complaint", "COMPLAINT"),
-                    java.util.Map.entry("delivery", "DELIVERY"),
-                    java.util.Map.entry("open", "OPEN"),
-                    java.util.Map.entry("click", "CLICK"),
-                    java.util.Map.entry("renderingFailure", "RENDERING_FAILURE"),
-                    java.util.Map.entry("deliveryDelay", "DELIVERY_DELAY"),
-                    java.util.Map.entry("subscription", "SUBSCRIPTION"));
+    private static final Map<String, String> V1_EVENT_TYPE_TO_INTERNAL =
+            Map.ofEntries(
+                    Map.entry("send", "SEND"),
+                    Map.entry("reject", "REJECT"),
+                    Map.entry("bounce", "BOUNCE"),
+                    Map.entry("complaint", "COMPLAINT"),
+                    Map.entry("delivery", "DELIVERY"),
+                    Map.entry("open", "OPEN"),
+                    Map.entry("click", "CLICK"),
+                    Map.entry("renderingFailure", "RENDERING_FAILURE"),
+                    Map.entry("deliveryDelay", "DELIVERY_DELAY"),
+                    Map.entry("subscription", "SUBSCRIPTION"));
 
-    private static final java.util.Map<String, String> INTERNAL_EVENT_TYPE_TO_V1;
+    private static final Map<String, String> INTERNAL_EVENT_TYPE_TO_V1;
     static {
-        java.util.Map<String, String> reverse = new java.util.HashMap<>();
-        for (var e : V1_EVENT_TYPE_TO_INTERNAL.entrySet()) {
+        Map<String, String> reverse = new HashMap<>();
+        for (Map.Entry<String, String> e : V1_EVENT_TYPE_TO_INTERNAL.entrySet()) {
             reverse.put(e.getValue(), e.getKey());
         }
-        INTERNAL_EVENT_TYPE_TO_V1 = java.util.Map.copyOf(reverse);
+        INTERNAL_EVENT_TYPE_TO_V1 = Map.copyOf(reverse);
     }
 
     /**
@@ -1510,6 +1564,12 @@ public class SesQueryHandler {
         return dest;
     }
 
+    private static String requireConfigurationSetName(MultivaluedMap<String, String> params, String name) {
+        String v = params.getFirst(name);
+        SesConfigurationSetService.validateName(v);
+        return v;
+    }
+
     private static String requireParam(MultivaluedMap<String, String> params, String name) {
         String v = params.getFirst(name);
         if (v == null || v.isBlank()) {
@@ -1533,7 +1593,7 @@ public class SesQueryHandler {
         JsonNode node;
         try {
             node = objectMapper.readTree(raw);
-        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+        } catch (JsonProcessingException e) {
             throw new AwsException("InvalidTemplate",
                     "Invalid TemplateData JSON: " + e.getMessage(), 400);
         }
@@ -1544,7 +1604,94 @@ public class SesQueryHandler {
         return node;
     }
 
+    // null for data that is not a JSON object, which a bulk send answers per entry.
+    private JsonNode templateDataObject(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return objectMapper.createObjectNode();
+        }
+        try {
+            JsonNode node = objectMapper.readTree(raw);
+            return node.isObject() ? node : null;
+        } catch (JsonProcessingException expected) {
+            // Malformed JSON is the same per-entry failure as a non-object value.
+            return null;
+        }
+    }
+
     // --- Helpers ---
+
+    // A skipped index is a tag with neither member, so it lists both (probe-confirmed).
+    private static void addMessageTagViolations(MultivaluedMap<String, String> params, String prefix,
+                                                String path, List<String> violations) {
+        int last = Math.min(lastMemberIndex(params, prefix + ".member."), MAX_VALIDATED_TAG_INDEX);
+        for (int i = 1; i <= last; i++) {
+            if (params.getFirst(prefix + ".member." + i + ".Name") == null) {
+                violations.add(SmithyValidationErrors.notNullWithoutValue(path + "." + i + ".member.name"));
+            }
+            if (params.getFirst(prefix + ".member." + i + ".Value") == null) {
+                violations.add(SmithyValidationErrors.notNullWithoutValue(path + "." + i + ".member.value"));
+            }
+        }
+    }
+
+    private static int lastMemberIndex(MultivaluedMap<String, String> params, String prefix) {
+        int last = 0;
+        for (String key : params.keySet()) {
+            if (key.startsWith(prefix)) {
+                int dot = key.indexOf('.', prefix.length());
+                last = Math.max(last, memberIndex(
+                        dot < 0 ? key.substring(prefix.length()) : key.substring(prefix.length(), dot)));
+            }
+        }
+        return last;
+    }
+
+    private static boolean hasBlankName(List<MessageTag> tags) {
+        return tags.stream().anyMatch(tag -> tag.name() == null || tag.name().isBlank());
+    }
+
+    private static boolean hasParamWithPrefix(MultivaluedMap<String, String> params, String prefix) {
+        return params.keySet().stream().anyMatch(key -> key.startsWith(prefix));
+    }
+
+    // Bounds the violation list a hostile index could inflate; an index above it still fails the
+    // destination count. Where AWS stops listing null destinations has not been probed.
+    private static final int MAX_VALIDATED_DESTINATION_INDEX = 1000;
+
+    // Bounds the violation list in the same way; a tag past it is read only up to the first gap.
+    private static final int MAX_VALIDATED_TAG_INDEX = 1000;
+
+    /** The highest {@code Destinations.member.N}, and the Ns that carry a {@code Destination}. */
+    private record BulkDestinationIndexes(int last, Set<Integer> withDestination) {}
+
+    private static BulkDestinationIndexes bulkDestinationIndexes(MultivaluedMap<String, String> params) {
+        String prefix = "Destinations.member.";
+        int last = 0;
+        Set<Integer> withDestination = new HashSet<>();
+        for (String key : params.keySet()) {
+            if (!key.startsWith(prefix)) {
+                continue;
+            }
+            int dot = key.indexOf('.', prefix.length());
+            int index = memberIndex(dot < 0 ? key.substring(prefix.length()) : key.substring(prefix.length(), dot));
+            if (index == 0) {
+                continue;
+            }
+            last = Math.max(last, index);
+            if (dot >= 0 && key.startsWith(".Destination.", dot)) {
+                withDestination.add(index);
+            }
+        }
+        return new BulkDestinationIndexes(last, withDestination);
+    }
+
+    // 0 for a token that is not a member index; one too long for an int is past any limit.
+    private static int memberIndex(String token) {
+        if (token.isEmpty() || token.charAt(0) == '0' || !token.chars().allMatch(c -> c >= '0' && c <= '9')) {
+            return 0;
+        }
+        return token.length() > 9 ? Integer.MAX_VALUE : Integer.parseInt(token);
+    }
 
     private List<String> extractMembers(MultivaluedMap<String, String> params, String prefix) {
         List<String> members = new ArrayList<>();
@@ -1562,18 +1709,24 @@ public class SesQueryHandler {
      * no members are present.
      */
     private List<MessageTag> extractMessageTags(MultivaluedMap<String, String> params, String prefix) {
+        List<MessageTag> tags = readMessageTags(params, prefix);
+        if (hasBlankName(tags)) {
+            throw new AwsException("InvalidParameterValue",
+                    "The tag name must be specified.", 400);
+        }
+        return tags;
+    }
+
+    private List<MessageTag> readMessageTags(MultivaluedMap<String, String> params, String prefix) {
         List<MessageTag> tags = new ArrayList<>();
         for (int i = 1; ; i++) {
             String name = getParam(params, prefix + ".member." + i + ".Name");
             String value = getParam(params, prefix + ".member." + i + ".Value");
-            if (name == null && value == null) break;
-            if (name == null || name.isBlank()) {
-                throw new AwsException("InvalidParameterValue",
-                        "The tag name must be specified.", 400);
+            if (name == null && value == null) {
+                return tags;
             }
             tags.add(new MessageTag(name, value));
         }
-        return tags;
     }
 
     private String getParam(MultivaluedMap<String, String> params, String name) {

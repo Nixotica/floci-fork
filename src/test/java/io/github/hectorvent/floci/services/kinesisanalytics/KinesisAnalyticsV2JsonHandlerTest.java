@@ -1,12 +1,13 @@
 package io.github.hectorvent.floci.services.kinesisanalytics;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.kinesisanalytics.container.FlinkContainerManager;
 import jakarta.ws.rs.core.Response;
@@ -96,8 +97,88 @@ class KinesisAnalyticsV2JsonHandlerTest {
 
         Response resp = handler.handle("ListApplications", MAPPER.createObjectNode(), REGION);
         assertThat(resp.getStatus(), is(200));
-        var summaries = entity(resp).get("ApplicationSummaries");
+        JsonNode summaries = entity(resp).get("ApplicationSummaries");
         assertEquals(2, summaries.size());
+    }
+
+    @Test
+    void listApplicationsHonorsLimitAndReturnsNextToken() {
+        String longName = "a".repeat(128);
+        createApplication(longName);
+        createApplication("demo-b");
+
+        ObjectNode request = MAPPER.createObjectNode().put("Limit", 1);
+        ObjectNode firstPage = entity(handler.handle("ListApplications", request, REGION));
+
+        assertEquals(1, firstPage.get("ApplicationSummaries").size());
+        assertEquals(longName, firstPage.get("ApplicationSummaries").get(0).get("ApplicationName").asText());
+        assertThat(firstPage.hasNonNull("NextToken"), is(true));
+        String token = firstPage.get("NextToken").asText();
+        assertEquals(longName, token);
+
+        createApplication("a0");
+        ObjectNode secondRequest = MAPPER.createObjectNode().put("Limit", 1).put("NextToken", token);
+        ObjectNode secondPage = entity(handler.handle("ListApplications", secondRequest, REGION));
+        assertEquals("demo-b", secondPage.get("ApplicationSummaries").get(0).get("ApplicationName").asText());
+        assertThat(secondPage.has("NextToken"), is(false));
+    }
+
+    @Test
+    void listApplicationsContinuesAfterTheLastReturnedApplicationIsDeleted() {
+        createApplication("demo-a");
+        createApplication("demo-b");
+
+        ObjectNode firstPage = entity(handler.handle("ListApplications",
+                MAPPER.createObjectNode().put("Limit", 1), REGION));
+        String firstName = firstPage.get("ApplicationSummaries").get(0).get("ApplicationName").asText();
+        String token = firstPage.get("NextToken").asText();
+        assertEquals(firstName, token);
+
+        ObjectNode describe = MAPPER.createObjectNode().put("ApplicationName", firstName);
+        double createTimestamp = entity(handler.handle("DescribeApplication", describe, REGION))
+                .get("ApplicationDetail").get("CreateTimestamp").asDouble();
+        ObjectNode delete = MAPPER.createObjectNode()
+                .put("ApplicationName", firstName)
+                .put("CreateTimestamp", createTimestamp);
+        assertThat(handler.handle("DeleteApplication", delete, REGION).getStatus(), is(200));
+
+        ObjectNode secondPage = entity(handler.handle("ListApplications",
+                MAPPER.createObjectNode().put("Limit", 1).put("NextToken", token), REGION));
+        assertEquals("demo-b", secondPage.get("ApplicationSummaries").get(0).get("ApplicationName").asText());
+    }
+
+    @Test
+    void listApplicationsUsesDefaultPageSizeAndEndsWithoutToken() {
+        for (int index = 0; index < 51; index++) {
+            createApplication(String.format("default-page-%02d", index));
+        }
+
+        ObjectNode firstPage = entity(handler.handle("ListApplications", MAPPER.createObjectNode(), REGION));
+
+        assertEquals(50, firstPage.get("ApplicationSummaries").size());
+        assertThat(firstPage.hasNonNull("NextToken"), is(true));
+
+        ObjectNode secondRequest = MAPPER.createObjectNode().put("NextToken",
+                firstPage.get("NextToken").asText());
+        ObjectNode secondPage = entity(handler.handle("ListApplications", secondRequest, REGION));
+
+        assertEquals(1, secondPage.get("ApplicationSummaries").size());
+        assertThat(secondPage.has("NextToken"), is(false));
+    }
+
+    @Test
+    void listApplicationsRejectsInvalidLimitAndToken() {
+        createApplication("demo-a");
+        for (int limit : new int[]{0, 51}) {
+            AwsException error = assertThrows(AwsException.class, () -> handler.handle("ListApplications",
+                    MAPPER.createObjectNode().put("Limit", limit), REGION));
+            assertEquals("InvalidRequestException", error.getErrorCode());
+        }
+        for (String token : new String[]{"", "!", "x".repeat(129)}) {
+            AwsException error = assertThrows(AwsException.class, () -> handler.handle("ListApplications",
+                    MAPPER.createObjectNode().put("NextToken", token), REGION));
+            assertEquals("InvalidRequestException", error.getErrorCode());
+        }
     }
 
     @Test
@@ -115,7 +196,7 @@ class KinesisAnalyticsV2JsonHandlerTest {
         del.put("CreateTimestamp", createTs);
         assertThat(handler.handle("DeleteApplication", del, REGION).getStatus(), is(200));
 
-        var summaries = entity(handler.handle("ListApplications", MAPPER.createObjectNode(), REGION))
+        JsonNode summaries = entity(handler.handle("ListApplications", MAPPER.createObjectNode(), REGION))
                 .get("ApplicationSummaries");
         assertEquals(0, summaries.size());
     }
@@ -145,7 +226,7 @@ class KinesisAnalyticsV2JsonHandlerTest {
         describe.put("ApplicationName", "coded");
         ObjectNode detail = (ObjectNode) entity(handler.handle("DescribeApplication", describe, REGION))
                 .get("ApplicationDetail");
-        var loc = detail.get("ApplicationConfigurationDescription")
+        JsonNode loc = detail.get("ApplicationConfigurationDescription")
                 .get("ApplicationCodeConfigurationDescription")
                 .get("CodeContentDescription").get("S3ApplicationCodeLocationDescription");
         assertEquals("arn:aws:s3:::flink-code", loc.get("BucketARN").asText());
@@ -182,7 +263,7 @@ class KinesisAnalyticsV2JsonHandlerTest {
         describe.put("ApplicationName", "envprops");
         ObjectNode detail = (ObjectNode) entity(handler.handle("DescribeApplication", describe, REGION))
                 .get("ApplicationDetail");
-        var groups = detail.get("ApplicationConfigurationDescription")
+        JsonNode groups = detail.get("ApplicationConfigurationDescription")
                 .get("EnvironmentPropertyDescriptions").get("PropertyGroupDescriptions");
         assertEquals(1, groups.size());
         assertEquals("ProducerConfigProperties", groups.get(0).get("PropertyGroupId").asText());
@@ -275,7 +356,7 @@ class KinesisAnalyticsV2JsonHandlerTest {
         ObjectNode detail = (ObjectNode) entity(updated).get("ApplicationDetail");
         assertEquals(2L, detail.get("ApplicationVersionId").asLong());
 
-        var loc = detail.get("ApplicationConfigurationDescription")
+        JsonNode loc = detail.get("ApplicationConfigurationDescription")
                 .get("ApplicationCodeConfigurationDescription")
                 .get("CodeContentDescription").get("S3ApplicationCodeLocationDescription");
         assertEquals("arn:aws:s3:::flink-code-v2", loc.get("BucketARN").asText());
@@ -306,7 +387,7 @@ class KinesisAnalyticsV2JsonHandlerTest {
         listReq.put("ResourceARN", arn);
         Response listed = handler.handle("ListTagsForResource", listReq, REGION);
         assertThat(listed.getStatus(), is(200));
-        var tags = entity(listed).get("Tags");
+        JsonNode tags = entity(listed).get("Tags");
         assertEquals(1, tags.size());
         assertEquals("env", tags.get(0).get("Key").asText());
         assertEquals("dev", tags.get(0).get("Value").asText());
@@ -357,7 +438,7 @@ class KinesisAnalyticsV2JsonHandlerTest {
         Response listed = handler.handle("ListApplicationSnapshots",
                 MAPPER.createObjectNode().put("ApplicationName", "streaming"), REGION);
         assertThat(listed.getStatus(), is(200));
-        var summaries = entity(listed).get("SnapshotSummaries");
+        JsonNode summaries = entity(listed).get("SnapshotSummaries");
         assertEquals(1, summaries.size());
         assertEquals("before-upgrade", summaries.get(0).get("SnapshotName").asText());
 
@@ -367,9 +448,117 @@ class KinesisAnalyticsV2JsonHandlerTest {
         deleteSnap.put("SnapshotCreationTimestamp", creationTimestamp);
         assertThat(handler.handle("DeleteApplicationSnapshot", deleteSnap, REGION).getStatus(), is(200));
 
-        var afterDelete = entity(handler.handle("ListApplicationSnapshots",
+        JsonNode afterDelete = entity(handler.handle("ListApplicationSnapshots",
                 MAPPER.createObjectNode().put("ApplicationName", "streaming"), REGION)).get("SnapshotSummaries");
         assertEquals(0, afterDelete.size());
+    }
+
+    @Test
+    void listApplicationSnapshotsHonorsLimitAndReturnsNextToken() {
+        createRunningCodedApplication("streaming");
+        createSnapshot("streaming", "snap-a");
+        createSnapshot("streaming", "snap-b");
+
+        ObjectNode firstPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming").put("Limit", 1), REGION));
+        JsonNode summaries = firstPage.get("SnapshotSummaries");
+        assertEquals(1, summaries.size());
+        assertEquals("snap-a", summaries.get(0).get("SnapshotName").asText());
+        assertThat(firstPage.hasNonNull("NextToken"), is(true));
+        assertEquals("snap-a", firstPage.get("NextToken").asText());
+
+        ObjectNode secondPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming")
+                        .put("Limit", 1).put("NextToken", "snap-a"), REGION));
+        assertEquals("snap-b",
+                secondPage.get("SnapshotSummaries").get(0).get("SnapshotName").asText());
+        assertThat(secondPage.has("NextToken"), is(false));
+    }
+
+    @Test
+    void listApplicationSnapshotsResumesAfterTheNamedSnapshotIsDeleted() {
+        createRunningCodedApplication("streaming");
+        createSnapshot("streaming", "snap-a");
+        createSnapshot("streaming", "snap-b");
+        createSnapshot("streaming", "snap-c");
+
+        ObjectNode firstPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming").put("Limit", 1), REGION));
+        String token = firstPage.get("NextToken").asText();
+        double creationTimestamp = firstPage.get("SnapshotSummaries").get(0)
+                .get("SnapshotCreationTimestamp").asDouble();
+
+        assertThat(handler.handle("DeleteApplicationSnapshot", MAPPER.createObjectNode()
+                .put("ApplicationName", "streaming").put("SnapshotName", token)
+                .put("SnapshotCreationTimestamp", creationTimestamp), REGION).getStatus(), is(200));
+
+        ObjectNode secondPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming")
+                        .put("Limit", 1).put("NextToken", token), REGION));
+        assertEquals("snap-b",
+                secondPage.get("SnapshotSummaries").get(0).get("SnapshotName").asText());
+
+        // The delete is what makes this a cursor-vs-offset proof, so confirm it really happened:
+        // offset semantics would resume at snap-c once snap-a is gone.
+        ObjectNode allPages = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming"), REGION));
+        assertEquals(2, allPages.get("SnapshotSummaries").size());
+    }
+
+    @Test
+    void listApplicationSnapshotsUsesDefaultPageSizeAndEndsWithoutToken() {
+        createRunningCodedApplication("streaming");
+        for (int i = 0; i < 51; i++) {
+            createSnapshot("streaming", String.format("snap-%02d", i));
+        }
+
+        ObjectNode firstPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming"), REGION));
+        assertEquals(50, firstPage.get("SnapshotSummaries").size());
+        assertEquals("snap-49", firstPage.get("NextToken").asText());
+
+        ObjectNode secondPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming")
+                        .put("NextToken", firstPage.get("NextToken").asText()), REGION));
+        assertEquals(1, secondPage.get("SnapshotSummaries").size());
+        assertThat(secondPage.has("NextToken"), is(false));
+    }
+
+    @Test
+    void listApplicationSnapshotsAcceptsAnyTokenWithinTheModeledLengthAsACursor() {
+        createRunningCodedApplication("streaming");
+        createSnapshot("streaming", "snap-a");
+
+        // AWS declares no pattern for this NextToken (unlike ListApplications, whose token reuses the
+        // ApplicationName shape), so a token is only a cursor: any string up to 512 characters is
+        // accepted, including one that names no snapshot.
+        ObjectNode fromPunctuation = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming").put("NextToken", "!!!"), REGION));
+        assertEquals("snap-a",
+                fromPunctuation.get("SnapshotSummaries").get(0).get("SnapshotName").asText());
+
+        ObjectNode pastTheEnd = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming")
+                        .put("NextToken", "z".repeat(512)), REGION));
+        assertEquals(0, pastTheEnd.get("SnapshotSummaries").size());
+        assertThat(pastTheEnd.has("NextToken"), is(false));
+    }
+
+    @Test
+    void listApplicationSnapshotsRejectsInvalidLimitAndToken() {
+        createRunningCodedApplication("streaming");
+        createSnapshot("streaming", "snap-a");
+
+        for (int limit : new int[]{0, 51}) {
+            AwsException error = assertThrows(AwsException.class, () -> handler.handle("ListApplicationSnapshots",
+                    MAPPER.createObjectNode().put("ApplicationName", "streaming").put("Limit", limit), REGION));
+            assertEquals("InvalidArgumentException", error.getErrorCode());
+        }
+        for (String token : new String[]{"", "a".repeat(513)}) {
+            AwsException error = assertThrows(AwsException.class, () -> handler.handle("ListApplicationSnapshots",
+                    MAPPER.createObjectNode().put("ApplicationName", "streaming").put("NextToken", token), REGION));
+            assertEquals("InvalidArgumentException", error.getErrorCode());
+        }
     }
 
     @Test
@@ -404,6 +593,12 @@ class KinesisAnalyticsV2JsonHandlerTest {
         assertThat(handler.handle("StartApplication", start, REGION).getStatus(), is(200));
     }
 
+    private void createSnapshot(String applicationName, String snapshotName) {
+        assertThat(handler.handle("CreateApplicationSnapshot", MAPPER.createObjectNode()
+                .put("ApplicationName", applicationName)
+                .put("SnapshotName", snapshotName), REGION).getStatus(), is(200));
+    }
+
     private String describeArn(String name) {
         ObjectNode describe = MAPPER.createObjectNode();
         describe.put("ApplicationName", name);
@@ -417,8 +612,8 @@ class KinesisAnalyticsV2JsonHandlerTest {
                 .thenReturn(AccountAwareStorageBackend.inMemory("000000000000"));
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.KinesisAnalyticsServiceConfig kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.kinesisAnalytics()).thenReturn(kaConfig);
         when(kaConfig.mock()).thenReturn(true);

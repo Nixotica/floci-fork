@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.codebuild.CodeBuildJsonHandler;
 import jakarta.ws.rs.core.Response;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
@@ -28,7 +30,7 @@ class CodeBuildCfnProvisionerTest {
             new CodeBuildCfnProvisioner(handler, mock(RegionResolver.class), mapper);
 
     private ProvisionContext ctx() {
-        var engine = mock(io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine.class);
+        CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "cfn-stack");
     }
@@ -96,9 +98,9 @@ class CodeBuildCfnProvisionerTest {
     void mapEntityFromHandlerIsConvertedNotDropped() throws Exception {
         // The real handler returns Response.ok(Map.of(...)) — a Map/POJO entity, never a JsonNode —
         // so a plain instanceof check silently drops the project and falls back to the guessed ARN.
-        java.util.Map<String, Object> project = new java.util.HashMap<>();
+        Map<String, Object> project = new HashMap<>();
         project.put("arn", "arn:aws:codebuild:us-east-1:000000000000:project/from-handler");
-        java.util.Map<String, Object> entity = java.util.Map.of("project", project);
+        Map<String, Object> entity = Map.of("project", project);
         when(handler.handle(eq("CreateProject"), any(), eq("us-east-1"), eq("000000000000")))
                 .thenReturn(Response.ok(entity).build());
 

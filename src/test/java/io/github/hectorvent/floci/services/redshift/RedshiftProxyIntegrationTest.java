@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.redshift;
 import io.github.hectorvent.floci.services.redshift.model.Cluster;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionTimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -13,8 +15,6 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.Objects;
-import org.awaitility.Awaitility;
-import org.awaitility.core.ConditionTimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -68,6 +68,38 @@ class RedshiftProxyIntegrationTest {
                 assertEquals(1, rs.getInt(1));
             }
         }
+    }
+
+    @Test
+    void pauseResumePreservesSqlAndProxyAuthentication() throws SQLException {
+        clusterId = "it-pause-resume";
+        Cluster cluster = service.createCluster(clusterId, "dc2.large", "admin", "Secret123");
+        int port = cluster.getEndpoint().getPort();
+        try (Connection connection = waitForConnection(cluster, "admin", "Secret123");
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE pause_data (value integer)");
+            statement.execute("INSERT INTO pause_data VALUES (42)");
+            statement.execute("CREATE VIEW pause_catalog_view AS SELECT * FROM pg_table_def");
+            assertEquals("paused", service.pauseCluster(clusterId).getClusterStatus());
+            assertThrows(SQLException.class, () -> statement.executeQuery("SELECT 1"));
+        }
+        assertThrows(SQLException.class,
+                () -> DriverManager.getConnection(jdbcUrl(cluster), "admin", "Secret123"));
+        assertEquals("available", service.resumeCluster(clusterId).getClusterStatus());
+        assertEquals(port, cluster.getEndpoint().getPort());
+        try (Connection connection = waitForConnection(cluster, "admin", "Secret123");
+             Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery("SELECT value FROM pause_data")) {
+            assertTrue(result.next());
+            assertEquals(42, result.getInt(1));
+        }
+        try (Connection connection = waitForConnection(cluster, "admin", "Secret123");
+             Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery("SELECT count(*) FROM pause_catalog_view")) {
+            assertTrue(result.next());
+        }
+        assertThrows(SQLException.class,
+                () -> DriverManager.getConnection(jdbcUrl(cluster), "admin", "wrong-password"));
     }
 
     @Test

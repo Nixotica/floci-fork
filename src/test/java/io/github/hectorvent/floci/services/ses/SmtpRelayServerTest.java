@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ses;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.ses.model.MessageAttachment;
 import io.github.hectorvent.floci.services.ses.model.MessageHeader;
 import io.vertx.core.Vertx;
 import io.vertx.ext.mail.MailClient;
@@ -10,6 +11,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -25,6 +27,8 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
@@ -77,7 +81,7 @@ class SmtpRelayServerTest {
     }
 
     private static EmulatorConfig config(String user, String pass, String starttls) {
-        EmulatorConfig config = mock(EmulatorConfig.class, org.mockito.Mockito.RETURNS_DEEP_STUBS);
+        EmulatorConfig config = mock(EmulatorConfig.class, Mockito.RETURNS_DEEP_STUBS);
         when(config.services().ses().smtpUser()).thenReturn(Optional.ofNullable(user));
         when(config.services().ses().smtpPass()).thenReturn(Optional.ofNullable(pass));
         when(config.services().ses().smtpStarttls()).thenReturn(starttls);
@@ -157,6 +161,34 @@ class SmtpRelayServerTest {
     }
 
     @Test
+    void structuredRelay_deliversSimpleAttachmentsOverSmtp() throws Exception {
+        server.reset();
+        byte[] pdf = "PDF-PAYLOAD".getBytes(StandardCharsets.UTF_8);
+        byte[] png = "PNG-PAYLOAD".getBytes(StandardCharsets.UTF_8);
+
+        relayAgainstServer().relay(SmtpRelay.RelayMessage.builder("sender@example.com")
+                .to(List.of("to@example.com"))
+                .subject("With attachments")
+                .bodyText("plain body")
+                .bodyHtml("<img src=\"cid:logo\">")
+                .messageId("msg-9")
+                .attachments(List.of(
+                        new MessageAttachment("report.pdf", pdf, "application/pdf",
+                                MessageAttachment.Disposition.ATTACHMENT, null, null, null),
+                        new MessageAttachment("logo.png", png, "image/png",
+                                MessageAttachment.Disposition.INLINE, null, "logo", null)))
+                .build());
+
+        assertTrue(server.awaitDelivery(), "the stub server should have accepted a message");
+        String data = server.data();
+        assertTrue(data.contains("report.pdf"), data);
+        assertTrue(data.contains(Base64.getEncoder().encodeToString(pdf)), data);
+        assertTrue(data.contains("Content-ID: <logo>"), data);
+        assertTrue(data.contains(Base64.getEncoder().encodeToString(png)), data);
+        assertTrue(data.contains("multipart/related"), data);
+    }
+
+    @Test
     void relay_authenticatesWithTheConfiguredCredentials() throws Exception {
         server.reset();
 
@@ -201,8 +233,8 @@ class SmtpRelayServerTest {
 
         private final ServerSocket serverSocket;
         private final Thread acceptThread;
-        private volatile java.util.concurrent.CountDownLatch delivered =
-                new java.util.concurrent.CountDownLatch(1);
+        private volatile CountDownLatch delivered =
+                new CountDownLatch(1);
         private volatile String mailFrom;
         private volatile String authCommand;
         private volatile String data;
@@ -224,7 +256,7 @@ class SmtpRelayServerTest {
         }
 
         void reset() {
-            delivered = new java.util.concurrent.CountDownLatch(1);
+            delivered = new CountDownLatch(1);
             mailFrom = null;
             authCommand = null;
             data = null;
@@ -232,7 +264,7 @@ class SmtpRelayServerTest {
         }
 
         boolean awaitDelivery() throws InterruptedException {
-            return delivered.await(20, java.util.concurrent.TimeUnit.SECONDS);
+            return delivered.await(20, TimeUnit.SECONDS);
         }
 
         String mailFrom() {

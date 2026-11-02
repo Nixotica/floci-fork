@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.inspector2;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.JsonErrorResponseUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -17,6 +19,10 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 @Path("/")
 @Produces(MediaType.APPLICATION_JSON)
@@ -50,8 +56,8 @@ public class Inspector2Controller {
             throw new AwsException("ValidationException", "nextToken is invalid.", 400);
         }
         InspectorState state = service.delegatedAdminState(region(headers), requestContext.getAccountId());
-        var response = objectMapper.createObjectNode();
-        var accounts = response.putArray("delegatedAdminAccounts");
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode accounts = response.putArray("delegatedAdminAccounts");
         if (state.getAdminAccountId() != null) {
             accounts.addObject().put("accountId", state.getAdminAccountId()).put("status", "ENABLED");
         }
@@ -64,7 +70,7 @@ public class Inspector2Controller {
         JsonNode request = parse(body);
         String accountId = request.path("delegatedAdminAccountId").asText(null);
         service.enableDelegatedAdmin(region(headers), requestContext.getAccountId(), accountId);
-        var response = objectMapper.createObjectNode();
+        ObjectNode response = objectMapper.createObjectNode();
         response.put("delegatedAdminAccountId", accountId);
         return Response.ok(response).build();
     }
@@ -75,7 +81,7 @@ public class Inspector2Controller {
         JsonNode request = parse(body);
         String accountId = request.path("delegatedAdminAccountId").asText(null);
         service.disableDelegatedAdmin(region(headers), requestContext.getAccountId(), accountId);
-        var response = objectMapper.createObjectNode();
+        ObjectNode response = objectMapper.createObjectNode();
         response.put("delegatedAdminAccountId", accountId);
         return Response.ok(response).build();
     }
@@ -89,13 +95,13 @@ public class Inspector2Controller {
             throw new AwsException("ValidationException",
                     "accountIds must contain at most 100 account IDs.", 400);
         }
-        java.util.List<String> requestedAccounts = requestedAccounts(accountIds);
-        var response = objectMapper.createObjectNode();
-        var accounts = response.putArray("accounts");
+        List<String> requestedAccounts = requestedAccounts(accountIds);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode accounts = response.putArray("accounts");
         for (String accountId : requestedAccounts) {
             InspectorState state = service.accountStatus(
                     region(headers), requestContext.getAccountId(), accountId);
-            var account = accounts.addObject();
+            ObjectNode account = accounts.addObject();
             account.put("accountId", accountId);
             account.set("state", stateNode(state.getStatus()));
             account.set("resourceState", resourceState(state));
@@ -107,18 +113,30 @@ public class Inspector2Controller {
     @POST
     @Path("/enable")
     public Response enable(@Context HttpHeaders headers, String body) {
-        JsonNode request = parse(body);
-        var enabled = service.enable(region(headers), requestContext.getAccountId(), request);
-        var response = objectMapper.createObjectNode();
-        var accounts = response.putArray("accounts");
-        enabled.forEach((accountId, state) -> {
-            var account = accounts.addObject();
+        Map<String, InspectorState> enabled = service.enable(
+                region(headers), requestContext.getAccountId(), parse(body));
+        return Response.ok(accountOperationResponse(enabled)).build();
+    }
+
+    @POST
+    @Path("/disable")
+    public Response disable(@Context HttpHeaders headers, String body) {
+        Map<String, InspectorState> disabled = service.disable(
+                region(headers), requestContext.getAccountId(), parse(body));
+        return Response.ok(accountOperationResponse(disabled)).build();
+    }
+
+    private ObjectNode accountOperationResponse(Map<String, InspectorState> states) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode accounts = response.putArray("accounts");
+        states.forEach((accountId, state) -> {
+            ObjectNode account = accounts.addObject();
             account.put("accountId", accountId);
             account.put("status", state.getStatus());
             account.set("resourceStatus", resourceStatus(state));
         });
         response.putArray("failedAccounts");
-        return Response.ok(response).build();
+        return response;
     }
 
     @POST
@@ -136,9 +154,9 @@ public class Inspector2Controller {
         return Response.ok(organizationConfigurationResponse(state)).build();
     }
 
-    private com.fasterxml.jackson.databind.node.ObjectNode organizationConfigurationResponse(InspectorState state) {
-        var response = objectMapper.createObjectNode();
-        var autoEnable = response.putObject("autoEnable");
+    private ObjectNode organizationConfigurationResponse(InspectorState state) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ObjectNode autoEnable = response.putObject("autoEnable");
         autoEnable.put("ec2", state.isAutoEnableEc2());
         autoEnable.put("ecr", state.isAutoEnableEcr());
         autoEnable.put("lambda", state.isAutoEnableLambda());
@@ -148,11 +166,11 @@ public class Inspector2Controller {
         return response;
     }
 
-    private java.util.List<String> requestedAccounts(JsonNode accountIds) {
+    private List<String> requestedAccounts(JsonNode accountIds) {
         if (accountIds == null || accountIds.isEmpty()) {
-            return java.util.List.of(requestContext.getAccountId());
+            return List.of(requestContext.getAccountId());
         }
-        java.util.List<String> result = new java.util.ArrayList<>(accountIds.size());
+        List<String> result = new ArrayList<>(accountIds.size());
         for (JsonNode accountId : accountIds) {
             Inspector2Service.requireAccountId(accountId.asText(null));
             result.add(accountId.asText());
@@ -160,8 +178,8 @@ public class Inspector2Controller {
         return result;
     }
 
-    private com.fasterxml.jackson.databind.node.ObjectNode resourceState(InspectorState state) {
-        var resources = objectMapper.createObjectNode();
+    private ObjectNode resourceState(InspectorState state) {
+        ObjectNode resources = objectMapper.createObjectNode();
         resources.set("ec2", stateNode(state.getEc2Status()));
         resources.set("ecr", stateNode(state.getEcrStatus()));
         resources.set("lambda", stateNode(state.getLambdaStatus()));
@@ -170,8 +188,8 @@ public class Inspector2Controller {
         return resources;
     }
 
-    private com.fasterxml.jackson.databind.node.ObjectNode resourceStatus(InspectorState state) {
-        var resources = objectMapper.createObjectNode();
+    private ObjectNode resourceStatus(InspectorState state) {
+        ObjectNode resources = objectMapper.createObjectNode();
         resources.put("ec2", state.getEc2Status());
         resources.put("ecr", state.getEcrStatus());
         resources.put("lambda", state.getLambdaStatus());
@@ -180,8 +198,8 @@ public class Inspector2Controller {
         return resources;
     }
 
-    private com.fasterxml.jackson.databind.node.ObjectNode stateNode(String status) {
-        var state = objectMapper.createObjectNode();
+    private ObjectNode stateNode(String status) {
+        ObjectNode state = objectMapper.createObjectNode();
         state.put("status", status);
         return state;
     }

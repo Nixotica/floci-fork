@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -144,7 +146,7 @@ class OrganizationsCfnIntegrationTest {
     }
 
     private static Response cloudFormation(String action, String... formParams) {
-        var request = given()
+        RequestSpecification request = given()
                 .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + MANAGEMENT_ACCOUNT
                         + "/20260823/us-east-1/cloudformation/aws4_request, SignedHeaders=host, Signature=abc")
                 .contentType("application/x-www-form-urlencoded")
@@ -312,7 +314,7 @@ class OrganizationsCfnIntegrationTest {
 
         organizations("DescribeResourcePolicy", "{}")
                 .then().statusCode(200)
-                .body("ResourcePolicy.Content", org.hamcrest.Matchers.containsString("organizations:Describe*"));
+                .body("ResourcePolicy.Content", Matchers.containsString("organizations:Describe*"));
     }
 
     @Test

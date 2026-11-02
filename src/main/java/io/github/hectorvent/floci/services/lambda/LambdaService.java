@@ -7,16 +7,28 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.CustomResourceLiveness;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
-import io.github.hectorvent.floci.core.storage.StorageBackedMap;
-import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.common.SignedMarkers;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.StorageBackedMap;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
+import io.github.hectorvent.floci.services.iam.AccessDeniedMessages.PolicyType;
+import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionService;
+import io.github.hectorvent.floci.services.lambda.durable.DurableWire;
+import io.github.hectorvent.floci.services.lambda.durable.model.DurableErrorObject;
+import io.github.hectorvent.floci.services.lambda.durable.model.DurableExecution;
+import io.github.hectorvent.floci.services.lambda.durable.model.DurableExecutionStatus;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
 import io.github.hectorvent.floci.services.lambda.model.FunctionEventInvokeConfig;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -27,9 +39,9 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.LambdaUrlConfig;
 import io.github.hectorvent.floci.services.lambda.model.ScalingConfig;
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
+import io.github.hectorvent.floci.services.lambda.zip.DeploymentPackage;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import io.github.hectorvent.floci.services.s3.S3Service;
-import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import jakarta.annotation.PostConstruct;
@@ -39,6 +51,9 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.math.BigDecimal;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
@@ -47,7 +62,9 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -55,6 +72,10 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
@@ -75,10 +96,23 @@ public class LambdaService implements ResourceProvider {
     private static final Pattern QUALIFIER = Pattern.compile(QUALIFIER_PATTERN);
     private static final Pattern EFS_ACCESS_POINT_ARN = Pattern.compile(
             "^arn:" + AwsArnUtils.PARTITION_REGEX + ":elasticfilesystem:(?:eusc-)?[a-z]{2}"
-                    + "(?:(?:-gov)|(?:-iso(?:b)?))?-[a-z]+-\\d:"
+                    + "(?:(?:-gov)|(?:-iso[a-z]?))?-[a-z]+-\\d:"
                     + "\\d{12}:access-point/fsap-[a-f0-9]{17}$");
     private static final Pattern FILE_SYSTEM_LOCAL_MOUNT_PATH = Pattern.compile("^/mnt/[A-Za-z0-9._-]+$");
     private static final Pattern LOG_GROUP_PATTERN = Pattern.compile("[.\\-_/#A-Za-z0-9]+");
+    // The model's Topic shape: 1-249 characters, pattern [^.]([a-zA-Z0-9\-_.]+); Topics holds at most 1.
+    private static final Pattern TOPIC_PATTERN = Pattern.compile("[^.]([a-zA-Z0-9\\-_.]+)");
+    private static final int MAX_TOPIC_LENGTH = 249;
+    private static final int MAX_TOPICS = 1;
+    private static final int MAX_SOURCE_ACCESS_CONFIGURATIONS = 23;
+    private static final int LIST_FUNCTIONS_PAGE_SIZE = 50;
+    private static final int MAX_LIST_FUNCTIONS_ITEMS = 10_000;
+    // UpdateFunctionCode S3Bucket (3-63 characters, [0-9A-Za-z\.\-_]*(?<!\.)) and S3Key (1-1024) shapes.
+    private static final Pattern S3_BUCKET_PATTERN = Pattern.compile("[0-9A-Za-z\\.\\-_]*(?<!\\.)");
+    // Create/UpdateAlias FunctionVersion (VersionWithLatestPublished: 1-1024, pattern below) and Description (max 256).
+    private static final Pattern ALIAS_FUNCTION_VERSION_PATTERN = Pattern.compile("(\\$LATEST(\\.PUBLISHED)?|[0-9]+)");
+    private static final int DEFAULT_SQS_BATCH_SIZE = 10;
+    private static final int DEFAULT_STREAM_BATCH_SIZE = 100;
     // The model's own Role pattern, which AWS quotes verbatim in its validation message; it
     // already accepts every partition.
     private static final Pattern ROLE_ARN_PATTERN = Pattern.compile(
@@ -89,6 +123,15 @@ public class LambdaService implements ResourceProvider {
     private static final int MAX_TAG_KEY_LENGTH = 128;
     private static final Pattern KMS_KEY_ARN_PATTERN = Pattern.compile(
             "^(arn:(aws[a-zA-Z-]*)?:[a-z0-9-.]+:.*)?$");
+    /** The DurableConfig member has its own pattern text, which AWS prints in the validation message. */
+    private static final Pattern DURABLE_KMS_KEY_ARN_PATTERN = Pattern.compile(
+            "(arn:(aws[a-zA-Z-]*)?:[a-z0-9-.]+:.*)|()");
+    private static final int MAX_DURABLE_EXECUTION_TIMEOUT_SECONDS = 31622400;
+    private static final int MAX_DURABLE_RETENTION_DAYS = 90;
+    private static final int DEFAULT_DURABLE_RETENTION_DAYS = 14;
+    private static final int MAX_FUNCTION_TIMEOUT_SECONDS = 900;
+    private static final int SYNC_DURABLE_GRACE_SECONDS = 5;
+    private static final Pattern DURABLE_EXECUTION_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9-_]+");
     private static final Pattern LAYER_VERSION_ARN_PATTERN = Pattern.compile(
             "^((arn:(aws[a-zA-Z-]*)?:lambda:(eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:\\d{12}:layer:[a-zA-Z0-9-_]+:[0-9]+)"
                     + "|(arn:[a-zA-Z0-9-]+:lambda:::awslayer:[a-zA-Z0-9-_]+))$");
@@ -96,9 +139,13 @@ public class LambdaService implements ResourceProvider {
     private static final Pattern FUNCTION_URL_QUALIFIER_PATTERN = Pattern.compile("^(?!^\\d+$)[0-9a-zA-Z-_]+$");
     private static final Pattern EVENT_SOURCE_ARN_PATTERN = Pattern.compile(
             "^arn:(aws[a-zA-Z0-9-]*):([a-zA-Z0-9-])+:((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1})?:(\\d{12})?:(.*)$");
-    private static final Pattern LIST_ESM_FUNCTION_NAME_PATTERN = Pattern.compile(
-            "^(arn:(aws[a-zA-Z-]*)?:lambda:)?((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?(\\d{12}:)?"
-                    + "(function:)?([a-zA-Z0-9-_\\.]+)(:(\\$LATEST(\\.PUBLISHED)?|[a-zA-Z0-9-_]+))?$");
+    private static final Pattern LIST_ESM_FUNCTION_NAME_PATTERN =
+            LambdaArnUtils.NAMESPACED_FUNCTION_NAME_PATTERN;
+    // AddPermission members: botocore's PrincipalOrgID, SourceOwner and EventSourceToken shapes.
+    private static final Pattern PRINCIPAL_ORG_ID_PATTERN = Pattern.compile("o-[a-z0-9]{10,32}");
+    private static final Pattern ACCOUNT_ID_PATTERN = Pattern.compile("\\d{12}");
+    private static final Pattern EVENT_SOURCE_TOKEN_PATTERN = Pattern.compile("[a-zA-Z0-9._\\-]+");
+    private static final int MAX_EVENT_SOURCE_TOKEN_LENGTH = 256;
 
     /** botocore lambda/2015-03-31 Runtime shape enum, kept in sync with service-2.json. */
     static final List<String> RUNTIME_VALUES = List.of(
@@ -124,7 +171,10 @@ public class LambdaService implements ResourceProvider {
      */
     private static final List<String> CONFIG_STRUCTURE_MEMBERS = List.of(
             "Environment", "EphemeralStorage", "TracingConfig", "DeadLetterConfig",
-            "VpcConfig", "SnapStart", "LoggingConfig", "ImageConfig");
+            "VpcConfig", "SnapStart", "LoggingConfig", "ImageConfig", "DurableConfig");
+
+    private static final Executor REACTIVE_SYNC_THREADS =
+            task -> Thread.ofVirtual().name("lambda-reactive-s3-sync").start(task);
 
     private final LambdaFunctionStore functionStore;
     private final LambdaExecutorService executorService;
@@ -144,28 +194,21 @@ public class LambdaService implements ResourceProvider {
     private final DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
     private final StorageFactory storageFactory;
     private final LambdaLayerService layerService;
+    private final LambdaCodeSigningConfigService codeSigningConfigService;
+    private final Map<String, PendingReactiveSync> pendingReactiveSyncs = new ConcurrentHashMap<>();
+    private final Map<String, Integer> runningReactiveSyncs = new ConcurrentHashMap<>();
+    private final Map<String, String> failedReactiveSyncs = new ConcurrentHashMap<>();
     private final Ec2Service ec2Service;
     /** Null in the constructors tests use, exactly as the other optional collaborators above are. */
     private final CustomResourceLiveness customResourceLiveness;
+    private final DurableExecutionService durableExecutionService;
     private final ObjectMapper objectMapper;
     private Map<String, Integer> versionCounters = new ConcurrentHashMap<>();
     private Map<String, FunctionEventInvokeConfig> eventInvokeConfigs = new ConcurrentHashMap<>();
-    /**
-     * Per-function locks covering PutFunctionConcurrency,
-     * DeleteFunctionConcurrency, and deleteFunction itself. Serializing the
-     * limiter update + persistence pair against itself for a given function
-     * prevents the limiter and store from diverging on interleaved concurrent
-     * requests.
-     *
-     * <p>Entries are intentionally never removed — see {@code deleteFunction}
-     * for the race this avoids. The map therefore grows by one {@code Object}
-     * per distinct function ARN the emulator has ever seen (create/delete
-     * cycles with fresh names included). Acceptable footprint for a local
-     * emulator workload.
-     */
-    private final ConcurrentHashMap<String, Object> concurrencyOpLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> policyMutationLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> versionCounterLocks = new ConcurrentHashMap<>();
+    private final SignedMarkers listFunctionMarkers = new SignedMarkers();
+    private final SignedMarkers codeSigningFunctionMarkers = new SignedMarkers();
 
     /**
      * Package-private constructor for testing without CDI. Config defaults
@@ -220,32 +263,66 @@ public class LambdaService implements ResourceProvider {
         this.layerService = null;
         this.ec2Service = null;
         this.customResourceLiveness = null;
+        this.durableExecutionService = null;
+        this.codeSigningConfigService = storageFactory == null
+                ? null : new LambdaCodeSigningConfigService(storageFactory, regionResolver);
         this.objectMapper = new ObjectMapper();
+    }
+
+    LambdaService(LambdaFunctionStore functionStore,
+                  LambdaExecutorService executorService,
+                  LambdaConcurrencyLimiter concurrencyLimiter,
+                  WarmPool warmPool,
+                  CodeStore codeStore,
+                  ZipExtractor zipExtractor,
+                  EmulatorConfig config,
+                  RegionResolver regionResolver,
+                  EsmStore esmStore,
+                  LambdaAliasStore aliasStore,
+                  LambdaTargetResolver targetResolver,
+                  S3Service s3Service,
+                  SqsService sqsService,
+                  SqsEventSourcePoller poller,
+                  KinesisEventSourcePoller kinesisPoller,
+                  DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
+                  StorageFactory storageFactory,
+                  LambdaLayerService layerService,
+                  Ec2Service ec2Service,
+                  CustomResourceLiveness customResourceLiveness,
+                  DurableExecutionService durableExecutionService,
+                  ObjectMapper objectMapper) {
+        this(functionStore, executorService, concurrencyLimiter, warmPool, codeStore, zipExtractor, config,
+                regionResolver, esmStore, aliasStore, targetResolver, s3Service, sqsService, poller,
+                kinesisPoller, dynamodbStreamsPoller, storageFactory, layerService, ec2Service,
+                customResourceLiveness, durableExecutionService, objectMapper, null);
     }
 
     @Inject
     public LambdaService(LambdaFunctionStore functionStore,
-                          LambdaExecutorService executorService,
-                          LambdaConcurrencyLimiter concurrencyLimiter,
-                          WarmPool warmPool,
-                          CodeStore codeStore,
-                          ZipExtractor zipExtractor,
-                          EmulatorConfig config,
-                          RegionResolver regionResolver,
-                          EsmStore esmStore,
-                          LambdaAliasStore aliasStore,
-                          LambdaTargetResolver targetResolver,
-                          S3Service s3Service,
-                          SqsService sqsService,
-                          SqsEventSourcePoller poller,
-                          KinesisEventSourcePoller kinesisPoller,
-                          DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
-                          StorageFactory storageFactory,
-                          LambdaLayerService layerService,
-                          Ec2Service ec2Service,
-                          CustomResourceLiveness customResourceLiveness,
-                          ObjectMapper objectMapper) {
+                         LambdaExecutorService executorService,
+                         LambdaConcurrencyLimiter concurrencyLimiter,
+                         WarmPool warmPool,
+                         CodeStore codeStore,
+                         ZipExtractor zipExtractor,
+                         EmulatorConfig config,
+                         RegionResolver regionResolver,
+                         EsmStore esmStore,
+                         LambdaAliasStore aliasStore,
+                         LambdaTargetResolver targetResolver,
+                         S3Service s3Service,
+                         SqsService sqsService,
+                         SqsEventSourcePoller poller,
+                         KinesisEventSourcePoller kinesisPoller,
+                         DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
+                         StorageFactory storageFactory,
+                         LambdaLayerService layerService,
+                         Ec2Service ec2Service,
+                         CustomResourceLiveness customResourceLiveness,
+                         DurableExecutionService durableExecutionService,
+                         ObjectMapper objectMapper,
+                         LambdaCodeSigningConfigService codeSigningConfigService) {
         this.customResourceLiveness = customResourceLiveness;
+        this.durableExecutionService = durableExecutionService;
         this.functionStore = functionStore;
         this.executorService = executorService;
         this.concurrencyLimiter = concurrencyLimiter;
@@ -265,6 +342,7 @@ public class LambdaService implements ResourceProvider {
         this.storageFactory = storageFactory;
         this.layerService = layerService;
         this.ec2Service = ec2Service;
+        this.codeSigningConfigService = codeSigningConfigService;
         this.objectMapper = objectMapper;
     }
 
@@ -301,8 +379,8 @@ public class LambdaService implements ResourceProvider {
                 if (!acceptable) {
                     throw new AwsException("AccessDeniedException",
                             "User is not authorized to perform: lambda:GetLayerVersion on resource: "
-                                    + arn + " because no resource-based policy allows the"
-                                    + " lambda:GetLayerVersion action", 403);
+                                    + arn + " " + PolicyType.RESOURCE_BASED_POLICY.noAllow("lambda:GetLayerVersion"),
+                            403);
                 }
                 LOG.warnv("Layer {0} belongs to another account; recorded on the function but its"
                         + " content will not be mounted at /opt", arn);
@@ -395,6 +473,22 @@ public class LambdaService implements ResourceProvider {
     }
 
     public LambdaFunction createFunction(String region, Map<String, Object> request) {
+        Object codeSigningConfigValue = request.get("CodeSigningConfigArn");
+        if (codeSigningConfigValue == null) {
+            return createFunctionInternal(region, request);
+        }
+        if (codeSigningConfigService == null) {
+            throw new IllegalStateException("Lambda code-signing configuration service is unavailable");
+        }
+        String codeSigningConfigArn = codeSigningConfigValue.toString();
+        // Keep the configuration alive until the function record is stored. DeleteCodeSigningConfig
+        // uses the same lock while checking attached functions, so a concurrent create cannot
+        // validate a configuration and then leave a dangling attachment after deletion.
+        return codeSigningConfigService.withConfigLock(codeSigningConfigArn,
+                () -> createFunctionInternal(region, request));
+    }
+
+    private LambdaFunction createFunctionInternal(String region, Map<String, Object> request) {
         Map<String, Object> environment = structureMember(request, "Environment");
         Map<String, String> environmentVariables = environmentVariables(environment);
         Map<String, Object> ephemeralStorage = structureMember(request, "EphemeralStorage");
@@ -404,6 +498,7 @@ public class LambdaService implements ResourceProvider {
         Map<String, Object> snapStart = structureMember(request, "SnapStart");
         Map<String, Object> loggingConfig = structureMember(request, "LoggingConfig");
         Map<String, Object> imageConfig = structureMember(request, "ImageConfig");
+        Map<String, Object> durableConfig = structureMember(request, "DurableConfig");
         Map<String, Object> code = structureMember(request, "Code");
 
         String functionName = (String) request.get("FunctionName");
@@ -413,7 +508,18 @@ public class LambdaService implements ResourceProvider {
         validateEnum(request.get("PackageType"), "packageType", List.of("Zip", "Image"));
         String packageType = request.getOrDefault("PackageType", "Zip").toString();
         String description = (String) request.get("Description");
-        int timeout = toInt(request.get("Timeout"), config != null ? config.services().lambda().defaultTimeoutSeconds() : 3);
+        String codeSigningConfigArn = request.get("CodeSigningConfigArn") == null
+                ? null : request.get("CodeSigningConfigArn").toString();
+        DurableConfigRequest durable = durableConfigRequest(durableConfig);
+        int defaultTimeout = config != null ? config.services().lambda().defaultTimeoutSeconds() : 3;
+        if (durable != null) {
+            if (durable.executionTimeout() == null) {
+                throw new AwsException("InvalidParameterValueException",
+                        "You cannot create a function with a durable configuration without an executionTimeout", 400);
+            }
+            defaultTimeout = Math.min(durable.executionTimeout(), MAX_FUNCTION_TIMEOUT_SECONDS);
+        }
+        int timeout = toInt(request.get("Timeout"), defaultTimeout);
         int memorySize = toInt(request.get("MemorySize"), config != null ? config.services().lambda().defaultMemoryMb() : 128);
 
         if (functionName == null || functionName.isBlank()) {
@@ -437,6 +543,13 @@ public class LambdaService implements ResourceProvider {
         }
         validateEnum(runtime, "runtime", RUNTIME_VALUES);
         validateMaxLength(description, "description", 256);
+        if (codeSigningConfigArn != null) {
+            if (codeSigningConfigService == null) {
+                throw new IllegalStateException("Lambda code-signing configuration service is unavailable");
+            }
+            codeSigningConfigService.requireForAttachment(
+                    region, regionResolver.getAccountId(), codeSigningConfigArn);
+        }
 
         @SuppressWarnings("unchecked")
         Map<String, String> tags = (Map<String, String>) request.get("Tags");
@@ -461,6 +574,7 @@ public class LambdaService implements ResourceProvider {
         fn.setState("Active");
         fn.setLastModified(System.currentTimeMillis());
         fn.setRevisionId(UUID.randomUUID().toString());
+        fn.setCodeSigningConfigArn(codeSigningConfigArn);
 
         // Handle environment variables
         if (environment != null) {
@@ -511,6 +625,7 @@ public class LambdaService implements ResourceProvider {
         }
 
         applySnapStart(fn, snapStart);
+        applyDurableConfig(fn, durable);
         applyLoggingConfig(fn, loggingConfig);
 
         List<LambdaFileSystemConfig> fileSystemConfigs =
@@ -569,6 +684,89 @@ public class LambdaService implements ResourceProvider {
                         "Function not found: " + functionName, 404));
     }
 
+    /** Resolves the $LATEST record that owns the code-signing attachment. */
+    public LambdaFunction getFunctionForCodeSigningConfig(String region, String functionName) {
+        String name = codeSigningFunctionName(region, functionName);
+        Optional<LambdaFunction> function = functionStore.getForAccount(
+                regionResolver.getAccountId(), region, name);
+        return function.orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                "Function not found: " + functionName, 404));
+    }
+
+    private String codeSigningFunctionName(String region, String functionName) {
+        // Code-signing attachment APIs use botocore's NamespacedFunctionName
+        // (max 256, dots allowed), not the narrower shape used by other routes.
+        LambdaArnUtils.ResolvedFunctionRef reference =
+                LambdaArnUtils.resolveNamespacedFunctionName(functionName);
+        if (AwsArnUtils.isArn(functionName)) {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
+            if (!region.equals(arn.region())
+                    || !regionResolver.getAccountId().equals(arn.accountId())
+                    || !regionResolver.partitionForRegion(region).equals(arn.partition())) {
+                throw new AwsException("ResourceNotFoundException", "Function not found: " + functionName, 404);
+            }
+            return reference.name();
+        }
+        // The shape matcher backtracks when a would-be prefix is actually a bare name or
+        // a qualified name (for example, "us-east-1:$LATEST").
+        if ((reference.region() != null && !region.equals(reference.region()))
+                || (reference.account() != null && !regionResolver.getAccountId().equals(reference.account()))) {
+            throw new AwsException("ResourceNotFoundException", "Function not found: " + functionName, 404);
+        }
+        return reference.name();
+    }
+
+    /** Attaches or replaces a code-signing configuration on the function's {@code $LATEST}. */
+    public LambdaFunction putFunctionCodeSigningConfig(String region, String functionName,
+                                                       String codeSigningConfigArn) {
+        return updateFunctionCodeSigningConfig(region, functionName, codeSigningConfigArn);
+    }
+
+    /** Removes a code-signing configuration from the function's {@code $LATEST}. */
+    public void deleteFunctionCodeSigningConfig(String region, String functionName) {
+        updateFunctionCodeSigningConfig(region, functionName, null);
+    }
+
+    private LambdaFunction updateFunctionCodeSigningConfig(String region, String functionName,
+                                                           String codeSigningConfigArn) {
+        String name = codeSigningFunctionName(region, functionName);
+        String functionArn = regionResolver.buildArn("lambda", region, "function:" + name);
+        synchronized (lockForConcurrencyOp(functionArn)) {
+            LambdaFunction function = getFunctionForCodeSigningConfig(region, functionName);
+            function.setAccountId(regionResolver.getAccountId());
+            function.setCodeSigningConfigArn(codeSigningConfigArn);
+            function.setLastModified(System.currentTimeMillis());
+            function.setRevisionId(UUID.randomUUID().toString());
+            // The account-aware lookup may have migrated a legacy record whose model predates
+            // accountId. The lookup already proved ownership from the ARN, so keep the write in
+            // the caller's partition instead of falling back to the default account.
+            functionStore.saveForAccount(regionResolver.getAccountId(), region, function);
+            return function;
+        }
+    }
+
+    /** Lists the full function ARNs that use a configuration in the caller's account and region. */
+    public PaginatedResult<String> listFunctionsByCodeSigningConfig(String region, String accountId,
+                                                                    String codeSigningConfigArn,
+                                                                    Integer maxItems, String marker) {
+        if (maxItems != null && (maxItems < 1 || maxItems > 10_000)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Value '" + maxItems + "' at 'maxItems' failed to satisfy constraint: "
+                            + "Member must be between 1 and 10000", 400);
+        }
+        String scope = accountId + "\n" + region + "\n" + codeSigningConfigArn + "\n";
+        List<String> functionArns = functionStore.listForAccount(accountId, region).stream()
+                .filter(function -> codeSigningConfigArn.equals(function.getCodeSigningConfigArn()))
+                .map(LambdaFunction::getFunctionArn)
+                .filter(Objects::nonNull)
+                .toList();
+        int limit = maxItems == null ? 50 : maxItems;
+        return Pagination.paginate(functionArns, value -> value, limit, marker,
+                codeSigningFunctionMarkers, scope,
+                ignored -> new AwsException("InvalidParameterValueException",
+                        "Invalid pagination key.", 400));
+    }
+
     public boolean functionExists(String region, String functionName) {
         try {
             // The qualifier-aware read resolves an embedded alias/version and enforces the ARN's
@@ -601,12 +799,12 @@ public class LambdaService implements ResourceProvider {
      */
     public LambdaFunction getFunction(String region, String functionName, String qualifier) {
         LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionName);
-        enforceRegion(region, ref);
+        LambdaArnUtils.enforceRegion(region, ref);
         String effective = resolveQualifier(ref.qualifier(), qualifier);
         if (effective == null) {
             return getFunction(region, functionName);
         }
-        if (functionName.startsWith("arn:")) {
+        if (AwsArnUtils.looksLikeArn(functionName)) {
             AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
             return targetResolver.resolveReadTargetForAccount(arn.accountId(), region, ref.name(), effective);
         }
@@ -636,7 +834,7 @@ public class LambdaService implements ResourceProvider {
      */
     String canonicalFunctionName(String region, String functionName) {
         LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionName);
-        enforceRegion(region, ref);
+        LambdaArnUtils.enforceRegion(region, ref);
         return ref.name();
     }
 
@@ -646,16 +844,7 @@ public class LambdaService implements ResourceProvider {
      * value, enforcing region match when the input is a full ARN.
      */
     LambdaArnUtils.ResolvedFunctionRef resolveWithRegion(String region, String functionName, String queryQualifier) {
-        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveWithQualifier(functionName, queryQualifier);
-        enforceRegion(region, ref);
-        return ref;
-    }
-
-    private void enforceRegion(String region, LambdaArnUtils.ResolvedFunctionRef ref) {
-        if (ref.region() != null && !ref.region().equals(region)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "Region '" + ref.region() + "' in ARN does not match request region '" + region + "'", 400);
-        }
+        return LambdaArnUtils.resolveWithRegion(region, functionName, queryQualifier);
     }
 
     private record ResolvedFunctionTarget(String functionArn, String functionName) {}
@@ -684,6 +873,17 @@ public class LambdaService implements ResourceProvider {
         return functionStore.list(region);
     }
 
+    public PaginatedResult<LambdaFunction> listFunctions(String region, String maxItems, String marker) {
+        List<String> errors = new ArrayList<>();
+        Integer requested = LambdaPagination.parseMaxItems(maxItems, MAX_LIST_FUNCTIONS_ITEMS, errors);
+        if (!errors.isEmpty()) {
+            throw SmithyValidationErrors.validationException(errors);
+        }
+        String scope = regionResolver.getAccountId() + "\n" + region + "\n";
+        return LambdaPagination.paginate(listFunctions(region), LambdaFunction::getFunctionName,
+                requested, LIST_FUNCTIONS_PAGE_SIZE, marker, listFunctionMarkers, scope);
+    }
+
     public LambdaFunction updateFunctionCode(String region, String functionName, Map<String, Object> request) {
         LambdaFunction fn = getFunction(region, functionName);
         // publishVersion copies roughly thirty fields off this same live object. Without the
@@ -706,11 +906,14 @@ public class LambdaService implements ResourceProvider {
         String imageUri = (String) request.get("ImageUri");
         String s3Bucket = (String) request.get("S3Bucket");
         String s3Key = (String) request.get("S3Key");
+        validateS3CodeLocation(s3Bucket, s3Key);
+
+        requireMatchingRevisionId(fn, request);
 
         if (zipFileBase64 != null) {
+            extractZipCode(fn, zipFileBase64, region);
             fn.setS3Bucket(null);
             fn.setS3Key(null);
-            extractZipCode(fn, zipFileBase64, region);
         }
         if (imageUri != null) {
             fn.setImageUri(imageUri);
@@ -732,6 +935,7 @@ public class LambdaService implements ResourceProvider {
 
         // Drain warm containers — they have stale code mounted
         warmPool.drainEnvironment(fn);
+        failedReactiveSyncs.remove(fn.getFunctionArn());
 
         functionStore.save(region, fn);
         LOG.infov("Updated code for function: {0}", functionName);
@@ -739,6 +943,22 @@ public class LambdaService implements ResourceProvider {
             return publishVersion(region, functionName, null);
         }
         return fn;
+    }
+
+    /**
+     * RevisionId optimistic locking: rejects the request with 412 when it carries a RevisionId that
+     * is not the function's current one. Callers hold the per-function lock and call this before
+     * mutating {@code fn}.
+     */
+    private static void requireMatchingRevisionId(LambdaFunction fn, Map<String, Object> request) {
+        if (request.containsKey("RevisionId")) {
+            String incomingRevision = (String) request.get("RevisionId");
+            if (incomingRevision != null && !incomingRevision.equals(fn.getRevisionId())) {
+                throw new AwsException("PreconditionFailedException",
+                        "The Revision Id provided does not match the latest Revision Id. "
+                        + "Call the GetFunction/GetAlias API to retrieve the latest Revision Id", 412);
+            }
+        }
     }
 
     public LambdaFunction updateFunctionConfiguration(String region, String functionName, Map<String, Object> request) {
@@ -772,6 +992,7 @@ public class LambdaService implements ResourceProvider {
         Map<String, Object> snapStart = structureMember(request, "SnapStart");
         Map<String, Object> loggingConfig = structureMember(request, "LoggingConfig");
         Map<String, Object> imageConfig = structureMember(request, "ImageConfig");
+        Map<String, Object> durableConfig = structureMember(request, "DurableConfig");
 
         // Validated before any field mutation below, not inline where Layers is applied further
         // down - fn is the live object backing this store entry (InMemoryStorage#get returns the
@@ -798,8 +1019,14 @@ public class LambdaService implements ResourceProvider {
             validateSnapStart(snapStart);
         }
         if (request.containsKey("LoggingConfig")) {
-            validateLoggingConfig(loggingConfig);
+            validateLoggingConfig(loggingConfig, fn.isDurable());
         }
+        if (durableConfig != null && !fn.isDurable()) {
+            throw new AwsException("InvalidParameterValueException",
+                    "You cannot add a durable configuration to a function that was originally created "
+                            + "with no durable configuration", 400);
+        }
+        DurableConfigRequest durable = durableConfigRequest(durableConfig);
         if (request.containsKey("Role")) {
             validateRoleArn((String) request.get("Role"));
         }
@@ -813,7 +1040,7 @@ public class LambdaService implements ResourceProvider {
 
         Map<String, Object> requestedVpcConfig = fn.getVpcConfig();
         if (requestedVpcConfigUpdate != null) {
-            requestedVpcConfig = new java.util.HashMap<>(requestedVpcConfigUpdate);
+            requestedVpcConfig = new HashMap<>(requestedVpcConfigUpdate);
         }
         List<LambdaFileSystemConfig> requestedFileSystemConfigs = fn.getFileSystemConfigs();
         if (request.containsKey("FileSystemConfigs")) {
@@ -822,6 +1049,9 @@ public class LambdaService implements ResourceProvider {
         if (request.containsKey("VpcConfig") || request.containsKey("FileSystemConfigs")) {
             validateFileSystemVpcConfig(requestedFileSystemConfigs, requestedVpcConfig);
         }
+
+        // Runs after request validation, like AWS, and before any field mutation
+        requireMatchingRevisionId(fn, request);
 
         if (request.containsKey("Description")) {
             fn.setDescription((String) request.get("Description"));
@@ -843,18 +1073,7 @@ public class LambdaService implements ResourceProvider {
         }
         if (request.containsKey("Environment")) {
             if (environment != null && environment.containsKey("Variables")) {
-                fn.setEnvironment(environmentVariables != null ? environmentVariables : new java.util.HashMap<>());
-            }
-        }
-
-        // RevisionId optimistic locking
-        if (request.containsKey("RevisionId")) {
-            String incomingRevision = (String) request.get("RevisionId");
-            if (incomingRevision != null && !incomingRevision.equals(fn.getRevisionId())) {
-                throw new AwsException("PreconditionFailedException",
-                        "The Revision Id provided does not match the latest Revision Id. "
-                        + "Call the GetFunction or the GetFunctionConfiguration API to retrieve "
-                        + "the latest Revision Id for your resource.", 412);
+                fn.setEnvironment(environmentVariables != null ? environmentVariables : new HashMap<>());
             }
         }
 
@@ -904,6 +1123,10 @@ public class LambdaService implements ResourceProvider {
             applyLoggingConfig(fn, loggingConfig);
         }
 
+        if (durable != null) {
+            mergeDurableConfig(fn, durable);
+        }
+
         if (request.containsKey("FileSystemConfigs")) {
             fn.setFileSystemConfigs(requestedFileSystemConfigs);
         }
@@ -934,6 +1157,8 @@ public class LambdaService implements ResourceProvider {
         warmPool.drainEnvironment(fn);
 
         functionStore.save(region, fn);
+        // LastUpdateStatus reports the last update of either kind, so this one replaces a failed sync's.
+        failedReactiveSyncs.remove(fn.getFunctionArn());
         LOG.infov("Updated configuration for function: {0}", functionName);
         return fn;
     }
@@ -980,10 +1205,10 @@ public class LambdaService implements ResourceProvider {
      */
     private void deleteFunctionVersion(String region, String functionName, String qualifier) {
         if (!QUALIFIER.matcher(qualifier).matches()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + qualifier + "' at 'qualifier' failed"
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + qualifier + "' at 'qualifier' failed"
                             + " to satisfy constraint: Member must satisfy regular expression"
-                            + " pattern: " + QUALIFIER_PATTERN, 400);
+                            + " pattern: " + QUALIFIER_PATTERN);
         }
         LambdaFunction fn = getFunction(region, functionName);
         if ("$LATEST".equals(qualifier)) {
@@ -1012,6 +1237,7 @@ public class LambdaService implements ResourceProvider {
             return;
         }
         synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            warmPool.deleteProvisionedQualifier(fn, qualifier);
             warmPool.drainEnvironment(version.get());
             functionStore.deleteVersion(region, name, qualifier);
             reclaimVersionCodeDirectory(region, fn, qualifier, version.get());
@@ -1040,6 +1266,7 @@ public class LambdaService implements ResourceProvider {
         // object, letting a follow-up request allocate a fresh lock and run
         // in parallel — the very serialization this map exists to prevent.
         synchronized (lockForConcurrencyOp(arn)) {
+            warmPool.deleteProvisionedFunction(fn);
             if (concurrencyLimiter != null) {
                 concurrencyLimiter.reset(arn);
             }
@@ -1052,6 +1279,7 @@ public class LambdaService implements ResourceProvider {
             reclaimLegacyCodeDirectoryIfUnused(functionName);
             versionCounters.remove(versionCounterKey(region, fn));
             versionCounters.remove(legacyVersionCounterKey(region, functionName));
+            failedReactiveSyncs.remove(arn);
             if (aliasStore != null) {
                 for (LambdaAlias alias : aliasStore.list(region, functionName)) {
                     aliasStore.delete(region, functionName, alias.getName());
@@ -1136,22 +1364,129 @@ public class LambdaService implements ResourceProvider {
      */
     public InvokeResult invoke(String region, String functionName, String queryQualifier, byte[] payload,
                                InvocationType type) {
+        return invoke(region, functionName, queryQualifier, payload, type, null);
+    }
+
+    /**
+     * Invokes a function, handing {@code clientContext} (the decoded {@code X-Amz-Client-Context} JSON) to a
+     * synchronous invocation. AWS passes it to synchronous invocations only.
+     */
+    public InvokeResult invoke(String region, String functionName, String queryQualifier, byte[] payload,
+                               InvocationType type, String clientContext) {
+        return invoke(region, functionName, queryQualifier, payload, type, clientContext, null);
+    }
+
+    /**
+     * Invokes a function. A durable function starts, or re-attaches to, the durable execution named
+     * by the {@code X-Amz-Durable-Execution-Name} header. A plain function ignores the name, as on AWS.
+     */
+    public InvokeResult invoke(String region, String functionName, String queryQualifier, byte[] payload,
+                               InvocationType type, String clientContext, String durableExecutionName) {
         validateInvokeQualifier(queryQualifier);
         LambdaArnUtils.ResolvedFunctionRef ref = resolveWithRegion(region, functionName, queryQualifier);
         String name = ref.name();
         String qualifier = ref.qualifier();
         LambdaFunction fn;
-        if (functionName.startsWith("arn:")) {
-            AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
-            fn = targetResolver.resolveInvokeTargetForAccount(arn.accountId(), region, name, qualifier);
+        // A full or partial ARN names its account, which is where the function runs and what IAM
+        // enforcement authorized the call against.
+        if (ref.account() != null) {
+            fn = targetResolver.resolveInvokeTargetForAccount(ref.account(), region, name, qualifier);
         } else {
             fn = targetResolver.resolveInvokeTarget(region, name, qualifier);
         }
         reportCustomResourceLiveness(payload);
+        InvokeResult durable = invokeIfDurable(fn, region, qualifier, durableExecutionName, payload, type);
+        if (durable != null) {
+            return durable;
+        }
         InvokeResult result = executorService.invoke(fn, payload, type,
-                LambdaInvocationChain.currentDepth(), qualifier);
+                LambdaInvocationChain.currentDepth(), qualifier, clientContext);
         result.setExecutedVersion(fn.getVersion());
         return result;
+    }
+
+    /** Null for a plain function, and for a DryRun, which only checks the qualifier. */
+    private InvokeResult invokeIfDurable(LambdaFunction fn, String region, String qualifier,
+                                         String durableExecutionName, byte[] payload, InvocationType type) {
+        if (!fn.isDurable()) {
+            return null;
+        }
+        if (qualifier == null) {
+            throw new AwsException("InvalidParameterValueException",
+                    "You cannot invoke a durable function using an unqualified ARN.", 400);
+        }
+        if (type == InvocationType.DryRun) {
+            return null;
+        }
+        InvokeResult result = invokeDurable(fn, region, durableExecutionName, payload, type);
+        result.setExecutedVersion(fn.getVersion());
+        return result;
+    }
+
+    /**
+     * RequestResponse waits for the whole execution, waits included, up to the 15 minute invocation
+     * limit. Event answers 202 as soon as the execution exists.
+     */
+    private InvokeResult invokeDurable(LambdaFunction fn, String region, String executionName, byte[] payload,
+                                       InvocationType type) {
+        boolean synchronous = type == InvocationType.RequestResponse;
+        if (synchronous && fn.getDurableExecutionTimeout() > MAX_FUNCTION_TIMEOUT_SECONDS) {
+            throw new AwsException("InvalidParameterValueException",
+                    "You cannot synchronously invoke a durable function with an executionTimeout greater than "
+                            + "15 minutes.", 400);
+        }
+        if (executionName != null) {
+            validateNonEmpty(executionName, "durableExecutionName", false);
+            validateMaxLength(executionName, "durableExecutionName", 64);
+            validatePattern(executionName, "durableExecutionName", DURABLE_EXECUTION_NAME_PATTERN);
+        }
+        String input = payload == null || payload.length == 0 ? "{}" : new String(payload, StandardCharsets.UTF_8);
+        DurableExecution execution = durableExecutionService.start(new DurableExecutionService.StartRequest(
+                fn.getAccountId(), region, fn.getFunctionName(), fn.getVersion(), executionName, input, synchronous));
+        String requestId = UUID.randomUUID().toString();
+        InvokeResult result;
+        if (!synchronous) {
+            result = new InvokeResult(202, null, new byte[0], null, requestId);
+        } else {
+            result = awaitDurableResult(execution.getExecutionArn(), requestId);
+        }
+        result.setDurableExecutionArn(execution.getExecutionArn());
+        return result;
+    }
+
+    private InvokeResult awaitDurableResult(String executionArn, String requestId) {
+        DurableExecution finished;
+        try {
+            // A little past the limit, so an execution that times out at 900 s reports its own error.
+            finished = durableExecutionService.awaitCompletion(executionArn)
+                    .get(MAX_FUNCTION_TIMEOUT_SECONDS + SYNC_DURABLE_GRACE_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            return unhandledDurableResult(DurableErrorObject.of(
+                    "Durable execution " + executionArn + " did not finish within 15 minutes",
+                    "DurableExecution.InvocationTimedOut"), requestId);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return unhandledDurableResult(DurableErrorObject.of("Invocation interrupted", "Interrupted"), requestId);
+        } catch (ExecutionException e) {
+            return unhandledDurableResult(DurableErrorObject.of(
+                    e.getCause() != null ? e.getCause().getMessage() : e.getMessage(), "InvocationError"), requestId);
+        }
+        if (finished.getStatus() == DurableExecutionStatus.SUCCEEDED) {
+            byte[] body = finished.getResult() == null ? new byte[0]
+                    : finished.getResult().getBytes(StandardCharsets.UTF_8);
+            return new InvokeResult(200, null, body, null, requestId);
+        }
+        return unhandledDurableResult(finished.getError(), requestId);
+    }
+
+    private static InvokeResult unhandledDurableResult(DurableErrorObject error, String requestId) {
+        return new InvokeResult(200, "Unhandled", DurableWire.functionErrorPayload(error), null, requestId);
+    }
+
+    /** Service integrations use the target's region; direct Invoke requests must match their endpoint region. */
+    public InvokeResult invokeTarget(String defaultRegion, String functionReference, byte[] payload, InvocationType type) {
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionReference);
+        return invoke(ref.region() == null ? defaultRegion : ref.region(), functionReference, payload, type);
     }
 
     /**
@@ -1178,6 +1513,10 @@ public class LambdaService implements ResourceProvider {
         LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionArn);
         LambdaFunction fn = targetResolver.resolveInvokeTargetForAccount(
                 arn.accountId(), arn.region(), ref.name(), ref.qualifier());
+        InvokeResult durable = invokeIfDurable(fn, arn.region(), ref.qualifier(), null, payload, type);
+        if (durable != null) {
+            return durable;
+        }
         InvokeResult result = executorService.invoke(fn, payload, type, chainDepth, ref.qualifier());
         result.setExecutedVersion(fn.getVersion());
         return result;
@@ -1217,6 +1556,11 @@ public class LambdaService implements ResourceProvider {
         boolean hasEventSourceArn = request.containsKey("EventSourceArn") && request.get("EventSourceArn") != null;
         boolean isSelfManagedKafka = hasKafkaSource || hasTopics;
 
+        // The SourceAccessConfigurations cap applies to every source type, not only self-managed Kafka
+        if (request.get("SourceAccessConfigurations") instanceof List<?> accessToCap) {
+            validateMaxItems(accessToCap, "sourceAccessConfigurations", MAX_SOURCE_ACCESS_CONFIGURATIONS);
+        }
+
         String eventSourceArn;
         String resolvedRegion;
         Map<String, Object> selfManagedEventSource = null;
@@ -1238,7 +1582,7 @@ public class LambdaService implements ResourceProvider {
             }
             eventSourceArn = null;
 
-            enforceRegion(region, fnRef);
+            LambdaArnUtils.enforceRegion(region, fnRef);
             resolvedRegion = region;
 
             Object rawSource = request.get("SelfManagedEventSource");
@@ -1271,6 +1615,7 @@ public class LambdaService implements ResourceProvider {
                 throw new AwsException("InvalidParameterValueException",
                         "Topics must be a non-empty list of strings", 400);
             }
+            validateTopicConstraints(topicList);
             List<String> validatedTopics = new ArrayList<>();
             for (Object item : topicList) {
                 if (!(item instanceof String s) || s.isBlank()) {
@@ -1332,7 +1677,10 @@ public class LambdaService implements ResourceProvider {
 
         ResolvedFunctionTarget target = resolveFunctionTarget(resolvedRegion, fnRef);
 
-        int batchSize = toInt(request.get("BatchSize"), 10);
+        // The model documents a per-source default: 10 for SQS, 100 for every other source type.
+        int defaultBatchSize = eventSourceArn != null && eventSourceArn.contains(":sqs:")
+                ? DEFAULT_SQS_BATCH_SIZE : DEFAULT_STREAM_BATCH_SIZE;
+        int batchSize = toInt(request.get("BatchSize"), defaultBatchSize);
         Integer maximumBatchingWindowInSeconds = parseMaximumBatchingWindow(request);
         boolean enabled = !Boolean.FALSE.equals(request.get("Enabled"));
 
@@ -1346,6 +1694,7 @@ public class LambdaService implements ResourceProvider {
 
         Integer maximumRetryAttempts = parseMaximumRetryAttempts(request);
         Integer maximumRecordAgeInSeconds = parseMaximumRecordAgeInSeconds(request);
+        Integer parallelizationFactor = parseParallelizationFactor(request, eventSourceArn);
 
         EventSourceMapping.DestinationConfig destinationConfig = parseDestinationConfig(request);
 
@@ -1374,6 +1723,7 @@ public class LambdaService implements ResourceProvider {
         esm.setBisectBatchOnFunctionError(bisectBatchOnFunctionError);
         esm.setMaximumRetryAttempts(maximumRetryAttempts);
         esm.setMaximumRecordAgeInSeconds(maximumRecordAgeInSeconds);
+        esm.setParallelizationFactor(parallelizationFactor);
         esm.setDestinationConfig(destinationConfig);
         esm.setFilterCriteria(filterCriteria);
         esm.setStartingPosition(startingPosition.position());
@@ -1430,19 +1780,17 @@ public class LambdaService implements ResourceProvider {
                     "FunctionResponseTypes must be a JSON array or null", 400);
         }
         if (types.size() > 1) {
-            throw new AwsException("InvalidParameterValueException",
-                    "1 validation error detected: Value '" + types + "' at 'functionResponseTypes' "
-                            + "failed to satisfy constraint: Member must have length less than or equal to 1",
-                    400);
+            throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                    "Value '" + types + "' at 'functionResponseTypes' "
+                            + "failed to satisfy constraint: Member must have length less than or equal to 1");
         }
         List<String> validated = new ArrayList<>();
         for (Object type : types) {
             if (!FUNCTION_RESPONSE_TYPES.contains(type)) {
-                throw new AwsException("InvalidParameterValueException",
-                        "1 validation error detected: Value '" + types + "' at 'functionResponseTypes' "
+                throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                        "Value '" + types + "' at 'functionResponseTypes' "
                                 + "failed to satisfy constraint: Member must satisfy constraint: "
-                                + "[Member must satisfy enum value set: " + FUNCTION_RESPONSE_TYPES + "]",
-                        400);
+                                + "[Member must satisfy enum value set: " + FUNCTION_RESPONSE_TYPES + "]");
             }
             validated.add((String) type);
         }
@@ -1530,28 +1878,39 @@ public class LambdaService implements ResourceProvider {
     /** Operators AWS documents that the matcher does not implement, rejected with a clearer message. */
     private static final Set<String> UNIMPLEMENTED_FILTER_OPERATORS = Set.of("cidr", "wildcard");
 
-    /** Comparisons {@code matchesNumericFilter} understands. Anything else evaluates false for every record. */
+    /** Comparisons {@code PipesFilterMatcher} understands. It treats a pattern with any other as matching nothing. */
     private static final Set<String> NUMERIC_COMPARISONS = Set.of("=", ">", ">=", "<", "<=");
 
     /**
      * Validates the recursive shape of an EventBridge filter pattern: every field value must be either a
-     * non-empty match array (a leaf) or a nested object (recursed into). A scalar or empty-array value is a
+     * non-empty match array (a leaf) or a nested object (recursed into), and {@code $or} a non-empty list of
+     * patterns, each validated the same way. A scalar or empty-array value is a
      * pattern the matcher can never satisfy, so, with enforcement active, it would silently drop every
      * record; reject it at create/update instead.
      *
      * <p>Match-array elements are validated against the operator set the matcher implements. This does couple
      * the validator to {@code PipesFilterMatcher}, which is deliberate: now that the pollers enforce filters,
-     * a pattern the matcher cannot satisfy is destructive rather than inert. A bad operand silently corrupts
-     * delivery instead of erroring, and the failure direction is not even consistent. {@code
-     * {"numeric":[">","abc"]}} coerces its operand to zero and matches every positive value, {@code
-     * {"numeric":[">"]}} matches every record because the comparison loop never runs, and an unknown operator
-     * matches nothing, so every record is checkpointed past or deleted. Failing at create/update is the only
+     * a pattern the matcher cannot evaluate is destructive rather than inert. The matcher refuses an unknown
+     * operator or a bad operand such as {@code {"numeric":[">","abc"]}}, and the pollers treat a refused pattern
+     * as matching nothing, so every record is checkpointed past or deleted. Failing at create/update is the only
      * point where the caller can still act on it.
      */
     private static void validatePatternStructure(JsonNode node) {
         for (Map.Entry<String, JsonNode> entry : node.properties()) {
             JsonNode value = entry.getValue();
-            if (value.isArray()) {
+            if ("$or".equals(entry.getKey())) {
+                if (!value.isArray() || value.isEmpty()) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Filter Pattern field '$or' must be a non-empty list of patterns", 400);
+                }
+                for (JsonNode branch : value) {
+                    if (!branch.isObject()) {
+                        throw new AwsException("InvalidParameterValueException",
+                                "Filter Pattern field '$or' must be a non-empty list of patterns", 400);
+                    }
+                    validatePatternStructure(branch);
+                }
+            } else if (value.isArray()) {
                 if (value.isEmpty()) {
                     throw new AwsException("InvalidParameterValueException",
                             "Filter Pattern field '" + entry.getKey() + "' must have a non-empty match array", 400);
@@ -1569,17 +1928,17 @@ public class LambdaService implements ResourceProvider {
     }
 
     /**
-     * A match-array element is either a literal the matcher compares directly (string, number, or null for
-     * "absent") or a single-operator object. Two operators in one object is rejected because the matcher
+     * A match-array element is either a literal the matcher compares directly (string, number, boolean, or
+     * null) or a single-operator object. Two operators in one object is rejected because the matcher
      * tests them in a fixed order and silently honours only the first.
      */
     private static void validateMatchElement(String field, JsonNode element) {
-        if (element.isTextual() || element.isNumber() || element.isNull()) {
+        if (element.isTextual() || element.isNumber() || element.isBoolean() || element.isNull()) {
             return;
         }
         if (!element.isObject()) {
             throw new AwsException("InvalidParameterValueException", "Filter Pattern field '" + field
-                    + "' has an invalid match value: expected a string, number, null, or an operator object", 400);
+                    + "' has an invalid match value: expected a string, number, boolean, null, or an operator object", 400);
         }
         List<String> operators = new ArrayList<>();
         element.fieldNames().forEachRemaining(operators::add);
@@ -1742,25 +2101,12 @@ public class LambdaService implements ResourceProvider {
             }
             return null;
         }
-        if (!(mc instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be a numeric value", 400);
-        }
-        double d = ((Number) mc).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be an integer", 400);
-        }
-        long longValue = ((Number) mc).longValue();
-        if (longValue < 2 || longValue > 1000) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be between 2 and 1000 (got " + longValue + ")", 400);
-        }
+        int maximumConcurrency = boundedInteger(mc, "ScalingConfig.MaximumConcurrency", 2, 1000);
         if (!isSqs) {
             throw new AwsException("InvalidParameterValueException",
                     "ScalingConfig is only supported for Amazon SQS event source mappings", 400);
         }
-        return new ScalingConfig((int) longValue);
+        return new ScalingConfig(maximumConcurrency);
     }
 
     /**
@@ -1769,69 +2115,75 @@ public class LambdaService implements ResourceProvider {
      * is absent so a create leaves it unset and an update leaves the stored value untouched.
      */
     private Integer parseMaximumBatchingWindow(Map<String, Object> request) {
-        Object raw = request.get("MaximumBatchingWindowInSeconds");
-        if (raw == null) {
-            return null;
-        }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be a numeric value", 400);
-        }
-        double d = ((Number) raw).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be an integer", 400);
-        }
-        long value = ((Number) raw).longValue();
-        if (value < 0 || value > 300) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be between 0 and 300 (got " + value + ")", 400);
-        }
-        return (int) value;
+        return boundedInteger(request.get("MaximumBatchingWindowInSeconds"), "MaximumBatchingWindowInSeconds", 0, 300);
     }
 
     private Integer parseMaximumRetryAttempts(Map<String, Object> request) {
-        Object raw = request.get("MaximumRetryAttempts");
-        if (raw == null) {
-            return null;
-        }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be a numeric value", 400);
-        }
-        double d = ((Number) raw).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be an integer", 400);
-        }
-        long value = ((Number) raw).longValue();
-        if (value < -1 || value > 10000) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be between -1 and 10000 (got " + value + ")", 400);
-        }
-        return (int) value;
+        return boundedInteger(request.get("MaximumRetryAttempts"), "MaximumRetryAttempts", -1, 10000);
     }
 
+    /** -1 (infinite) or 60 to 604800: the one member whose range has a gap. */
     private Integer parseMaximumRecordAgeInSeconds(Map<String, Object> request) {
         Object raw = request.get("MaximumRecordAgeInSeconds");
+        String range = "-1 or between 60 and 604800";
+        Integer value = boundedInteger(raw, "MaximumRecordAgeInSeconds", -1, 604800, range);
+        if (value != null && value != -1 && value < 60) {
+            throw outOfRange("MaximumRecordAgeInSeconds", range, value);
+        }
+        return value;
+    }
+
+    /**
+     * Reads an integer member of an event source mapping request: {@code null} when absent, otherwise a
+     * whole number from {@code minimum} to {@code maximum}, or {@code InvalidParameterValueException}. The
+     * range is checked on the value as sent, before it is narrowed, so a value beyond {@code long} cannot
+     * wrap into range.
+     */
+    private static Integer boundedInteger(Object raw, String member, int minimum, int maximum) {
+        return boundedInteger(raw, member, minimum, maximum, "between " + minimum + " and " + maximum);
+    }
+
+    private static Integer boundedInteger(Object raw, String member, int minimum, int maximum, String range) {
         if (raw == null) {
             return null;
         }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be a numeric value", 400);
+        if (!(raw instanceof Number number)) {
+            throw new AwsException("InvalidParameterValueException", member + " must be a numeric value", 400);
         }
-        double d = ((Number) raw).doubleValue();
+        double d = number.doubleValue();
         if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be an integer", 400);
+            throw new AwsException("InvalidParameterValueException", member + " must be an integer", 400);
         }
-        long value = ((Number) raw).longValue();
-        if (value != -1 && (value < 60 || value > 604800)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be -1 or between 60 and 604800 (got " + value + ")", 400);
+        if (d < minimum || d > maximum) {
+            throw outOfRange(member, range, number);
         }
-        return (int) value;
+        return number.intValue();
+    }
+
+    private static AwsException outOfRange(String member, String range, Number value) {
+        // Printed as a whole number whatever its JSON spelling: 301.0 reads as 301.
+        String got = new BigDecimal(value.toString()).toBigInteger().toString();
+        return new AwsException("InvalidParameterValueException",
+                member + " must be " + range + " (got " + got + ")", 400);
+    }
+
+    /**
+     * Parses {@code ParallelizationFactor}: an integer in [1, 10], accepted only on Kinesis and
+     * DynamoDB Streams sources. Returns {@code null} when the field is absent.
+     */
+    private Integer parseParallelizationFactor(Map<String, Object> request, String eventSourceArn) {
+        Integer value = boundedInteger(request.get("ParallelizationFactor"), "ParallelizationFactor", 1, 10);
+        if (value != null && !isStreamSource(eventSourceArn)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "ParallelizationFactor is only supported for Amazon Kinesis and Amazon DynamoDB Streams event sources",
+                    400);
+        }
+        return value;
+    }
+
+    static boolean isStreamSource(String eventSourceArn) {
+        return eventSourceArn != null
+                && (eventSourceArn.contains(":kinesis:") || eventSourceArn.contains(":dynamodb:"));
     }
 
     private void startPollingHelper(EventSourceMapping esm) {
@@ -1862,8 +2214,21 @@ public class LambdaService implements ResourceProvider {
 
     public EventSourceMapping getEventSourceMapping(String uuid) {
         return esmStore.get(uuid)
+                .filter(this::inRequestRegion)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "EventSourceMapping not found: " + uuid, 404));
+    }
+
+    /**
+     * Mappings are stored by UUID for every region, so a request sees only its own region's. A mapping
+     * persisted before its region was recorded takes the region of its function ARN.
+     */
+    private boolean inRequestRegion(EventSourceMapping esm) {
+        String region = esm.getRegion();
+        if (region == null && esm.getFunctionArn() != null && AwsArnUtils.isArn(esm.getFunctionArn())) {
+            region = AwsArnUtils.parse(esm.getFunctionArn()).region();
+        }
+        return region == null || region.equals(regionResolver.getRegion());
     }
 
     public List<EventSourceMapping> listEventSourceMappings(String functionArn) {
@@ -1882,6 +2247,7 @@ public class LambdaService implements ResourceProvider {
         } else {
             mappings = esmStore.list();
         }
+        mappings = mappings.stream().filter(this::inRequestRegion).toList();
         if (eventSourceArn != null && !eventSourceArn.isBlank()) {
             mappings = mappings.stream()
                     .filter(esm -> eventSourceArn.equals(esm.getEventSourceArn()))
@@ -1936,6 +2302,11 @@ public class LambdaService implements ResourceProvider {
             Integer maximumRecordAge = parseMaximumRecordAgeInSeconds(request);
             changes.add(m -> m.setMaximumRecordAgeInSeconds(maximumRecordAge));
         }
+        if (request.get("ParallelizationFactor") != null) {
+            // A JSON null is an absent member and leaves the stored factor unchanged.
+            Integer parallelizationFactor = parseParallelizationFactor(request, esm.getEventSourceArn());
+            changes.add(m -> m.setParallelizationFactor(parallelizationFactor));
+        }
 
         if (request.containsKey("DestinationConfig")) {
             EventSourceMapping.DestinationConfig destinationConfig = parseDestinationConfig(request);
@@ -1978,6 +2349,7 @@ public class LambdaService implements ResourceProvider {
                 throw new AwsException("InvalidParameterValueException",
                         "Topics must be a non-empty list of strings", 400);
             }
+            validateTopicConstraints(topicList);
             List<String> validatedTopics = new ArrayList<>();
             for (Object item : topicList) {
                 if (!(item instanceof String s) || s.isBlank()) {
@@ -1996,6 +2368,7 @@ public class LambdaService implements ResourceProvider {
                     throw new AwsException("InvalidParameterValueException",
                             "SourceAccessConfigurations must be a list", 400);
                 }
+                validateMaxItems(accessList, "sourceAccessConfigurations", MAX_SOURCE_ACCESS_CONFIGURATIONS);
                 List<Map<String, Object>> typedAccess = new ArrayList<>();
                 for (Object item : accessList) {
                     if (!(item instanceof Map<?, ?> m)) {
@@ -2033,6 +2406,8 @@ public class LambdaService implements ResourceProvider {
         esmStore.delete(uuid);
         if (esm.getEventSourceArn() != null && esm.getEventSourceArn().contains(":dynamodb:")) {
             dynamodbStreamsPoller.mappingDeleted(uuid);
+        } else if (esm.getEventSourceArn() != null && esm.getEventSourceArn().contains(":kinesis:")) {
+            kinesisPoller.mappingDeleted(uuid);
         }
         LOG.infov("Deleted ESM {0}", uuid);
     }
@@ -2043,7 +2418,7 @@ public class LambdaService implements ResourceProvider {
      * Locked get-increment-put: StorageBackedMap has no atomic merge, so the
      * sequence must not interleave or concurrent PublishVersion calls could issue
      * duplicate version numbers. The lock is per counter key (same pattern as
-     * {@code concurrencyOpLocks}) so publishes of unrelated functions do not
+     * the per-function concurrency lock) so publishes of unrelated functions do not
      * serialize on the instance monitor for the storage round-trip.
      */
     /**
@@ -2079,21 +2454,14 @@ public class LambdaService implements ResourceProvider {
     }
 
     /** The highest-numbered published version of a function, if any. */
-    private java.util.Optional<LambdaFunction> newestVersion(String region, String functionName) {
+    private Optional<LambdaFunction> newestVersion(String region, String functionName) {
         return functionStore.listVersions(region, functionName).stream()
                 .filter(v -> v.getVersion() != null && !"$LATEST".equals(v.getVersion()))
                 .filter(v -> v.getVersion().chars().allMatch(Character::isDigit))
-                .max(java.util.Comparator.comparingLong(v -> Long.parseLong(v.getVersion())));
+                .max(Comparator.comparingLong(v -> Long.parseLong(v.getVersion())));
     }
 
-    /**
-     * Copies the function's current code into a directory belonging to this version, falling back
-     * to {@code $LATEST}'s path if there is nothing to copy or the copy fails.
-     *
-     * <p>A copy failure must not fail the publish: the version is still a correct snapshot of the
-     * configuration, and falling back leaves it exactly as good as every version published before
-     * this existed, rather than turning a working call into an error.
-     */
+    /** Publishes an owned code snapshot; a failed copy must not reference mutable {@code $LATEST}. */
     private String versionCodePath(String region, LambdaFunction fn, String version) {
         String current = fn.getCodeLocalPath();
         if (current == null || fn.getHotReloadHostPath() != null) {
@@ -2102,12 +2470,14 @@ public class LambdaService implements ResourceProvider {
         try {
             Path copied = codeStore.copyForVersion(
                     ownerAccount(fn), region, fn.getFunctionName(), version, Path.of(current));
-            return copied == null ? current : copied.toAbsolutePath().normalize().toString();
+            if (copied == null) {
+                throw new IOException("Code directory is missing: " + current);
+            }
+            return copied.toAbsolutePath().normalize().toString();
         } catch (IOException e) {
-            LOG.warnv("Could not give version {0} of {1} its own code directory, "
-                            + "falling back to the shared one: {2}",
-                    version, fn.getFunctionName(), e.getMessage());
-            return current;
+            throw new AwsException("ServiceException",
+                    "Could not create a code snapshot for version " + version + " of "
+                            + fn.getFunctionName() + ": " + e.getMessage(), 500);
         }
     }
 
@@ -2117,10 +2487,9 @@ public class LambdaService implements ResourceProvider {
             if (current == null && legacyCounterKey != null) {
                 // Counters persisted before the key carried the owning account. Starting over
                 // from 0 here would re-issue a version number that already names a snapshot.
-                current = versionCounters.remove(legacyCounterKey);
+                current = versionCounters.get(legacyCounterKey);
             }
             int next = (current != null ? current : 0) + 1;
-            versionCounters.put(counterKey, next);
             return next;
         }
     }
@@ -2192,8 +2561,10 @@ public class LambdaService implements ResourceProvider {
                         + "returning it rather than creating a duplicate", functionName, unchanged.getVersion());
                 return unchanged;
             }
-            int version = nextVersionNumber(versionCounterKey(region, fn),
-                    legacyVersionCounterKey(region, functionName));
+            String counterKey = versionCounterKey(region, fn);
+            String legacyCounterKey = legacyVersionCounterKey(region, functionName);
+            boolean migrateLegacyCounter = !versionCounters.containsKey(counterKey);
+            int version = nextVersionNumber(counterKey, legacyCounterKey);
             LambdaFunction snapshot = new LambdaFunction();
             snapshot.setAccountId(fn.getAccountId());
             snapshot.setFunctionName(fn.getFunctionName());
@@ -2211,7 +2582,7 @@ public class LambdaService implements ResourceProvider {
             snapshot.setEnvironment(fn.getEnvironment());
             snapshot.setVpcConfig(fn.getVpcConfig() == null
                     ? null
-                    : new java.util.HashMap<>(fn.getVpcConfig()));
+                    : new HashMap<>(fn.getVpcConfig()));
             snapshot.setVpcId(fn.getVpcId());
             snapshot.setSnapStartApplyOn(fn.getSnapStartApplyOn());
             snapshot.setLogFormat(fn.getLogFormat());
@@ -2236,6 +2607,7 @@ public class LambdaService implements ResourceProvider {
             // point is that its bind-mounted directory tracks the developer's working tree.
             snapshot.setCodeLocalPath(versionCodePath(region, fn, String.valueOf(version)));
             snapshot.setCodeSha256(fn.getCodeSha256());
+            snapshot.setCodeSigningConfigArn(fn.getCodeSigningConfigArn());
             snapshot.setS3Bucket(fn.getS3Bucket());
             snapshot.setS3Key(fn.getS3Key());
             snapshot.setHotReloadHostPath(fn.getHotReloadHostPath());
@@ -2249,8 +2621,15 @@ public class LambdaService implements ResourceProvider {
             snapshot.setTracingMode(fn.getTracingMode());
             snapshot.setDeadLetterTargetArn(fn.getDeadLetterTargetArn());
             snapshot.setKmsKeyArn(fn.getKmsKeyArn());
+            snapshot.setDurableExecutionTimeout(fn.getDurableExecutionTimeout());
+            snapshot.setDurableRetentionPeriodInDays(fn.getDurableRetentionPeriodInDays());
+            snapshot.setDurableKmsKeyArn(fn.getDurableKmsKeyArn());
 
             functionStore.save(region, snapshot);
+            versionCounters.put(counterKey, version);
+            if (migrateLegacyCounter) {
+                versionCounters.remove(legacyCounterKey);
+            }
             LOG.infov("Published version {0} for function {1}", version, functionName);
             return snapshot;
         }
@@ -2302,32 +2681,28 @@ public class LambdaService implements ResourceProvider {
             return null;
         }
         if (!(value instanceof List<?> architectures)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "1 validation error detected: Value '" + value + "' at 'architectures' "
-                            + "failed to satisfy constraint: Member must be a list",
-                    400);
+            throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                    "Value '" + value + "' at 'architectures' "
+                            + "failed to satisfy constraint: Member must be a list");
         }
         if (architectures.isEmpty()) {
-            throw new AwsException("InvalidParameterValueException",
-                    "1 validation error detected: Value '[]' at 'architectures' "
-                            + "failed to satisfy constraint: Member must have length greater than or equal to 1",
-                    400);
+            throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                    "Value '[]' at 'architectures' "
+                            + "failed to satisfy constraint: Member must have length greater than or equal to 1");
         }
         if (architectures.size() > 1) {
-            throw new AwsException("InvalidParameterValueException",
-                    "1 validation error detected: Value '" + architectures + "' at 'architectures' "
-                            + "failed to satisfy constraint: Member must have length less than or equal to 1",
-                    400);
+            throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                    "Value '" + architectures + "' at 'architectures' "
+                            + "failed to satisfy constraint: Member must have length less than or equal to 1");
         }
 
         Object architecture = architectures.getFirst();
         if (!FUNCTION_ARCHITECTURES.contains(architecture)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "1 validation error detected: Value '" + architecture
+            throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                    "Value '" + architecture
                             + "' at 'architectures.1.member' "
                             + "failed to satisfy constraint: Member must satisfy enum value set: "
-                            + FUNCTION_ARCHITECTURES,
-                    400);
+                            + FUNCTION_ARCHITECTURES);
         }
         return List.of((String) architecture);
     }
@@ -2427,10 +2802,10 @@ public class LambdaService implements ResourceProvider {
         }
         Object applyOn = snapStart.get("ApplyOn");
         if (applyOn != null && !"None".equals(applyOn) && !"PublishedVersions".equals(applyOn)) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + applyOn + "' at 'snapStart.applyOn' failed to "
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + applyOn + "' at 'snapStart.applyOn' failed to "
                             + "satisfy constraint: Member must satisfy enum value set: "
-                            + "[PublishedVersions, None]", 400);
+                            + "[PublishedVersions, None]");
         }
     }
 
@@ -2443,26 +2818,106 @@ public class LambdaService implements ResourceProvider {
         fn.setSnapStartApplyOn(applyOn instanceof String s && !s.isBlank() ? s : "None");
     }
 
-    private static void validateLoggingConfig(Object value) {
+    /** The members of a request's DurableConfig after type, range and pattern validation; each may be absent. */
+    private record DurableConfigRequest(Integer executionTimeout, Integer retentionPeriodInDays, String kmsKeyArn) {
+    }
+
+    private static DurableConfigRequest durableConfigRequest(Map<String, Object> durableConfig) {
+        if (durableConfig == null) {
+            return null;
+        }
+        Integer executionTimeout = durableConfigInteger(durableConfig.get("ExecutionTimeout"),
+                "ExecutionTimeout", MAX_DURABLE_EXECUTION_TIMEOUT_SECONDS);
+        Integer retentionPeriodInDays = durableConfigInteger(durableConfig.get("RetentionPeriodInDays"),
+                "RetentionPeriodInDays", MAX_DURABLE_RETENTION_DAYS);
+        Object kmsKeyArn = durableConfig.get("KMSKeyArn");
+        if (kmsKeyArn != null && !(kmsKeyArn instanceof String)) {
+            throw new AwsException("SerializationException", "DurableConfig.KMSKeyArn must be a string", 400);
+        }
+        validatePattern(kmsKeyArn, "durableConfig.kMSKeyArn", DURABLE_KMS_KEY_ARN_PATTERN);
+        return new DurableConfigRequest(executionTimeout, retentionPeriodInDays, (String) kmsKeyArn);
+    }
+
+    private static Integer durableConfigInteger(Object value, String member, int maximum) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long)) {
+            throw new AwsException("SerializationException", "DurableConfig." + member + " must be an integer", 400);
+        }
+        long number = ((Number) value).longValue();
+        if (number < 1 || number > maximum) {
+            String field = "durableConfig." + Character.toLowerCase(member.charAt(0)) + member.substring(1);
+            String bound = number < 1 ? "greater than or equal to 1" : "less than or equal to " + maximum;
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + number + "' at '" + field + "' failed to satisfy "
+                            + "constraint: Member must have value " + bound);
+        }
+        return (int) number;
+    }
+
+    private static void applyDurableConfig(LambdaFunction fn, DurableConfigRequest durable) {
+        if (durable == null) {
+            return;
+        }
+        fn.setDurableRetentionPeriodInDays(DEFAULT_DURABLE_RETENTION_DAYS);
+        mergeDurableConfig(fn, durable);
+        fn.setLogFormat("JSON");
+    }
+
+    /** UpdateFunctionConfiguration merges DurableConfig per member; a member left out keeps its stored value. */
+    private static void mergeDurableConfig(LambdaFunction fn, DurableConfigRequest durable) {
+        if (durable.executionTimeout() != null) {
+            fn.setDurableExecutionTimeout(durable.executionTimeout());
+        }
+        if (durable.retentionPeriodInDays() != null) {
+            fn.setDurableRetentionPeriodInDays(durable.retentionPeriodInDays());
+        }
+        if (durable.kmsKeyArn() != null) {
+            fn.setDurableKmsKeyArn(durable.kmsKeyArn().isEmpty() ? null : durable.kmsKeyArn());
+        }
+    }
+
+    private static void validateLoggingConfig(Object value, boolean durable) {
         if (!(value instanceof Map<?, ?> logging)) {
             return;
         }
+        if (durable && "Text".equals(logging.get("LogFormat"))) {
+            throw new AwsException("InvalidParameterValueException",
+                    "You cannot use plain text logs with a durable function. Only JSON format logs are supported",
+                    400);
+        }
         validateEnum(logging.get("LogFormat"), "loggingConfig.logFormat", List.of("JSON", "Text"));
+        // In the order Lambda lists them in the message (measured, eu-west-1, 2026-10-18).
         validateEnum(logging.get("ApplicationLogLevel"), "loggingConfig.applicationLogLevel",
-                List.of("TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"));
+                List.of("FATAL", "TRACE", "WARN", "ERROR", "INFO", "DEBUG"));
         validateEnum(logging.get("SystemLogLevel"), "loggingConfig.systemLogLevel",
-                List.of("DEBUG", "INFO", "WARN"));
+                List.of("WARN", "INFO", "DEBUG"));
+        // Measured on Lambda (eu-west-1, 2026-10-18): either level under Text, named or the default
+        // format, is refused on create and update alike, not stored and not ignored.
+        if ("Text".equals(logFormat(logging, durable)) && (nonBlank(logging.get("ApplicationLogLevel")) != null
+                || nonBlank(logging.get("SystemLogLevel")) != null)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "LogLevel is not supported when LogFormat is set to \"Text\". Remove LogLevel from your "
+                            + "request or change the LogFormat to \"JSON\" and try again.", 400);
+        }
         validateLogGroup(logging.get("LogGroup"));
+    }
+
+    /** The LogFormat a LoggingConfig names, else the function's default: JSON if durable, Text otherwise. */
+    private static String logFormat(Map<?, ?> logging, boolean durable) {
+        String named = nonBlank(logging.get("LogFormat"));
+        return named != null ? named : durable ? "JSON" : "Text";
     }
 
     static void validateEnum(Object value, String field, List<String> allowed) {
         if (value == null || allowed.contains(value)) {
             return;
         }
-        throw new AwsException("ValidationException",
-                "1 validation error detected: Value '" + value + "' at '" + field + "' failed to satisfy "
+        throw SmithyValidationErrors.validationException(
+                "Value '" + value + "' at '" + field + "' failed to satisfy "
                         + "constraint: Member must satisfy enum value set: ["
-                        + String.join(", ", allowed) + "]", 400);
+                        + String.join(", ", allowed) + "]");
     }
 
     /**
@@ -2481,11 +2936,7 @@ public class LambdaService implements ResourceProvider {
         if (!(requireListOrNull(value, field) instanceof List<?> list)) {
             return;
         }
-        if (list.size() > maxItems) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value at '" + field + "' failed to satisfy constraint: "
-                            + "Member must have length less than or equal to " + maxItems, 400);
-        }
+        validateMaxItems(list, field, maxItems);
         for (Object item : list) {
             validateEnum(item, field + ".member", allowed);
         }
@@ -2497,9 +2948,9 @@ public class LambdaService implements ResourceProvider {
             return;
         }
         if (!pattern.matcher(s).matches()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + s + "' at '" + field + "' failed to satisfy "
-                            + "constraint: Member must satisfy regular expression pattern: " + pattern.pattern(), 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + s + "' at '" + field + "' failed to satisfy "
+                            + "constraint: Member must satisfy regular expression pattern: " + pattern.pattern());
         }
     }
 
@@ -2508,11 +2959,7 @@ public class LambdaService implements ResourceProvider {
         if (!(requireListOrNull(value, field) instanceof List<?> list)) {
             return;
         }
-        if (list.size() > maxItems) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value at '" + field + "' failed to satisfy constraint: "
-                            + "Member must have length less than or equal to " + maxItems, 400);
-        }
+        validateMaxItems(list, field, maxItems);
         for (Object item : list) {
             validatePattern(item, field + ".member", pattern);
         }
@@ -2521,20 +2968,63 @@ public class LambdaService implements ResourceProvider {
     /** Enforces a shape's 1-character minimum: an empty string is rejected, and null too when the member is required. */
     private static void validateNonEmpty(String value, String field, boolean required) {
         if ((value == null && required) || (value != null && value.isEmpty())) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + (value == null ? "" : value) + "' at '" + field
-                            + "' failed to satisfy constraint: Member must have length greater than or equal to 1",
-                    400);
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + (value == null ? "" : value) + "' at '" + field
+                            + "' failed to satisfy constraint: Member must have length greater than or equal to 1");
         }
     }
 
-    private static void validateMaxLength(Object value, String field, int maxLength) {
+    /** Topics: at most MAX_TOPICS entries, each 1 to MAX_TOPIC_LENGTH characters matching TOPIC_PATTERN. */
+    private static void validateTopicConstraints(List<?> topics) {
+        for (Object topic : topics) {
+            if (topic instanceof String s) {
+                validateNonEmpty(s, "topics.member", false);
+            }
+        }
+        validateArnList(topics, "topics", TOPIC_PATTERN, MAX_TOPICS);
+        for (Object topic : topics) {
+            validateMaxLength(topic, "topics.member", MAX_TOPIC_LENGTH);
+        }
+    }
+
+    private static void validateS3CodeLocation(String bucket, String key) {
+        if (bucket != null) {
+            if (bucket.length() < 3) {
+                throw SmithyValidationErrors.validationException(
+                        "Value '" + bucket + "' at 's3Bucket' failed to satisfy constraint: "
+                                + "Member must have length greater than or equal to 3");
+            }
+            validateMaxLength(bucket, "s3Bucket", 63);
+            validatePattern(bucket, "s3Bucket", S3_BUCKET_PATTERN);
+        }
+        if (key != null) {
+            validateNonEmpty(key, "s3Key", false);
+            validateMaxLength(key, "s3Key", 1024);
+        }
+    }
+
+    private static void validateAliasMembers(String functionVersion, String description) {
+        validateNonEmpty(functionVersion, "functionVersion", false);
+        validateMaxLength(functionVersion, "functionVersion", 1024);
+        validatePattern(functionVersion, "functionVersion", ALIAS_FUNCTION_VERSION_PATTERN);
+        validateMaxLength(description, "description", 256);
+    }
+
+    private static void validateMaxItems(List<?> list, String field, int maxItems) {
+        if (list.size() > maxItems) {
+            throw SmithyValidationErrors.validationException(
+                    "Value at '" + field + "' failed to satisfy constraint: "
+                            + "Member must have length less than or equal to " + maxItems);
+        }
+    }
+
+    static void validateMaxLength(Object value, String field, int maxLength) {
         if (!(value instanceof String s) || s.length() <= maxLength) {
             return;
         }
-        throw new AwsException("ValidationException",
-                "1 validation error detected: Value at '" + field + "' failed to satisfy constraint: "
-                        + "Member must have length less than or equal to " + maxLength, 400);
+        throw SmithyValidationErrors.validationException(
+                "Value at '" + field + "' failed to satisfy constraint: "
+                        + "Member must have length less than or equal to " + maxLength);
     }
 
     /**
@@ -2556,10 +3046,10 @@ public class LambdaService implements ResourceProvider {
             return;
         }
         if (group.length() > 512 || !LOG_GROUP_PATTERN.matcher(group).matches()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + group + "' at 'loggingConfig.logGroup' failed to "
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + group + "' at 'loggingConfig.logGroup' failed to "
                             + "satisfy constraint: Member must satisfy regular expression pattern: "
-                            + "[.\\-_/#A-Za-z0-9]+ or member must have length less than or equal to 512", 400);
+                            + "[.\\-_/#A-Za-z0-9]+ or member must have length less than or equal to 512");
         }
     }
 
@@ -2569,10 +3059,10 @@ public class LambdaService implements ResourceProvider {
      */
     private static void validateRoleArn(String role) {
         if (role == null || !ROLE_ARN_PATTERN.matcher(role).matches()) {
-            throw new AwsException("InvalidParameterValueException",
-                    "1 validation error detected: Value '" + role + "' at 'role' failed to satisfy "
+            throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                    "Value '" + role + "' at 'role' failed to satisfy "
                             + "constraint: Member must satisfy regular expression pattern: "
-                            + ROLE_ARN_PATTERN.pattern(), 400);
+                            + ROLE_ARN_PATTERN.pattern());
         }
     }
 
@@ -2584,19 +3074,19 @@ public class LambdaService implements ResourceProvider {
      */
     private static void validateHandler(String handler) {
         if (handler == null) {
-            throw new AwsException("InvalidParameterValueException",
-                    "1 validation error detected: Value 'null' at 'handler' failed to satisfy "
-                            + "constraint: Member must not be null", 400);
+            throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                    "Value 'null' at 'handler' failed to satisfy "
+                            + "constraint: Member must not be null");
         }
         if (handler.isEmpty()) {
             return;
         }
         if (handler.length() > MAX_HANDLER_LENGTH || !HANDLER_PATTERN.matcher(handler).matches()) {
-            throw new AwsException("InvalidParameterValueException",
-                    "1 validation error detected: Value '" + handler + "' at 'handler' failed to satisfy "
+            throw SmithyValidationErrors.exception("InvalidParameterValueException",
+                    "Value '" + handler + "' at 'handler' failed to satisfy "
                             + "constraint: Member must satisfy regular expression pattern: "
                             + HANDLER_PATTERN.pattern() + " or member must have length less than or equal to "
-                            + MAX_HANDLER_LENGTH, 400);
+                            + MAX_HANDLER_LENGTH);
         }
     }
 
@@ -2604,26 +3094,47 @@ public class LambdaService implements ResourceProvider {
      * LoggingConfig is replaced wholesale, not merged: AWS resets any member the request omits
      * back to its default, so an update that names only LogFormat drops a previously set LogGroup.
      *
-     * <p>ApplicationLogLevel and SystemLogLevel are JSON-format-only: {@link #putLoggingConfig}
-     * never surfaces them for a Text-format function. Storing them anyway would leave state
-     * that is accepted, persisted and then never observable through any read path — the same
-     * accepted-then-forgotten shape this fix removes elsewhere — so they are only kept when the
-     * resolved format is JSON.
+     * <p>ApplicationLogLevel and SystemLogLevel are JSON-format-only: {@link #validateLoggingConfig}
+     * refuses either under Text, as Lambda does, so they are only ever stored for JSON.
      */
     private static void applyLoggingConfig(LambdaFunction fn, Object value) {
         if (!(value instanceof Map<?, ?> logging)) {
             return;
         }
-        validateLoggingConfig(value);
-        String format = logging.get("LogFormat") instanceof String f && !f.isBlank() ? f : "Text";
-        boolean json = "JSON".equals(format);
-        fn.setLogFormat(format);
-        fn.setApplicationLogLevel(json && logging.get("ApplicationLogLevel") instanceof String level
-                && !level.isBlank() ? level : null);
-        fn.setSystemLogLevel(json && logging.get("SystemLogLevel") instanceof String level
-                && !level.isBlank() ? level : null);
-        fn.setLogGroup(logging.get("LogGroup") instanceof String group && !group.isBlank()
-                ? group : null);
+        LoggingSettings settings = loggingSettings(logging, fn.isDurable());
+        fn.setLogFormat(settings.logFormat());
+        fn.setApplicationLogLevel(settings.applicationLogLevel());
+        fn.setSystemLogLevel(settings.systemLogLevel());
+        fn.setLogGroup(settings.logGroup());
+    }
+
+    /** A function's logging settings as Lambda stores them; see {@link #loggingSettings(Map, boolean)}. */
+    public record LoggingSettings(String logFormat, String applicationLogLevel, String systemLogLevel,
+                                  String logGroup) {
+    }
+
+    /**
+     * What Lambda stores for a LoggingConfig, once it is valid: an omitted LogFormat is the
+     * function's default, JSON for a durable function and Text otherwise, and a blank value is an
+     * omitted one, an omitted LogGroup meaning {@code /aws/lambda/<name>}. An invalid value is
+     * refused as Lambda refuses it, a log level under Text included, so a comparison of these
+     * settings cannot pass it as unchanged.
+     */
+    public static LoggingSettings loggingSettings(Map<?, ?> logging, boolean durable) {
+        validateLoggingConfig(logging, durable);
+        return new LoggingSettings(logFormat(logging, durable), nonBlank(logging.get("ApplicationLogLevel")),
+                nonBlank(logging.get("SystemLogLevel")), nonBlank(logging.get("LogGroup")));
+    }
+
+    /** The function's stored logging settings, its default LogFormat when it has none stored. */
+    public static LoggingSettings loggingSettings(LambdaFunction fn) {
+        return new LoggingSettings(
+                fn.getLogFormat() != null ? fn.getLogFormat() : logFormat(Map.of(), fn.isDurable()),
+                fn.getApplicationLogLevel(), fn.getSystemLogLevel(), fn.getLogGroup());
+    }
+
+    private static String nonBlank(Object value) {
+        return value instanceof String s && !s.isBlank() ? s : null;
     }
 
     private static boolean hasValues(Map<String, Object> config, String key) {
@@ -2648,7 +3159,10 @@ public class LambdaService implements ResourceProvider {
                     "Version must be a published version number, got: " + version, 400);
         }
         LambdaFunction fn = getFunction(region, functionName); // throws 404 if not found
-        functionStore.deleteVersion(region, fn.getFunctionName(), version);
+        synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            warmPool.deleteProvisionedQualifier(fn, version);
+            functionStore.deleteVersion(region, fn.getFunctionName(), version);
+        }
         LOG.infov("Deleted version {0} of function {1}", version, fn.getFunctionName());
     }
 
@@ -2656,8 +3170,9 @@ public class LambdaService implements ResourceProvider {
 
     public LambdaAlias createAlias(String region, String functionName, String aliasName,
                                    String functionVersion, String description,
-                                   java.util.Map<String, Double> routingConfig) {
+                                   Map<String, Double> routingConfig) {
         validateAliasName(aliasName);
+        validateAliasMembers(functionVersion, description);
         LambdaFunction fn = getFunction(region, functionName);
         functionName = fn.getFunctionName();
         if (aliasStore != null && aliasStore.get(region, functionName, aliasName).isPresent()) {
@@ -2697,16 +3212,21 @@ public class LambdaService implements ResourceProvider {
 
     public LambdaAlias updateAlias(String region, String functionName, String aliasName,
                                    String functionVersion, String description,
-                                   java.util.Map<String, Double> routingConfig) {
+                                   Map<String, Double> routingConfig) {
         validateAliasName(aliasName);
-        LambdaAlias alias = getAlias(region, functionName, aliasName);
-        if (functionVersion != null) alias.setFunctionVersion(functionVersion);
-        if (description != null) alias.setDescription(description);
-        if (routingConfig != null) alias.setRoutingConfig(routingConfig.isEmpty() ? null : routingConfig);
-        alias.setLastModifiedDate(System.currentTimeMillis() / 1000L);
-        alias.setRevisionId(UUID.randomUUID().toString());
-        if (aliasStore != null) aliasStore.save(region, alias);
-        return alias;
+        validateAliasMembers(functionVersion, description);
+        LambdaFunction fn = getFunction(region, functionName);
+        synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            LambdaAlias alias = getAlias(region, functionName, aliasName);
+            warmPool.validateProvisionedAliasUpdate(fn, aliasName, functionVersion);
+            if (functionVersion != null) alias.setFunctionVersion(functionVersion);
+            if (description != null) alias.setDescription(description);
+            if (routingConfig != null) alias.setRoutingConfig(routingConfig.isEmpty() ? null : routingConfig);
+            alias.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            alias.setRevisionId(UUID.randomUUID().toString());
+            if (aliasStore != null) aliasStore.save(region, alias);
+            return alias;
+        }
     }
 
     /** FunctionUrlQualifier in botocore: 1-128 characters, not all digits. */
@@ -2732,14 +3252,38 @@ public class LambdaService implements ResourceProvider {
     public void deleteAlias(String region, String functionName, String aliasName) {
         validatePattern(aliasName, "name", ALIAS_NAME_PATTERN);
         String canonical = canonicalFunctionName(region, functionName);
-        getAlias(region, canonical, aliasName); // verify it exists
-        if (aliasStore != null) aliasStore.delete(region, canonical, aliasName);
+        LambdaFunction fn = getFunction(region, canonical);
+        synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            getAlias(region, canonical, aliasName); // verify it exists
+            warmPool.deleteProvisionedQualifier(fn, aliasName);
+            if (aliasStore != null) aliasStore.delete(region, canonical, aliasName);
+        }
         LOG.infov("Deleted alias {0} for function {1}", aliasName, canonical);
     }
 
     // ──────────────────────────── Function URL Config ────────────────────────────
 
+    /** The partitions where AWS documents Lambda function URLs as not available. */
+    private static final Set<String> FUNCTION_URL_UNAVAILABLE_PARTITIONS = Set.of("aws-us-gov", "aws-cn");
+
+    /**
+     * Function URLs are not available in AWS GovCloud (US) or in the China Regions: "AWS Lambda
+     * Function URLs is not available"
+     * (https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-lambda.html) and "Amazon
+     * Lambda Function URLs is not available in the China Regions"
+     * (https://docs.amazonaws.cn/en_us/aws/latest/userguide/lambda.html). No source shows AWS's
+     * message for the refusal, so the wording is Floci's own.
+     */
+    private static void requireFunctionUrlsAvailable(String region) {
+        AwsPartition partition = AwsPartitions.forRegionOrCommercial(region);
+        if (FUNCTION_URL_UNAVAILABLE_PARTITIONS.contains(partition.id())) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Function URLs are not available in partition " + partition.id() + ".", 400);
+        }
+    }
+
     public LambdaUrlConfig createFunctionUrlConfig(String region, String functionName, String qualifier, Map<String, Object> request) {
+        requireFunctionUrlsAvailable(region);
         validateFunctionUrlQualifier(qualifier);
         LambdaArnUtils.ResolvedFunctionRef ref = resolveWithRegion(region, functionName, qualifier);
         functionName = ref.name();
@@ -2916,6 +3460,7 @@ public class LambdaService implements ResourceProvider {
         // concurrent Puts cannot leave the limiter and persisted state out of
         // sync, regardless of which call acquires the reservedLock first.
         synchronized (lockForConcurrencyOp(arn)) {
+            warmPool.validateProvisionedReservation(fn, reservedConcurrentExecutions);
             Integer previousReserved = null;
             boolean limiterUpdated = false;
             if (concurrencyLimiter != null) {
@@ -2992,7 +3537,7 @@ public class LambdaService implements ResourceProvider {
 
     /** Package-private (not private) so tests can hold this lock to prove a critical section waits for it. */
     Object lockForConcurrencyOp(String functionArn) {
-        return concurrencyOpLocks.computeIfAbsent(functionArn, k -> new Object());
+        return functionStore.lockForConcurrencyOp(functionArn);
     }
 
     public LambdaFunction getFunctionByUrlId(String urlId) {
@@ -3043,18 +3588,18 @@ public class LambdaService implements ResourceProvider {
 
     /** Stable, account-scoped S3 key for a published layer version's archive. */
     public static String layerObjectKey(String accountId, String layerName, long version) {
-        var account = accountId != null ? accountId : "000000000000";
+        String account = accountId != null ? accountId : "000000000000";
         return "layers/" + account + "/" + layerName + "/" + version;
     }
 
     /** Percent-encodes each path segment of a bucket path or object key for use in a URL. */
     public static String encodeObjectPath(String path) {
-        var encoded = new StringBuilder();
-        for (var segment : path.split("/", -1)) {
+        StringBuilder encoded = new StringBuilder();
+        for (String segment : path.split("/", -1)) {
             if (!encoded.isEmpty()) {
                 encoded.append('/');
             }
-            encoded.append(java.net.URLEncoder.encode(segment, java.nio.charset.StandardCharsets.UTF_8)
+            encoded.append(URLEncoder.encode(segment, StandardCharsets.UTF_8)
                     .replace("+", "%20"));
         }
         return encoded.toString();
@@ -3066,35 +3611,30 @@ public class LambdaService implements ResourceProvider {
             throw new AwsException("RequestEntityTooLargeException",
                     "Request must be smaller than 52428800 bytes.", 413);
         }
-        extractZipCodeBytes(fn, zipBytes, region);
+        extractZipCodePackage(fn, DeploymentPackage.of(zipBytes), region);
     }
 
-    private void extractZipCodeBytes(LambdaFunction fn, byte[] zipBytes, String region) {
+    private void extractZipCodePackage(LambdaFunction fn, DeploymentPackage zip, String region) {
         Path codePath = codeStore.getCodePath(ownerAccount(fn), region, fn.getFunctionName());
         try {
-            zipExtractor.extractTo(zipBytes, codePath, configuredZipMaxEntries());
+            zip.extractTo(zipExtractor, codePath, configuredZipMaxEntries(),
+                    () -> storeDeploymentPackage(fn, zip, region));
             // Publish the new code identity under the same per-function lock publishVersion holds.
             // PublishVersion's CodeSha256 precondition is a check-then-act: it compares the hash and
             // then snapshots the code. Mutating these fields without the lock lets an overlapping
             // deploy move $LATEST between those two steps, so a version would carry code whose hash
-            // the caller never authorised even though the check passed. Extraction to disk stays
-            // outside the lock; only the fields that decide what a snapshot copies are inside it.
-            String newSha256 = null;
-            try {
-                byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(zipBytes);
-                newSha256 = Base64.getEncoder().encodeToString(digest);
-            } catch (java.security.NoSuchAlgorithmException ignored) {}
+            // the caller never authorised even though the check passed. UpdateFunctionCode and reactive
+            // sync hold this monitor across extraction; a new function is saved after extraction.
+            String newSha256 = zip.sha256();
             synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
                 fn.setCodeLocalPath(codePath.toAbsolutePath().normalize().toString());
-                fn.setCodeSizeBytes(zipBytes.length);
+                fn.setHotReloadHostPath(null);
+                fn.setCodeSizeBytes(zip.size());
                 if (newSha256 != null) {
                     fn.setCodeSha256(newSha256);
                 }
             }
 
-            // Deploy succeeded: keep the exact package so GetFunction can serve
-            // a real Code.Location.
-            storeDeploymentPackage(fn, zipBytes, region);
             // Reclaim a directory left behind by a function created before account-scoping;
             // codePath above is already the new location, so this is a no-op once migrated.
             // Locked against publishVersion (see its own comment) so a version cannot be
@@ -3124,8 +3664,8 @@ public class LambdaService implements ResourceProvider {
         return configured;
     }
 
-    private void storeDeploymentPackage(LambdaFunction fn, byte[] zipBytes, String region) {
-        boolean stored = putTasksObjectQuietly(s3Service, region, codeObjectKey(fn), zipBytes,
+    private void storeDeploymentPackage(LambdaFunction fn, DeploymentPackage zip, String region) {
+        boolean stored = putTasksObjectQuietly(s3Service, region, codeObjectKey(fn), zip,
                 "deployment package for " + fn.getFunctionName());
         if (!stored && requiresStoredTasksObject(config)) {
             throw new AwsException("ServiceException",
@@ -3141,21 +3681,20 @@ public class LambdaService implements ResourceProvider {
      * executor depends on it can fail loudly instead of silently succeeding.
      */
     static boolean putTasksObjectQuietly(S3Service s3Service, String region, String key,
-                                         byte[] zipBytes, String what) {
+                                         DeploymentPackage zip, String what) {
         if (s3Service == null) {
             return false;
         }
         String bucket = tasksBucketName(region);
         try {
             try {
-                s3Service.createBucket(bucket, region);
+                s3Service.createInternalBucket(bucket, region);
             } catch (AwsException e) {
-                // createBucket is idempotent only in us-east-1; elsewhere it 409s if it exists.
                 if (!"BucketAlreadyOwnedByYou".equals(e.getErrorCode())) {
                     throw e;
                 }
             }
-            s3Service.putObject(bucket, key, zipBytes, "application/zip", java.util.Map.of());
+            zip.putObject(s3Service, bucket, key, "application/zip");
             return true;
         } catch (Exception e) {
             LOG.warnv("Could not store {0}: {1}", what, e.getMessage());
@@ -3178,16 +3717,25 @@ public class LambdaService implements ResourceProvider {
             throw new AwsException("ServiceUnavailableException", "S3 service not available", 503);
         }
 
-        fn.setS3Bucket(s3Bucket);
-        fn.setS3Key(s3Key);
-        S3Object obj;
+        DeploymentPackage zip;
         try {
-            obj = s3Service.getObject(s3Bucket, s3Key);
+            zip = readS3Package(fn, s3Bucket, s3Key, region);
         } catch (Exception e) {
             throw new AwsException("InvalidParameterValueException",
                     "Unable to fetch code from s3://" + s3Bucket + "/" + s3Key + ": " + e.getMessage(), 400);
         }
-        extractZipCodeBytes(fn, obj.getData(), region);
+        try (zip) {
+            extractZipCodePackage(fn, zip, region);
+        }
+        fn.setS3Bucket(s3Bucket);
+        fn.setS3Key(s3Key);
+    }
+
+    /** Staged beside the function's code directory, where the extractor stages too. */
+    private DeploymentPackage readS3Package(LambdaFunction fn, String s3Bucket, String s3Key, String region)
+            throws IOException {
+        return DeploymentPackage.read(s3Service.openObject(s3Bucket, s3Key, null),
+                codeStore.getCodePath(ownerAccount(fn), region, fn.getFunctionName()).getParent());
     }
 
     private void applyHotReload(LambdaFunction fn, String hostPath) {
@@ -3290,6 +3838,7 @@ public class LambdaService implements ResourceProvider {
     }
 
     public Map<String, Object> addPermission(String region, String functionName, String qualifier, Map<String, Object> request) {
+        validatePermissionConditions(request);
         LambdaArnUtils.ResolvedFunctionRef ref = resolveWithRegion(region, functionName, qualifier);
         LambdaFunction observed = getFunction(region, ref.name());
         synchronized (lockForPolicyMutation(observed.getFunctionArn())) {
@@ -3310,25 +3859,16 @@ public class LambdaService implements ResourceProvider {
 
             String principal = (String) request.get("Principal");
             String action = (String) request.get("Action");
-            String sourceArn = (String) request.get("SourceArn");
-            String sourceAccount = (String) request.get("SourceAccount");
 
-            Map<String, Object> statement = new java.util.LinkedHashMap<>();
+            Map<String, Object> statement = new LinkedHashMap<>();
             statement.put("Sid", statementId);
             statement.put("Effect", "Allow");
-            if (principal != null && principal.contains(".")) {
-                statement.put("Principal", Map.of("Service", principal));
-            } else if (principal != null && principal.startsWith("arn:")) {
-                statement.put("Principal", Map.of("AWS", principal));
-            } else {
-                statement.put("Principal", principal);
-            }
+            statement.put("Principal", permissionPrincipal(principal, region));
             statement.put("Action", action);
             statement.put("Resource", resourceArn);
-            if (sourceArn != null) {
-                statement.put("Condition", Map.of("ArnLike", Map.of("AWS:SourceArn", sourceArn)));
-            } else if (sourceAccount != null) {
-                statement.put("Condition", Map.of("StringEquals", Map.of("AWS:SourceAccount", sourceAccount)));
+            Map<String, Object> condition = permissionCondition(request);
+            if (!condition.isEmpty()) {
+                statement.put("Condition", condition);
             }
 
             fn.getPolicies().add(statement);
@@ -3336,6 +3876,76 @@ public class LambdaService implements ResourceProvider {
             LOG.infov("Added permission {0} to function {1}", statementId, functionName);
             return statement;
         }
+    }
+
+    /** The model constraints on the AddPermission members that become conditions. */
+    private static void validatePermissionConditions(Map<String, Object> request) {
+        validatePattern(request.get("SourceAccount"), "sourceAccount", ACCOUNT_ID_PATTERN);
+        validatePattern(request.get("PrincipalOrgID"), "principalOrgID", PRINCIPAL_ORG_ID_PATTERN);
+        validateEnum(request.get("FunctionUrlAuthType"), "functionUrlAuthType", FUNCTION_URL_AUTH_TYPE_VALUES);
+        validateMaxLength(request.get("EventSourceToken"), "eventSourceToken", MAX_EVENT_SOURCE_TOKEN_LENGTH);
+        validatePattern(request.get("EventSourceToken"), "eventSourceToken", EVENT_SOURCE_TOKEN_PATTERN);
+    }
+
+    /**
+     * The statement's Principal as AWS writes it: an ARN, or an account ID as that account's root
+     * ARN, is an {@code AWS} principal, a domain-style name is a {@code Service}, and anything else
+     * (such as {@code *}) is kept as given. ARNs are checked first because an IAM role, user or
+     * session name may contain a dot.
+     */
+    private Object permissionPrincipal(String principal, String region) {
+        if (principal == null) {
+            return null;
+        }
+        if (AwsArnUtils.looksLikeArn(principal)) {
+            return Map.of("AWS", principal);
+        }
+        if (ACCOUNT_ID_PATTERN.matcher(principal).matches()) {
+            String partition = regionResolver.partitionForRegion(region);
+            return Map.of("AWS", AwsArnUtils.Arn.global(partition, "iam", principal, "root").toString());
+        }
+        if (principal.contains(".")) {
+            return Map.of("Service", principal);
+        }
+        return principal;
+    }
+
+    /**
+     * The statement's Condition, in the layout AWS writes: {@code SourceArn} under {@code ArnLike},
+     * the other string members under {@code StringEquals}, and {@code InvokedViaFunctionUrl} under
+     * {@code Bool} as the string {@code "true"}. Empty when the request carries none of them.
+     */
+    private static Map<String, Object> permissionCondition(Map<String, Object> request) {
+        Map<String, Object> stringEquals = new LinkedHashMap<>();
+        String sourceAccount = (String) request.get("SourceAccount");
+        if (sourceAccount != null) {
+            stringEquals.put("AWS:SourceAccount", sourceAccount);
+        }
+        String functionUrlAuthType = (String) request.get("FunctionUrlAuthType");
+        if (functionUrlAuthType != null) {
+            stringEquals.put("lambda:FunctionUrlAuthType", functionUrlAuthType);
+        }
+        String principalOrgId = (String) request.get("PrincipalOrgID");
+        if (principalOrgId != null) {
+            stringEquals.put("aws:PrincipalOrgID", principalOrgId);
+        }
+        String eventSourceToken = (String) request.get("EventSourceToken");
+        if (eventSourceToken != null) {
+            stringEquals.put("lambda:EventSourceToken", eventSourceToken);
+        }
+
+        Map<String, Object> condition = new LinkedHashMap<>();
+        if (!stringEquals.isEmpty()) {
+            condition.put("StringEquals", stringEquals);
+        }
+        String sourceArn = (String) request.get("SourceArn");
+        if (sourceArn != null) {
+            condition.put("ArnLike", Map.of("AWS:SourceArn", sourceArn));
+        }
+        if (Boolean.TRUE.equals(request.get("InvokedViaFunctionUrl"))) {
+            condition.put("Bool", Map.of("lambda:InvokedViaFunctionUrl", "true"));
+        }
+        return condition;
     }
 
     public Map<String, Object> getPolicy(String region, String functionName, String qualifier) {
@@ -3346,18 +3956,52 @@ public class LambdaService implements ResourceProvider {
             String resourceArn = policyResourceArn(fn, ref.qualifier());
             List<Map<String, Object>> statements = fn.getPolicies().stream()
                     .filter(statement -> scopedTo(statement, resourceArn))
-                    .<Map<String, Object>>map(java.util.LinkedHashMap::new)
+                    .<Map<String, Object>>map(LinkedHashMap::new)
                     .toList();
             if (statements.isEmpty()) {
                 throw new AwsException("ResourceNotFoundException",
                         "The resource you requested does not exist.", 404);
             }
-            Map<String, Object> policy = new java.util.LinkedHashMap<>();
+            Map<String, Object> policy = new LinkedHashMap<>();
             policy.put("Version", "2012-10-17");
             policy.put("Id", "default");
             policy.put("Statement", statements);
             return Map.of("policy", policy, "revisionId", fn.getRevisionId());
         }
+    }
+
+    /**
+     * Every statement in the resource-based policies of a function in {@code accountId}: the
+     * function's own and those of each of its versions and aliases, which each statement's
+     * {@code Resource} tells apart. Read under the lock the policy mutations hold, so a statement
+     * being added or removed is seen whole or not at all. Empty when the function does not exist or
+     * has no policy.
+     */
+    public List<Map<String, Object>> policyStatements(String accountId, String region, String functionName) {
+        Optional<LambdaFunction> observed = functionStore.getForAccount(accountId, region, functionName);
+        if (observed.isEmpty()) {
+            return List.of();
+        }
+        synchronized (lockForPolicyMutation(observed.get().getFunctionArn())) {
+            return functionStore.getForAccount(accountId, region, functionName)
+                    .map(fn -> fn.getPolicies().stream()
+                            .<Map<String, Object>>map(LinkedHashMap::new)
+                            .toList())
+                    .orElse(List.of());
+        }
+    }
+
+    /**
+     * Reads the function, version or alias a full ARN names, in the ARN's own account and Region,
+     * where an invoke of that ARN runs it. {@link #getFunction(String, String)} reads a name in the
+     * caller's account, which for another account's ARN is a different function or none.
+     */
+    public LambdaFunction getFunctionByArn(String functionArn) {
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionArn);
+        if (ref.region() == null || ref.account() == null) {
+            throw new AwsException("InvalidParameterValueException", "Not a function ARN: " + functionArn, 400);
+        }
+        return targetResolver.resolveReadTargetForAccount(ref.account(), ref.region(), ref.name(), ref.qualifier());
     }
 
     /**
@@ -3445,11 +4089,11 @@ public class LambdaService implements ResourceProvider {
         for (String key : tags.keySet()) {
             if (key.isEmpty() || key.codePointCount(0, key.length()) > MAX_TAG_KEY_LENGTH
                     || !TAG_KEY_PATTERN.matcher(key).matches()) {
-                throw new AwsException("ValidationException", "1 validation error detected: Value '" + tags
+                throw SmithyValidationErrors.validationException("Value '" + tags
                         + "' at 'tags' failed to satisfy constraint: Map keys must satisfy constraint: [Member"
                         + " must have length less than or equal to " + MAX_TAG_KEY_LENGTH + ", Member must have"
                         + " length greater than or equal to 1, Member must satisfy regular expression pattern: "
-                        + TAG_KEY_PATTERN.pattern() + "]", 400);
+                        + TAG_KEY_PATTERN.pattern() + "]");
             }
         }
     }
@@ -3477,7 +4121,7 @@ public class LambdaService implements ResourceProvider {
      * than the mapping's is reported as missing, as AWS does.
      */
     private EventSourceMapping taggedEventSourceMapping(String resourceArn) {
-        if (resourceArn == null || !resourceArn.startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(resourceArn)) {
             return null;
         }
         AwsArnUtils.Arn arn;
@@ -3507,7 +4151,7 @@ public class LambdaService implements ResourceProvider {
         if (functionArn == null || functionArn.isBlank()) {
             throw new AwsException("InvalidParameterValueException", "Resource ARN is required", 400);
         }
-        if (!functionArn.startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(functionArn)) {
             throw new AwsException("InvalidParameterValueException",
                     "Resource ARN must be a full Lambda function ARN: " + functionArn, 400);
         }
@@ -3672,6 +4316,9 @@ public class LambdaService implements ResourceProvider {
      * functions linked to the updated object.
      */
     public void onS3ObjectUpdated(@Observes S3ObjectUpdatedEvent event) {
+        if (!reactiveS3SyncEnabled()) {
+            return;
+        }
         LOG.debugv("Observing S3 update: {0}/{1}", event.bucketName(), event.key());
         // For simplicity, we scan all functions in the default region
         // Most local dev setups use a single region.
@@ -3680,26 +4327,118 @@ public class LambdaService implements ResourceProvider {
         // other account would silently never hot-reload from S3.
         String region = regionResolver.getDefaultRegion();
         List<LambdaFunction> functions = functionStore.listAllAccounts(region);
+        boolean async = reactiveS3SyncAsync();
         for (LambdaFunction fn : functions) {
-            if (fn.isHotReload()) {
+            if (!event.bucketName().equals(fn.getS3Bucket()) || !event.key().equals(fn.getS3Key())) {
                 continue;
             }
-            if (event.bucketName().equals(fn.getS3Bucket()) && event.key().equals(fn.getS3Key())) {
-                LOG.infov("Reactive S3 Sync: updating function {0} from s3://{1}/{2}",
-                        fn.getFunctionName(), event.bucketName(), event.key());
-                try {
-                    S3Object obj = s3Service.getObject(event.bucketName(), event.key());
-                    extractZipCodeBytes(fn, obj.getData(), region);
-                    fn.setLastModified(Instant.now().toEpochMilli());
-                    fn.setRevisionId(UUID.randomUUID().toString());
-                    functionStore.saveForAccount(ownerAccount(fn), region, fn);
-
-                    // Push to warm workers
-                    warmPool.pushCodeUpdate(fn);
-                } catch (Exception e) {
-                    LOG.warnv("Failed reactive sync for function {0}: {1}", fn.getFunctionName(), e.getMessage());
-                }
+            if (!async) {
+                syncFromS3(fn, event.bucketName(), event.key(), region);
+                continue;
+            }
+            // The newest upload replaces any source still waiting, and a queued sync reads its object
+            // when it starts, so one queued sync per function covers every upload before it. The
+            // uploader's account goes with it: S3 resolves the bucket in the caller's account, and
+            // the background thread has no request of its own.
+            String functionArn = fn.getFunctionArn();
+            PendingReactiveSync source = new PendingReactiveSync(regionResolver.getAccountId(),
+                    event.bucketName(), event.key());
+            if (pendingReactiveSyncs.put(functionArn, source) == null) {
+                String ownerAccountId = ownerAccount(fn);
+                String functionName = fn.getFunctionName();
+                REACTIVE_SYNC_THREADS.execute(() -> syncQueued(ownerAccountId, region, functionName, functionArn));
             }
         }
+    }
+
+    /** Re-reads the function, which may have been redeployed or deleted while the sync was queued. */
+    private void syncQueued(String ownerAccountId, String region, String functionName, String functionArn) {
+        // Marked running before the pending source is taken, so the function never reports neither.
+        runningReactiveSyncs.merge(functionArn, 1, Integer::sum);
+        try {
+            synchronized (lockForConcurrencyOp(functionArn)) {
+                PendingReactiveSync source = pendingReactiveSyncs.remove(functionArn);
+                if (source == null) {
+                    return;
+                }
+                RequestScopes.runAs(source.accountId(), () ->
+                        functionStore.getForAccount(ownerAccountId, region, functionName)
+                                .ifPresent(fn -> deployFromS3(fn, source.bucketName(), source.key(), region)));
+            }
+        } finally {
+            runningReactiveSyncs.computeIfPresent(functionArn, (arn, count) -> count == 1 ? null : count - 1);
+        }
+    }
+
+    private void syncFromS3(LambdaFunction fn, String bucketName, String key, String region) {
+        String functionArn = fn.getFunctionArn();
+        runningReactiveSyncs.merge(functionArn, 1, Integer::sum);
+        try {
+            synchronized (lockForConcurrencyOp(functionArn)) {
+                deployFromS3(fn, bucketName, key, region);
+            }
+        } finally {
+            runningReactiveSyncs.computeIfPresent(functionArn, (arn, count) -> count == 1 ? null : count - 1);
+        }
+    }
+
+    /** Callers hold the function's lock. */
+    private void deployFromS3(LambdaFunction fn, String bucketName, String key, String region) {
+        if (fn.isHotReload()) {
+            return;
+        }
+        if (bucketName.equals(fn.getS3Bucket()) && key.equals(fn.getS3Key())) {
+            LOG.infov("Reactive S3 Sync: updating function {0} from s3://{1}/{2}",
+                    fn.getFunctionName(), bucketName, key);
+            try {
+                try (DeploymentPackage zip = readS3Package(fn, bucketName, key, region)) {
+                    extractZipCodePackage(fn, zip, region);
+                }
+                fn.setLastModified(Instant.now().toEpochMilli());
+                fn.setRevisionId(UUID.randomUUID().toString());
+                functionStore.saveForAccount(ownerAccount(fn), region, fn);
+
+                // Push to warm workers
+                warmPool.pushCodeUpdate(fn);
+                failedReactiveSyncs.remove(fn.getFunctionArn());
+            } catch (Exception e) {
+                LOG.warnv("Failed reactive sync for function {0}: {1}", fn.getFunctionName(), e.getMessage());
+                failedReactiveSyncs.put(fn.getFunctionArn(), "Reactive S3 sync from s3://" + bucketName
+                        + "/" + key + " failed: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * The function's LastUpdateStatus, which only a reactive S3 sync moves off Successful:
+     * InProgress from the upload until the re-deploy of {@code $LATEST} finishes, Failed when the
+     * last one could not. Held in memory, so a restart cannot leave an update reported as running.
+     */
+    public String lastUpdateStatus(LambdaFunction fn) {
+        if (!"$LATEST".equals(fn.getVersion())) {
+            return "Successful";
+        }
+        String functionArn = fn.getFunctionArn();
+        // Pending first: a sync marks itself running before it takes the pending source.
+        if (pendingReactiveSyncs.containsKey(functionArn) || runningReactiveSyncs.containsKey(functionArn)) {
+            return "InProgress";
+        }
+        return failedReactiveSyncs.containsKey(functionArn) ? "Failed" : "Successful";
+    }
+
+    /** Why the last reactive S3 sync of {@code $LATEST} failed, or null when it did not. */
+    public String lastUpdateStatusReason(LambdaFunction fn) {
+        return "Failed".equals(lastUpdateStatus(fn)) ? failedReactiveSyncs.get(fn.getFunctionArn()) : null;
+    }
+
+    private boolean reactiveS3SyncEnabled() {
+        return config == null || config.services().lambda().reactiveS3Sync().enabled();
+    }
+
+    private boolean reactiveS3SyncAsync() {
+        return config != null && config.services().lambda().reactiveS3Sync().async();
+    }
+
+    private record PendingReactiveSync(String accountId, String bucketName, String key) {
     }
 }

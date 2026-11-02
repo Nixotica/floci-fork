@@ -3,9 +3,11 @@ package io.github.hectorvent.floci.services.kinesisanalytics.container;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.MountType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
@@ -16,33 +18,48 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
-import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.kinesisanalytics.model.FlinkApplication;
 import io.github.hectorvent.floci.services.kinesisanalytics.model.Snapshot;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
+import io.github.hectorvent.floci.testing.DockerArchiveUploadFixture;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Properties;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -189,7 +206,7 @@ class FlinkContainerManagerTest {
         ContainerBuilder containerBuilder = Mockito.mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = Mockito.mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
-        when(builder.build()).thenReturn(Mockito.mock(ContainerSpec.class));
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
 
         RegionResolver regionResolver = Mockito.mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
@@ -254,7 +271,7 @@ class FlinkContainerManagerTest {
                 "FLINK-2_3", "arn:aws:iam::000000000000:role/x", "STREAMING");
         app.setApplicationVersionId(2L);
 
-        String config = new String(manager.msfStyleLog4j2Config(app), java.nio.charset.StandardCharsets.UTF_8);
+        String config = new String(manager.msfStyleLog4j2Config(app), StandardCharsets.UTF_8);
 
         assertTrue(config.contains(
                 "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/demo}{JSON}\""));
@@ -276,13 +293,13 @@ class FlinkContainerManagerTest {
                 "FLINK-2_3", "arn:aws:iam::000000000000:role/x", "STREAMING");
         app.setApplicationVersionId(1L);
 
-        String config = new String(manager.msfStyleLog4j2Config(app), java.nio.charset.StandardCharsets.UTF_8);
+        String config = new String(manager.msfStyleLog4j2Config(app), StandardCharsets.UTF_8);
 
         assertTrue(config.contains(
                 "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\\\-{env:PATH}-owned}{JSON}\""));
 
-        java.util.Properties parsed = new java.util.Properties();
-        parsed.load(new java.io.ByteArrayInputStream(config.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        Properties parsed = new Properties();
+        parsed.load(new ByteArrayInputStream(config.getBytes(StandardCharsets.UTF_8)));
         String loadedPattern = parsed.getProperty("appender.console.layout.pattern");
         assertTrue(loadedPattern.contains(
                 "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\-{env:PATH}-owned}{JSON}\""));
@@ -355,6 +372,9 @@ class FlinkContainerManagerTest {
                 "FLINK_PROPERTIES=jobmanager.rpc.address: localhost\ntaskmanager.numberOfTaskSlots: 3"));
         assertEquals("container:jm-id", tmSpec.networkMode());
         verify(awsEnv).sdkBaselineEnv("us-west-2", Optional.empty());
+        // Both JVMs trust Floci's CA, as the job's SDK clients need for Floci over HTTPS.
+        assertTrue(jmSpec.javaTrustStore());
+        assertTrue(tmSpec.javaTrustStore());
     }
 
     @Test
@@ -408,6 +428,122 @@ class FlinkContainerManagerTest {
         verify(lifecycleManager, atLeastOnce()).removeIfExists("floci-aws-kinesisanalytics-arn-aws-kinesisanalytics-us-west-2-000000000000-application-log4j-copy-failure-tm");
         verify(lifecycleManager, Mockito.never()).startCreated(any(), any());
         assertNull(app.getContainerId());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 73, 8192})
+    void startupRetriesConsumedLogConfigurationUploadsBeforeStarting(int consumedBytes) throws Exception {
+        FlinkApplication app = application("copy-retry");
+        when(lifecycleManager.create(any())).thenReturn("jm-id");
+        DockerClient docker = mock(DockerClient.class);
+        when(lifecycleManager.getDockerClient()).thenReturn(docker);
+        DockerArchiveUploadFixture uploads = new DockerArchiveUploadFixture(docker, "jm-id");
+        uploads.failures = 1;
+        uploads.consumedBytes = consumedBytes;
+        uploads.failure = new RuntimeException(new IOException("Connection reset"));
+        when(lifecycleManager.startCreated(any(), any())).thenAnswer(invocation -> {
+            assertEquals(1, uploads.completed.size(), "configuration must be uploaded before starting");
+            return new ContainerInfo("jm-id", Map.of(8081, new EndpointInfo("localhost", 49152)));
+        });
+        FlinkContainerManager startup = spy(manager);
+        doAnswer(invocation -> {
+            manager.copyFileIntoContainer(invocation.getArgument(0), invocation.getArgument(1),
+                    invocation.getArgument(2), invocation.getArgument(3), invocation.getArgument(4), 0);
+            return null;
+        }).when(startup).copyFileIntoContainer(anyString(), anyString(), anyString(), any(), anyBoolean(), anyLong());
+
+        startup.startCluster(app);
+
+        assertEquals(2, uploads.commands.size());
+        assertEquals(1, uploads.completed.size());
+        assertNotSame(uploads.streams.get(0), uploads.streams.get(1));
+        uploads.commands.forEach(command -> verify(command).withRemotePath("/opt/flink/conf"));
+        try (TarArchiveInputStream tar = new TarArchiveInputStream(
+                new ByteArrayInputStream(uploads.completed.getFirst()))) {
+            TarArchiveEntry entry = tar.getNextEntry();
+            assertEquals("log4j-console.properties", entry.getName());
+            assertEquals(0644, entry.getMode());
+            assertArrayEquals(manager.msfStyleLog4j2Config(app), tar.readAllBytes());
+            assertNull(tar.getNextEntry());
+        }
+        verify(lifecycleManager).startCreated(eq("jm-id"), any());
+        assertEquals("jm-id", app.getContainerId());
+    }
+
+    @Test
+    void applicationPropertiesRetryKeepsTheNestedPathAndPayload() throws Exception {
+        DockerArchiveUploadFixture uploads = failingUpload(new RuntimeException(new IOException("Broken pipe")), 2);
+        byte[] content = manager.applicationPropertiesJson(application("properties-retry"));
+
+        manager.copyFileIntoContainer("jm-id", "/etc", "flink/application_properties.json", content, false, 0);
+
+        assertEquals(3, uploads.commands.size());
+        assertEquals(1, uploads.completed.size());
+        assertNotSame(uploads.streams.get(0), uploads.streams.get(1));
+        assertNotSame(uploads.streams.get(1), uploads.streams.get(2));
+        uploads.commands.forEach(command -> verify(command).withRemotePath("/etc"));
+        try (TarArchiveInputStream tar = new TarArchiveInputStream(
+                new ByteArrayInputStream(uploads.completed.getFirst()))) {
+            TarArchiveEntry entry = tar.getNextEntry();
+            assertEquals("flink/application_properties.json", entry.getName());
+            assertEquals(0644, entry.getMode());
+            assertArrayEquals(content, tar.readAllBytes());
+            assertNull(tar.getNextEntry());
+        }
+    }
+
+    @Test
+    void requiredCopyExhaustsSixAttemptsBeforePropagatingTheFailure() {
+        DockerArchiveUploadFixture uploads = failingUpload(new RuntimeException(new IOException("Broken pipe")), 6);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.copyFileIntoContainer("jm-id", "/opt/flink/conf", "log4j-console.properties",
+                        new byte[]{1, 2, 3}, true, 0));
+
+        assertEquals(6, uploads.commands.size());
+        assertTrue(uploads.completed.isEmpty());
+        assertTrue(failure.getMessage().contains("log4j-console.properties"));
+        assertSame(uploads.failure, failure.getCause().getCause());
+    }
+
+    @Test
+    void optionalCopyStillSuppressesFailureAfterExhaustingRetries() {
+        DockerArchiveUploadFixture uploads = failingUpload(new RuntimeException(new IOException("Broken pipe")), 6);
+
+        manager.copyFileIntoContainer("jm-id", "/etc", "flink/application_properties.json",
+                new byte[]{1}, false, 0);
+
+        assertEquals(6, uploads.commands.size());
+        assertTrue(uploads.completed.isEmpty());
+    }
+
+    @Test
+    void daemonRejectionIsNotRetried() {
+        DockerArchiveUploadFixture uploads = failingUpload(new NotFoundException("container missing"), 6);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.copyFileIntoContainer("jm-id", "/etc", "flink/application_properties.json",
+                        new byte[]{1}, true, 0));
+
+        assertEquals(1, uploads.commands.size());
+        assertSame(uploads.failure, failure.getCause().getCause());
+    }
+
+    @Test
+    void missingContainerDoesNotAttemptAnUpload() {
+        manager.copyFileIntoContainer(null, "/etc", "flink/application_properties.json", new byte[]{1}, true, 0);
+
+        verify(lifecycleManager, Mockito.never()).getDockerClient();
+    }
+
+    private DockerArchiveUploadFixture failingUpload(RuntimeException failure, int failures) {
+        DockerClient docker = mock(DockerClient.class);
+        when(lifecycleManager.getDockerClient()).thenReturn(docker);
+        DockerArchiveUploadFixture uploads = new DockerArchiveUploadFixture(docker, "jm-id");
+        uploads.failure = failure;
+        uploads.failures = failures;
+        uploads.consumedBytes = 73;
+        return uploads;
     }
 
     private List<ContainerSpec> captureCreatedSpecs() {

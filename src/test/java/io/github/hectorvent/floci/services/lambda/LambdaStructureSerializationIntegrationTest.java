@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -18,11 +19,11 @@ class LambdaStructureSerializationIntegrationTest {
     private static final String QUEUE_ARN = "arn:aws:sqs:us-east-1:000000000000:structure-queue";
     private static final List<String> FUNCTION_STRUCTURE_MEMBERS = List.of(
             "Environment", "EphemeralStorage", "TracingConfig", "DeadLetterConfig",
-            "VpcConfig", "SnapStart", "LoggingConfig", "ImageConfig");
+            "VpcConfig", "SnapStart", "LoggingConfig", "ImageConfig", "DurableConfig");
 
     @Test
     void createFunctionRejectsScalarStructureMembers() {
-        List<String> members = new java.util.ArrayList<>(FUNCTION_STRUCTURE_MEMBERS);
+        List<String> members = new ArrayList<>(FUNCTION_STRUCTURE_MEMBERS);
         members.add("Code");
 
         for (String member : members) {

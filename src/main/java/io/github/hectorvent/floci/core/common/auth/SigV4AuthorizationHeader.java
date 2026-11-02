@@ -9,8 +9,11 @@ import java.util.Map;
  * Shared by every SigV4 verifier in this codebase that accepts a header-signed request:
  * {@code ExecuteApiSigV4Authorizer} (API Gateway) and {@code IamAuthValidator} (AppSync) both
  * parsed this independently before this class existed.
+ *
+ * <p>{@code missingEqualSign} is true when a part has no {@code =}. AppSync refuses such a header.
  */
-public record SigV4AuthorizationHeader(String credential, String signedHeaders, String signature) {
+public record SigV4AuthorizationHeader(String credential, String signedHeaders, String signature,
+                                       boolean missingEqualSign) {
 
     private static final String ALGORITHM = "AWS4-HMAC-SHA256";
 
@@ -21,21 +24,29 @@ public record SigV4AuthorizationHeader(String credential, String signedHeaders, 
      * {@code X-Amz-Date} it reads from a different source than this header).
      */
     public static SigV4AuthorizationHeader parse(String authorization) {
+        return parse(authorization, ALGORITHM);
+    }
+
+    /** The same parameters from a header of {@code algorithm}, such as SigV4a's. */
+    public static SigV4AuthorizationHeader parse(String authorization, String algorithm) {
         if (authorization == null) {
             return null;
         }
         String trimmed = authorization.trim();
-        if (!trimmed.regionMatches(true, 0, ALGORITHM, 0, ALGORITHM.length())) {
+        if (!trimmed.regionMatches(true, 0, algorithm, 0, algorithm.length())) {
             return null;
         }
         Map<String, String> parameters = new LinkedHashMap<>();
-        for (String part : trimmed.substring(ALGORITHM.length()).split(",")) {
+        boolean missingEqualSign = false;
+        for (String part : trimmed.substring(algorithm.length()).split(",")) {
             int equals = part.indexOf('=');
             if (equals > 0) {
                 parameters.put(part.substring(0, equals).trim(), part.substring(equals + 1).trim());
+            } else if (equals < 0 && !part.isBlank()) {
+                missingEqualSign = true;
             }
         }
-        return new SigV4AuthorizationHeader(
-                parameters.get("Credential"), parameters.get("SignedHeaders"), parameters.get("Signature"));
+        return new SigV4AuthorizationHeader(parameters.get("Credential"), parameters.get("SignedHeaders"),
+                parameters.get("Signature"), missingEqualSign);
     }
 }

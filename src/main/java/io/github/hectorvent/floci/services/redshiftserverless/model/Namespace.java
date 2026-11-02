@@ -16,6 +16,13 @@ public class Namespace {
     private String namespaceId;
     private String namespaceArn;
     private String adminUsername;
+    /**
+     * Persisted so the workgroup backend can be created and restored with the namespace admin
+     * credentials. AWS never returns it, so no response builder may read it.
+     */
+    private String adminUserPassword;
+    private String adminPasswordSecretArn;
+    private String adminPasswordSecretKmsKeyId;
     private String dbName;
     private String kmsKeyId;
     private String defaultIamRoleArn;
@@ -39,6 +46,9 @@ public class Namespace {
         this.namespaceId = other.namespaceId;
         this.namespaceArn = other.namespaceArn;
         this.adminUsername = other.adminUsername;
+        this.adminUserPassword = other.adminUserPassword;
+        this.adminPasswordSecretArn = other.adminPasswordSecretArn;
+        this.adminPasswordSecretKmsKeyId = other.adminPasswordSecretKmsKeyId;
         this.dbName = other.dbName;
         this.kmsKeyId = other.kmsKeyId;
         this.defaultIamRoleArn = other.defaultIamRoleArn;
@@ -81,8 +91,32 @@ public class Namespace {
         this.adminUsername = adminUsername;
     }
 
+    public String getAdminUserPassword() {
+        return adminUserPassword;
+    }
+
+    public void setAdminUserPassword(String adminUserPassword) {
+        this.adminUserPassword = adminUserPassword;
+    }
+
     public String getDbName() {
         return dbName;
+    }
+
+    public String getAdminPasswordSecretArn() {
+        return adminPasswordSecretArn;
+    }
+
+    public void setAdminPasswordSecretArn(String adminPasswordSecretArn) {
+        this.adminPasswordSecretArn = adminPasswordSecretArn;
+    }
+
+    public String getAdminPasswordSecretKmsKeyId() {
+        return adminPasswordSecretKmsKeyId;
+    }
+
+    public void setAdminPasswordSecretKmsKeyId(String adminPasswordSecretKmsKeyId) {
+        this.adminPasswordSecretKmsKeyId = adminPasswordSecretKmsKeyId;
     }
 
     public void setDbName(String dbName) {

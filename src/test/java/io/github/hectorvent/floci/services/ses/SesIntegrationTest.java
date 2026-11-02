@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 
@@ -16,12 +19,28 @@ import static org.hamcrest.Matchers.*;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class SesIntegrationTest {
 
+    // sender@example.com is deleted at @Order(20), and the domain test after it expects no
+    // identity under example.com, so the later sends use a sender of their own.
+    private static final String INSPECTION_SENDER = "inspection-sender@floci.test";
+
     private static String authorization(String service) {
         return authorization(service, "us-east-1");
     }
 
     private static String authorization(String service, String region) {
         return "AWS4-HMAC-SHA256 Credential=AKID/20260101/" + region + "/" + service + "/aws4_request";
+    }
+
+    private static void verifySender(String address) {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", authorization("email"))
+            .formParam("Action", "VerifyEmailIdentity")
+            .formParam("EmailAddress", address)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
     }
 
     @Test
@@ -222,13 +241,14 @@ class SesIntegrationTest {
         // Regression for https://github.com/floci-io/floci/issues/797
         // AWS SES SendRawEmail allows omitting the Source parameter when the
         // raw MIME message contains a From: header.
+        verifySender(INSPECTION_SENDER);
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
             .formParam("Action", "SendRawEmail")
             .formParam("Destinations.member.1", "recipient@example.com")
             .formParam("RawMessage.Data",
-                "From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: hello\r\n\r\nbody\r\n")
+                "From: " + INSPECTION_SENDER + "\r\nTo: recipient@example.com\r\nSubject: hello\r\n\r\nbody\r\n")
         .when()
             .post("/")
         .then()
@@ -304,10 +324,10 @@ class SesIntegrationTest {
 
     @Test
     @Order(15)
-    void getAccountSendingEnabled_acceptsSesv2CredentialScopeAlias() {
+    void getAccountSendingEnabled_acceptsTheSesCredentialScope() {
         given()
             .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", authorization("sesv2"))
+            .header("Authorization", authorization("ses"))
             .formParam("Action", "GetAccountSendingEnabled")
         .when()
             .post("/")
@@ -421,13 +441,14 @@ class SesIntegrationTest {
     @Test
     @Order(21)
     void sendEmailV1_replyToAddressesStoredInInspection() {
+        verifySender(INSPECTION_SENDER);
         given().delete("/_aws/ses").then().statusCode(200);
 
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
             .formParam("Action", "SendEmail")
-            .formParam("Source", "sender@example.com")
+            .formParam("Source", INSPECTION_SENDER)
             .formParam("Destination.ToAddresses.member.1", "recipient@example.com")
             .formParam("ReplyToAddresses.member.1", "reply@example.com")
             .formParam("Message.Subject.Data", "V1 ReplyTo")
@@ -449,15 +470,17 @@ class SesIntegrationTest {
     @Test
     @Order(21)
     void sendEmailV1_returnPathStoredInInspection() {
+        verifySender(INSPECTION_SENDER);
+        verifySender("inspection-bounces@floci.test");
         given().delete("/_aws/ses").then().statusCode(200);
 
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
             .formParam("Action", "SendEmail")
-            .formParam("Source", "sender@example.com")
+            .formParam("Source", INSPECTION_SENDER)
             .formParam("Destination.ToAddresses.member.1", "recipient@example.com")
-            .formParam("ReturnPath", "bounces@example.com")
+            .formParam("ReturnPath", "inspection-bounces@floci.test")
             .formParam("Message.Subject.Data", "V1 ReturnPath")
             .formParam("Message.Body.Text.Data", "body")
         .when()
@@ -470,26 +493,28 @@ class SesIntegrationTest {
             .get("/_aws/ses")
         .then()
             .statusCode(200)
-            .body("messages[0].ReturnPath", equalTo("bounces@example.com"));
+            .body("messages[0].ReturnPath", equalTo("inspection-bounces@floci.test"));
     }
 
     @Test
     @Order(21)
     void sendRawEmailV1_returnPathHeaderStoredInInspection() {
+        verifySender(INSPECTION_SENDER);
+        verifySender("inspection-mime-bounces@floci.test");
         given().delete("/_aws/ses").then().statusCode(200);
 
-        String raw = "From: sender@example.com\r\n"
+        String raw = "From: " + INSPECTION_SENDER + "\r\n"
                 + "To: recipient@example.com\r\n"
-                + "Return-Path: <mime-bounces@example.com>\r\n"
+                + "Return-Path: <inspection-mime-bounces@floci.test>\r\n"
                 + "Subject: raw-return-path\r\n\r\nbody";
-        String rawB64 = java.util.Base64.getEncoder().encodeToString(
-                raw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String rawB64 = Base64.getEncoder().encodeToString(
+                raw.getBytes(StandardCharsets.UTF_8));
 
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
             .formParam("Action", "SendRawEmail")
-            .formParam("Source", "sender@example.com")
+            .formParam("Source", INSPECTION_SENDER)
             .formParam("Destinations.member.1", "recipient@example.com")
             .formParam("RawMessage.Data", rawB64)
         .when()
@@ -502,7 +527,7 @@ class SesIntegrationTest {
             .get("/_aws/ses")
         .then()
             .statusCode(200)
-            .body("messages[0].ReturnPath", equalTo("mime-bounces@example.com"));
+            .body("messages[0].ReturnPath", equalTo("inspection-mime-bounces@floci.test"));
     }
 
     @Test

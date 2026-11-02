@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.redshift.proxy;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
 
 final class BackendResponseCoordinator {
 
@@ -24,6 +26,10 @@ final class BackendResponseCoordinator {
     }
 
     Ticket register(Operation operation, ExtendedQuerySession.Mutation mutation) {
+        return register(operation, mutation, null);
+    }
+
+    Ticket register(Operation operation, ExtendedQuerySession.Mutation mutation, BiConsumer<Character, byte[]> response) {
         lock.lock();
         try {
             Ticket ticket = new Ticket(nextSequence++, operation);
@@ -35,7 +41,7 @@ final class BackendResponseCoordinator {
                     resolvedGates.put(ticket.sequence(), GateResult.SKIPPED_AFTER_ERROR);
                 }
             } else {
-                pending.addLast(new PendingOperation(ticket, mutation));
+                pending.addLast(new PendingOperation(ticket, mutation, response));
             }
             changed.signalAll();
             return ticket;
@@ -106,6 +112,9 @@ final class BackendResponseCoordinator {
     void onBackendFrame(char type, byte[] body) {
         lock.lock();
         try {
+            if (type == 'C') {
+                updateStatusFromCommandTag(new String(body, StandardCharsets.UTF_8));
+            }
             if (type == 'Z') {
                 updateReadyStatus(body);
             }
@@ -120,6 +129,9 @@ final class BackendResponseCoordinator {
             }
 
             Operation operation = head.ticket().operation();
+            if (head.response() != null) {
+                head.response().accept(type, body);
+            }
             if (type == 'E') {
                 if (operation != Operation.SIMPLE_QUERY) {
                     pending.removeFirst();
@@ -215,6 +227,28 @@ final class BackendResponseCoordinator {
         }
     }
 
+    /**
+     * Tracks transaction boundaries as the tag arrives, so a statement pipelined after COMMIT sees them. The
+     * ROLLBACK tag is also sent for ROLLBACK TO SAVEPOINT, which leaves the transaction open, so only the
+     * ReadyForQuery status can say that a rollback ended it.
+     */
+    private void updateStatusFromCommandTag(String tag) {
+        boolean transactionEnded = switch (tag) {
+            case "BEGIN\0" -> {
+                lastReadyStatus = 'T';
+                yield false;
+            }
+            case "COMMIT\0", "END\0" -> {
+                lastReadyStatus = 'I';
+                yield true;
+            }
+            default -> false;
+        };
+        if (transactionEnded) {
+            session.transactionEnded();
+        }
+    }
+
     private void updateReadyStatus(byte[] body) {
         if (body != null && body.length == 1) {
             lastReadyStatus = (char) body[0];
@@ -290,6 +324,7 @@ final class BackendResponseCoordinator {
     record Ticket(long sequence, Operation operation) {
     }
 
-    private record PendingOperation(Ticket ticket, ExtendedQuerySession.Mutation mutation) {
+    private record PendingOperation(Ticket ticket, ExtendedQuerySession.Mutation mutation,
+                                    BiConsumer<Character, byte[]> response) {
     }
 }

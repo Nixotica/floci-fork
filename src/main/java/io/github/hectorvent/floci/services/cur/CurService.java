@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.S3DestinationValidation;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cur.model.ReportDefinition;
@@ -14,9 +16,11 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * AWS CUR (Cost and Usage Report) management plane.
@@ -39,8 +43,8 @@ public class CurService {
     /** AWS hard limit per account: 5 report definitions. */
     private static final int MAX_REPORTS_PER_ACCOUNT = 5;
     /** AWS allows the report name to contain alphanumerics, hyphens, and underscores. */
-    private static final java.util.regex.Pattern REPORT_NAME_PATTERN =
-            java.util.regex.Pattern.compile("[A-Za-z0-9_-]+");
+    private static final Pattern REPORT_NAME_PATTERN =
+            Pattern.compile("[A-Za-z0-9_-]+");
 
     private static final Set<String> ALLOWED_TIME_UNITS = Set.of("HOURLY", "DAILY", "MONTHLY");
     /**
@@ -139,15 +143,15 @@ public class CurService {
      */
     public Map<String, List<ReportDefinition>> listAllReportsByAccount() {
         Collection<ReportDefinition> all;
-        if (store instanceof io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend<?> aware) {
+        if (store instanceof AccountAwareStorageBackend<?> aware) {
             @SuppressWarnings("unchecked")
-            io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend<ReportDefinition> typed =
-                    (io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend<ReportDefinition>) aware;
+            AccountAwareStorageBackend<ReportDefinition> typed =
+                    (AccountAwareStorageBackend<ReportDefinition>) aware;
             all = typed.scanAllAccounts();
         } else {
             all = store.scan(key -> true);
         }
-        Map<String, List<ReportDefinition>> result = new java.util.LinkedHashMap<>();
+        Map<String, List<ReportDefinition>> result = new LinkedHashMap<>();
         for (ReportDefinition def : all) {
             String accountId = def.getOwnerAccountId();
             if (accountId == null || accountId.isEmpty()) {
@@ -197,13 +201,13 @@ public class CurService {
         if (accountId == null || reportName == null || region == null || status == null) {
             return;
         }
-        if (!(store instanceof io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend<?> aware)) {
+        if (!(store instanceof AccountAwareStorageBackend<?> aware)) {
             markReportStatus(reportName, region, status);
             return;
         }
         @SuppressWarnings("unchecked")
-        io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend<ReportDefinition> typed =
-                (io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend<ReportDefinition>) aware;
+        AccountAwareStorageBackend<ReportDefinition> typed =
+                (AccountAwareStorageBackend<ReportDefinition>) aware;
         String key = compositeKey(region, reportName);
         typed.getForAccount(accountId, key).ifPresent(def -> {
             def.setReportStatus(status);
@@ -281,8 +285,8 @@ public class CurService {
 
     private static void requireNonEmpty(String value, String field) {
         if (value == null || value.isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value at '" + field + "' failed to satisfy constraint: Member must not be null.", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value at '" + field + "' failed to satisfy constraint: Member must not be null.");
         }
     }
 

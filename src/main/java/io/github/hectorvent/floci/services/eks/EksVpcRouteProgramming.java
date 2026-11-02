@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.eks;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
@@ -128,12 +129,13 @@ public final class EksVpcRouteProgramming {
         return new ArrayList<>(result);
     }
 
-    public static List<VpcRouteEntry> resolveProgrammableRoutes(Cluster cluster, List<RouteTable> applicableTables, Ec2Service ec2Service) {
+    /** {@code region} is the cluster's own, as {@code EksClusterManager.clusterRegion} resolves it. */
+    public static List<VpcRouteEntry> resolveProgrammableRoutes(Cluster cluster, String region,
+            List<RouteTable> applicableTables, Ec2Service ec2Service) {
         if (cluster == null || applicableTables == null || applicableTables.isEmpty() || ec2Service == null) {
             return List.of();
         }
         String accountId = clusterAccountId(cluster);
-        String region = clusterRegion(cluster);
         Map<String, String> resolved = new LinkedHashMap<>();
 
         for (RouteTable table : applicableTables) {
@@ -268,24 +270,10 @@ public final class EksVpcRouteProgramming {
         if (isSet(cluster.getAccountId())) {
             return cluster.getAccountId();
         }
-        if (isSet(cluster.getArn())) {
-            String[] parts = cluster.getArn().split(":");
-            if (parts.length > 4 && isSet(parts[4])) {
-                return parts[4];
-            }
-        }
-        return null;
+        String accountId = AwsArnUtils.accountOrDefault(cluster.getArn(), null);
+        return isSet(accountId) ? accountId : null;
     }
 
-    private static String clusterRegion(Cluster cluster) {
-        if (cluster != null && cluster.getArn() != null) {
-            String[] parts = cluster.getArn().split(":");
-            if (parts.length > 3 && !parts[3].isBlank()) {
-                return parts[3];
-            }
-        }
-        return "us-east-1"; // partition-literal: fallback only when the record carries no region; no resolver in scope (follow-up)
-    }
 
     private static boolean isSet(String s) {
         return s != null && !s.isBlank();

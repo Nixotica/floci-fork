@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -92,6 +93,20 @@ class ContainerBuilderTest {
     }
 
     @Test
+    void withEmbeddedDns_preservesExplicitResolversWithoutAddingFallbacks() {
+        TestFixture fixture = new TestFixture();
+        when(fixture.embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
+
+        ContainerSpec spec = fixture.builder.newContainer("alpine")
+                .withDnsServer("172.18.0.8")
+                .withDnsServer("172.18.0.9")
+                .withEmbeddedDns()
+                .build();
+
+        assertEquals(List.of("172.18.0.8", "172.18.0.9"), spec.dnsServers());
+    }
+
+    @Test
     void withCgroupnsModeRecordsDockerNamespaceMode() {
         TestFixture fixture = new TestFixture();
 
@@ -100,6 +115,14 @@ class ContainerBuilderTest {
                 .build();
 
         assertEquals("host", spec.cgroupnsMode());
+    }
+
+    @Test
+    void withJavaTrustStoreRecordsThatTheContainersJvmsTrustFlocisCa() {
+        TestFixture fixture = new TestFixture();
+
+        assertTrue(fixture.builder.newContainer("alpine").withJavaTrustStore().build().javaTrustStore());
+        assertFalse(fixture.builder.newContainer("alpine").build().javaTrustStore());
     }
 
     @Test

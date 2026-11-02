@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
@@ -16,13 +17,11 @@ import io.github.hectorvent.floci.services.rum.model.AppMonitor;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -486,7 +485,7 @@ public class RumService implements ResourceProvider {
             return 0;
         }
         try {
-            String decoded = new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8);
+            String decoded = Base64Url.decode(token);
             if (!decoded.startsWith(TOKEN_PREFIX)) {
                 throw validation("nextToken is invalid.");
             }
@@ -501,8 +500,7 @@ public class RumService implements ResourceProvider {
     }
 
     private static String encodeOffset(int offset) {
-        return Base64.getUrlEncoder().withoutPadding()
-                .encodeToString((TOKEN_PREFIX + offset).getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(TOKEN_PREFIX + offset);
     }
 
     private static AwsException resourceConflict(String name) {

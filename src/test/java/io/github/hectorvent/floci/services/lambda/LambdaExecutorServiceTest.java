@@ -5,8 +5,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.FunctionEventInvokeConfig;
-import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.PendingInvocation;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
@@ -60,13 +60,13 @@ class LambdaExecutorServiceTest {
     @Mock WarmPool warmPool;
     @Mock LambdaConcurrencyLimiter concurrencyLimiter;
 
-    private final List<LambdaExecutorService> retryExecutors = new ArrayList<>();
+    private final List<LambdaExecutorService> executors = new ArrayList<>();
     private LambdaExecutorService executor;
     private LambdaFunction fn;
 
     @BeforeEach
     void setUp() {
-        executor = new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter);
+        executor = registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter));
 
         fn = new LambdaFunction();
         fn.setFunctionName("test-fn");
@@ -77,10 +77,15 @@ class LambdaExecutorServiceTest {
     }
 
     @AfterEach
-    void shutDownRetryExecutors() {
-        for (LambdaExecutorService retryExecutor : retryExecutors) {
-            retryExecutor.shutdown();
+    void shutDownExecutors() {
+        for (LambdaExecutorService owned : executors) {
+            owned.shutdown();
         }
+    }
+
+    private LambdaExecutorService registerExecutor(LambdaExecutorService owned) {
+        executors.add(owned);
+        return owned;
     }
 
     @Test
@@ -106,8 +111,8 @@ class LambdaExecutorServiceTest {
         version.setFunctionArn(fn.getFunctionArn() + ":1");
         LambdaService lambdaService = mock(LambdaService.class);
         when(lambdaService.findLatest(version)).thenReturn(Optional.of(fn));
-        LambdaExecutorService versionExecutor = new LambdaExecutorService(warmPool, new ObjectMapper(),
-                new LambdaConcurrencyLimiter(), null, lambdaService);
+        LambdaExecutorService versionExecutor = registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(),
+                new LambdaConcurrencyLimiter(), null, lambdaService));
 
         AwsException ex = assertThrows(AwsException.class,
                 () -> versionExecutor.invoke(version, "{}".getBytes(), InvocationType.RequestResponse));
@@ -127,7 +132,7 @@ class LambdaExecutorServiceTest {
     void asyncInvocationPassesInvokedAliasToDestinationRouter() {
         AsyncInvokeDestinationRouter router = mock(AsyncInvokeDestinationRouter.class);
         executor.shutdown();
-        executor = new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, router);
+        executor = registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, router));
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         ContainerHandle handle = new ContainerHandle("cid-alias", "test-fn", rtas, ContainerState.WARM);
         when(warmPool.acquire(fn)).thenReturn(handle);
@@ -178,6 +183,25 @@ class LambdaExecutorServiceTest {
     }
 
     @Test
+    void syncInvoke_clientContext_isPlacedOnTheEnqueuedInvocation() {
+        RuntimeApiServer rtas = mock(RuntimeApiServer.class);
+        ContainerHandle handle = new ContainerHandle("cid-ctx", "test-fn", rtas, ContainerState.WARM);
+        when(warmPool.acquire(any())).thenReturn(handle);
+        AtomicReference<String> seen = new AtomicReference<>();
+        doAnswer(inv -> {
+            PendingInvocation pi = inv.getArgument(0);
+            seen.set(pi.getClientContext());
+            pi.getResultFuture().complete(new InvokeResult(200, null, "{}".getBytes(), null, "req-ctx"));
+            return pi.getResultFuture();
+        }).when(rtas).enqueue(any(PendingInvocation.class));
+
+        String clientContext = "{\"custom\":{\"traceparent\":\"00-abc-def-01\"}}";
+        executor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse, 0, null, clientContext);
+
+        assertEquals(clientContext, seen.get());
+    }
+
+    @Test
     void successfulInvocation_releasesHandle_doesNotDestroy() {
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         ContainerHandle handle = new ContainerHandle("cid-2", "test-fn", rtas, ContainerState.WARM);
@@ -196,6 +220,42 @@ class LambdaExecutorServiceTest {
         verify(warmPool, never()).destroyHandle(handle);
         assertEquals(200, result.getStatusCode());
         assertNull(result.getFunctionError());
+    }
+
+    @Test
+    void dispatchWait_coldRuntimeGetsTheInitBudget() {
+        LambdaExecutorService withBudget =
+                registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, 10));
+        try {
+            assertEquals(10_000, withBudget.dispatchWaitMs(1, true, 50_000, 50_000));
+        } finally {
+            withBudget.shutdown();
+        }
+    }
+
+    @Test
+    void dispatchWait_warmRuntimeGetsTheTimeoutPlusGraceNotTheInitBudget() {
+        LambdaExecutorService withBudget =
+                registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, 10));
+        try {
+            assertEquals(3_000, withBudget.dispatchWaitMs(1, false, 50_000, 50_000));
+        } finally {
+            withBudget.shutdown();
+        }
+    }
+
+    @Test
+    void dispatchWait_lateStartedRuntimeGetsWhatIsLeftOfTheInitBudget() {
+        LambdaExecutorService withBudget =
+                registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, 10));
+        try {
+            // The launcher spent 4 of the 10 seconds after the start (extensions, log attach).
+            assertEquals(6_000, withBudget.dispatchWaitMs(1, true, 50_000, 54_000));
+            // Once less is left than Timeout plus grace, that wait applies instead.
+            assertEquals(3_000, withBudget.dispatchWaitMs(1, true, 50_000, 59_000));
+        } finally {
+            withBudget.shutdown();
+        }
     }
 
     @Test
@@ -286,7 +346,7 @@ class LambdaExecutorServiceTest {
     void eventInvocation_answers202AndRoutesTheResultToDestinations() throws Exception {
         AsyncInvokeDestinationRouter router = mock(AsyncInvokeDestinationRouter.class);
         LambdaExecutorService routingExecutor =
-                new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, router);
+                registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, router));
 
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         ContainerHandle handle = new ContainerHandle("cid-async", "test-fn", rtas, ContainerState.WARM);
@@ -323,7 +383,8 @@ class LambdaExecutorServiceTest {
         when(lambdaService.isLive(fn)).thenReturn(true);
 
         LambdaExecutorService retryExecutor =
-                new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, router, lambdaService);
+                registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(),
+                        concurrencyLimiter, router, lambdaService));
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         ContainerHandle handle = new ContainerHandle("cid-retry", "test-fn", rtas, ContainerState.WARM);
         when(warmPool.acquire(any())).thenReturn(handle);
@@ -360,7 +421,8 @@ class LambdaExecutorServiceTest {
         when(lambdaService.findEventInvokeConfig(fn, null)).thenReturn(Optional.of(config));
         when(lambdaService.isLive(fn)).thenReturn(true);
         LambdaExecutorService retryExecutor =
-                new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, router, lambdaService);
+                registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(),
+                        concurrencyLimiter, router, lambdaService));
 
         CountDownLatch routed = new CountDownLatch(1);
         doAnswer(invocation -> {
@@ -390,8 +452,8 @@ class LambdaExecutorServiceTest {
         when(lambdaService.findEventInvokeConfig(fn, null)).thenReturn(Optional.of(config));
         when(lambdaService.isLive(fn)).thenReturn(true);
         MutableClock clock = new MutableClock();
-        LambdaExecutorService retryExecutor = new LambdaExecutorService(warmPool, new ObjectMapper(),
-                concurrencyLimiter, router, lambdaService, clock, Duration.ZERO);
+        LambdaExecutorService retryExecutor = registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(),
+                concurrencyLimiter, router, lambdaService, clock, Duration.ZERO));
 
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         ContainerHandle handle = new ContainerHandle("cid-age-after-failure", "test-fn", rtas, ContainerState.WARM);
@@ -638,9 +700,8 @@ class LambdaExecutorServiceTest {
 
     private LambdaExecutorService retryingExecutor(AsyncInvokeDestinationRouter router, LambdaService lambdaService,
                                                    Duration asyncRetryDelay) {
-        LambdaExecutorService retryExecutor = new LambdaExecutorService(warmPool, new ObjectMapper(),
-                concurrencyLimiter, router, lambdaService, Clock.systemUTC(), asyncRetryDelay);
-        retryExecutors.add(retryExecutor);
+        LambdaExecutorService retryExecutor = registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(),
+                concurrencyLimiter, router, lambdaService, Clock.systemUTC(), asyncRetryDelay));
         return retryExecutor;
     }
 

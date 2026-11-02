@@ -9,9 +9,15 @@ import io.github.hectorvent.floci.services.s3tables.model.S3Table;
 import io.github.hectorvent.floci.services.s3tables.model.TableBucket;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -145,7 +151,7 @@ class S3TablesServiceTest {
                 null, null, Map.of(), REGION);
     }
 
-    private void assertError(String expectedCode, org.junit.jupiter.api.function.Executable action) {
+    private void assertError(String expectedCode, Executable action) {
         AwsException exception = assertThrows(AwsException.class, action);
         assertEquals(expectedCode, exception.getErrorCode());
     }
@@ -154,20 +160,20 @@ class S3TablesServiceTest {
     void allowsOnlyOneConcurrentMetadataUpdatePerVersionToken() throws Exception {
         String arn = createBucketWithNamespace("analytics");
         S3Table created = createTable(arn, "analytics", "events");
-        var ready = new java.util.concurrent.CountDownLatch(2);
-        var start = new java.util.concurrent.CountDownLatch(1);
-        var executor = java.util.concurrent.Executors.newFixedThreadPool(2);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
 
         try {
-            var first = executor.submit(() -> updateMetadataWithToken(arn, created.getVersionToken(),
+            Future<String> first = executor.submit(() -> updateMetadataWithToken(arn, created.getVersionToken(),
                     "s3://warehouse/events/metadata/v2.json", ready, start));
-            var second = executor.submit(() -> updateMetadataWithToken(arn, created.getVersionToken(),
+            Future<String> second = executor.submit(() -> updateMetadataWithToken(arn, created.getVersionToken(),
                     "s3://warehouse/events/metadata/v3.json", ready, start));
 
-            assertEquals(true, ready.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(true, ready.await(5, TimeUnit.SECONDS));
             start.countDown();
-            List<String> outcomes = List.of(first.get(5, java.util.concurrent.TimeUnit.SECONDS),
-                    second.get(5, java.util.concurrent.TimeUnit.SECONDS));
+            List<String> outcomes = List.of(first.get(5, TimeUnit.SECONDS),
+                    second.get(5, TimeUnit.SECONDS));
 
             assertEquals(1L, outcomes.stream().filter("updated"::equals).count());
             assertEquals(1L, outcomes.stream().filter("ConflictException"::equals).count());
@@ -177,10 +183,10 @@ class S3TablesServiceTest {
     }
 
     private String updateMetadataWithToken(String arn, String token, String metadataLocation,
-                                           java.util.concurrent.CountDownLatch ready,
-                                           java.util.concurrent.CountDownLatch start) throws InterruptedException {
+                                           CountDownLatch ready,
+                                           CountDownLatch start) throws InterruptedException {
         ready.countDown();
-        if (!start.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
+        if (!start.await(5, TimeUnit.SECONDS)) {
             return "timed out";
         }
         try {

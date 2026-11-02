@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @QuarkusTest
@@ -72,9 +73,18 @@ class ApiGatewayCognitoAuthorizerIntegrationTest {
             given().header("Authorization", "Bearer " + accessToken)
                     .when().get(base + "secured").then().statusCode(401);
             given().header("X-Id-Token", "Bearer " + idToken)
-                    .when().get(base + "secured").then().statusCode(403);
+                    .when().get(base + "secured").then().statusCode(401)
+                    .header("x-amzn-ErrorType", equalTo("UnauthorizedException"))
+                    .body("message", equalTo("Unauthorized"));
             given().header("X-Id-Token", "Bearer " + accessToken)
-                    .when().get(base + "missing-scope").then().statusCode(403);
+                    .when().get(base + "missing-scope").then().statusCode(401)
+                    .body("message", equalTo("Unauthorized"));
+            given().contentType(ContentType.JSON).body("""
+                    {"responseTemplates":{"application/json":"{\\"title\\": \\"Unauthorized\\", \\"status\\": 401}"}}
+                    """).when().put("/restapis/" + apiId + "/gatewayresponses/UNAUTHORIZED").then().statusCode(201);
+            given().header("X-Id-Token", "Bearer " + accessToken)
+                    .when().get(base + "missing-scope").then().statusCode(401)
+                    .body("title", equalTo("Unauthorized"));
             given().header("X-Id-Token", "not-a-jwt")
                     .when().get(base + "secured").then().statusCode(401);
             given().header("X-Id-Token", "Bearer " + accessToken)
@@ -99,6 +109,38 @@ class ApiGatewayCognitoAuthorizerIntegrationTest {
                     .when().get(base + "unscoped").then().statusCode(401);
         } finally {
             given().when().delete("/restapis/" + apiId).then().statusCode(202);
+        }
+    }
+
+    @Test
+    void rejectsTokensOfDeletedUser() throws Exception {
+        UserPool pool = cognitoService.createUserPool(Map.of("PoolName", "deleted-user-pool"), "us-east-1");
+        Map<String, Object> tokens = issueTokens(pool);
+        String accessToken = (String) tokens.get("AccessToken");
+        String idToken = (String) tokens.get("IdToken");
+        String apiId = given().contentType(ContentType.JSON)
+                .body(Map.of("name", "cognito-deleted-user-test"))
+                .post("/restapis").then().statusCode(201).extract().path("id");
+        try {
+            String rootId = given().get("/restapis/" + apiId + "/resources")
+                    .then().statusCode(200).extract().path("item[0].id");
+            String securedId = createResource(apiId, rootId, "secured");
+            String authorizerId = createAuthorizer(apiId, "Guard", pool.getArn());
+            configureMethod(apiId, securedId, authorizerId, "COGNITO_USER_POOLS", List.of());
+            given().contentType(ContentType.JSON).body(Map.of("stageName", "test"))
+                    .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
+            String securedPath = "/execute-api/" + apiId + "/test/secured";
+            given().header("X-Id-Token", "Bearer " + accessToken)
+                    .get(securedPath).then().statusCode(200);
+
+            cognitoService.deleteUser(accessToken);
+
+            given().header("X-Id-Token", "Bearer " + accessToken)
+                    .get(securedPath).then().statusCode(401);
+            given().header("X-Id-Token", "Bearer " + idToken)
+                    .get(securedPath).then().statusCode(401);
+        } finally {
+            given().delete("/restapis/" + apiId).then().statusCode(202);
         }
     }
 

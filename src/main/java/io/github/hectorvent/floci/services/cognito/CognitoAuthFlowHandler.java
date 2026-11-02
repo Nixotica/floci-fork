@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClient;
@@ -16,8 +17,13 @@ import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import org.jboss.logging.Logger;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -28,6 +34,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
@@ -41,6 +48,7 @@ import java.util.function.Function;
  *
  * For CUSTOM_AUTH, dispatches Cognito Lambda triggers
  * (DefineAuthChallenge, CreateAuthChallenge, VerifyAuthChallengeResponse).
+ * CreateAuthChallenge is optional; decision and custom-challenge verification triggers are required.
  * CUSTOM_AUTH is trigger-driven: if any required trigger is not configured,
  * invocation fails, or the response is incomplete, authentication fails.
  *
@@ -52,9 +60,14 @@ final class CognitoAuthFlowHandler {
     private static final Logger LOG = Logger.getLogger(CognitoAuthFlowHandler.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String CUSTOM_MESSAGE_CODE_PARAMETER = "{####}";
+    private static final String CUSTOM_MESSAGE_USERNAME_PARAMETER = "{username}";
+    /** The {@code callerContext.clientId} AWS sends for an admin action, which names no app client. */
+    private static final String CLIENT_ID_NOT_APPLICABLE = "CLIENT_ID_NOT_APPLICABLE";
     /** The message of a wrong password, which managed login also shows for an unknown user. */
     static final String INCORRECT_CREDENTIALS = "Incorrect username or password";
     static final int MAX_USER_AUTH_SESSIONS_PER_PARTITION = 4_096;
+    /** VerifySoftwareToken's {@code FriendlyDeviceName} length limit in the service model. */
+    static final int MAX_FRIENDLY_DEVICE_NAME_LENGTH = 131_072;
     /** The challenges a USER_AUTH PREFERRED_CHALLENGE may name, in the order AWS lists them when refusing another. */
     private static final List<String> PREFERRED_CHALLENGES =
             List.of("PASSWORD", "PASSWORD_SRP", "SMS_OTP", "EMAIL_OTP", "WEB_AUTHN");
@@ -66,9 +79,11 @@ final class CognitoAuthFlowHandler {
     private final LambdaService lambdaService;
     private final RegionResolver regionResolver;
     private final Clock clock;
+    private final ConcurrentHashMap<String, PasswordChangeSession> passwordChangeSessions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, SrpSession> srpSessions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CustomAuthToken> customAuthSessions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, TotpSession> totpSessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, MfaSession> mfaSessions = new ConcurrentHashMap<>();
     /**
      * Guards both USER_AUTH session maps and nothing else: no storage I/O or Lambda trigger runs under it,
      * so one user's sign-in cannot hold up another's. The code store redeems sign-in codes, once, outside it.
@@ -82,12 +97,22 @@ final class CognitoAuthFlowHandler {
                               String secretBlockBase64, Map<String, String> clientMetadata,
                               Instant expiresAt) {}
 
+    private record PasswordChangeSession(String userPoolId, String username, String clientId, Instant expiresAt) {}
+
     private enum TotpPhase { SETUP, ASSOCIATED, VERIFIED, CODE_REQUIRED }
 
     private record TotpSession(String userPoolId, String username, String clientId,
                                TotpPhase phase, Map<String, String> clientMetadata,
                                String triggerSource, Instant expiresAt, String secret,
                                AtomicInteger failedAttempts) {}
+
+    /**
+     * A pending SMS_MFA, email MFA (EMAIL_OTP) or SELECT_MFA_TYPE challenge after a first factor.
+     * {@code choices} holds SELECT_MFA_TYPE's MFAS_CAN_CHOOSE.
+     */
+    private record MfaSession(String userPoolId, String username, String clientId, String challengeName,
+                              List<String> choices, Map<String, String> clientMetadata, String triggerSource,
+                              Instant expiresAt) {}
 
     /**
      * Correlates a USER_AUTH challenge response back to the InitiateAuth/RespondToAuthChallenge
@@ -97,7 +122,7 @@ final class CognitoAuthFlowHandler {
      * caller trigger an OTP send without ever starting a flow.
      */
     private record UserAuthSession(String userPoolId, String username, String clientId, String challengeName,
-                                   Instant expiresAt, boolean userExists) {}
+                                   Instant expiresAt, boolean userExists, byte[] webAuthnChallenge) {}
 
     static final class CustomAuthSession {
         final String userPoolId;
@@ -107,6 +132,7 @@ final class CognitoAuthFlowHandler {
         Map<String, String> privateChallengeParameters;
         Map<String, String> clientMetadata = Map.of();
         String currentChallengeName;
+        SrpSession srpSession;
 
         CustomAuthSession(String userPoolId, String username, String clientId) {
             this.userPoolId = userPoolId;
@@ -333,7 +359,16 @@ final class CognitoAuthFlowHandler {
         return result;
     }
 
-    Map<String, Object> verifySoftwareToken(String accessToken, String session, String userCode) {
+    Map<String, Object> verifySoftwareToken(String accessToken, String session, String userCode,
+                                            String friendlyDeviceName) {
+        // Smithy's @length counts Unicode scalar values, so a supplementary character counts once.
+        int nameLength = friendlyDeviceName == null ? 0
+                : friendlyDeviceName.codePointCount(0, friendlyDeviceName.length());
+        if (nameLength > MAX_FRIENDLY_DEVICE_NAME_LENGTH) {
+            throw SmithyValidationErrors.exception("InvalidParameterException", "Value '" + friendlyDeviceName
+                    + "' at 'friendlyDeviceName' failed to satisfy constraint: "
+                    + "Member must have length less than or equal to " + MAX_FRIENDLY_DEVICE_NAME_LENGTH);
+        }
         requireOneTotpCredential(accessToken, session);
         if (userCode == null || !userCode.matches("[0-9]{6}")) {
             throw new AwsException("InvalidParameterException", "UserCode must be a six-digit code", 400);
@@ -352,7 +387,7 @@ final class CognitoAuthFlowHandler {
             username = token.username();
         }
         if (!service.activateSoftwareTokenMfa(poolId, username, state == null ? null : state.secret(),
-                userCode, clock.instant())) {
+                userCode, friendlyDeviceName, clock.instant())) {
             throw new AwsException("CodeMismatchException",
                     "Invalid verification code provided, please try again.", 400);
         }
@@ -415,21 +450,38 @@ final class CognitoAuthFlowHandler {
                 if (!state.secret().equals(user.getSoftwareTokenMfaSecret())) {
                     throw new AwsException("NotAuthorizedException", "Software token is not verified", 400);
                 }
-            } else if (!state.secret().equals(user.getSoftwareTokenMfaSecret())
-                    || !CognitoTotp.validCode(state.secret(),
-                    responses.get("SOFTWARE_TOKEN_MFA_CODE"), clock.instant())) {
-                if (state.failedAttempts().incrementAndGet() >= CognitoTotp.MAX_FAILED_ATTEMPTS) {
-                    totpSessions.remove(session, state);
+            } else {
+                OptionalLong step = state.secret().equals(user.getSoftwareTokenMfaSecret())
+                        ? CognitoTotp.matchingStep(state.secret(), responses.get("SOFTWARE_TOKEN_MFA_CODE"),
+                                clock.instant())
+                        : OptionalLong.empty();
+                if (step.isEmpty()) {
+                    countFailedTotpAttempt(session, state);
+                    throw new AwsException("CodeMismatchException",
+                            "Invalid verification code provided, please try again.", 400);
                 }
-                throw new AwsException("CodeMismatchException", "Invalid verification code provided, please try again.", 400);
+                if (!service.consumeSoftwareTokenStep(pool.getId(), user.getUsername(), step.getAsLong())) {
+                    countFailedTotpAttempt(session, state);
+                    throw new AwsException("ExpiredCodeException",
+                            "Your software token has already been used once.", 400);
+                }
             }
             if (!totpSessions.remove(session, state)) {
                 throw new AwsException("NotAuthorizedException", "Session not found", 400);
             }
         }
+        if (phase == TotpPhase.VERIFIED) {
+            service.activateSoftwareTokenMfaAfterSetup(pool.getId(), user.getUsername());
+        }
         Map<String, String> metadata = clientMetadata != null && !clientMetadata.isEmpty()
                 ? clientMetadata : state.clientMetadata();
         return authenticationResult(pool, client, user, state.triggerSource(), metadata);
+    }
+
+    private void countFailedTotpAttempt(String session, TotpSession state) {
+        if (state.failedAttempts().incrementAndGet() >= CognitoTotp.MAX_FAILED_ATTEMPTS) {
+            totpSessions.remove(session, state);
+        }
     }
 
     private Map<String, Object> processChallenge(UserPool pool, UserPoolClient client, String challengeName,
@@ -455,31 +507,79 @@ final class CognitoAuthFlowHandler {
             rejectSimulatedUser(consumeUserAuthSession(pool, client, session, "PASSWORD_SRP"));
             return handleUserSrpAuth(pool, client, responses, clientMetadata);
         }
+        if ("SMS_MFA".equals(challengeName)) {
+            return handleMessageMfaChallenge(pool, client, "SMS_MFA", session, responses, clientMetadata);
+        }
+        // EMAIL_OTP names both the email MFA challenge and USER_AUTH's email first factor; the session tells them apart.
+        if (("EMAIL_OTP".equals(challengeName) || "EMAIL_MFA".equals(challengeName))
+                && session != null && mfaSessions.containsKey(session)) {
+            return handleMessageMfaChallenge(pool, client, "EMAIL_OTP", session, responses, clientMetadata);
+        }
+        if ("SELECT_MFA_TYPE".equals(challengeName)) {
+            return handleSelectMfaType(pool, client, session, responses, clientMetadata);
+        }
         if ("EMAIL_OTP".equals(challengeName) || "SMS_OTP".equals(challengeName)) {
             rejectSimulatedUser(consumeUserAuthSession(pool, client, session, challengeName));
             return handleOtpChallengeResponse(pool, client, challengeName, responses, clientMetadata);
         }
+        if ("WEB_AUTHN".equals(challengeName)) {
+            return handleWebAuthnChallengeResponse(pool, client, session, responses, clientMetadata);
+        }
         if ("NEW_PASSWORD_REQUIRED".equals(challengeName)) {
-            String username = responses.get("USERNAME");
-            String newPassword = responses.get("NEW_PASSWORD");
-            if (username == null || newPassword == null) {
-                throw new AwsException("InvalidParameterException", "USERNAME and NEW_PASSWORD are required", 400);
-            }
-            service.adminSetUserPassword(pool.getId(), username, newPassword, true);
-            // Apply any userAttributes.<name> updates the client provided.
-            Map<String, String> attrUpdates = new HashMap<>();
-            for (Map.Entry<String, String> e : responses.entrySet()) {
-                if (e.getKey() != null && e.getKey().startsWith("userAttributes.")) {
-                    attrUpdates.put(e.getKey().substring("userAttributes.".length()), e.getValue());
+            CustomAuthToken custom = session == null ? null : customAuthSessions.get(session);
+            if (custom != null) {
+                CustomAuthSession state = requireCustomSession(pool, client, session, challengeName);
+                synchronized (state) {
+                    requireCustomSession(pool, client, session, challengeName);
+                    validateCustomUsername(pool, client, state, responses);
+                    changePassword(pool, responses);
+                    consumeCustomSession(session, state);
+                    state.history.get(state.history.size() - 1).put("challengeResult", true);
                 }
+                CognitoUser user = applyNewPasswordAttributes(pool, responses);
+                return continueCustomSrpAuth(pool, client, user, session, state, clientMetadata);
             }
-            if (!attrUpdates.isEmpty()) {
-                service.adminUpdateUserAttributes(pool.getId(), username, attrUpdates);
+            PasswordChangeSession pending = session == null ? null : passwordChangeSessions.get(session);
+            if (pending == null || sessionExpired(pending.expiresAt())
+                    || !pool.getId().equals(pending.userPoolId()) || !client.getClientId().equals(pending.clientId())
+                    || !pending.username().equals(responses.get("USERNAME"))) {
+                throw new AwsException("NotAuthorizedException", "Invalid session for the user.", 400);
             }
-            CognitoUser user = service.adminGetUser(pool.getId(), username);
+            validateSecretHash(client, responses, pending.username());
+            synchronized (pending) {
+                if (passwordChangeSessions.get(session) != pending || sessionExpired(pending.expiresAt())) {
+                    throw new AwsException("NotAuthorizedException", "Session not found", 400);
+                }
+                changePassword(pool, responses);
+                passwordChangeSessions.remove(session, pending);
+            }
+            CognitoUser user = applyNewPasswordAttributes(pool, responses);
             return completePrimaryAuth(pool, client, user, "TokenGeneration_NewPasswordChallenge", clientMetadata);
         }
         throw new AwsException("InvalidParameterException", "Unsupported challenge: " + challengeName, 400);
+    }
+
+    private void changePassword(UserPool pool, Map<String, String> responses) {
+        String username = responses.get("USERNAME");
+        String newPassword = responses.get("NEW_PASSWORD");
+        if (username == null || newPassword == null) {
+            throw new AwsException("InvalidParameterException", "USERNAME and NEW_PASSWORD are required", 400);
+        }
+        service.adminSetUserPassword(pool.getId(), username, newPassword, true);
+    }
+
+    private CognitoUser applyNewPasswordAttributes(UserPool pool, Map<String, String> responses) {
+        String username = responses.get("USERNAME");
+        Map<String, String> attrUpdates = new HashMap<>();
+        for (Map.Entry<String, String> entry : responses.entrySet()) {
+            if (entry.getKey() != null && entry.getKey().startsWith("userAttributes.")) {
+                attrUpdates.put(entry.getKey().substring("userAttributes.".length()), entry.getValue());
+            }
+        }
+        if (!attrUpdates.isEmpty()) {
+            service.adminUpdateUserAttributes(pool.getId(), username, attrUpdates);
+        }
+        return service.adminGetUser(pool.getId(), username);
     }
 
     // ──────────────────────────── USER_PASSWORD / REFRESH ────────────────────────────
@@ -627,13 +727,7 @@ final class CognitoAuthFlowHandler {
 
         firePreAuthentication(pool, client, user, null, clientMetadata, false);
 
-        if (!user.isEnabled()) throw new AwsException("UserNotConfirmedException", "User is disabled", 400);
-        if ("RESET_REQUIRED".equals(user.getUserStatus())) {
-            throw new AwsException("PasswordResetRequiredException", "Password reset required", 400);
-        }
-        if ("UNCONFIRMED".equals(user.getUserStatus())) {
-            throw new AwsException("UserNotConfirmedException", "User is not confirmed", 400);
-        }
+        requireSignInEligible(user);
         if (user.getPasswordHash() == null || !user.getPasswordHash().equals(service.hashPassword(password))) {
             throw new AwsException("NotAuthorizedException", INCORRECT_CREDENTIALS, 400);
         }
@@ -655,6 +749,9 @@ final class CognitoAuthFlowHandler {
         if (!pool.getId().equals(parts[0])) {
             throw new AwsException("NotAuthorizedException", "Invalid Refresh Token", 400);
         }
+        CognitoService.requireRefreshTokenOfClient(client, parts);
+        List<String> scopes = CognitoService.refreshTokenScopes(parts);
+        CognitoService.requireScopesStillAllowed(client, scopes);
         String username = parts[1];
         long iat;
         try {
@@ -683,22 +780,26 @@ final class CognitoAuthFlowHandler {
             throw ae;
         }
         CognitoService.ClaimsOverride override = firePreTokenGeneration(pool, client, user,
-                clientMetadata, "TokenGeneration_RefreshTokens", List.of());
-        Map<String, Object> auth = new HashMap<>();
-        auth.put("AccessToken", service.generateSignedJwt(user, pool, "access", client, override, refreshTokenUuid));
-        auth.put("IdToken", service.generateSignedJwt(user, pool, "id", client, override, refreshTokenUuid));
-        auth.put("ExpiresIn", service.getAccessTokenExpiresInSeconds(client));
-        auth.put("TokenType", "Bearer");
+                clientMetadata, "TokenGeneration_RefreshTokens", scopes);
         Map<String, Object> result = new HashMap<>();
-        result.put("AuthenticationResult", auth);
+        result.put("AuthenticationResult", service.accessAndIdTokens(user, pool, client, override, refreshTokenUuid,
+                scopes, CognitoService.refreshTokenAuthTime(parts, iat)));
         return result;
     }
 
     private Map<String, Object> buildNewPasswordRequiredChallenge(UserPool pool, UserPoolClient client, CognitoUser user) {
         String session = buildSessionToken(pool.getId(), user.getUsername(), client.getClientId());
+        purgeExpired(passwordChangeSessions, PasswordChangeSession::expiresAt);
+        passwordChangeSessions.put(session, new PasswordChangeSession(pool.getId(), user.getUsername(),
+                client.getClientId(), sessionExpiry(client, clock.instant())));
         Map<String, Object> result = new HashMap<>();
         result.put("ChallengeName", "NEW_PASSWORD_REQUIRED");
         result.put("Session", session);
+        result.put("ChallengeParameters", newPasswordChallengeParameters(user));
+        return result;
+    }
+
+    private static Map<String, String> newPasswordChallengeParameters(CognitoUser user) {
         Map<String, String> params = new HashMap<>();
         params.put("USER_ID_FOR_SRP", user.getUsername());
         params.put("requiredAttributes", "[]");
@@ -708,8 +809,7 @@ final class CognitoAuthFlowHandler {
         } catch (Exception e) {
             params.put("userAttributes", "{}");
         }
-        result.put("ChallengeParameters", params);
-        return result;
+        return params;
     }
 
     private static String buildSessionToken(String poolId, String username, String clientId) {
@@ -736,9 +836,9 @@ final class CognitoAuthFlowHandler {
         }
         String expected;
         try {
-            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
-            mac.init(new javax.crypto.spec.SecretKeySpec(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), "HmacSHA256"));
-            byte[] sig = mac.doFinal((username + client.getClientId()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] sig = mac.doFinal((username + client.getClientId()).getBytes(StandardCharsets.UTF_8));
             expected = Base64.getEncoder().encodeToString(sig);
         } catch (Exception e) {
             throw new AwsException("InternalErrorException", "SECRET_HASH computation failed", 500);
@@ -774,17 +874,18 @@ final class CognitoAuthFlowHandler {
         CognitoUser user = service.adminGetUser(pool.getId(), username);
         firePreAuthentication(pool, client, user, null, clientMetadata, false);
 
-        if (!user.isEnabled()) throw new AwsException("UserNotConfirmedException", "User is disabled", 400);
-        if ("RESET_REQUIRED".equals(user.getUserStatus())) {
-            throw new AwsException("PasswordResetRequiredException", "Password reset required", 400);
-        }
-        if ("UNCONFIRMED".equals(user.getUserStatus())) {
-            throw new AwsException("UserNotConfirmedException", "User is not confirmed", 400);
-        }
+        requireSignInEligible(user);
         if (user.getSrpVerifier() == null) {
             throw new AwsException("NotAuthorizedException", "User does not support SRP auth", 400);
         }
 
+        return buildSrpChallenge(pool, client, user, aHex, clientMetadata, null);
+    }
+
+    private Map<String, Object> buildSrpChallenge(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                  String aHex, Map<String, String> clientMetadata,
+                                                  CustomAuthSession custom) {
+        validateSrpPublicValue(aHex);
         String[] serverB = CognitoSrpHelper.generateServerB(user.getSrpVerifier());
         String bHex = serverB[0];
         String bPublicHex = serverB[1];
@@ -792,14 +893,21 @@ final class CognitoAuthFlowHandler {
         String sessionToken = buildSessionToken(pool.getId(), user.getUsername(), client.getClientId());
 
         byte[] secretBlock = new byte[16];
-        new java.security.SecureRandom().nextBytes(secretBlock);
+        new SecureRandom().nextBytes(secretBlock);
         String secretBlockBase64 = Base64.getEncoder().encodeToString(secretBlock);
 
         purgeExpired(srpSessions, SrpSession::expiresAt);
-        srpSessions.put(sessionToken, new SrpSession(
-                pool.getId(), user.getUsername(), client.getClientId(),
+        SrpSession srp = new SrpSession(pool.getId(), user.getUsername(), client.getClientId(),
                 aHex, bHex, bPublicHex, secretBlockBase64,
-                clientMetadata == null ? Map.of() : clientMetadata, sessionExpiry(client, clock.instant())));
+                clientMetadata == null ? Map.of() : clientMetadata, sessionExpiry(client, clock.instant()));
+        if (custom == null) {
+            srpSessions.put(sessionToken, srp);
+        } else {
+            custom.srpSession = srp;
+            custom.currentChallengeName = "PASSWORD_VERIFIER";
+            custom.history.add(new HashMap<>(Map.of("challengeName", "PASSWORD_VERIFIER")));
+            issueCustomAuthToken(sessionToken, custom, client);
+        }
 
         Map<String, Object> result = new HashMap<>();
         result.put("ChallengeName", "PASSWORD_VERIFIER");
@@ -834,6 +942,35 @@ final class CognitoAuthFlowHandler {
             srpSessions.remove(session);
             throw sessionExpiredException();
         }
+        CognitoUser user = verifySrpProof(pool, client, srp, responses);
+
+        Map<String, String> effectiveMetadata = (clientMetadata != null && !clientMetadata.isEmpty())
+                ? clientMetadata : srp.clientMetadata();
+        srpSessions.remove(session);
+
+        if (user.isTemporaryPassword() || "FORCE_CHANGE_PASSWORD".equals(user.getUserStatus())) {
+            return buildNewPasswordRequiredChallenge(pool, client, user);
+        }
+
+        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", effectiveMetadata);
+    }
+
+    private static void validateSrpPublicValue(String aHex) {
+        if (aHex == null || aHex.isBlank()) {
+            throw new AwsException("InvalidParameterException", "SRP_A is required", 400);
+        }
+        try {
+            BigInteger publicA = new BigInteger(aHex, 16);
+            if (publicA.signum() <= 0 || publicA.mod(CognitoSrpHelper.N).signum() == 0) {
+                throw new NumberFormatException("Invalid SRP public value");
+            }
+        } catch (NumberFormatException invalid) {
+            throw new AwsException("InvalidParameterException", "Invalid SRP_A", 400);
+        }
+    }
+
+    private CognitoUser verifySrpProof(UserPool pool, UserPoolClient client, SrpSession srp,
+                                       Map<String, String> responses) {
         if (!pool.getId().equals(srp.userPoolId()) || !client.getClientId().equals(srp.clientId())) {
             throw new AwsException("NotAuthorizedException", "Session does not match client", 400);
         }
@@ -851,13 +988,7 @@ final class CognitoAuthFlowHandler {
         validateSecretHash(client, responses, username);
 
         CognitoUser user = service.adminGetUser(pool.getId(), username);
-        if (!user.isEnabled()) throw new AwsException("UserNotConfirmedException", "User is disabled", 400);
-        if ("RESET_REQUIRED".equals(user.getUserStatus())) {
-            throw new AwsException("PasswordResetRequiredException", "Password reset required", 400);
-        }
-        if ("UNCONFIRMED".equals(user.getUserStatus())) {
-            throw new AwsException("UserNotConfirmedException", "User is not confirmed", 400);
-        }
+        requireSignInEligible(user);
         if (user.getSrpVerifier() == null) {
             throw new AwsException("NotAuthorizedException", "User does not support SRP auth", 400);
         }
@@ -866,17 +997,10 @@ final class CognitoAuthFlowHandler {
         byte[] secretBlock = Base64.getDecoder().decode(srp.secretBlockBase64());
         boolean valid = CognitoSrpHelper.verifySignature(sessionKey, pool.getId(), user.getUsername(),
                 secretBlock, timestamp, claimSignature);
-        if (!valid) throw new AwsException("NotAuthorizedException", "Incorrect username or password", 400);
-
-        Map<String, String> effectiveMetadata = (clientMetadata != null && !clientMetadata.isEmpty())
-                ? clientMetadata : srp.clientMetadata();
-        srpSessions.remove(session);
-
-        if (user.isTemporaryPassword() || "FORCE_CHANGE_PASSWORD".equals(user.getUserStatus())) {
-            return buildNewPasswordRequiredChallenge(pool, client, user);
+        if (!valid || !srp.secretBlockBase64().equals(responses.get("PASSWORD_CLAIM_SECRET_BLOCK"))) {
+            throw new AwsException("NotAuthorizedException", "Incorrect username or password", 400);
         }
-
-        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", effectiveMetadata);
+        return user;
     }
 
     // ──────────────────────────── USER_AUTH (choice-based) ────────────────────────────
@@ -886,8 +1010,8 @@ final class CognitoAuthFlowHandler {
      * {@code PASSWORD_SRP} reuse {@link #authenticateWithPassword} and {@link #handleUserSrpAuth}
      * unchanged rather than reverifying the same credential a second way.
      *
-     * <p>Not implemented: {@code WEB_AUTHN} and the {@code ConfirmSignUp} session as a
-     * first-factor shortcut (tracked as follow-ups on the issue this was added for).
+     * <p>Not implemented: the {@code ConfirmSignUp} session as a first-factor shortcut (tracked as a
+     * follow-up on the issue this was added for).
      */
     private Map<String, Object> handleUserAuth(UserPool pool, UserPoolClient client,
                                                 Map<String, String> params, Map<String, String> clientMetadata) {
@@ -982,6 +1106,7 @@ final class CognitoAuthFlowHandler {
                     advertised, clientMetadata);
             case "SMS_OTP" -> issueOtpChallenge(pool, client, user, "SMS_OTP", "phone_number", "SMS",
                     advertised, clientMetadata);
+            case "WEB_AUTHN" -> issueWebAuthnChallenge(pool, client, user, advertised, clientMetadata);
             default -> throw new AwsException("InvalidParameterException",
                     challenge + " is not a supported challenge", 400);
         };
@@ -993,11 +1118,86 @@ final class CognitoAuthFlowHandler {
         firePreAuthentication(pool, client, user, null, clientMetadata, false);
         VerificationCode.Purpose purpose = "EMAIL_OTP".equals(challengeName)
                 ? VerificationCode.Purpose.EMAIL_OTP : VerificationCode.Purpose.SMS_OTP;
-        Map<String, Object> customMessage = fireCustomMessage(pool, client, user, "CustomMessage_Authentication");
+        Map<String, Object> customMessage = customEmailSenderTakesOver(pool, deliveryMedium) ? Map.of()
+                : fireCustomMessage(pool, client, user, "CustomMessage_Authentication", null);
         Map<String, String> challengeParams = new HashMap<>(
-                service.issueSignInOtp(pool, user, purpose, attributeName, deliveryMedium, customMessage));
+                service.issueSignInOtp(pool, client, user, purpose, attributeName, deliveryMedium, customMessage));
         challengeParams.put("USERNAME", user.getUsername());
         return userAuthChallengeResponse(pool, client, user, challengeName, available, challengeParams);
+    }
+
+    /**
+     * Issues a {@code WEB_AUTHN} challenge: {@code CREDENTIAL_REQUEST_OPTIONS} is the
+     * {@code PublicKeyCredentialRequestOptionsJSON} to pass to the browser or platform, allowing the
+     * user's registered passkeys, and its challenge stays with the session.
+     */
+    private Map<String, Object> issueWebAuthnChallenge(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                       List<String> available, Map<String, String> clientMetadata) {
+        firePreAuthentication(pool, client, user, null, clientMetadata, false);
+        byte[] challenge = service.newWebAuthnChallenge();
+        String options;
+        try {
+            options = service.webAuthnRequestOptions(pool, user, challenge,
+                    Duration.ofMinutes(client.getAuthSessionValidity()).toMillis());
+        } catch (AwsException e) {
+            if (!"WebAuthnConfigurationMissingException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            throw new AwsException("InvalidUserPoolConfigurationException", e.getMessage(), 400);
+        }
+        Map<String, String> challengeParams = new HashMap<>();
+        challengeParams.put("CREDENTIAL_REQUEST_OPTIONS", options);
+        challengeParams.put("USERNAME", user.getUsername());
+        return userAuthChallengeResponse(pool, client, user.getUsername(), "WEB_AUTHN", available, challengeParams,
+                true, challenge);
+    }
+
+    /**
+     * Answers a {@code WEB_AUTHN} challenge: {@code CREDENTIAL} is the {@code AuthenticationResponseJSON}
+     * signed over the session's challenge by one of the user's passkeys. A passkey that verified the user
+     * satisfies MFA for a user who turned passkey MFA on, in a pool whose
+     * {@code WebAuthnConfiguration.FactorConfiguration} is {@code MULTI_FACTOR_WITH_USER_VERIFICATION};
+     * otherwise the pool's MFA rules apply as after a password.
+     */
+    private Map<String, Object> handleWebAuthnChallengeResponse(UserPool pool, UserPoolClient client, String session,
+                                                                Map<String, String> responses,
+                                                                Map<String, String> clientMetadata) {
+        UserAuthSession state = consumeUserAuthSession(pool, client, session, "WEB_AUTHN");
+        rejectSimulatedUser(state);
+        String username = responses.get("USERNAME");
+        String credential = responses.get("CREDENTIAL");
+        if (username == null || credential == null) {
+            throw new AwsException("InvalidParameterException", "USERNAME and CREDENTIAL are required", 400);
+        }
+        validateSecretHash(client, responses, username);
+        CognitoUser user = service.adminGetUser(pool.getId(), username);
+        if (!user.getUsername().equals(state.username())) {
+            throw new AwsException("NotAuthorizedException", "Session does not match user", 400);
+        }
+        requireSignInEligible(user);
+        // For a user whose passkey stands in for MFA, the assertion must verify the user.
+        boolean userVerified = service.verifyWebAuthnSignIn(pool, user.getUsername(), state.webAuthnChallenge(),
+                credential);
+        user = service.adminGetUser(pool.getId(), user.getUsername());
+        if (userVerified && passkeySatisfiesMfa(pool, user)) {
+            return authenticationResult(pool, client, user, "TokenGeneration_Authentication", clientMetadata);
+        }
+        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", clientMetadata);
+    }
+
+    /** Whether the pool lets a passkey that verified the user stand in for MFA. */
+    static boolean passkeyMfaAllowed(UserPool pool) {
+        return pool.getWebAuthnConfiguration() != null
+                && "MULTI_FACTOR_WITH_USER_VERIFICATION".equals(pool.getWebAuthnConfiguration().getFactorConfiguration());
+    }
+
+    /**
+     * Whether a user-verified passkey sign-in satisfies MFA for {@code user}. AWS needs both the pool's
+     * {@code FactorConfiguration} and the user's own {@code WebAuthnMfaSettings}: the pool only makes
+     * passkey MFA possible, and each user opts in.
+     */
+    static boolean passkeySatisfiesMfa(UserPool pool, CognitoUser user) {
+        return passkeyMfaAllowed(pool) && user.isWebAuthnMfaEnabled();
     }
 
     private Map<String, Object> handleOtpChallengeResponse(UserPool pool, UserPoolClient client, String challengeName,
@@ -1031,13 +1231,22 @@ final class CognitoAuthFlowHandler {
                                                             String challengeName, List<String> available,
                                                             Map<String, String> challengeParameters) {
         return userAuthChallengeResponse(pool, client, user.getUsername(), challengeName, available,
-                challengeParameters, true);
+                challengeParameters, true, null);
     }
 
     private Map<String, Object> userAuthChallengeResponse(UserPool pool, UserPoolClient client, String username,
                                                             String challengeName, List<String> available,
                                                             Map<String, String> challengeParameters,
                                                             boolean userExists) {
+        return userAuthChallengeResponse(pool, client, username, challengeName, available, challengeParameters,
+                userExists, null);
+    }
+
+    /** {@code webAuthnChallenge} is the challenge a {@code WEB_AUTHN} answer must sign, kept with the session. */
+    private Map<String, Object> userAuthChallengeResponse(UserPool pool, UserPoolClient client, String username,
+                                                            String challengeName, List<String> available,
+                                                            Map<String, String> challengeParameters,
+                                                            boolean userExists, byte[] webAuthnChallenge) {
         String session = userAuthSessionToken(pool.getId(), client.getClientId());
         synchronized (userAuthSessionLock) {
             Instant issuedAt = clock.instant();
@@ -1052,7 +1261,7 @@ final class CognitoAuthFlowHandler {
                 tokens.remove();
             }
             store.put(session, new UserAuthSession(pool.getId(), username, client.getClientId(),
-                    challengeName, sessionExpiry(client, issuedAt), userExists));
+                    challengeName, sessionExpiry(client, issuedAt), userExists, webAuthnChallenge));
         }
         Map<String, Object> result = new HashMap<>();
         result.put("ChallengeName", challengeName);
@@ -1153,7 +1362,7 @@ final class CognitoAuthFlowHandler {
      * when it names none: AWS's DescribeUserPool reports {@code ["PASSWORD"]} for a pool created without a
      * sign-in policy. Floci now stores that default too, but a pool it persisted earlier may have none.
      */
-    private static List<String> allowedFirstAuthFactors(UserPool pool) {
+    static List<String> allowedFirstAuthFactors(UserPool pool) {
         Map<String, Object> policies = pool.getPolicies();
         if (policies == null || !(policies.get("SignInPolicy") instanceof Map<?, ?> signInPolicy)
                 || !(signInPolicy.get("AllowedFirstAuthFactors") instanceof List<?> factors) || factors.isEmpty()) {
@@ -1177,6 +1386,18 @@ final class CognitoAuthFlowHandler {
         List<String> available = availableUserAuthChallenges(user);
         List<String> allowed = allowedFirstAuthFactors(pool);
         available.removeIf(challenge -> !allowed.contains("PASSWORD_SRP".equals(challenge) ? "PASSWORD" : challenge));
+        // Where MFA is optional, AWS lets a user who has turned on an MFA factor sign in with a password
+        // only, so that the second factor still follows. A user who turned passkey MFA on keeps WEB_AUTHN,
+        // since a user-verified passkey satisfies MFA on its own.
+        if ("OPTIONAL".equals(pool.getMfaConfiguration()) && !mfaFactors(pool, user).isEmpty()) {
+            boolean passkeyIsMfa = passkeySatisfiesMfa(pool, user);
+            available.removeIf(challenge -> !"PASSWORD".equals(challenge) && !"PASSWORD_SRP".equals(challenge)
+                    && !(passkeyIsMfa && "WEB_AUTHN".equals(challenge)));
+        }
+        // Where MFA is required, a passkey is a sign-in choice only for a user whose passkey satisfies MFA.
+        if ("ON".equals(pool.getMfaConfiguration()) && !passkeySatisfiesMfa(pool, user)) {
+            available.remove("WEB_AUTHN");
+        }
         return available;
     }
 
@@ -1197,6 +1418,9 @@ final class CognitoAuthFlowHandler {
                 available.add("SMS_OTP");
             }
         }
+        if (!user.getWebAuthnCredentials().isEmpty()) {
+            available.add("WEB_AUTHN");
+        }
         return available;
     }
 
@@ -1204,7 +1428,7 @@ final class CognitoAuthFlowHandler {
      * The sign-in factors {@code user} has set up, as GetUserAuthFactors reports them, in the
      * {@code AuthFactorType} enum's order. AWS lists what the user holds, not what the pool's
      * {@code AllowedFirstAuthFactors} permits, so neither that policy nor Floci's code-delivery
-     * wiring filters this list. {@code WEB_AUTHN} never appears: Floci stores no passkeys.
+     * wiring filters this list. {@code WEB_AUTHN} appears once the user has registered a passkey.
      */
     List<String> configuredUserAuthFactors(CognitoUser user) {
         List<String> factors = new ArrayList<>();
@@ -1216,6 +1440,9 @@ final class CognitoAuthFlowHandler {
         }
         if (hasVerifiedAttribute(user, "phone_number")) {
             factors.add("SMS_OTP");
+        }
+        if (!user.getWebAuthnCredentials().isEmpty()) {
+            factors.add("WEB_AUTHN");
         }
         if (user.getSoftwareTokenMfaSecret() != null) {
             factors.add("SOFTWARE_TOKEN");
@@ -1235,14 +1462,19 @@ final class CognitoAuthFlowHandler {
     }
 
     private void requireSignInEligible(CognitoUser user) {
-        if (!user.isEnabled()) {
-            throw new AwsException("UserNotConfirmedException", "User is disabled", 400);
-        }
+        requireEnabled(user);
         if ("RESET_REQUIRED".equals(user.getUserStatus())) {
             throw new AwsException("PasswordResetRequiredException", "Password reset required", 400);
         }
         if ("UNCONFIRMED".equals(user.getUserStatus())) {
             throw new AwsException("UserNotConfirmedException", "User is not confirmed", 400);
+        }
+    }
+
+    /** AWS rejects a disabled user with NotAuthorizedException, not UserNotConfirmedException. */
+    private static void requireEnabled(CognitoUser user) {
+        if (!user.isEnabled()) {
+            throw new AwsException("NotAuthorizedException", "User is disabled.", 400);
         }
     }
 
@@ -1256,7 +1488,7 @@ final class CognitoAuthFlowHandler {
 
         CognitoUser user = service.adminGetUser(pool.getId(), username);
         firePreAuthentication(pool, client, user, null, clientMetadata, false);
-        if (!user.isEnabled()) throw new AwsException("UserNotConfirmedException", "User is disabled", 400);
+        requireEnabled(user);
         if ("RESET_REQUIRED".equals(user.getUserStatus())) {
             throw new AwsException("PasswordResetRequiredException", "Password reset required", 400);
         }
@@ -1264,6 +1496,16 @@ final class CognitoAuthFlowHandler {
         CustomAuthSession state =
                 new CustomAuthSession(pool.getId(), user.getUsername(), client.getClientId());
         state.clientMetadata = clientMetadata == null ? Map.of() : clientMetadata;
+        boolean srpAuth = "SRP_A".equals(authParameters.get("CHALLENGE_NAME"));
+        if (srpAuth) {
+            validateSecretHash(client, authParameters, username);
+            validateSrpPublicValue(authParameters.get("SRP_A"));
+            requireSignInEligible(user);
+            if (user.getSrpVerifier() == null) {
+                throw new AwsException("NotAuthorizedException", "User does not support SRP auth", 400);
+            }
+            state.history.add(new HashMap<>(Map.of("challengeName", "SRP_A", "challengeResult", true)));
+        }
 
         Map<String, Object> defineResp = defineAuthChallenge(pool, client, user, state);
         if (Boolean.TRUE.equals(defineResp.get("failAuthentication"))) {
@@ -1278,6 +1520,9 @@ final class CognitoAuthFlowHandler {
 
         String challengeName = (String) defineResp.getOrDefault("challengeName", "CUSTOM_CHALLENGE");
         state.currentChallengeName = challengeName;
+        if (srpAuth && "PASSWORD_VERIFIER".equals(challengeName)) {
+            return buildSrpChallenge(pool, client, user, authParameters.get("SRP_A"), state.clientMetadata, state);
+        }
 
         Map<String, String> publicParams = new HashMap<>();
         publicParams.put("USERNAME", user.getUsername());
@@ -1302,22 +1547,7 @@ final class CognitoAuthFlowHandler {
     private Map<String, Object> handleCustomChallenge(UserPool pool, UserPoolClient client,
                                                        String session, Map<String, String> responses,
                                                        Map<String, String> clientMetadata) {
-        if (session == null) throw new AwsException("InvalidParameterException", "Session is required", 400);
-        CustomAuthToken token = customAuthSessions.get(session);
-        if (token == null) {
-            throw new AwsException("NotAuthorizedException", "Session not found", 400);
-        }
-        if (sessionExpired(token.expiresAt())) {
-            customAuthSessions.remove(session);
-            throw sessionExpiredException();
-        }
-        CustomAuthSession state = token.state();
-        if (!state.userPoolId.equals(pool.getId()) || !state.clientId.equals(client.getClientId())) {
-            throw new AwsException("NotAuthorizedException", "Session does not match client", 400);
-        }
-        if (clientMetadata != null && !clientMetadata.isEmpty()) {
-            state.clientMetadata = clientMetadata;
-        }
+        CustomAuthSession state = requireCustomSession(pool, client, session, "CUSTOM_CHALLENGE");
 
         String answer = responses.get("ANSWER");
         if (answer == null) answer = responses.get("custom:ANSWER");
@@ -1333,9 +1563,16 @@ final class CognitoAuthFlowHandler {
             throw new AwsException("NotAuthorizedException", "Invalid session for the user.", 400);
         }
 
+        consumeCustomSession(session, state);
+        if (clientMetadata != null && !clientMetadata.isEmpty()) {
+            state.clientMetadata = clientMetadata;
+        }
         boolean answerCorrect = verifyAuthChallenge(pool, client, user, state, answer);
         if (!state.history.isEmpty()) {
             state.history.get(state.history.size() - 1).put("challengeResult", answerCorrect);
+        }
+        if (state.srpSession != null) {
+            return continueCustomSrpAuth(pool, client, user, session, state, clientMetadata);
         }
 
         Map<String, Object> defineResp = defineAuthChallenge(pool, client, user, state);
@@ -1374,11 +1611,15 @@ final class CognitoAuthFlowHandler {
                                                                 CustomAuthSession state,
                                                                 Map<String, String> responses,
                                                                 Map<String, String> clientMetadata) {
+        requireCustomSession(pool, client, session, "PASSWORD_VERIFIER");
+        if (state.srpSession != null) {
+            CognitoUser user = verifySrpProof(pool, client, state.srpSession, responses);
+            consumeCustomSession(session, state);
+            state.history.get(state.history.size() - 1).put("challengeResult", true);
+            return continueCustomSrpAuth(pool, client, user, session, state, clientMetadata);
+        }
         if (!state.userPoolId.equals(pool.getId()) || !state.clientId.equals(client.getClientId())) {
             throw new AwsException("NotAuthorizedException", "Session does not match client", 400);
-        }
-        if (clientMetadata != null && !clientMetadata.isEmpty()) {
-            state.clientMetadata = clientMetadata;
         }
 
         String password = responses.get("ANSWER");
@@ -1390,6 +1631,10 @@ final class CognitoAuthFlowHandler {
         CognitoUser user = service.adminGetUser(pool.getId(), state.username);
         boolean passwordOK = user.getPasswordHash() != null
                 && user.getPasswordHash().equals(service.hashPassword(password));
+        consumeCustomSession(session, state);
+        if (clientMetadata != null && !clientMetadata.isEmpty()) {
+            state.clientMetadata = clientMetadata;
+        }
         if (!state.history.isEmpty()) {
             state.history.get(state.history.size() - 1).put("challengeResult", passwordOK);
         }
@@ -1426,6 +1671,71 @@ final class CognitoAuthFlowHandler {
         return result;
     }
 
+    private CustomAuthSession requireCustomSession(UserPool pool, UserPoolClient client,
+                                                    String session, String challengeName) {
+        CustomAuthToken token = session == null ? null : customAuthSessions.get(session);
+        if (token == null) {
+            throw new AwsException("NotAuthorizedException", "Session not found", 400);
+        }
+        if (sessionExpired(token.expiresAt())) {
+            customAuthSessions.remove(session, token);
+            throw sessionExpiredException();
+        }
+        CustomAuthSession state = token.state();
+        if (!state.userPoolId.equals(pool.getId()) || !state.clientId.equals(client.getClientId())
+                || !challengeName.equals(state.currentChallengeName)) {
+            throw new AwsException("NotAuthorizedException", "Invalid session for the user.", 400);
+        }
+        return state;
+    }
+
+    private void consumeCustomSession(String session, CustomAuthSession state) {
+        CustomAuthToken token = customAuthSessions.get(session);
+        if (token == null || token.state() != state || !customAuthSessions.remove(session, token)) {
+            throw new AwsException("NotAuthorizedException", "Session not found", 400);
+        }
+    }
+
+    private void validateCustomUsername(UserPool pool, UserPoolClient client, CustomAuthSession state,
+                                          Map<String, String> responses) {
+        String supplied = responses.get("USERNAME");
+        if (!state.username.equals(resolveToCanonicalUsername(pool, supplied))) {
+            throw new AwsException("NotAuthorizedException", "Invalid session for the user.", 400);
+        }
+        validateSecretHash(client, responses, supplied);
+    }
+
+    private Map<String, Object> continueCustomSrpAuth(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                       String session, CustomAuthSession state,
+                                                       Map<String, String> clientMetadata) {
+        if (clientMetadata != null && !clientMetadata.isEmpty()) {
+            state.clientMetadata = clientMetadata;
+        }
+        Map<String, Object> decision = defineAuthChallenge(pool, client, user, state);
+        customAuthSessions.remove(session);
+        if (Boolean.TRUE.equals(decision.get("failAuthentication"))) {
+            throw new AwsException("NotAuthorizedException", "Custom auth failed", 400);
+        }
+        boolean passwordChange = user.isTemporaryPassword() || "FORCE_CHANGE_PASSWORD".equals(user.getUserStatus());
+        if (!passwordChange && Boolean.TRUE.equals(decision.get("issueTokens"))) {
+            return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata);
+        }
+        String challengeName = passwordChange ? "NEW_PASSWORD_REQUIRED"
+                : (String) decision.getOrDefault("challengeName", "CUSTOM_CHALLENGE");
+        if (!"CUSTOM_CHALLENGE".equals(challengeName) && !"NEW_PASSWORD_REQUIRED".equals(challengeName)) {
+            throw new AwsException("InvalidLambdaResponseException", "Unexpected custom SRP challenge", 400);
+        }
+        state.currentChallengeName = challengeName;
+        Map<String, String> params = "NEW_PASSWORD_REQUIRED".equals(challengeName)
+                ? newPasswordChallengeParameters(user) : new HashMap<>();
+        params.put("USERNAME", state.username);
+        applyCreateResponse(state, challengeName, "CUSTOM_CHALLENGE".equals(challengeName)
+                ? createAuthChallenge(pool, client, user, state, challengeName) : Map.of(), params);
+        String next = buildSessionToken(pool.getId(), state.username, client.getClientId());
+        issueCustomAuthToken(next, state, client);
+        return Map.of("ChallengeName", challengeName, "Session", next, "ChallengeParameters", params);
+    }
+
     // ──────────────────────────── CUSTOM_AUTH triggers + helpers ────────────────────────────
 
     private Map<String, Object> defineAuthChallenge(UserPool pool, UserPoolClient client, CognitoUser user,
@@ -1449,6 +1759,9 @@ final class CognitoAuthFlowHandler {
 
     private Map<String, Object> createAuthChallenge(UserPool pool, UserPoolClient client, CognitoUser user,
                                                      CustomAuthSession state, String challengeName) {
+        if (resolveTriggerArn(pool, "CreateAuthChallenge") == null) {
+            return Map.of();
+        }
         Map<String, Object> req = new HashMap<>();
         req.put("challengeName", challengeName);
         req.put("session", new ArrayList<>(state.history));
@@ -1530,29 +1843,8 @@ final class CognitoAuthFlowHandler {
         if (functionRef == null) return TriggerResult.notConfigured();
 
         String region = regionForPool(pool);
-
-        Map<String, Object> event = new HashMap<>();
-        event.put("version", "1");
-        event.put("region", region);
-        event.put("userPoolId", pool.getId());
-        event.put("userName", user == null ? null : user.getUsername());
-        event.put("callerContext", Map.of(
-                "awsSdkVersion", "floci",
-                "clientId", client.getClientId()));
-        event.put("triggerSource", triggerSource);
-        Map<String, Object> req = new HashMap<>(request);
-        if (user != null) {
-            Map<String, String> userAttributes = new LinkedHashMap<>();
-            if (user.getAttributes() != null) {
-                userAttributes.putAll(user.getAttributes());
-            }
-            if ("PreAuthentication".equals(triggerKey)) {
-                userAttributes.put("cognito:user_status", user.getUserStatus());
-            }
-            req.put("userAttributes", userAttributes);
-        }
-        event.put("request", req);
-        event.put("response", new HashMap<>());
+        String clientId = client == null ? CLIENT_ID_NOT_APPLICABLE : client.getClientId();
+        Map<String, Object> event = triggerEvent(pool, clientId, user, triggerKey, triggerSource, request);
 
         try {
             byte[] payload = MAPPER.writeValueAsBytes(event);
@@ -1594,6 +1886,42 @@ final class CognitoAuthFlowHandler {
             LOG.warnv(e, "Cognito trigger {0} invocation failed", triggerKey);
             return TriggerResult.error(TriggerErrorKind.INVOCATION_FAILED, e.getMessage());
         }
+    }
+
+    /** The event every trigger receives: the common parameters around the trigger's own request. */
+    private Map<String, Object> triggerEvent(UserPool pool, String clientId, CognitoUser user, String triggerKey,
+                                             String triggerSource, Map<String, Object> request) {
+        Map<String, Object> event = new HashMap<>();
+        event.put("version", "1");
+        event.put("region", regionForPool(pool));
+        event.put("userPoolId", pool.getId());
+        event.put("userName", user == null ? null : user.getUsername());
+        event.put("callerContext", Map.of(
+                "awsSdkVersion", "floci",
+                "clientId", clientId));
+        event.put("triggerSource", triggerSource);
+        Map<String, Object> req = new HashMap<>(request);
+        if (user != null) {
+            Map<String, String> userAttributes = new LinkedHashMap<>();
+            if (user.getAttributes() != null) {
+                userAttributes.putAll(user.getAttributes());
+            }
+            if ("PreAuthentication".equals(triggerKey) || "CustomEmailSender".equals(triggerKey)
+                    || "CustomMessage".equals(triggerKey)) {
+                userAttributes.put("cognito:user_status", user.getUserStatus());
+            }
+            req.put("userAttributes", userAttributes);
+        }
+        event.put("request", req);
+        Map<String, Object> response = new HashMap<>();
+        if ("CustomMessage".equals(triggerKey)) {
+            req.put("linkParameter", "{##Click Here##}");
+            response.put("emailMessage", null);
+            response.put("emailSubject", null);
+            response.put("smsMessage", null);
+        }
+        event.put("response", response);
+        return event;
     }
 
     private static String lambdaFunctionErrorMessage(InvokeResult result) {
@@ -1653,8 +1981,7 @@ final class CognitoAuthFlowHandler {
         TriggerResult result = invokeTrigger(pool, client, user,
                 "PreAuthentication", "PreAuthentication_Authentication", req);
         if (result.errored()) {
-            throw new AwsException("NotAuthorizedException",
-                    "PreAuthentication failed with error " + result.errorMessage() + ".", 400);
+            throw blockingTriggerFailure(result, "PreAuthentication");
         }
     }
 
@@ -1692,8 +2019,7 @@ final class CognitoAuthFlowHandler {
         req.put("clientMetadata", clientMetadata == null ? Map.of() : clientMetadata);
         TriggerResult result = invokeTrigger(pool, client, user, "PreSignUp", triggerSource, req);
         if (result.errored()) {
-            throw new AwsException("NotAuthorizedException",
-                    "PreSignUp trigger denied signup: " + result.errorMessage(), 400);
+            throw blockingTriggerFailure(result, "PreSignUp");
         }
         if (!result.configured() || result.response() == null) return PreSignUpResponse.empty();
         Map<String, Object> resp = result.response();
@@ -1704,18 +2030,84 @@ final class CognitoAuthFlowHandler {
     }
 
     /**
+     * Fires PreSignUp with triggerSource {@code PreSignUp_AdminCreateUser}. AWS ignores
+     * {@code autoConfirmUser}, {@code autoVerifyEmail} and {@code autoVerifyPhone} for this
+     * source, so the response is discarded and only a failure changes the outcome.
+     */
+    void firePreSignUpForAdminCreateUser(UserPool pool, CognitoUser user,
+                                         Map<String, String> validationData,
+                                         Map<String, String> clientMetadata) {
+        Map<String, Object> req = new HashMap<>();
+        req.put("validationData", validationData == null ? Map.of() : validationData);
+        req.put("clientMetadata", clientMetadata == null ? Map.of() : clientMetadata);
+        TriggerResult result = invokeTrigger(pool, null, user, "PreSignUp", "PreSignUp_AdminCreateUser", req);
+        if (result.errored()) {
+            throw blockingTriggerFailure(result, "PreSignUp");
+        }
+    }
+
+    /**
+     * Maps a failed PreSignUp/PreAuthentication invocation the way Cognito does: a function
+     * that returned an error payload surfaces as {@code UserLambdaValidationException}
+     * ("&lt;Trigger&gt; failed with error &lt;errorMessage&gt;."), while an uninvokable
+     * function or a malformed response keeps the generic Lambda error mapping.
+     */
+    private AwsException blockingTriggerFailure(TriggerResult result, String triggerName) {
+        if (result.errorKind() == TriggerErrorKind.USER_VALIDATION) {
+            return new AwsException("UserLambdaValidationException",
+                    triggerName + " failed with error " + result.errorMessage() + ".", 400);
+        }
+        return triggerFailure(result, triggerName);
+    }
+
+    /**
      * Fires the CustomMessage trigger, if configured, so the function can override the
      * subject/body Cognito would otherwise deliver. Non-blocking: an unconfigured or
      * failing trigger falls back to the pool's default templated message, mirroring how
-     * {@link #firePostConfirmation} tolerates errors.
+     * {@link #firePostConfirmation} tolerates errors. {@code clientMetadata} is the request's
+     * ClientMetadata; a sign-in code's event omits the member when it carries none.
      */
     Map<String, Object> fireCustomMessage(UserPool pool, UserPoolClient client, CognitoUser user,
-                                           String triggerSource) {
+                                           String triggerSource, Map<String, String> clientMetadata) {
         Map<String, Object> req = new HashMap<>();
         req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
-        req.put("usernameParameter", user.getUsername());
-        req.put("clientMetadata", Map.of());
-        TriggerResult result = invokeTrigger(pool, client, user, "CustomMessage", triggerSource, req);
+        req.put("usernameParameter", null);
+        putCustomMessageClientMetadata(req, clientMetadata);
+        return customMessageResponse(pool, client, user, triggerSource, req);
+    }
+
+    /**
+     * Fires the CustomMessage trigger for an AdminCreateUser invitation. The request carries the
+     * {@code {username}} and {@code {####}} placeholders, which Cognito fills in after the function
+     * returns, and the request's {@code ClientMetadata}. Non-blocking, as for the other sources.
+     */
+    Map<String, Object> fireCustomMessageForAdminCreateUser(UserPool pool, CognitoUser user,
+                                                            Map<String, String> clientMetadata) {
+        Map<String, Object> req = new HashMap<>();
+        req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
+        req.put("usernameParameter", CUSTOM_MESSAGE_USERNAME_PARAMETER);
+        putCustomMessageClientMetadata(req, clientMetadata);
+        return customMessageResponse(pool, null, user, "CustomMessage_AdminCreateUser", req);
+    }
+
+    private static void putCustomMessageClientMetadata(Map<String, Object> request, Map<String, String> clientMetadata) {
+        Map<String, String> metadata = requestClientMetadata(clientMetadata);
+        if (metadata != null) {
+            request.put("clientMetadata", metadata);
+        }
+    }
+
+    /**
+     * Normalizes absent or empty ClientMetadata for each trigger's event shape. CustomMessage
+     * omits the member; CustomEmailSender includes it with null.
+     */
+    private static Map<String, String> requestClientMetadata(Map<String, String> clientMetadata) {
+        return clientMetadata == null || clientMetadata.isEmpty() ? null : clientMetadata;
+    }
+
+    private Map<String, Object> customMessageResponse(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                      String triggerSource, Map<String, Object> request) {
+        TriggerResult result = invokeTrigger(pool, client, user, "CustomMessage", triggerSource, request);
         if (!result.configured()) return null;
         if (result.errored()) {
             LOG.warnv("CustomMessage trigger failed for pool {0} (source {1}): {2}",
@@ -1723,6 +2115,41 @@ final class CognitoAuthFlowHandler {
             return null;
         }
         return result.response();
+    }
+
+    boolean hasCustomEmailSender(UserPool pool) {
+        return lambdaService != null && resolveTriggerArn(pool, "CustomEmailSender") != null;
+    }
+
+    /** Whether a code going by {@code deliveryMedium} goes to the CustomEmailSender, so no CustomMessage shapes it. */
+    private boolean customEmailSenderTakesOver(UserPool pool, String deliveryMedium) {
+        return "EMAIL".equals(deliveryMedium) && hasCustomEmailSender(pool);
+    }
+
+    /**
+     * Hands an encrypted code to the pool's CustomEmailSender function, which delivers the email in
+     * Cognito's place. Cognito invokes custom sender triggers asynchronously, so the function's own
+     * outcome never reaches the caller; a function that cannot be invoked at all throws.
+     * {@code clientMetadata} is the request's ClientMetadata, or null when it carries none; the
+     * caller passes null for a sign-in code, whose event Cognito sends without InitiateAuth's
+     * (measured, eu-west-1, 2026-10-16 and 2026-10-20).
+     */
+    void fireCustomEmailSender(UserPool pool, String clientId, CognitoUser user, String triggerSource,
+                               String encryptedCode, Map<String, String> clientMetadata) {
+        Map<String, Object> req = new HashMap<>();
+        req.put("type", "customEmailSenderRequestV1");
+        req.put("code", encryptedCode);
+        req.put("clientMetadata", requestClientMetadata(clientMetadata));
+        byte[] payload;
+        try {
+            payload = MAPPER.writeValueAsBytes(
+                    triggerEvent(pool, clientId == null ? CLIENT_ID_NOT_APPLICABLE : clientId,
+                            user, "CustomEmailSender", triggerSource, req));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Cannot serialize the CustomEmailSender event", e);
+        }
+        lambdaService.invoke(regionForPool(pool), resolveTriggerArn(pool, "CustomEmailSender"), payload,
+                InvocationType.Event);
     }
 
     private CognitoService.ClaimsOverride firePreTokenGeneration(UserPool pool, UserPoolClient client, CognitoUser user,
@@ -1894,27 +2321,238 @@ final class CognitoAuthFlowHandler {
         }
     }
 
+    /**
+     * Ends a successful first factor with tokens, or with the MFA challenge the pool and user call for:
+     * the user's preferred factor, the only one, or SELECT_MFA_TYPE between several. A pool that requires
+     * MFA sets up an authenticator for a user with no factor it can use, when it offers software-token MFA.
+     */
     private Map<String, Object> completePrimaryAuth(UserPool pool, UserPoolClient client, CognitoUser user,
                                                      String triggerSource, Map<String, String> clientMetadata) {
-        if (!"ON".equals(pool.getMfaConfiguration())
-                || !Boolean.TRUE.equals(pool.getSoftwareTokenMfaEnabled())) {
+        String mode = pool.getMfaConfiguration();
+        if (!"ON".equals(mode) && !"OPTIONAL".equals(mode)) {
             return authenticationResult(pool, client, user, triggerSource, clientMetadata);
         }
-        TotpPhase phase = user.getSoftwareTokenMfaSecret() == null
-                ? TotpPhase.SETUP : TotpPhase.CODE_REQUIRED;
+        Map<String, String> metadata = clientMetadata == null ? Map.of() : Map.copyOf(clientMetadata);
+        List<String> factors = mfaFactors(pool, user);
+        if (factors.isEmpty()) {
+            if ("ON".equals(mode) && Boolean.TRUE.equals(pool.getSoftwareTokenMfaEnabled())) {
+                return totpChallenge(pool, client, user, TotpPhase.SETUP, triggerSource, metadata);
+            }
+            return authenticationResult(pool, client, user, triggerSource, clientMetadata);
+        }
+        String preferred = CognitoService.preferredMfaSetting(pool, user);
+        if (preferred != null && factors.contains(preferred)) {
+            return startMfaChallenge(pool, client, user, preferred, triggerSource, metadata);
+        }
+        if (factors.size() == 1) {
+            return startMfaChallenge(pool, client, user, factors.get(0), triggerSource, metadata);
+        }
+        return selectMfaTypeChallenge(pool, client, user, factors, triggerSource, metadata);
+    }
+
+    /**
+     * The MFA factors a sign-in by {@code user} can be asked for, in the order SELECT_MFA_TYPE lists them.
+     * Where MFA is optional, a factor counts once the user has turned it on with SetUserMFAPreference.
+     * Where it is required, every factor the pool offers and the user can receive counts, since AWS lets
+     * users of such a pool choose only which one is preferred. An SMS factor needs a pool that offers SMS
+     * MFA and the user's phone number; an email factor needs the pool's EmailMfaConfiguration and the
+     * user's email address.
+     * A pool that requires MFA does not assign either one when its attribute is the primary account-recovery
+     * destination, as in AWS, unless that would leave the user with no factor and no software-token setup.
+     * A factor the user turned on is never left out.
+     */
+    private List<String> mfaFactors(UserPool pool, CognitoUser user) {
+        List<String> factors = mfaFactors(pool, user, true);
+        // Leaving the recovery attribute out must never leave a pool that requires MFA with no factor at
+        // all: completePrimaryAuth would then issue tokens without a code. When software-token setup is not
+        // available as the alternative, offer the factors the filter dropped.
+        if (factors.isEmpty() && "ON".equals(pool.getMfaConfiguration())
+                && !Boolean.TRUE.equals(pool.getSoftwareTokenMfaEnabled())) {
+            return mfaFactors(pool, user, false);
+        }
+        return factors;
+    }
+
+    /**
+     * @param skipRecoveryAttribute leave out an email or phone factor that the pool would only assign because
+     *                              MFA is required, when that attribute is the primary recovery destination.
+     *                              A factor the user turned on themselves is always kept: AWS prompts for the
+     *                              user's enabled, preferred factor before it works out an assignment.
+     */
+    private List<String> mfaFactors(UserPool pool, CognitoUser user, boolean skipRecoveryAttribute) {
+        boolean required = "ON".equals(pool.getMfaConfiguration());
+        boolean messaging = service.verificationServicesConfigured();
+        boolean smsEnabled = user.getSmsMfaSettings() != null && user.getSmsMfaSettings().isEnabled();
+        boolean emailEnabled = user.getEmailMfaSettings() != null && user.getEmailMfaSettings().isEnabled();
+        List<String> factors = new ArrayList<>();
+        if (messaging && smsMfaOffered(pool) && user.getAttributes().get("phone_number") != null
+                && (smsEnabled || (required
+                        && (!skipRecoveryAttribute || service.isNotPrimaryRecoveryAttribute(pool, "phone_number"))))) {
+            factors.add("SMS_MFA");
+        }
+        if (required ? CognitoService.softwareTokenMfaActive(pool, user) : CognitoService.softwareTokenMfaEnabled(user)) {
+            factors.add("SOFTWARE_TOKEN_MFA");
+        }
+        if (messaging && pool.getEmailMfaConfiguration() != null && user.getAttributes().get("email") != null
+                && (emailEnabled || (required
+                        && (!skipRecoveryAttribute || service.isNotPrimaryRecoveryAttribute(pool, "email"))))) {
+            factors.add("EMAIL_OTP");
+        }
+        return factors;
+    }
+
+    /**
+     * Whether the pool offers SMS MFA: SetUserPoolMfaConfig set an SmsMfaConfiguration, or the pool has the
+     * SmsConfiguration that CreateUserPool requires alongside MfaConfiguration ON or OPTIONAL. AWS makes SMS
+     * an MFA factor for any pool with an SMS configuration.
+     */
+    private static boolean smsMfaOffered(UserPool pool) {
+        return pool.getSmsMfaConfiguration() != null
+                || (pool.getSmsConfiguration() != null && !pool.getSmsConfiguration().isEmpty());
+    }
+
+    private Map<String, Object> startMfaChallenge(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                  String factor, String triggerSource,
+                                                  Map<String, String> metadata) {
+        if ("SOFTWARE_TOKEN_MFA".equals(factor)) {
+            return totpChallenge(pool, client, user, TotpPhase.CODE_REQUIRED, triggerSource, metadata);
+        }
+        boolean sms = "SMS_MFA".equals(factor);
+        Map<String, Object> customMessage = customEmailSenderTakesOver(pool, sms ? "SMS" : "EMAIL") ? Map.of()
+                : fireCustomMessage(pool, client, user, "CustomMessage_Authentication", null);
+        Map<String, String> parameters = new HashMap<>(service.issueMfaCode(pool, client, user,
+                sms ? VerificationCode.Purpose.SMS_MFA : VerificationCode.Purpose.EMAIL_MFA,
+                sms ? "phone_number" : "email", sms ? "SMS" : "EMAIL", customMessage));
+        parameters.put("USERNAME", user.getUsername());
+        Map<String, Object> result = new HashMap<>();
+        result.put("ChallengeName", factor);
+        result.put("Session", issueMfaSession(pool, client, user, factor, List.of(), triggerSource, metadata));
+        result.put("ChallengeParameters", parameters);
+        return result;
+    }
+
+    private Map<String, Object> selectMfaTypeChallenge(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                       List<String> factors, String triggerSource,
+                                                       Map<String, String> metadata) {
+        Map<String, String> parameters = new HashMap<>();
+        parameters.put("USERNAME", user.getUsername());
+        try {
+            parameters.put("MFAS_CAN_CHOOSE", MAPPER.writeValueAsString(factors));
+        } catch (JsonProcessingException e) {
+            throw new AwsException("InternalErrorException", "Failed to list the MFA choices", 500);
+        }
+        Map<String, Object> result = new HashMap<>();
+        result.put("ChallengeName", "SELECT_MFA_TYPE");
+        result.put("Session", issueMfaSession(pool, client, user, "SELECT_MFA_TYPE", factors, triggerSource,
+                metadata));
+        result.put("ChallengeParameters", parameters);
+        return result;
+    }
+
+    private Map<String, Object> totpChallenge(UserPool pool, UserPoolClient client, CognitoUser user,
+                                              TotpPhase phase, String triggerSource, Map<String, String> metadata) {
         String challengeName = phase == TotpPhase.SETUP ? "MFA_SETUP" : "SOFTWARE_TOKEN_MFA";
         Map<String, Object> result = new HashMap<>();
         result.put("ChallengeName", challengeName);
         result.put("Session", issueTotpSession(pool.getId(), user.getUsername(), client.getClientId(),
-                phase, clientMetadata == null ? Map.of() : Map.copyOf(clientMetadata), triggerSource,
-                sessionExpiry(client, clock.instant()), user.getSoftwareTokenMfaSecret()));
+                phase, metadata, triggerSource, sessionExpiry(client, clock.instant()),
+                user.getSoftwareTokenMfaSecret()));
         Map<String, String> parameters = new HashMap<>();
-        parameters.put("USERNAME", user.getUsername());
         if (phase == TotpPhase.SETUP) {
+            parameters.put("USERNAME", user.getUsername());
             parameters.put("MFAS_CAN_SETUP", "[\"SOFTWARE_TOKEN_MFA\"]");
+        } else {
+            // As on AWS: the canonical username (never an alias) to answer with, and the authenticator's name.
+            parameters.put("USER_ID_FOR_SRP", user.getUsername());
+            if (user.getSoftwareTokenMfaDeviceName() != null) {
+                parameters.put("FRIENDLY_DEVICE_NAME", user.getSoftwareTokenMfaDeviceName());
+            }
         }
         result.put("ChallengeParameters", parameters);
         return result;
+    }
+
+    private String issueMfaSession(UserPool pool, UserPoolClient client, CognitoUser user, String challengeName,
+                                   List<String> choices, String triggerSource, Map<String, String> metadata) {
+        purgeExpired(mfaSessions, MfaSession::expiresAt);
+        String token = buildSessionToken(pool.getId(), user.getUsername(), client.getClientId());
+        mfaSessions.put(token, new MfaSession(pool.getId(), user.getUsername(), client.getClientId(), challengeName,
+                List.copyOf(choices), metadata, triggerSource, sessionExpiry(client, clock.instant())));
+        return token;
+    }
+
+    private MfaSession requireMfaSession(UserPool pool, UserPoolClient client, String session,
+                                         String challengeName, Map<String, String> responses) {
+        MfaSession state = session == null ? null : mfaSessions.get(session);
+        if (state == null || !challengeName.equals(state.challengeName())) {
+            throw new AwsException("NotAuthorizedException", "Session not found", 400);
+        }
+        if (sessionExpired(state.expiresAt())) {
+            mfaSessions.remove(session, state);
+            throw sessionExpiredException();
+        }
+        if (!pool.getId().equals(state.userPoolId()) || !client.getClientId().equals(state.clientId())) {
+            throw new AwsException("NotAuthorizedException", "Session does not match client", 400);
+        }
+        String username = responses.get("USERNAME");
+        if (username == null || !username.equals(state.username())) {
+            throw new AwsException("NotAuthorizedException", "Session does not match user", 400);
+        }
+        validateSecretHash(client, responses, username);
+        return state;
+    }
+
+    /**
+     * Answers an SMS_MFA or email (EMAIL_OTP) MFA challenge with the code sent for it. A wrong code
+     * leaves the session for another try, until the code itself stops working. The phone number or
+     * email address the code went to counts as verified afterwards, as on AWS.
+     */
+    private Map<String, Object> handleMessageMfaChallenge(UserPool pool, UserPoolClient client, String challengeName,
+                                                          String session, Map<String, String> responses,
+                                                          Map<String, String> clientMetadata) {
+        MfaSession state = requireMfaSession(pool, client, session, challengeName, responses);
+        boolean sms = "SMS_MFA".equals(challengeName);
+        String code = sms ? responses.get("SMS_MFA_CODE")
+                : responses.getOrDefault("EMAIL_OTP_CODE", responses.get("EMAIL_MFA_CODE"));
+        if (code == null) {
+            throw new AwsException("InvalidParameterException",
+                    "USERNAME and " + (sms ? "SMS_MFA_CODE" : "EMAIL_OTP_CODE") + " are required", 400);
+        }
+        CognitoUser user = service.adminGetUser(pool.getId(), state.username());
+        requireSignInEligible(user);
+        service.consumeSignInOtp(pool.getId(), user.getUsername(),
+                sms ? VerificationCode.Purpose.SMS_MFA : VerificationCode.Purpose.EMAIL_MFA, code);
+        if (!mfaSessions.remove(session, state)) {
+            throw new AwsException("NotAuthorizedException", "Session not found", 400);
+        }
+        service.markAttributeVerified(pool.getId(), user.getUsername(), sms ? "phone_number" : "email");
+        user = service.adminGetUser(pool.getId(), user.getUsername());
+        Map<String, String> metadata = clientMetadata != null && !clientMetadata.isEmpty()
+                ? clientMetadata : state.clientMetadata();
+        return authenticationResult(pool, client, user, state.triggerSource(), metadata);
+    }
+
+    /** Answers SELECT_MFA_TYPE: {@code ANSWER} names one of {@code MFAS_CAN_CHOOSE}, whose challenge follows. */
+    private Map<String, Object> handleSelectMfaType(UserPool pool, UserPoolClient client, String session,
+                                                    Map<String, String> responses,
+                                                    Map<String, String> clientMetadata) {
+        MfaSession state = requireMfaSession(pool, client, session, "SELECT_MFA_TYPE", responses);
+        String answer = responses.get("ANSWER");
+        if ("EMAIL_MFA".equals(answer)) {
+            answer = "EMAIL_OTP";
+        }
+        if (answer == null || !state.choices().contains(answer)) {
+            throw new AwsException("InvalidParameterException",
+                    "ANSWER must be one of " + state.choices(), 400);
+        }
+        if (!mfaSessions.remove(session, state)) {
+            throw new AwsException("NotAuthorizedException", "Session not found", 400);
+        }
+        CognitoUser user = service.adminGetUser(pool.getId(), state.username());
+        requireSignInEligible(user);
+        Map<String, String> metadata = clientMetadata != null && !clientMetadata.isEmpty()
+                ? Map.copyOf(clientMetadata) : state.clientMetadata();
+        return startMfaChallenge(pool, client, user, answer, state.triggerSource(), metadata);
     }
 
     private Map<String, Object> authenticationResult(UserPool pool, UserPoolClient client, CognitoUser user,
@@ -1932,8 +2570,10 @@ final class CognitoAuthFlowHandler {
         return service.generateAuthResult(user, pool, client, override);
     }
 
-    CognitoService.ClaimsOverride preTokenGenerationForRefresh(UserPool pool, UserPoolClient client, CognitoUser user) {
-        return firePreTokenGeneration(pool, client, user, Map.of(), "TokenGeneration_RefreshTokens", List.of());
+    /** {@code scopes} are those of the grant being refreshed, or null for a sign-in through the API. */
+    CognitoService.ClaimsOverride preTokenGenerationForRefresh(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                               List<String> scopes) {
+        return firePreTokenGeneration(pool, client, user, Map.of(), "TokenGeneration_RefreshTokens", scopes);
     }
 
     /**
@@ -1959,6 +2599,10 @@ final class CognitoAuthFlowHandler {
         if (cfg == null) return null;
         Object v = cfg.get(triggerKey);
         if (v instanceof String s && !s.isBlank()) return s;
+        // Custom sender triggers are configured as { LambdaArn, LambdaVersion }.
+        if (v instanceof Map<?, ?> m && m.get("LambdaArn") instanceof String arn && !arn.isBlank()) {
+            return arn;
+        }
         // V2 form: PreTokenGeneration is configured under "PreTokenGenerationConfig"
         // as { LambdaArn, LambdaVersion } (UpdateUserPool / UpdateUserPoolClient
         // API). Fall through so callers using the V1 key still work, and pick up

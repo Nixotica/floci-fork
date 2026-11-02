@@ -14,6 +14,8 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
@@ -84,7 +86,7 @@ public class AppSyncController {
     @Path("/v1/apis")
     public Response listGraphqlApis(@QueryParam("maxResults") Integer maxResults,
                                     @QueryParam("nextToken") String nextToken) {
-        var page = service.listGraphqlApis(maxResults, nextToken);
+        AppSyncService.Page<GraphqlApi> page = service.listGraphqlApis(maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("graphqlApis");
         page.items().forEach(items::addPOJO);
@@ -106,7 +108,7 @@ public class AppSyncController {
         String definition = (String) request.get("definition");
         if (definition != null) {
             try {
-                definition = new String(java.util.Base64.getDecoder().decode(definition), java.nio.charset.StandardCharsets.UTF_8);
+                definition = new String(Base64.getDecoder().decode(definition), StandardCharsets.UTF_8);
             } catch (IllegalArgumentException e) {
                 // Not base64, use as-is
             }
@@ -182,7 +184,7 @@ public class AppSyncController {
     public Response listDataSources(@PathParam("apiId") String apiId,
                                     @QueryParam("maxResults") Integer maxResults,
                                     @QueryParam("nextToken") String nextToken) {
-        var page = service.listDataSources(apiId, maxResults, nextToken);
+        AppSyncService.Page<DataSource> page = service.listDataSources(apiId, maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("dataSources");
         page.items().forEach(items::addPOJO);
@@ -218,7 +220,7 @@ public class AppSyncController {
                                         @PathParam("typeName") String typeName,
                                         @QueryParam("maxResults") Integer maxResults,
                                         @QueryParam("nextToken") String nextToken) {
-        var page = service.listResolversByType(apiId, typeName, maxResults, nextToken);
+        AppSyncService.Page<Resolver> page = service.listResolversByType(apiId, typeName, maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("resolvers");
         page.items().forEach(items::addPOJO);
@@ -270,7 +272,7 @@ public class AppSyncController {
                                             @PathParam("functionId") String functionId,
                                             @QueryParam("maxResults") Integer maxResults,
                                             @QueryParam("nextToken") String nextToken) {
-        var page = service.listResolversByFunction(apiId, functionId, maxResults, nextToken);
+        AppSyncService.Page<Resolver> page = service.listResolversByFunction(apiId, functionId, maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("resolvers");
         page.items().forEach(items::addPOJO);
@@ -332,7 +334,7 @@ public class AppSyncController {
     public Response listFunctions(@PathParam("apiId") String apiId,
                                   @QueryParam("maxResults") Integer maxResults,
                                   @QueryParam("nextToken") String nextToken) {
-        var page = service.listFunctions(apiId, maxResults, nextToken);
+        AppSyncService.Page<FunctionConfiguration> page = service.listFunctions(apiId, maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("functions");
         page.items().forEach(items::addPOJO);
@@ -392,7 +394,7 @@ public class AppSyncController {
     public Response listTypes(@PathParam("apiId") String apiId,
                               @QueryParam("maxResults") Integer maxResults,
                               @QueryParam("nextToken") String nextToken) {
-        var page = service.listTypes(apiId, maxResults, nextToken);
+        AppSyncService.Page<AppSyncType> page = service.listTypes(apiId, maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("types");
         page.items().forEach(items::addPOJO);
@@ -422,7 +424,7 @@ public class AppSyncController {
     public Response listApiKeys(@PathParam("apiId") String apiId,
                                 @QueryParam("maxResults") Integer maxResults,
                                 @QueryParam("nextToken") String nextToken) {
-        var page = service.listApiKeys(apiId, maxResults, nextToken);
+        AppSyncService.Page<ApiKey> page = service.listApiKeys(apiId, maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("apiKeys");
         page.items().forEach(items::addPOJO);
@@ -513,7 +515,7 @@ public class AppSyncController {
     @Path("/v1/domainnames")
     public Response listDomainNames(@QueryParam("maxResults") Integer maxResults,
                                     @QueryParam("nextToken") String nextToken) {
-        var page = service.listDomainNames(maxResults, nextToken);
+        AppSyncService.Page<DomainName> page = service.listDomainNames(maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("domainNameConfigs");
         page.items().forEach(items::addPOJO);
@@ -550,7 +552,7 @@ public class AppSyncController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         String apiId = (String) request.get("apiId");
-        var assoc = service.associateApi(domainName, apiId);
+        ApiAssociation assoc = service.associateApi(domainName, apiId);
         ObjectNode root = objectMapper.createObjectNode();
         root.set("apiAssociation", objectMapper.valueToTree(assoc));
         return Response.status(200).entity(root).build();
@@ -559,7 +561,7 @@ public class AppSyncController {
     @GET
     @Path("/v1/domainnames/{domainName}/apiassociation")
     public Response getApiAssociation(@PathParam("domainName") String domainName) {
-        var assoc = service.getApiAssociation(domainName);
+        ApiAssociation assoc = service.getApiAssociation(domainName);
         ObjectNode root = objectMapper.createObjectNode();
         root.set("apiAssociation", objectMapper.valueToTree(assoc));
         return Response.ok(root).build();
@@ -619,7 +621,7 @@ public class AppSyncController {
     public Response listChannelNamespaces(@PathParam("apiId") String apiId,
                                           @QueryParam("maxResults") Integer maxResults,
                                           @QueryParam("nextToken") String nextToken) {
-        var page = service.listChannelNamespaces(apiId, maxResults, nextToken);
+        AppSyncService.Page<ChannelNamespace> page = service.listChannelNamespaces(apiId, maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("channelNamespaces");
         page.items().forEach(items::addPOJO);
@@ -641,7 +643,7 @@ public class AppSyncController {
         String region = regionResolver.resolveRegion(headers);
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
-        var assoc = service.createMergedApiAssociation(sourceApiIdentifier, request, region);
+        SourceApiAssociation assoc = service.createMergedApiAssociation(sourceApiIdentifier, request, region);
         ObjectNode root = objectMapper.createObjectNode();
         root.set("sourceApiAssociation", objectMapper.valueToTree(assoc));
         return Response.status(200).entity(root).build();
@@ -655,7 +657,7 @@ public class AppSyncController {
         String region = regionResolver.resolveRegion(headers);
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
-        var assoc = service.createSourceApiAssociation(mergedApiIdentifier, request, region);
+        SourceApiAssociation assoc = service.createSourceApiAssociation(mergedApiIdentifier, request, region);
         ObjectNode root = objectMapper.createObjectNode();
         root.set("sourceApiAssociation", objectMapper.valueToTree(assoc));
         return Response.status(200).entity(root).build();
@@ -665,7 +667,7 @@ public class AppSyncController {
     @Path("/v1/mergedApis/{mergedApiIdentifier}/sourceApiAssociations/{associationId}")
     public Response getSourceApiAssociation(@PathParam("mergedApiIdentifier") String mergedApiIdentifier,
                                              @PathParam("associationId") String associationId) {
-        var assoc = service.getSourceApiAssociation(mergedApiIdentifier, associationId);
+        SourceApiAssociation assoc = service.getSourceApiAssociation(mergedApiIdentifier, associationId);
         ObjectNode root = objectMapper.createObjectNode();
         root.set("sourceApiAssociation", objectMapper.valueToTree(assoc));
         return Response.ok(root).build();
@@ -678,7 +680,7 @@ public class AppSyncController {
                                                 String body) throws IOException {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
-        var assoc = service.updateSourceApiAssociation(mergedApiIdentifier, associationId, request);
+        SourceApiAssociation assoc = service.updateSourceApiAssociation(mergedApiIdentifier, associationId, request);
         ObjectNode root = objectMapper.createObjectNode();
         root.set("sourceApiAssociation", objectMapper.valueToTree(assoc));
         return Response.ok(root).build();
@@ -689,7 +691,7 @@ public class AppSyncController {
     public Response listSourceApiAssociations(@PathParam("apiId") String apiId,
                                                @QueryParam("maxResults") Integer maxResults,
                                                @QueryParam("nextToken") String nextToken) {
-        var page = service.listSourceApiAssociations(apiId, maxResults, nextToken);
+        AppSyncService.Page<SourceApiAssociationSummary> page = service.listSourceApiAssociations(apiId, maxResults, nextToken);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("sourceApiAssociationSummaries");
         page.items().forEach(items::addPOJO);
@@ -715,7 +717,7 @@ public class AppSyncController {
     @Path("/v1/sourceApis/{sourceApiIdentifier}/mergedApiAssociations/{associationId}")
     public Response disassociateMergedGraphqlApi(@PathParam("sourceApiIdentifier") String sourceApiIdentifier,
                                                     @PathParam("associationId") String associationId) {
-        var assoc = service.deleteMergedApiAssociation(sourceApiIdentifier, associationId);
+        SourceApiAssociation assoc = service.deleteMergedApiAssociation(sourceApiIdentifier, associationId);
         ObjectNode root = objectMapper.createObjectNode();
         root.put("sourceApiAssociationStatus", assoc.getSourceApiAssociationStatus());
         return Response.ok(root).build();

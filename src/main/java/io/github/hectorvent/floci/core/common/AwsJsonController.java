@@ -5,21 +5,23 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
-import io.github.hectorvent.floci.services.cloudcontrol.CloudControlJsonHandler;
 import io.github.hectorvent.floci.services.bcmpricingcalculator.BcmPricingCalculatorJsonHandler;
+import io.github.hectorvent.floci.services.cloudcontrol.CloudControlJsonHandler;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbRequestShapes;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbResponses;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbStreamsJsonHandler;
-import io.github.hectorvent.floci.services.networkfirewall.NetworkFirewallJsonHandler;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceJsonHandler;
+import io.github.hectorvent.floci.services.networkfirewall.NetworkFirewallJsonHandler;
+import io.github.hectorvent.floci.services.paymentcryptography.PaymentCryptographyJsonHandler;
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandler;
 import io.github.hectorvent.floci.services.swf.SwfJsonHandler;
 import io.github.hectorvent.floci.services.timestreaminfluxdb.TimestreamInfluxDbJsonHandler;
 import io.github.hectorvent.floci.services.verifiedpermissions.VerifiedPermissionsJsonHandler;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
@@ -34,8 +36,15 @@ import org.jboss.logging.Logger;
  * Currently supported services:
  * - DynamoDB (DynamoDB_20120810.*)
  * - SQS (AmazonSQS.*)
+ * <p>
+ * A gzip-encoded CloudWatch {@code PutMetricData} body arrives here decompressed, by
+ * {@link CloudWatchGzipReaderInterceptor}.
+ * <p>
+ * Requests run on virtual threads: SQS ReceiveMessage and Step Functions GetActivityTask wait up
+ * to 20 and 60 seconds for work, and that wait must not hold one of the shared request workers.
  */
 @Path("/")
+@CloudWatchGzipBody
 public class AwsJsonController {
 
     public static final String CONTENT_TYPE_AWS_JSON_1_0 = "application/x-amz-json-1.0";
@@ -54,6 +63,7 @@ public class AwsJsonController {
     private final CloudControlJsonHandler cloudControlJsonHandler;
     private final SwfJsonHandler swfJsonHandler;
     private final NetworkFirewallJsonHandler networkFirewallJsonHandler;
+    private final PaymentCryptographyJsonHandler paymentCryptographyJsonHandler;
     private final MarketplaceJsonHandler marketplaceJsonHandler;
     private final VerifiedPermissionsJsonHandler verifiedPermissionsJsonHandler;
     private final BcmPricingCalculatorJsonHandler bcmPricingCalculatorJsonHandler;
@@ -70,6 +80,7 @@ public class AwsJsonController {
                              CloudControlJsonHandler cloudControlJsonHandler,
                              SwfJsonHandler swfJsonHandler,
                              NetworkFirewallJsonHandler networkFirewallJsonHandler,
+                             PaymentCryptographyJsonHandler paymentCryptographyJsonHandler,
                              MarketplaceJsonHandler marketplaceJsonHandler,
                              VerifiedPermissionsJsonHandler verifiedPermissionsJsonHandler,
                              BcmPricingCalculatorJsonHandler bcmPricingCalculatorJsonHandler,
@@ -87,15 +98,40 @@ public class AwsJsonController {
         this.cloudControlJsonHandler = cloudControlJsonHandler;
         this.swfJsonHandler = swfJsonHandler;
         this.networkFirewallJsonHandler = networkFirewallJsonHandler;
+        this.paymentCryptographyJsonHandler = paymentCryptographyJsonHandler;
         this.marketplaceJsonHandler = marketplaceJsonHandler;
         this.verifiedPermissionsJsonHandler = verifiedPermissionsJsonHandler;
         this.bcmPricingCalculatorJsonHandler = bcmPricingCalculatorJsonHandler;
         this.timestreamInfluxDbJsonHandler = timestreamInfluxDbJsonHandler;
     }
 
+    /**
+     * Accept plain JSON only for catalog descriptors declaring that format.
+     * Keep the wire headers intact and delegate to the same JSON handler.
+     */
+    @POST
+    @Consumes("application/json")
+    @Produces("application/json")
+    @RunOnVirtualThread
+    public Response handlePlainJsonRequest(
+            @HeaderParam("X-Amz-Target") String target,
+            @Context HttpHeaders httpHeaders,
+            String body) {
+        if (target == null) {
+            return JsonErrorResponseUtils.createMissingTargetErrorResponse();
+        }
+        if (catalog.matchPlainJsonTarget(target).isEmpty()) {
+            return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
+        }
+        return Response.fromResponse(handleJsonRequest(target, httpHeaders, body))
+                .type("application/json")
+                .build();
+    }
+
     @POST
     @Consumes(CONTENT_TYPE_AWS_JSON_1_0)
     @Produces(CONTENT_TYPE_AWS_JSON_1_0)
+    @RunOnVirtualThread
     public Response handleJsonRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
@@ -138,6 +174,9 @@ public class AwsJsonController {
                     if (targetMatch.prefix().startsWith("DynamoDBStreams_")) {
                         yield dynamoDbStreamsJsonHandler.handle(action, request, region);
                     }
+                    if (targetMatch.jsonOnly()) {
+                        yield dynamoDbJsonHandler.handleLegacy(action, request, region);
+                    }
                     DynamoDbRequestShapes.check(action, request);
                     yield dynamoDbJsonHandler.handle(action, request, region);
                 }
@@ -145,11 +184,17 @@ public class AwsJsonController {
                 case "sns" -> snsJsonHandler.handle(action, request, region);
                 case "states" -> sfnJsonHandler.handle(action, request, region);
                 case "swf" -> swfJsonHandler.handle(action, request, region);
-                case "monitoring" -> cloudWatchMetricsJsonHandler.handle(action, request, region);
+                case "monitoring" -> targetMatch.jsonOnly()
+                        ? cloudWatchMetricsJsonHandler.handleLegacy(action, request, region)
+                        : cloudWatchMetricsJsonHandler.handle(action, request, region);
                 case "cloudcontrol" -> cloudControlJsonHandler.handle(
                                         action, request, region, regionResolver.getAccountId());
                 case "network-firewall" -> networkFirewallJsonHandler.handle(
                         action, request, region, regionResolver.getAccountId());
+                // The control plane of Payment Cryptography is an awsJson 1.0 service: the
+                // AWS SDK sends application/x-amz-json-1.0 and targets
+                // PaymentCryptographyControlPlane.<Operation>.
+                case "paymentcryptography" -> paymentCryptographyJsonHandler.handle(action, request, region);
                 case "marketplace" -> marketplaceJsonHandler.handle(action, request, region);
                 case "verifiedpermissions" -> verifiedPermissionsJsonHandler.handle(action, request, region);
                 case "bcm-pricing-calculator" -> bcmPricingCalculatorJsonHandler.handle(action, request, region);
@@ -175,7 +220,22 @@ public class AwsJsonController {
         // boundary so other callers of DynamoDbJsonHandler (CBOR, API Gateway proxy,
         // Step Functions tasks) keep their original ObjectNode entity.
         if ("dynamodb".equals(serviceKey)) {
+            if (targetMatch.jsonOnly()) {
+                response = DynamoDbResponses.withLegacyErrorNamespace(response, objectMapper);
+            }
             return DynamoDbResponses.withCrc32(response, objectMapper);
+        }
+        if ("sqs".equals(serviceKey) && response.getEntity() != null
+                && !(response.getEntity() instanceof byte[])) {
+            byte[] bodyBytes = JsonResponseBytes.serializeOrNull(response.getEntity(), objectMapper,
+                    LOG, "Failed to serialize SQS JSON response");
+            if (bodyBytes == null) {
+                return response;
+            }
+            return Response.fromResponse(response)
+                    .entity(bodyBytes)
+                    .type(CONTENT_TYPE_AWS_JSON_1_0)
+                    .build();
         }
         return response;
     }

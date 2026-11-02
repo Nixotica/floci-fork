@@ -5,6 +5,10 @@
 
 Floci emulates the AWS Glue Data Catalog (databases, tables, partitions, functions, connections) and Glue Schema Registry, allowing you to manage local data lake metadata and schema-version workflows.
 
+Table and partition column-statistics reads fill omitted required numeric members with `0` for
+string, binary, long, double, decimal, date, and boolean statistics. Supplied values and stored
+records are preserved; optional minimum and maximum values remain absent when omitted.
+
 ## Supported Actions
 
 ### Data Catalog
@@ -130,7 +134,7 @@ retroactively.
 |--------|-------------|
 | CreateSecurityConfiguration | Creates a named security configuration. |
 | GetSecurityConfiguration | Returns a named security configuration. |
-| GetSecurityConfigurations | Lists stored security configurations. `MaxResults` and `NextToken` are currently ignored, so the complete list is returned. |
+| GetSecurityConfigurations | Lists stored security configurations with `MaxResults` (1 to 200) and `NextToken` pagination, scoped to the account and region. |
 | DeleteSecurityConfiguration | Deletes a named security configuration. |
 
 #### Jobs
@@ -249,6 +253,21 @@ Blueprints are not emulated.
 | GetClassifiers | Lists classifiers, paged by `MaxResults` and `NextToken`. |
 | UpdateClassifier | Partially updates a classifier without changing its type. |
 | DeleteClassifier | Deletes a classifier by name. |
+
+#### Data quality rulesets
+
+| Action | Description |
+|--------|-------------|
+| CreateDataQualityRuleset | Stores a named DQDL ruleset, optionally with a `TargetTable` and tags. |
+| GetDataQualityRuleset | Returns a ruleset with its `CreatedOn` and `LastModifiedOn`. |
+| UpdateDataQualityRuleset | Replaces the `Description` or `Ruleset` the request sets and keeps the rest. |
+| DeleteDataQualityRuleset | Deletes a ruleset and its tags. |
+| ListDataQualityRulesets | Lists rulesets in name order with `RuleCount`, filtered by `Filter` (name, description, target table, created and last modified times) and `Tags`, paged by `MaxResults` (1 to 1000) and `NextToken`. |
+
+Rulesets are stored, not evaluated: there are no recommendation or evaluation runs, so
+`RecommendationRunId` is never set. `RuleCount` is the number of entries in the ruleset's
+top level `Rules = [ ... ]` list, with a composite rule counted once. Rulesets are tagged by
+ARN `arn:aws:glue:<region>:<account>:dataQualityRuleset/<name>`.
 
 ### Schema Registry
 

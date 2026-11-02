@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.securityhub;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.JsonErrorResponseUtils;
@@ -26,6 +27,7 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
 import java.time.Instant;
+import java.util.Map;
 
 @Path("/")
 @Produces(MediaType.APPLICATION_JSON)
@@ -58,7 +60,7 @@ public class SecurityHubController {
         }
         SecurityHubState state = securityHubService.organizationAdminState(region(headers));
         ObjectNode response = objectMapper.createObjectNode();
-        var accounts = response.putArray("AdminAccounts");
+        ArrayNode accounts = response.putArray("AdminAccounts");
         String requestedFeature = securityHubService.normalizeFeature(feature);
         if (state.getAdminAccountId() != null && requestedFeature.equals(state.getAdminFeature())) {
             accounts.addObject()
@@ -109,6 +111,55 @@ public class SecurityHubController {
     }
 
     @GET
+    @Path("/standards")
+    public Response describeStandards(@Context HttpHeaders headers) {
+        String region = region(headers);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode standards = response.putArray("Standards");
+        for (SecurityHubService.Standard standard : SecurityHubService.STANDARDS) {
+            ObjectNode item = standards.addObject()
+                    .put("StandardsArn", securityHubService.standardsArn(region, standard))
+                    .put("Name", standard.name())
+                    .put("Description", standard.name())
+                    .put("EnabledByDefault", standard.enabledByDefault());
+            item.putObject("StandardsManagedBy").put("Company", "AWS").put("Product", "Security Hub");
+        }
+        return Response.ok(response).build();
+    }
+
+    @POST
+    @Path("/standards/register")
+    public Response batchEnableStandards(@Context HttpHeaders headers, String body) {
+        return subscriptions(securityHubService.enableStandards(region(headers), readTree(body)), "READY");
+    }
+
+    @POST
+    @Path("/standards/deregister")
+    public Response batchDisableStandards(@Context HttpHeaders headers, String body) {
+        return subscriptions(securityHubService.disableStandards(region(headers), readTree(body)), "DELETING");
+    }
+
+    @POST
+    @Path("/standards/get")
+    public Response getEnabledStandards(@Context HttpHeaders headers, String body) {
+        return subscriptions(securityHubService.enabledStandards(region(headers), readTree(body)), "READY");
+    }
+
+    private Response subscriptions(Map<String, String> subscriptions, String status) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode items = response.putArray("StandardsSubscriptions");
+        subscriptions.forEach((subscriptionArn, standardsArn) -> {
+            ObjectNode item = items.addObject()
+                    .put("StandardsSubscriptionArn", subscriptionArn)
+                    .put("StandardsArn", standardsArn)
+                    .put("StandardsStatus", status)
+                    .put("StandardsControlsUpdatable", "READY_FOR_UPDATES");
+            item.putObject("StandardsInput");
+        });
+        return Response.ok(response).build();
+    }
+
+    @GET
     @Path("/findingAggregator/list")
     public Response listFindingAggregators(@Context HttpHeaders headers,
                                            @QueryParam("MaxResults") String maxResultsValue,
@@ -122,7 +173,7 @@ public class SecurityHubController {
         }
         SecurityHubState state = securityHubService.state(region(headers));
         ObjectNode response = objectMapper.createObjectNode();
-        var items = response.putArray("FindingAggregators");
+        ArrayNode items = response.putArray("FindingAggregators");
         if (state.getAggregatorArn() != null) {
             items.addObject().put("FindingAggregatorArn", state.getAggregatorArn());
         }
@@ -182,10 +233,10 @@ public class SecurityHubController {
                                               @QueryParam("NextToken") String nextToken) {
         String region = region(headers);
         Integer maxResults = Pagination.parseMaxResults(maxResultsValue, "InvalidInputException");
-        PaginatedResult<java.util.Map.Entry<String, JsonNode>> page =
+        PaginatedResult<Map.Entry<String, JsonNode>> page =
                 securityHubService.policyPage(region, maxResults, nextToken);
         ObjectNode response = objectMapper.createObjectNode();
-        var items = response.putArray("ConfigurationPolicySummaries");
+        ArrayNode items = response.putArray("ConfigurationPolicySummaries");
         page.items().forEach(entry -> items.add(policySummary(region, entry.getKey(), entry.getValue())));
         if (page.nextToken() != null) {
             response.put("NextToken", page.nextToken());
@@ -246,7 +297,7 @@ public class SecurityHubController {
         String region = region(headers);
         PaginatedResult<SecurityHubAssociation> page = securityHubService.associationPage(region, readTree(body));
         ObjectNode response = objectMapper.createObjectNode();
-        var items = response.putArray("ConfigurationPolicyAssociationSummaries");
+        ArrayNode items = response.putArray("ConfigurationPolicyAssociationSummaries");
         page.items().forEach(entry -> items.add(association(entry)));
         if (page.nextToken() != null) {
             response.put("NextToken", page.nextToken());

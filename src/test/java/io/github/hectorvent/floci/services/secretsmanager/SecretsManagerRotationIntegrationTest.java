@@ -4,14 +4,21 @@ import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
-import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.InjectMock;
+import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -28,9 +35,25 @@ public class SecretsManagerRotationIntegrationTest {
     @InjectMock
     LambdaService lambdaService;
 
+    private final List<String> secretsToDelete = new ArrayList<>();
+
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @AfterEach
+    void deleteCreatedSecrets() {
+        for (String secretId : secretsToDelete) {
+            given()
+                .header("X-Amz-Target", "secretsmanager.DeleteSecret")
+                .contentType(SM_CONTENT_TYPE)
+                .body("{\"SecretId\": \"" + secretId + "\", \"ForceDeleteWithoutRecovery\": true}")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+        }
     }
 
     @Test
@@ -56,6 +79,7 @@ public class SecretsManagerRotationIntegrationTest {
         .then()
             .statusCode(200)
             .extract().asString();
+        secretsToDelete.add(secretName);
 
         // extract ARN if needed, but we can just refer by Name
 
@@ -87,7 +111,7 @@ public class SecretsManagerRotationIntegrationTest {
         boolean hasFinish = false;
 
         for (byte[] payloadBytes : payloadCaptor.getAllValues()) {
-            String payloadStr = new String(payloadBytes, java.nio.charset.StandardCharsets.UTF_8);
+            String payloadStr = new String(payloadBytes, StandardCharsets.UTF_8);
             if (payloadStr.contains("\"Step\":\"createSecret\"")) hasCreate = true;
             if (payloadStr.contains("\"Step\":\"setSecret\"")) hasSet = true;
             if (payloadStr.contains("\"Step\":\"testSecret\"")) hasTest = true;
@@ -98,6 +122,18 @@ public class SecretsManagerRotationIntegrationTest {
         assertTrue(hasSet, "Should invoke setSecret");
         assertTrue(hasTest, "Should invoke testSecret");
         assertTrue(hasFinish, "Should invoke finishSecret");
+
+        // Let the rotation finish before cleanup deletes the secret, which it would otherwise go on
+        // trying to update.
+        await().atMost(Duration.ofSeconds(5)).until(() -> given()
+                .header("X-Amz-Target", "secretsmanager.DescribeSecret")
+                .contentType(SM_CONTENT_TYPE)
+                .body("{\"SecretId\": \"" + secretName + "\"}")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract().path("LastRotatedDate") != null);
     }
 
     @Test
@@ -111,6 +147,7 @@ public class SecretsManagerRotationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        secretsToDelete.add(secretName);
 
         given()
             .header("X-Amz-Target", "secretsmanager.RotateSecret")

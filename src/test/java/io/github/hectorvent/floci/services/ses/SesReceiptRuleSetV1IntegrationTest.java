@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ses;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -24,7 +25,7 @@ class SesReceiptRuleSetV1IntegrationTest {
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-west-2/email/aws4_request";
     private static final String RS = "floci-v1-rule-set";
 
-    private static io.restassured.specification.RequestSpecification req(String action) {
+    private static RequestSpecification req(String action) {
         return given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", AUTH)
@@ -66,6 +67,18 @@ class SesReceiptRuleSetV1IntegrationTest {
         .when().post("/").then().statusCode(200)
                 .body(containsString("<RuleSets>"))
                 .body(containsString("<Name>" + RS + "</Name>"));
+    }
+
+    // Unordered on purpose: it holds whether or not the rule set above still exists.
+    @Test
+    void listReceiptRuleSets_treatsAnEmptyTokenAsAbsentAndRefusesAnyOther() {
+        req("ListReceiptRuleSets").formParam("NextToken", "")
+        .when().post("/").then().statusCode(200)
+                .body(containsString("ListReceiptRuleSetsResponse"));
+        req("ListReceiptRuleSets").formParam("NextToken", "garbage")
+        .when().post("/").then().statusCode(400)
+                .body(containsString("<Code>InvalidParameterValue</Code>"))
+                .body(containsString("<Message>Invalid page token: garbage</Message>"));
     }
 
     @Test

@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.acm.model.Certificate;
 import io.github.hectorvent.floci.services.acm.model.CertificateOptions;
 import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
@@ -97,10 +99,16 @@ public class AcmJsonHandler {
         if (domainName == null || domainName.isBlank()) {
             return Response.status(400)
                 .entity(new AwsErrorResponse("ValidationException",
-                    "Value null at 'domainName' failed to satisfy constraint: Member must not be null"))
+                    SmithyValidationErrors.notNull("domainName")))
                 .build();
         }
-        List<String> sans = parseStringList(request.path("SubjectAlternativeNames"));
+        JsonNode sanNode = request.path("SubjectAlternativeNames");
+        if (sanNode.isArray() && sanNode.isEmpty()) {
+            throw SmithyValidationErrors.validationException(
+                "Value '[]' at 'subjectAlternativeNames' failed to satisfy "
+                    + "constraint: Member must have length greater than or equal to 1");
+        }
+        List<String> sans = parseStringList(sanNode);
         ValidationMethod validationMethod = parseValidationMethod(request.path("ValidationMethod").asText(null));
         String idempotencyToken = request.path("IdempotencyToken").asText(null);
         KeyAlgorithm keyAlgorithm = KeyAlgorithm.fromAwsName(request.path("KeyAlgorithm").asText(null));
@@ -154,10 +162,11 @@ public class AcmJsonHandler {
 
         ListResult result = service.listCertificates(statuses, keyTypes, region, maxItems, nextToken);
 
+        Map<String, List<String>> consumers = service.certificateInUseBy(result.certificates());
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode summaryList = objectMapper.createArrayNode();
         for (Certificate cert : result.certificates()) {
-            summaryList.add(buildCertificateSummary(cert));
+            summaryList.add(buildCertificateSummary(cert, consumers.get(cert.getArn())));
         }
         response.set("CertificateSummaryList", summaryList);
         if (result.nextToken() != null) {
@@ -377,25 +386,23 @@ public class AcmJsonHandler {
         }
 
         if (cert.getCreatedAt() != null) {
-            node.put("CreatedAt", cert.getCreatedAt().toEpochMilli() / 1000.0);
+            node.put("CreatedAt", EpochSeconds.fromInstant(cert.getCreatedAt()));
         }
         if (cert.getIssuedAt() != null) {
-            node.put("IssuedAt", cert.getIssuedAt().toEpochMilli() / 1000.0);
+            node.put("IssuedAt", EpochSeconds.fromInstant(cert.getIssuedAt()));
         }
         if (cert.getImportedAt() != null) {
-            node.put("ImportedAt", cert.getImportedAt().toEpochMilli() / 1000.0);
+            node.put("ImportedAt", EpochSeconds.fromInstant(cert.getImportedAt()));
         }
         if (cert.getNotBefore() != null) {
-            node.put("NotBefore", cert.getNotBefore().toEpochMilli() / 1000.0);
+            node.put("NotBefore", EpochSeconds.fromInstant(cert.getNotBefore()));
         }
         if (cert.getNotAfter() != null) {
-            node.put("NotAfter", cert.getNotAfter().toEpochMilli() / 1000.0);
+            node.put("NotAfter", EpochSeconds.fromInstant(cert.getNotAfter()));
         }
 
         ArrayNode inUseBy = objectMapper.createArrayNode();
-        if (cert.getInUseBy() != null) {
-            cert.getInUseBy().forEach(inUseBy::add);
-        }
+        service.certificateInUseBy(cert).forEach(inUseBy::add);
         node.set("InUseBy", inUseBy);
 
         if (cert.getDomainValidationOptions() != null && !cert.getDomainValidationOptions().isEmpty()) {
@@ -456,7 +463,7 @@ public class AcmJsonHandler {
         return node;
     }
 
-    private ObjectNode buildCertificateSummary(Certificate cert) {
+    private ObjectNode buildCertificateSummary(Certificate cert, List<String> consumers) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("CertificateArn", cert.getArn());
         node.put("DomainName", cert.getDomainName());
@@ -486,23 +493,23 @@ public class AcmJsonHandler {
         node.set("ExtendedKeyUsages", extKeyUsages);
 
         if (cert.getCreatedAt() != null) {
-            node.put("CreatedAt", cert.getCreatedAt().toEpochMilli() / 1000.0);
+            node.put("CreatedAt", EpochSeconds.fromInstant(cert.getCreatedAt()));
         }
         if (cert.getIssuedAt() != null) {
-            node.put("IssuedAt", cert.getIssuedAt().toEpochMilli() / 1000.0);
+            node.put("IssuedAt", EpochSeconds.fromInstant(cert.getIssuedAt()));
         }
         if (cert.getImportedAt() != null) {
-            node.put("ImportedAt", cert.getImportedAt().toEpochMilli() / 1000.0);
+            node.put("ImportedAt", EpochSeconds.fromInstant(cert.getImportedAt()));
         }
         if (cert.getNotBefore() != null) {
-            node.put("NotBefore", cert.getNotBefore().toEpochMilli() / 1000.0);
+            node.put("NotBefore", EpochSeconds.fromInstant(cert.getNotBefore()));
         }
         if (cert.getNotAfter() != null) {
-            node.put("NotAfter", cert.getNotAfter().toEpochMilli() / 1000.0);
+            node.put("NotAfter", EpochSeconds.fromInstant(cert.getNotAfter()));
         }
 
         node.put("RenewalEligibility", "INELIGIBLE");
-        node.put("InUse", cert.getInUseBy() != null && !cert.getInUseBy().isEmpty());
+        node.put("InUse", !consumers.isEmpty());
 
         return node;
     }

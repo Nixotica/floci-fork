@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CidrCanonicalizer;
@@ -10,7 +11,10 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
+import io.github.hectorvent.floci.services.ec2.model.ManagedPrefixList;
 import io.github.hectorvent.floci.services.ec2.model.NatGateway;
+import io.github.hectorvent.floci.services.ec2.model.NatGatewayAddress;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.Route;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.RouteTableAssociation;
@@ -21,16 +25,19 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * CloudFormation provisioning for the EC2 networking types: {@code AWS::EC2::Subnet},
- * {@code InternetGateway}, {@code RouteTable}, {@code Route}, {@code NatGateway}, {@code EIP} and
+ * {@code InternetGateway}, {@code RouteTable}, {@code Route}, {@code NatGateway}, {@code EIP}, {@code PrefixList} and
  * {@code SubnetRouteTableAssociation}. Extracted from the former CloudFormation monolith as
  * part of the per-service decomposition. The physical id is the EC2 id the service assigns, except
  * for a Route, whose id is the registry primary identifier {@code <RouteTableId>|<destination>} (what
@@ -55,13 +62,15 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
     private static final String ROUTE = "AWS::EC2::Route";
     private static final String NAT_GATEWAY = "AWS::EC2::NatGateway";
     private static final String EIP = "AWS::EC2::EIP";
+    private static final String PREFIX_LIST = "AWS::EC2::PrefixList";
     private static final String SUBNET_ROUTE_TABLE_ASSOCIATION = "AWS::EC2::SubnetRouteTableAssociation";
     private static final String ROUTE_ID_SEPARATOR = "|";
     private static final Logger LOG = Logger.getLogger(Ec2NetworkCfnProvisioner.class);
     /**
      * What an in-place update changed on a reused entity, recorded before the change so a stack
      * rollback can put it back: the prior tags (and the keys the update wrote), a subnet's prior
-     * MapPublicIpOnLaunch, a route's prior target. Internal, like the other {@code __Floci} attributes.
+     * MapPublicIpOnLaunch, a route's prior target, a prefix list's prior name, capacity and entries.
+     * Internal, like the other {@code __Floci} attributes.
      */
     static final String IN_PLACE_PRIOR_ATTR = "__FlociEc2NetworkPrior";
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -75,7 +84,13 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public Set<String> resourceTypes() {
-        return Set.of(SUBNET, INTERNET_GATEWAY, ROUTE_TABLE, ROUTE, NAT_GATEWAY, EIP, SUBNET_ROUTE_TABLE_ASSOCIATION);
+        return Set.of(SUBNET, INTERNET_GATEWAY, ROUTE_TABLE, ROUTE, NAT_GATEWAY, EIP, PREFIX_LIST,
+                SUBNET_ROUTE_TABLE_ASSOCIATION);
+    }
+
+    @Override
+    public Map<String, Set<String>> integerAttributes() {
+        return Map.of(PREFIX_LIST, Set.of("Version"));
     }
 
     @Override
@@ -88,6 +103,7 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             case ROUTE -> provisionRoute(r, props, ctx);
             case NAT_GATEWAY -> provisionNatGateway(r, props, ctx);
             case EIP -> provisionEip(r, props, ctx);
+            case PREFIX_LIST -> provisionPrefixList(r, props, ctx);
             case SUBNET_ROUTE_TABLE_ASSOCIATION -> provisionSubnetRouteTableAssociation(r, props, ctx);
             default -> throw new IllegalStateException("Ec2NetworkCfnProvisioner cannot handle " + r.getResourceType());
         }
@@ -121,10 +137,13 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
     /**
      * A replacement is undone through the cleanup record: the displaced entity was never touched.
      * A reused entity that an update changed in place (tags, a subnet's MapPublicIpOnLaunch, a
-     * route's target) is put back from the snapshot taken before the change. Without either, the
-     * update changed nothing about the entity. A provision that fails mid-way restores its own
-     * snapshot before the failure propagates (see {@link #guarded}), so the previous metadata the
-     * engine restores for that resource matches the entity again.
+     * route's target, a prefix list's name, capacity or entries) is put back from the snapshot
+     * taken before the change; the snapshot is removed only after the restore succeeds, so a
+     * restore that throws keeps it for a ContinueUpdateRollback retry. Without either, the update
+     * changed nothing about the entity.
+     * A provision that fails mid-way restores its own snapshot before the failure propagates (see
+     * {@link #guarded}), so the previous metadata the engine restores for that resource matches
+     * the entity again.
      */
     @Override
     public boolean rollbackUpdate(StackResource resource) {
@@ -132,10 +151,7 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             resource.getAttributes().remove(IN_PLACE_PRIOR_ATTR);
             return true;
         }
-        String snapshot = resource.getAttributes().remove(IN_PLACE_PRIOR_ATTR);
-        if (snapshot != null) {
-            restoreInPlace(resource, snapshot);
-        }
+        undoInPlace(resource);
         return true;
     }
 
@@ -150,10 +166,14 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         String entityId = prior.path("entityId").asText();
         if (prior.has("tags")) {
             Map<String, String> priorTags = new LinkedHashMap<>();
-            prior.get("tags").fields().forEachRemaining(f -> priorTags.put(f.getKey(), f.getValue().asText()));
+            prior.get("tags").fields().forEachRemaining(f -> {
+                if (!Ec2Service.isAwsTagKey(f.getKey())) {
+                    priorTags.put(f.getKey(), f.getValue().asText());
+                }
+            });
             List<Tag> added = new ArrayList<>();
             prior.path("appliedKeys").forEach(key -> {
-                if (!priorTags.containsKey(key.asText())) {
+                if (!Ec2Service.isAwsTagKey(key.asText()) && !priorTags.containsKey(key.asText())) {
                     added.add(new Tag(key.asText(), null));
                 }
             });
@@ -167,6 +187,19 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         if (prior.has("mapPublicIpOnLaunch")) {
             ec2Service.modifySubnetAttribute(region, entityId, "mapPublicIpOnLaunch", prior.get("mapPublicIpOnLaunch").asText());
         }
+        if (prior.has("prefixList")) {
+            // Putting the entries back is a modification like any other, so the list moves on to a
+            // new version rather than returning to the old one, and Fn::GetAtt Version follows it.
+            JsonNode before = prior.get("prefixList");
+            List<PrefixListEntry> entries = new ArrayList<>();
+            before.path("entries").forEach(entry -> entries.add(
+                    new PrefixListEntry(entry.path("cidr").asText(), entry.path("description").asText(null))));
+            ManagedPrefixList current = ec2Service.describeManagedPrefixLists(region, List.of(entityId), Map.of())
+                    .getFirst();
+            ManagedPrefixList restored = modifyPrefixList(region, current, before.path("name").asText(),
+                    before.path("maxEntries").asInt(), EntryChanges.between(current.currentEntries(), entries));
+            resource.getAttributes().put("Version", Long.toString(restored.getVersion()));
+        }
         if (prior.has("route")) {
             ObjectNode target = (ObjectNode) prior.get("route");
             String routeTableId = target.path("routeTableId").asText();
@@ -175,7 +208,8 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             String prefixList = text(target, "destinationPrefixListId");
             String egressOnly = text(target, "egressOnlyInternetGatewayId");
             if (egressOnly != null) {
-                ec2Service.deleteRoute(region, routeTableId, cidr, ipv6, prefixList);
+                CfnDeletes.safeDelete("route", routeTableId, () -> ec2Service.deleteRoute(region, routeTableId, cidr,
+                        ipv6, prefixList), "InvalidRoute.NotFound");
                 ec2Service.createRoute(region, routeTableId, cidr, ipv6, prefixList, null, null, egressOnly, null);
             } else {
                 ec2Service.replaceRoute(region, routeTableId, cidr, ipv6, prefixList,
@@ -234,6 +268,8 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             case NAT_GATEWAY -> CfnDeletes.safeDelete("NAT gateway", physicalId,
                     () -> ec2Service.deleteNatGateway(region, physicalId), "NatGatewayNotFound");
             case EIP -> releaseByPublicIp(physicalId, region);
+            case PREFIX_LIST -> CfnDeletes.safeDelete("prefix list", physicalId,
+                    () -> ec2Service.deleteManagedPrefixList(region, physicalId), "InvalidPrefixListID.NotFound");
             case SUBNET_ROUTE_TABLE_ASSOCIATION -> CfnDeletes.safeDelete("route table association", physicalId,
                     () -> ec2Service.disassociateRouteTable(region, physicalId), "InvalidAssociationID.NotFound");
             default -> { }
@@ -269,23 +305,27 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
 
     /**
      * Reconciles the template's {@code Tags} onto an entity: keys the template dropped are removed,
-     * the rest written. A template without a Tags property leaves whatever the entity carries.
+     * the rest written. A template without a Tags property clears them when the previous template
+     * declared Tags, and leaves whatever the entity carries when no template ever did.
      */
     private void applyTags(StackResource r, boolean reused, String resourceId, List<Tag> current, JsonNode props, ProvisionContext ctx) {
-        if (props == null || !props.has("Tags")) {
+        boolean declared = props != null && props.has("Tags");
+        if (!declared && !ctx.droppedProperties(props).contains("Tags")) {
             return;
         }
         Map<String, String> desired = ctx.resolveTags(props, "Tags");
         Map<String, String> currentTags = new LinkedHashMap<>();
         for (Tag tag : current == null ? List.<Tag>of() : current) {
-            currentTags.put(tag.getKey(), tag.getValue());
+            if (!Ec2Service.isAwsTagKey(tag.getKey())) {
+                currentTags.put(tag.getKey(), tag.getValue());
+            }
         }
         List<String> stale = ProvisionContext.staleTagKeys(currentTags, desired);
         if (reused && ctx.isUpdate() && (!stale.isEmpty() || !desired.equals(currentTags))) {
             ObjectNode prior = inPlacePrior(r, resourceId, ctx);
             ObjectNode tags = prior.putObject("tags");
             currentTags.forEach(tags::put);
-            var applied = prior.putArray("appliedKeys");
+            ArrayNode applied = prior.putArray("appliedKeys");
             desired.keySet().forEach(applied::add);
             writeInPlacePrior(r, prior);
         }
@@ -335,6 +375,20 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         return tolerateNotFound(() -> ec2Service.describeNatGateways(region, List.of(natGatewayId), Map.of()).stream()
                 .filter(nat -> !"deleted".equals(nat.getState()))
                 .findFirst().orElse(null), "NatGatewayNotFound", natGatewayId);
+    }
+
+    /** Whether the gateway's primary address is {@code privateIpAddress}, both in canonical form. */
+    private static boolean holdsPrivateIp(NatGateway nat, String privateIpAddress) {
+        return nat.getNatGatewayAddresses().stream()
+                .filter(NatGatewayAddress::isPrimary)
+                .map(NatGatewayAddress::getPrivateIp)
+                .filter(Objects::nonNull)
+                .anyMatch(ip -> CidrCanonicalizer.sameBlock(ip + "/32", privateIpAddress + "/32"));
+    }
+
+    private ManagedPrefixList findPrefixList(String prefixListId, String region) {
+        return tolerateNotFound(() -> ec2Service.describeManagedPrefixLists(region, List.of(prefixListId), Map.of())
+                .stream().findFirst().orElse(null), "InvalidPrefixListID.NotFound", prefixListId);
     }
 
     private Address findAddress(String allocationId, String publicIp, String region) {
@@ -402,82 +456,41 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         // only MapPublicIpOnLaunch is applied; changed, a new subnet replaces it.
         Subnet existing = ctx.isUpdate() ? findSubnet(ctx.priorPhysicalId(), ctx.region()) : null;
         boolean reuse = existing != null && Objects.equals(vpcId, existing.getVpcId())
-                && Objects.equals(cidr, existing.getCidrBlock())
+                // Both sides canonical: a subnet saved before canonicalization may still hold host bits.
+                && CidrCanonicalizer.sameBlock(cidr, existing.getCidrBlock())
                 && (az == null || az.equals(existing.getAvailabilityZone()));
         Subnet subnet = reuse ? existing : ec2Service.createSubnet(ctx.region(), vpcId, cidr, az);
         r.setPhysicalId(subnet.getSubnetId());
         r.getAttributes().put("SubnetId", subnet.getSubnetId());
         r.getAttributes().put("VpcId", subnet.getVpcId());
         r.getAttributes().put("AvailabilityZone", subnet.getAvailabilityZone());
-        guarded(r, ctx, !reuse, () -> ec2Service.deleteSubnet(ctx.region(), subnet.getSubnetId()), () -> {
+        CfnRollback.guarded(r, ctx, !reuse, () -> ec2Service.deleteSubnet(ctx.region(), subnet.getSubnetId()),
+                () -> undoInPlace(r), () -> {
             applyTags(r, reuse, subnet.getSubnetId(), reuse ? existing.getTags() : List.of(), props, ctx);
-            if (mapPublicIpOnLaunch != null) {
-                if (reuse && ctx.isUpdate() && existing.isMapPublicIpOnLaunch() != Boolean.parseBoolean(mapPublicIpOnLaunch)) {
+            // A flag the previous template declared and this one drops goes back to false, the launch default.
+            String desiredMapPublicIp = mapPublicIpOnLaunch == null && reuse && ctx.droppedProperties(props).contains("MapPublicIpOnLaunch")
+                    ? "false" : mapPublicIpOnLaunch;
+            if (desiredMapPublicIp != null) {
+                if (reuse && ctx.isUpdate() && existing.isMapPublicIpOnLaunch() != Boolean.parseBoolean(desiredMapPublicIp)) {
                     ObjectNode prior = inPlacePrior(r, subnet.getSubnetId(), ctx);
                     prior.put("mapPublicIpOnLaunch", String.valueOf(existing.isMapPublicIpOnLaunch()));
                     writeInPlacePrior(r, prior);
                 }
-                ec2Service.modifySubnetAttribute(ctx.region(), subnet.getSubnetId(), "mapPublicIpOnLaunch", mapPublicIpOnLaunch);
+                ec2Service.modifySubnetAttribute(ctx.region(), subnet.getSubnetId(), "mapPublicIpOnLaunch", desiredMapPublicIp);
             }
         });
     }
 
     /**
-     * Runs the steps that follow an EC2 create or change a reused entity in place. If one of them
-     * throws, what this provision did is undone before the failure propagates: a created entity is
-     * deleted again, a reused one is put back from its snapshot. The engine only removes a failed
-     * create it can see, and on a failed update it restores the previous resource metadata and
-     * discards the attempted one, snapshot included, so the undo has to happen here.
-     *
-     * <p>A compensation that fails is reported, never hidden. A created entity carries
-     * {@link CfnRollback#ROLLBACK_OWNED_ATTR} while the steps run, so the engine's create rollback
-     * deletes it (and reports that failing) if the undo here could not, and during an update the
-     * entity is also listed in the cleanup record, which the engine carries onto the restored
-     * resource and runs before the next committed update or the stack delete; a reused entity keeps its
-     * snapshot and the reason lands in {@link CfnRollback#UPDATE_ROLLBACK_FAILURE_ATTR}, which the
-     * engine copies onto the committed resource so the rollback walker reports
-     * UPDATE_ROLLBACK_FAILED instead of claiming the prior state is live.
+     * The in-place undo handed to {@link CfnRollback#guarded}: puts a reused entity back from its
+     * snapshot and spends it, leaving it in place when the restore fails so the next rollback can
+     * retry.
      */
-    private void guarded(StackResource r, ProvisionContext ctx, boolean created, Runnable undoCreate, Runnable steps) {
-        if (created) {
-            r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
-        }
-        try {
-            steps.run();
-            r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
-        } catch (RuntimeException e) {
-            if (created) {
-                try {
-                    undoCreate.run();
-                    r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
-                } catch (RuntimeException undo) {
-                    e.addSuppressed(undo);
-                    String reason = "Could not remove " + r.getPhysicalId() + ", created for " + r.getLogicalId()
-                            + " by a failed update: " + undo.getMessage();
-                    LOG.warn(reason);
-                    r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, reason);
-                    if (ctx.isUpdate()) {
-                        // The engine restores the previous resource and keeps only what the cleanup
-                        // record carries, so the replacement is listed there for the next cleanup.
-                        ReplacementCleanup.recordOrphan(r, r.getPhysicalId(), r.getResourceType(), ctx.region());
-                    }
-                }
-            } else {
-                String snapshot = r.getAttributes().get(IN_PLACE_PRIOR_ATTR);
-                if (snapshot != null) {
-                    try {
-                        restoreInPlace(r, snapshot);
-                        r.getAttributes().remove(IN_PLACE_PRIOR_ATTR);
-                    } catch (RuntimeException undo) {
-                        e.addSuppressed(undo);
-                        String reason = "Could not restore " + r.getPhysicalId() + " for " + r.getLogicalId()
-                                + " after a failed update: " + undo.getMessage();
-                        LOG.warn(reason);
-                        r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, reason);
-                    }
-                }
-            }
-            throw e;
+    private void undoInPlace(StackResource r) {
+        String snapshot = r.getAttributes().get(IN_PLACE_PRIOR_ATTR);
+        if (snapshot != null) {
+            restoreInPlace(r, snapshot);
+            r.getAttributes().remove(IN_PLACE_PRIOR_ATTR);
         }
     }
 
@@ -486,7 +499,8 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         InternetGateway igw = existing != null ? existing : ec2Service.createInternetGateway(ctx.region());
         r.setPhysicalId(igw.getInternetGatewayId());
         r.getAttributes().put("InternetGatewayId", igw.getInternetGatewayId());
-        guarded(r, ctx, existing == null, () -> ec2Service.deleteInternetGateway(ctx.region(), igw.getInternetGatewayId()),
+        CfnRollback.guarded(r, ctx, existing == null,
+                () -> ec2Service.deleteInternetGateway(ctx.region(), igw.getInternetGatewayId()), () -> undoInPlace(r),
                 () -> applyTags(r, existing != null, igw.getInternetGatewayId(), existing != null ? existing.getTags() : List.of(), props, ctx));
     }
 
@@ -499,7 +513,8 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         RouteTable rt = reuse ? existing : ec2Service.createRouteTable(ctx.region(), vpcId);
         r.setPhysicalId(rt.getRouteTableId());
         r.getAttributes().put("RouteTableId", rt.getRouteTableId());
-        guarded(r, ctx, !reuse, () -> ec2Service.deleteRouteTable(ctx.region(), rt.getRouteTableId()),
+        CfnRollback.guarded(r, ctx, !reuse, () -> ec2Service.deleteRouteTable(ctx.region(), rt.getRouteTableId()),
+                () -> undoInPlace(r),
                 () -> applyTags(r, reuse, rt.getRouteTableId(), reuse ? existing.getTags() : List.of(), props, ctx));
     }
 
@@ -528,7 +543,7 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         String egressOnlyInternetGatewayId = ctx.resolveOptional(props, "EgressOnlyInternetGatewayId");
         String vpcPeeringConnectionId = ctx.resolveOptional(props, "VpcPeeringConnectionId");
         require(ROUTE, "RouteTableId", routeTableId);
-        long destinations = java.util.stream.Stream.of(destinationCidr, destinationIpv6Cidr, destinationPrefixListId)
+        long destinations = Stream.of(destinationCidr, destinationIpv6Cidr, destinationPrefixListId)
                 .filter(value -> value != null && !value.isBlank()).count();
         if (destinations != 1) {
             throw new AwsException("ValidationError", ROUTE + " requires exactly one of DestinationCidrBlock,"
@@ -567,7 +582,7 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             target.put("egressOnlyInternetGatewayId", current.getEgressOnlyInternetGatewayId());
             target.put("vpcPeeringConnectionId", current.getVpcPeeringConnectionId());
             writeInPlacePrior(r, prior);
-            guarded(r, ctx, false, () -> { }, () -> {
+            CfnRollback.guarded(r, ctx, false, () -> { }, () -> undoInPlace(r), () -> {
                 if (egressOnlyInternetGatewayId != null) {
                     // ReplaceRoute has no egress-only target; re-creating the route is the same outcome.
                     ec2Service.deleteRoute(ctx.region(), routeTableId, destinationCidr, destinationIpv6Cidr, destinationPrefixListId);
@@ -587,8 +602,13 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void provisionNatGateway(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Ec2Service.requireZonalNatGateway(ctx.resolveOptional(props, "AvailabilityMode"));
+        Ec2Service.requireNoSecondaryNatGatewayAddresses(ctx.resolveStringList(props, "SecondaryAllocationIds"),
+                ctx.resolveStringList(props, "SecondaryPrivateIpAddresses"),
+                ctx.resolveOptional(props, "SecondaryPrivateIpAddressCount"));
         String subnetId = ctx.resolveOptional(props, "SubnetId");
         String allocationId = ctx.resolveOptional(props, "AllocationId");
+        String privateIpAddress = ctx.resolveOrDefault(props, "PrivateIpAddress", null);
         require(NAT_GATEWAY, "SubnetId", subnetId);
         // ConnectivityType defaults to public in the schema; a public gateway needs an EIP, a
         // private one must not have one, as AWS validates.
@@ -600,19 +620,44 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         if ("private".equals(connectivityType) && allocationId != null && !allocationId.isBlank()) {
             throw new AwsException("ValidationError", "AWS::EC2::NatGateway with ConnectivityType private cannot have an AllocationId", 400);
         }
-        // SubnetId, AllocationId and ConnectivityType are createOnly: the same triple keeps the
-        // gateway, a change replaces it.
+        // SubnetId, AllocationId, ConnectivityType and PrivateIpAddress are createOnly: the same
+        // values keep the gateway, a change replaces it. With no PrivateIpAddress the gateway keeps
+        // the address it was given.
         NatGateway existing = ctx.isUpdate() ? findNatGateway(ctx.priorPhysicalId(), ctx.region()) : null;
         boolean reuse = existing != null && Objects.equals(subnetId, existing.getSubnetId())
                 && Objects.equals(allocationId, existing.getAllocationId())
-                && connectivityType.equalsIgnoreCase(existing.getConnectivityType() == null ? "public" : existing.getConnectivityType());
+                && connectivityType.equalsIgnoreCase(existing.getConnectivityType() == null ? "public" : existing.getConnectivityType())
+                && (privateIpAddress == null || holdsPrivateIp(existing, privateIpAddress));
         NatGateway nat = reuse ? existing
-                : ec2Service.createNatGateway(ctx.region(), subnetId, allocationId, connectivityType, tagList(props, ctx));
+                : ec2Service.createNatGateway(ctx.region(), subnetId, allocationId, connectivityType, privateIpAddress,
+                        tagList(props, ctx));
+        if ("failed".equals(nat.getState())) {
+            // The resource fails and its failed gateway is not left behind.
+            ec2Service.deleteNatGateway(ctx.region(), nat.getNatGatewayId());
+            throw new AwsException(nat.getFailureCode(), nat.getFailureMessage(), 400);
+        }
         if (reuse) {
-            guarded(r, ctx, false, () -> { }, () -> applyTags(r, true, nat.getNatGatewayId(), existing.getTags(), props, ctx));
+            CfnRollback.guarded(r, ctx, false, () -> { }, () -> undoInPlace(r), () -> applyTags(r, true, nat.getNatGatewayId(), existing.getTags(), props, ctx));
         }
         r.setPhysicalId(nat.getNatGatewayId());
         r.getAttributes().put("NatGatewayId", nat.getNatGatewayId());
+        nat.getNatGatewayAddresses().stream()
+                .filter(NatGatewayAddress::isPrimary)
+                .map(NatGatewayAddress::getNetworkInterfaceId)
+                .filter(Objects::nonNull)
+                .findFirst()
+                .ifPresent(eniId -> r.getAttributes().put("EniId", eniId));
+        // The gateway holds its subnet and Elastic IP until it is deleted; an EIP's physical id is
+        // its public IP.
+        if (nat.getSubnetId() != null) {
+            r.getAttributes().put(CfnRollback.USES_ATTR_PREFIX + "SubnetId", nat.getSubnetId());
+        }
+        Address eip = allocationId == null || allocationId.isBlank() ? null : findAddress(allocationId, null, ctx.region());
+        if (eip != null && eip.getPublicIp() != null) {
+            r.getAttributes().put(CfnRollback.USES_ATTR_PREFIX + "PublicIp", eip.getPublicIp());
+        } else {
+            r.getAttributes().remove(CfnRollback.USES_ATTR_PREFIX + "PublicIp");
+        }
     }
 
     private void provisionEip(StackResource r, JsonNode props, ProvisionContext ctx) {
@@ -624,7 +669,207 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         r.setPhysicalId(addr.getPublicIp());
         r.getAttributes().put("AllocationId", addr.getAllocationId());
         r.getAttributes().put("PublicIp", addr.getPublicIp());
-        guarded(r, ctx, existing == null, () -> ec2Service.releaseAddress(ctx.region(), addr.getAllocationId()),
+        CfnRollback.guarded(r, ctx, existing == null,
+                () -> ec2Service.releaseAddress(ctx.region(), addr.getAllocationId()), () -> undoInPlace(r),
                 () -> applyTags(r, existing != null, addr.getAllocationId(), existing != null ? existing.getTags() : List.of(), props, ctx));
+    }
+
+    /**
+     * A customer-managed prefix list. Its schema has no create-only property, so an update changes
+     * the list it already has in place, and only a list gone out of band is created anew. MaxEntries
+     * is required to create a list; an update that leaves it out keeps the list's capacity.
+     */
+    private void provisionPrefixList(StackResource r, JsonNode props, ProvisionContext ctx) {
+        String name = ctx.resolveOptional(props, "PrefixListName");
+        String family = ctx.resolveOptional(props, "AddressFamily");
+        require(PREFIX_LIST, "PrefixListName", name);
+        require(PREFIX_LIST, "AddressFamily", family);
+        Integer maxEntries = ctx.resolveOptionalInt(props, "MaxEntries");
+        List<PrefixListEntry> entries = prefixListEntries(props, ctx);
+        ManagedPrefixList existing = ctx.isUpdate() ? findPrefixList(ctx.priorPhysicalId(), ctx.region()) : null;
+        if (existing == null) {
+            if (maxEntries == null) {
+                throw new AwsException("ValidationError", PREFIX_LIST + " requires MaxEntries", 400);
+            }
+            ManagedPrefixList created = ec2Service.createManagedPrefixList(ctx.region(), name, family, maxEntries,
+                    entries == null ? List.of() : entries, List.of());
+            setPrefixListAttributes(r, created);
+            // Tags go through CreateTags, as on the other types here, so EC2 checks them all; a tag it
+            // refuses removes the new list again.
+            CfnRollback.guarded(r, ctx, true,
+                    () -> ec2Service.deleteManagedPrefixList(ctx.region(), created.getPrefixListId()),
+                    () -> undoInPlace(r), () -> applyTags(r, false, created.getPrefixListId(), List.of(), props, ctx));
+        } else {
+            updatePrefixList(r, existing, name, family,
+                    maxEntries != null ? maxEntries : existing.getMaxEntries(), entries, props, ctx);
+            setPrefixListAttributes(r, ec2Service.describeManagedPrefixLists(ctx.region(),
+                    List.of(existing.getPrefixListId()), Map.of()).getFirst());
+        }
+    }
+
+    private static void setPrefixListAttributes(StackResource r, ManagedPrefixList list) {
+        r.setPhysicalId(list.getPrefixListId());
+        r.getAttributes().put("PrefixListId", list.getPrefixListId());
+        r.getAttributes().put("Arn", list.getPrefixListArn());
+        r.getAttributes().put("OwnerId", list.getOwnerId());
+        r.getAttributes().put("Version", Long.toString(list.getVersion()));
+    }
+
+    /**
+     * Applies an update to a kept prefix list. Two changes fail it before anything is touched: another
+     * AddressFamily, which EC2 has no way to change on an existing list, and a new MaxEntries together
+     * with changed Entries, which CloudFormation does not apply in one update. The tags go first and
+     * the ModifyManagedPrefixList calls last, so a failure undoes at most the tags and leaves the
+     * list on the version it had.
+     *
+     * <p>Entries and Tags are each brought to the template only when it declares them, or the
+     * previous template did: a template that drops them clears them, and entries or tags no template
+     * ever declared are left alone.
+     */
+    private void updatePrefixList(StackResource r, ManagedPrefixList existing, String name, String family,
+                                  int maxEntries, List<PrefixListEntry> entries, JsonNode props, ProvisionContext ctx) {
+        if (!family.equals(existing.getAddressFamily())) {
+            throw new AwsException("ValidationError", PREFIX_LIST + " cannot change the AddressFamily of prefix list "
+                    + existing.getPrefixListId() + " from " + existing.getAddressFamily() + " to " + family, 400);
+        }
+        if (entries != null) {
+            entries.forEach(entry -> ec2Service.validatePrefixListEntry(entry, family));
+        }
+        List<PrefixListEntry> desired = entries != null ? entries
+                : ctx.previouslyDeclared("Entries") ? List.of() : existing.currentEntries();
+        EntryChanges changes = EntryChanges.between(existing.currentEntries(), desired);
+        boolean resized = !Objects.equals(maxEntries, existing.getMaxEntries());
+        if (!changes.isEmpty() && resized) {
+            throw new AwsException("ValidationError", PREFIX_LIST + " cannot change MaxEntries (from "
+                    + existing.getMaxEntries() + " to " + maxEntries + ") and Entries ("
+                    + (changes.add().size() + changes.readd().size()) + " to add, "
+                    + (changes.remove().size() + changes.redescribe().size()) + " to remove) in the same update", 400);
+        }
+        String prefixListId = existing.getPrefixListId();
+        if (!changes.isEmpty() || resized || !name.equals(existing.getPrefixListName())) {
+            ObjectNode prior = inPlacePrior(r, prefixListId, ctx);
+            ObjectNode before = prior.putObject("prefixList");
+            before.put("name", existing.getPrefixListName());
+            before.put("maxEntries", existing.getMaxEntries());
+            ArrayNode saved = before.putArray("entries");
+            for (PrefixListEntry entry : existing.currentEntries()) {
+                ObjectNode row = saved.addObject().put("cidr", entry.getCidr());
+                if (entry.getDescription() != null) {
+                    row.put("description", entry.getDescription());
+                }
+            }
+            writeInPlacePrior(r, prior);
+        }
+        CfnRollback.guarded(r, ctx, false, () -> { }, () -> undoInPlace(r), () -> {
+            applyTags(r, true, prefixListId, existing.getTags(), props, ctx);
+            modifyPrefixList(ctx.region(), existing, name, maxEntries, changes);
+        });
+    }
+
+    /**
+     * Gives a prefix list {@code name} and {@code maxEntries} and applies {@code changes}, or does
+     * nothing when none of them changes it. EC2 refuses a request that removes and adds the same CIDR,
+     * which is how an entry's description changes, so such an entry is added back by a second call.
+     * The first call carries everything EC2 could refuse, and the capacity the second needs is checked
+     * before the first, so a change EC2 refuses leaves the list as it was; only another change to the
+     * list landing between the two calls can still fail the second. Each call that changes entries
+     * makes a version.
+     */
+    private ManagedPrefixList modifyPrefixList(String region, ManagedPrefixList list, String name, int maxEntries,
+                                               EntryChanges changes) {
+        boolean resized = !Objects.equals(maxEntries, list.getMaxEntries());
+        if (changes.isEmpty() && !resized && name.equals(list.getPrefixListName())) {
+            return list;
+        }
+        if (!changes.readd().isEmpty()) {
+            int capacity = resized ? maxEntries : list.getMaxEntries();
+            int after = list.currentEntries().size() - changes.remove().size() - changes.redescribe().size()
+                    + changes.add().size() + changes.readd().size();
+            if (after > capacity) {
+                throw new AwsException("InvalidParameterValue",
+                        "The number of entries exceeds the maximum of " + capacity + ".", 400);
+            }
+        }
+        List<String> removals = new ArrayList<>(changes.remove());
+        removals.addAll(changes.redescribe());
+        ManagedPrefixList current = ec2Service.modifyManagedPrefixList(region, list.getPrefixListId(),
+                list.getVersion(), name, resized ? maxEntries : null, changes.add(), removals);
+        if (!changes.readd().isEmpty()) {
+            current = ec2Service.modifyManagedPrefixList(region, current.getPrefixListId(), current.getVersion(),
+                    null, null, changes.readd(), List.of());
+        }
+        return current;
+    }
+
+    /**
+     * The template's Entries, with what {@code AWS::NoValue} stands for left out, or null when it does
+     * not declare them. A CIDR is passed on as written, as Floci's CreateManagedPrefixList takes it.
+     */
+    private static List<PrefixListEntry> prefixListEntries(JsonNode props, ProvisionContext ctx) {
+        JsonNode rows = props.has("Entries") ? ctx.engine().resolveNodeOmittingNoValue(props.get("Entries")) : null;
+        if (rows == null || rows.isNull() || rows.isMissingNode()) {
+            return null;
+        }
+        if (!rows.isArray()) {
+            throw new AwsException("ValidationError", PREFIX_LIST + " Entries must be a list", 400);
+        }
+        List<PrefixListEntry> entries = new ArrayList<>();
+        for (JsonNode row : rows) {
+            String cidr = row.path("Cidr").asText(null);
+            require(PREFIX_LIST, "Entries.Cidr", cidr);
+            entries.add(new PrefixListEntry(cidr, row.path("Description").asText(null)));
+        }
+        return entries;
+    }
+
+    /**
+     * What takes a prefix list from its current entries to the desired ones: the entries to add and the
+     * CIDRs to remove, with an entry whose block is both removed and added back (a changed description)
+     * kept apart as a CIDR to {@code redescribe} and an entry to {@code readd}. Validated entries match
+     * when their CIDRs identify the same block and their descriptions are the same.
+     */
+    private record EntryChanges(List<PrefixListEntry> add, List<String> remove, List<String> redescribe,
+                                List<PrefixListEntry> readd) {
+
+        static EntryChanges between(List<PrefixListEntry> current, List<PrefixListEntry> desired) {
+            Set<List<String>> held = current.stream().map(EntryChanges::key).collect(Collectors.toSet());
+            Set<List<String>> wanted = desired.stream().map(EntryChanges::key).collect(Collectors.toSet());
+            List<PrefixListEntry> leaving = current.stream().filter(entry -> !wanted.contains(key(entry))).toList();
+            List<PrefixListEntry> arriving = desired.stream().filter(entry -> !held.contains(key(entry))).toList();
+            Set<String> leavingBlocks = leaving.stream().map(entry -> block(entry.getCidr())).collect(Collectors.toSet());
+            Set<String> arrivingBlocks = arriving.stream().map(entry -> block(entry.getCidr())).collect(Collectors.toSet());
+            List<PrefixListEntry> add = new ArrayList<>();
+            List<PrefixListEntry> readd = new ArrayList<>();
+            for (PrefixListEntry entry : arriving) {
+                if (leavingBlocks.contains(block(entry.getCidr()))) {
+                    readd.add(entry);
+                } else {
+                    add.add(entry);
+                }
+            }
+            List<String> remove = new ArrayList<>();
+            List<String> redescribe = new ArrayList<>();
+            for (PrefixListEntry entry : leaving) {
+                if (arrivingBlocks.contains(block(entry.getCidr()))) {
+                    redescribe.add(entry.getCidr());
+                } else {
+                    remove.add(entry.getCidr());
+                }
+            }
+            return new EntryChanges(add, remove, redescribe, readd);
+        }
+
+        boolean isEmpty() {
+            return add.isEmpty() && remove.isEmpty() && redescribe.isEmpty() && readd.isEmpty();
+        }
+
+        /** An entry's block and description; a list, which unlike {@code List.of} holds a null description. */
+        private static List<String> key(PrefixListEntry entry) {
+            return Arrays.asList(block(entry.getCidr()), entry.getDescription());
+        }
+
+        private static String block(String cidr) {
+            return CidrCanonicalizer.canonicalize(cidr).orElse(cidr);
+        }
     }
 }

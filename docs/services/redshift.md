@@ -8,9 +8,115 @@ Floci emulates Amazon Redshift by managing a real [PostgreSQL](https://www.postg
 
 > **Always read the host and port from `DescribeClusters`** rather than assuming a fixed port. PostgreSQL listens on `5432` *inside* the container; the port you connect to is dynamically assigned on the host and returned as `Clusters[0].Endpoint.Port`. Redshift's conventional port is `5439`, but the emulator does not bind it: use whatever `DescribeClusters` reports.
 
-The container has **no persistent volume**: if the physical container survives a Floci restart it is adopted and its data is kept, but if the container itself is gone (host reboot, `docker rm`, a pruned dev box) the cluster comes back empty. Use `CreateClusterSnapshot` / `RestoreFromClusterSnapshot` to preserve data explicitly.
+The PostgreSQL image uses an anonymous volume, which Floci removes with the container and does not reattach to a replacement: if the physical container survives a Floci restart it is adopted and its data is kept, but if the container itself is gone (host reboot, `docker rm`, a pruned dev box) the cluster comes back empty. Use `CreateClusterSnapshot` / `RestoreFromClusterSnapshot` to preserve data explicitly. Failed recovery preserves an adopted container and its volume. Once reboot teardown begins, a failed reboot retains its pre-reboot dump for manual recovery. A failed proxy stop preserves the original database container.
+
+Snapshot-dump and catalog-seed uploads retry transient Docker I/O failures for up to six attempts with a fresh upload each time. The SQL commands themselves are not retried. An exhausted snapshot upload fails the restore; an exhausted catalog-seed upload retains the warning-only startup behavior.
 
 For running SQL without a PostgreSQL wire connection (the way Lambda and Step Functions do), see the [Redshift Data API](redshift-data.md).
+
+## Pausing and resuming provisioned clusters
+
+`PauseCluster` accepts an `available` cluster and returns it as `paused`.
+It closes the auth proxy and stops PostgreSQL without removing the container or its
+data volume. Existing SQL connections are disconnected. `ResumeCluster` accepts a
+`paused` cluster, starts the same container, waits for PostgreSQL readiness, and
+restores the auth proxy with the same endpoint and authentication settings.
+Both operations complete synchronously in Floci. Repeating either operation in the
+wrong state returns `InvalidClusterState`; an unknown identifier returns `ClusterNotFound`.
+Clusters with automated snapshots disabled cannot be paused. Resume the cluster
+before modifying it, rebooting it, or creating a snapshot.
+
+Floci preserves the original container directly instead of creating an additional
+automated snapshot for pause. It retains all user tables and views, including
+no-backup tables, and does not simulate maintenance-version upgrades on resume.
+
+The proxy port remains reserved while paused, including after a Floci restart with
+persistent cluster metadata. Startup leaves paused clusters stopped. Resume requires
+the original container to still exist: if it was removed externally, Floci returns
+an error instead of creating an empty replacement database. A failed resume attempts
+to stop the container again so it can be retried. If that rollback also fails, the
+cluster is marked `unavailable` and its data-bearing container is retained.
+Failure to close the proxy during pause also marks the cluster `unavailable`,
+because its listener may have partially stopped. Resume rollback attempts proxy
+shutdown and database shutdown independently and keeps the proxy port reserved.
+Delete a paused cluster with `SkipFinalClusterSnapshot=true`, or resume it before
+requesting a final snapshot.
+
+Zero-ETL polling skips paused targets without consuming stream records or changing
+their checkpoints. Polling continues after resume; a healthy poll clears an earlier
+integration failure even when the stream has no new records.
+Healthy idle polls do not rewrite integration state; recovery persists only changed
+health fields and retains the stored stream checkpoints.
+
+```bash
+aws --endpoint-url http://localhost:4566 redshift pause-cluster --cluster-identifier warehouse
+aws --endpoint-url http://localhost:4566 redshift resume-cluster --cluster-identifier warehouse
+```
+
+## Events and notifications
+
+`DescribeEvents` returns the last hour by default, accepts `StartTime`, `EndTime`,
+`Duration`, and a paired `SourceType`/`SourceIdentifier` filter, and retains the last
+14 days. `MaxRecords` accepts 20 through 100; continue with the returned `Marker`.
+These bounds follow the [AWS DescribeEvents API](https://docs.aws.amazon.com/redshift/latest/APIReference/API_DescribeEvents.html).
+History and event subscriptions are isolated by account and region and use the
+configured Redshift storage mode, including persistent, hybrid and WAL storage.
+
+Floci records cluster creation, deletion, reboot, restore, password changes,
+parameter-group association and security-group changes. Snapshot operations record
+start, completion and failure, including final snapshots. Parameter-group creation,
+update, reset and deletion also produce events. The IDs, categories and severities
+come from the [AWS event catalog](https://docs.aws.amazon.com/redshift/latest/mgmt/working-with-event-notifications.html).
+`DescribeEventCategories` lists the event IDs implemented by Floci, grouped by source
+type. It does not advertise hardware failures, maintenance or other conditions Floci
+does not simulate. Security-group and scheduled-action source types are accepted as
+filters, but Floci does not model resources or generate events for those source types.
+
+Use `CreateEventSubscription`, `ModifyEventSubscription`, `DescribeEventSubscriptions`
+and `DeleteEventSubscription` to manage SNS delivery. A subscription can filter source
+type, source IDs, categories and severity. Omitted severity receives both INFO and
+ERROR; explicit severity selects only that severity. All specified filters must match.
+Only standard SNS topics are accepted, as required by
+[AWS subscription rules](https://docs.aws.amazon.com/redshift/latest/mgmt/working-with-event-notifications-subscribe.html).
+Subscriptions default to enabled; set `Enabled=false` to stop delivery without deleting
+the subscription. The limit is 20 subscriptions per account and region.
+
+Matching events are published to SNS with subject `Amazon Redshift Notification`.
+The JSON message includes `Event Source`, `Event Time`, `Source ID`, `Event ID`,
+`Event Categories`, `Severity` and `Event Message`. AWS does not specify a stable
+notification-body schema in the API reference; this message format is Floci's
+representation of the event details, not a claim of byte-for-byte AWS parity.
+With IAM enforcement on, the topic's policy must allow the `redshift.amazonaws.com`
+principal to `sns:Publish` (conditions on `aws:SourceArn`, the subscription's ARN, and
+`aws:SourceAccount` apply); otherwise nothing is published and the subscription becomes
+`no-permission`. A deleted topic changes subscription status to `topic-not-exist`;
+other authorization failures also change it to `no-permission`. Notification delivery failures are logged
+and do not roll back the Redshift operation.
+
+For example, parameter-group events work without a database container:
+
+```bash
+TOPIC=$(aws --endpoint-url http://localhost:4566 sns create-topic \
+  --name redshift-events --query TopicArn --output text)
+aws --endpoint-url http://localhost:4566 redshift create-event-subscription \
+  --subscription-name parameter-events --sns-topic-arn "$TOPIC" \
+  --source-type cluster-parameter-group --event-categories configuration
+aws --endpoint-url http://localhost:4566 redshift create-cluster-parameter-group \
+  --parameter-group-name event-demo --parameter-group-family redshift-1.0 \
+  --description 'Event example'
+aws --endpoint-url http://localhost:4566 redshift describe-events \
+  --source-type cluster-parameter-group --source-identifier event-demo
+```
+
+### CloudFormation
+
+`AWS::Redshift::EventSubscription` creates a real subscription. `Ref` returns its
+name; `Fn::GetAtt` supports `CustomerAwsId`, `CustSubscriptionId`, `Status`,
+`SubscriptionCreationTime`, `SourceIdsList` and `EventCategoriesList`, with the last
+two returned as lists. Updating filters, enabled state, topic and tags reconciles the
+existing subscription; changing `SubscriptionName` replaces it. Removing optional
+filters from the template clears them. Stack deletion removes the subscription.
+The attributes follow the [CloudFormation resource schema](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-redshift-eventsubscription.html).
 
 ## Supported Actions
 
@@ -19,17 +125,18 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
 | --- | --- |
 | `CreateCluster` | Create a cluster and start a PostgreSQL container for it |
 | `DescribeClusters` | List clusters and their connection details |
-| `DeleteCluster` | Stop and remove a cluster and its container |
+| `DeleteCluster` | Create the requested final snapshot, then remove the cluster; accepts `SkipFinalClusterSnapshot` to delete without a backup |
 | `CreateClusterSnapshot` | Back up a cluster to a SQL dump via `pg_dump` |
-| `DescribeClusterSnapshots` | List snapshots, optionally filtered by snapshot or cluster identifier |
+| `DescribeClusterSnapshots` | List snapshots, optionally filtered by snapshot or cluster identifier and SnapshotType (manual or automated) |
 | `DeleteClusterSnapshot` | Remove a snapshot and its stored dump |
 | `RestoreFromClusterSnapshot` | Create a new cluster and load a snapshot's dump into it via `psql`; accepts `SnapshotIdentifier` or a same-account, same-region `SnapshotArn` |
 | `CreateClusterParameterGroup` | Register a parameter group (metadata only) |
 | `DescribeClusterParameterGroups` | List parameter groups, optionally filtered by name |
 | `DescribeClusterParameters` | Return the parameters of a group, with any values set by `ModifyClusterParameterGroup` |
 | `ModifyClusterParameterGroup` | Update parameter values on a group |
+| `ResetClusterParameterGroup` | Reset selected parameters or all parameters to the emulated defaults |
 | `DeleteClusterParameterGroup` | Remove a parameter group |
-| `CreateTags` | Add or overwrite tags on a cluster, snapshot, subnet group, parameter group or snapshot copy grant |
+| `CreateTags` | Add or overwrite tags on a cluster, snapshot, subnet group, parameter group, snapshot copy grant or snapshot schedule |
 | `DeleteTags` | Remove tags by key from a resource |
 | `DescribeTags` | List tagged resources and their tags |
 | `CreateClusterSubnetGroup` | Register a cluster subnet group (metadata only) |
@@ -42,17 +149,147 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
 | `CreateSnapshotCopyGrant` | Register a snapshot copy grant, defaulting `KmsKeyId` to the AWS-managed Redshift key. `SnapshotCopyGrantName` must be 1-63 characters, start with a lowercase letter, and contain only lowercase letters, digits and non-consecutive hyphens |
 | `DescribeSnapshotCopyGrants` | List snapshot copy grants, optionally filtered by name, paged with `MaxRecords` and `Marker` |
 | `DeleteSnapshotCopyGrant` | Remove a snapshot copy grant |
+| `DescribeEvents` | Return retained events filtered by source and time, with marker pagination |
+| `DescribeEventCategories` | List implemented event IDs, categories and severities by source type |
+| `CreateEventSubscription` | Create an enabled or disabled subscription delivering matching events to a standard SNS topic |
+| `ModifyEventSubscription` | Update the specified subscription filters, topic or enabled state |
+| `DeleteEventSubscription` | Delete an event notification subscription |
+| `DescribeEventSubscriptions` | List event subscriptions filtered by name or tags |
+| `EnableSnapshotCopy` | Record cross-region snapshot copy on a cluster (`RetentionPeriod` defaults to 7, `ManualSnapshotRetentionPeriod` to -1); `DescribeClusters` then reports `ClusterSnapshotCopyStatus`. A `DestinationRegion` that is not an AWS region is refused with `UnknownSnapshotCopyRegionFault`. A background sweep then copies the cluster's snapshots to that Region, see [Cross-region snapshot copy](#cross-region-snapshot-copy) |
+| `DisableSnapshotCopy` | Clear a cluster's snapshot copy configuration |
+| `ModifySnapshotCopyRetentionPeriod` | Change the automated (or, with `Manual`, the manual) snapshot copy retention period |
+| `CreateSnapshotSchedule` | Create a UTC rate or cron schedule that takes automated snapshots on associated clusters, with optional tags |
+| `ModifySnapshotSchedule` | Replace a schedule's definitions |
+| `DescribeSnapshotSchedules` | List schedules filtered by `ScheduleIdentifier`, `ClusterIdentifier`, `TagKeys` and `TagValues`, paged with `MaxRecords` and `Marker`, with their associated clusters |
+| `DeleteSnapshotSchedule` | Remove a schedule; refused with `InvalidClusterSnapshotScheduleState` while a cluster uses it |
+| `ModifyClusterSnapshotSchedule` | Associate a cluster with a schedule, or disassociate it with `DisassociateSchedule` |
 | `ModifyCluster` | Update node type, parameter group, security groups, Multi-AZ flag, or the master password |
 | `DescribeClusterVersions` | Return the single emulated engine version and its parameter group family |
 | `DescribeOrderableClusterOptions` | Return the static node types and cluster types, optionally filtered by `NodeType` or `ClusterVersion` |
-| `ModifyClusterIamRoles` | Add or remove the IAM roles associated with a cluster; COPY and UNLOAD see the change on new connections. `DefaultIamRoleArn` is ignored |
+| `ModifyClusterIamRoles` | Add or remove associated IAM roles and set `DefaultIamRoleArn`; COPY and UNLOAD see the change on new connections |
 | `DescribeLoggingStatus` | Return a cluster's stored audit-logging configuration |
-| `EnableLogging` | Store audit-logging configuration (S3 bucket, CloudWatch, or S3 table via `LogDestinationType`); no logs are delivered |
+| `EnableLogging` | Store audit-logging configuration and deliver the selected connection, user, and user-activity audit records to CloudWatch Logs for provisioned clusters |
 | `DisableLogging` | Clear a cluster's audit-logging configuration |
+| `PauseCluster` | Stop a provisioned cluster and its auth proxy while retaining the container and data |
+| `ResumeCluster` | Restart a paused cluster and restore its auth proxy on the same endpoint |
 | `RebootCluster` | Restart a cluster's container |
 | `GetClusterCredentials` | Issue a short-lived DbUser / DbPassword pair the auth proxy and Data API accept for a non-master user |
 | `GetClusterCredentialsWithIAM` | Issue short-lived credentials with the DbUser derived from the caller's IAM identity |
 <!-- floci:actions:end -->
+
+CloudWatch audit events use the AWS log groups `/aws/redshift/cluster/<clusterIdentifier>/<logType>` and CSV log records. `connectionlog` and `userlog` follow the logging export selection. `useractivitylog` additionally requires `enable_user_activity_logging=true` in the cluster parameter group, which is false by default.
+
+Audit delivery covers PostgreSQL wire connections and Data API connections, including batch statements and retained sessions. Records identify the requested database user and database, even when temporary credentials use a master connection internally. User changes are published after commit and discarded on rollback, including rollback to a savepoint on the wire path. SQL password literals are redacted, including literals separated from `PASSWORD` by SQL comments.
+
+### Final snapshots on cluster deletion
+
+`DeleteCluster` defaults `SkipFinalClusterSnapshot` to `false`, so a
+`FinalClusterSnapshotIdentifier` is required unless the request explicitly skips the final
+snapshot. Supplying a final snapshot name together with `SkipFinalClusterSnapshot=true` is
+rejected. Final snapshot names use the same validation and uniqueness rules as
+`CreateClusterSnapshot`.
+
+Floci completes the database dump and commits the snapshot metadata before stopping the proxy
+or removing the cluster. Dump failures and reported snapshot storage errors leave the cluster
+available. The final snapshot remains visible through `DescribeClusterSnapshots` after the
+source cluster is deleted, and `RestoreFromClusterSnapshot` can restore its data to a new
+cluster. Deletion is synchronous: Floci returns `deleting` after teardown rather than exposing
+AWS's intermediate `final-snapshot` state.
+
+Database dumps run under account-scoped cluster and snapshot locks, so a slow dump does not
+hold the service-wide mutation monitor. Operations on the same cluster and snapshot identifier
+remain coordinated, including snapshot deletion and restore. A dump whose metadata was not
+committed is removed on failure; if the commit succeeded and a later flush reports an error,
+the dump is retained for the committed snapshot.
+
+`FinalClusterSnapshotRetentionPeriod` defaults to `-1` and accepts `-1` or 1 to 3,653 days.
+It is persisted and returned as the snapshot's `ManualSnapshotRetentionPeriod`; automatic
+expiration is not implemented. Manual snapshots created by `CreateClusterSnapshot`, and older
+snapshots without stored retention metadata, also return the default `-1`. Snapshot metadata
+uses the configured storage mode. Persistent and WAL metadata commit failures are reported
+before teardown; hybrid retains its existing
+write-behind durability and logged flush failures.
+
+If teardown fails after the final snapshot was created, the snapshot is retained. A retry
+must use a different snapshot name, or explicitly skip the final snapshot; an existing backup
+is never overwritten. Internal provisioner cleanup keeps its existing deletion behavior and
+explicitly skips the final snapshot.
+
+```bash
+aws redshift delete-cluster --cluster-identifier warehouse \
+  --final-cluster-snapshot-identifier warehouse-final \
+  --final-cluster-snapshot-retention-period 7
+
+aws redshift delete-cluster --cluster-identifier disposable \
+  --skip-final-cluster-snapshot
+```
+
+See the AWS [DeleteCluster API reference](https://docs.aws.amazon.com/redshift/latest/APIReference/API_DeleteCluster.html).
+
+### Resetting parameter groups
+
+`ResetClusterParameterGroup` resets all parameters with `ResetAllParameters=true`, or the named
+parameters with `ResetAllParameters=false` and a `Parameters` list. Each list entry needs only
+`ParameterName`, and at most 20 entries are accepted. When the flag is omitted, Floci resets the
+supplied names, or all parameters if no names were supplied. An explicit `true` cannot be combined
+with a nonempty list, and an explicit `false` requires at least one name. An empty Query list,
+encoded as `Parameters=`, is treated like an omitted list. The API reference describes the omitted flag as
+defaulting to `true` but also describes supplying names without the flag; Floci resolves that
+ambiguity by using whether names were supplied. These combinations have not been verified against
+a live AWS cluster.
+
+Parameters report `Source=engine-default` initially, `user` after modification, and
+`engine-default` after reset. `DescribeClusterParameters` accepts `Source=user` or
+`Source=engine-default` to filter the result. The implicit `default.redshift-1.0` group is readable
+but cannot be modified or reset.
+
+Creating a group named `default.redshift-1.0` is rejected. Earlier Floci versions allowed such a
+group to be stored: for those legacy groups, both describe operations return the stored values,
+and modify/reset remain available. The read-only built-in group is used only when no stored
+group exists under that name.
+
+The default catalog remains limited to Floci's existing `max_cursor_result_set_size=0` and
+`wlm_json_configuration={}` values, rather than the complete AWS engine catalog. Modifications to
+other names are stored as before; resetting those names removes their overrides and omits them
+from subsequent descriptions because Floci has no default to report. Resetting all parameters
+restores the two catalog entries. Parameter groups remain metadata only: modifying or resetting
+them does not change PostgreSQL settings, and Floci does not track the clusters' pending reboot
+state. The reset response returns a descriptive `ParameterGroupStatus` message.
+
+Sources are persisted with parameter values. For older stored groups without a source, Floci
+reports `engine-default` when the value matches its catalog and `user` otherwise. The old format
+cannot distinguish an explicit assignment of a default value from an unchanged default.
+
+### Default IAM role for COPY and UNLOAD
+
+`CreateCluster` and `ModifyClusterIamRoles` accept `DefaultIamRoleArn`. It must name a role
+in the cluster's associated `IamRoles` list, including roles added in the same request.
+`DescribeClusters` returns the configured ARN. Removing that role clears the default.
+An explicit empty or whitespace-only `DefaultIamRoleArn` means no default: it creates a cluster
+without one or clears an existing default while retaining the associated roles. Omitting the field
+on an update otherwise keeps the existing default. The setting uses the
+cluster's configured storage backend and is reapplied when its proxy restarts.
+
+Both `COPY ... IAM_ROLE default` and `UNLOAD ... IAM_ROLE default` use that role, in Simple
+Query and zero-parameter Extended Query statements. A cluster without a default fails these
+statements with SQLSTATE `42501`; it never falls back to unsigned S3 access. Role association,
+trust and S3 permission checks are the same as for an explicit role ARN. Existing connections
+keep the role configuration captured when they connected; open a new connection after changing it.
+
+```bash
+aws redshift modify-cluster-iam-roles \
+  --cluster-identifier my-warehouse \
+  --add-iam-roles "$REDSHIFT_ROLE_ARN" \
+  --default-iam-role-arn "$REDSHIFT_ROLE_ARN"
+```
+
+```sql
+COPY people FROM 's3://my-data/people.csv' IAM_ROLE default CSV;
+UNLOAD ('SELECT * FROM people') TO 's3://my-data/export/' IAM_ROLE default CSV;
+```
+
+See AWS's [default IAM role guide](https://docs.aws.amazon.com/redshift/latest/mgmt/default-iam-role.html)
+and [COPY authorization parameters](https://docs.aws.amazon.com/redshift/latest/dg/copy-parameters-authorization.html).
 
 ### Snapshot copy grants
 
@@ -68,6 +305,73 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
   `SnapshotCopyGrantNotFoundFault`, which the Redshift model pins at HTTP 400.
   `CreateTags`/`DeleteTags`/`DescribeTags` do not list that fault at all and return
   `ResourceNotFoundFault` (HTTP 404) for any missing resource, grants included.
+
+## Cross-region snapshot copy
+
+`EnableSnapshotCopy` makes a background sweep (`FLOCI_SERVICES_REDSHIFT_SNAPSHOT_COPY_SWEEP_INTERVAL_SECONDS`, 60 by default) copy the cluster's snapshots to the destination Region.
+
+- **Only newer snapshots are copied.** A snapshot taken before copy was enabled stays where it is, as does a snapshot of a cluster whose copy was later disabled.
+- **A copy is a separate snapshot in the destination Region.** It keeps the source's identifier, cluster identifier and type, gets an ARN in the destination Region, reports `SourceRegion`, and carries the copy grant's `KmsKeyId` when the cluster has one. `DescribeClusterSnapshots`, `DeleteClusterSnapshot`, `RestoreFromClusterSnapshot` and the tagging actions use the copy when the request's Region has one, and the snapshot itself otherwise.
+- **The dump is copied to its own file.** Copies live under `<persistent-path>/redshift-dumps/<account>/copies/<region>/`.
+- **Copies are independent of the source.** Deleting the source snapshot leaves the copy, and deleting a copy does not bring it back: the source remembers the Regions it was carried to. A copy interrupted by a restart is finished by the next sweep without a second dump.
+- **Hybrid storage can lose a copy after a crash.** The copy is written before the source is marked, but hybrid storage flushes in the background and does not report a failed write. If the copy's write fails and the source's succeeds, a crash before the next flush leaves the source marked as copied without a copy, and later sweeps skip it. Persistent and WAL storage report the failed write before the source is marked, so a crash there leaves the snapshot to be copied again.
+- **Retention.** Copied automated snapshots follow the cluster's current `RetentionPeriod`, so `ModifySnapshotCopyRetentionPeriod` changes existing ones. Copied manual snapshots keep the `ManualSnapshotRetentionPeriod` they were copied with; `-1` keeps them until deleted. Retention counts from the source snapshot's creation time.
+- **The cluster store has no Region.** A cluster restored from a copy is created in the same store as every other cluster, as before.
+
+## Automated snapshots
+
+Clusters take automated SQL-dump snapshots using their associated snapshot schedule. Use
+`CreateSnapshotSchedule` followed by `ModifyClusterSnapshotSchedule` to attach a schedule.
+Without an attached schedule, a cluster uses `rate(8 hours)`. Schedules run in UTC and accept
+`rate(1 hour)` through `rate(24 hours)`, `rate(1 day)`, Redshift's three-field shorthand such
+as `cron(0 9,17 MON-FRI)`, and full six-field cron expressions. Field ranges and near-term
+execution spacing are validated; overlapping executions less than one hour apart are rejected
+within a 400-day lookahead. The worker also enforces at least one hour between actual backups.
+
+`CreateCluster` and `ModifyCluster` accept `AutomatedSnapshotRetentionPeriod` from 0 to 35 days,
+with a default of 1. Zero disables automation and removes automated snapshots; RA3 and RG node
+families require 1 to 35 days. Decreasing retention cleans up expired automated snapshots.
+The newest automated snapshot is kept even after its retention period, until automation is
+disabled or the cluster is deleted. Manual snapshots are unaffected. `DescribeClusterSnapshots`
+returns `SnapshotType` and accepts `SnapshotType=automated` or `manual`. Automated snapshots
+can be restored with `RestoreFromClusterSnapshot`; `DeleteClusterSnapshot` refuses their
+manual deletion with `InvalidClusterSnapshotState`.
+
+The background sweep checks all owning accounts, takes dumps only for available clusters, and
+removes automated backups left by deleted clusters. Checkpoints use the Redshift storage mode
+and survive restart. A failed dump leaves its occurrence retryable and removes partial output.
+A committed dump is reused if saving its checkpoint failed. Cluster operations and concurrent
+sweeps share resource locks. Changing or reattaching a schedule starts a new scheduling anchor.
+
+These backups are full PostgreSQL dumps using the existing Docker backend. Floci does not
+implement AWS's data-change-based trigger or incremental snapshot storage. Missed occurrences
+are coalesced to one current backup, which contains the data at dump time, rather than replayed
+as historical backups. Older persisted clusters acquire their initial scheduling anchor on the
+first sweep. Cleanup after deleting a cluster runs on the next sweep.
+
+## CloudWatch metrics
+
+Floci publishes metrics for every `available` cluster to the `AWS/Redshift` CloudWatch namespace once a minute, each stamped with the minute that ended. The only dimension is `ClusterIdentifier`.
+
+Each minute is attempted at most once per publisher lifetime. After a pause, overdue ticks skip minutes already attempted instead of publishing duplicate samples. Failed writes are not retried within the same minute because they may already have stored some samples.
+
+| Metric | Unit | Value |
+| --- | --- | --- |
+| `HealthStatus` | `Count` | `1` while the cluster is `available` |
+| `MaintenanceMode` | `Count` | `0`; Floci models no maintenance windows |
+| `DatabaseConnections` | `Count` | Clients currently connected through the cluster's auth proxy |
+
+A cluster that is not `available` (for example `creating`, `deleting` or `failed`) publishes nothing, and `DatabaseConnections` is omitted for a cluster whose proxy is not running. A reboot keeps the status `available`, so `HealthStatus` stays `1` during it and `DatabaseConnections` is omitted until the proxy is back. `DatabaseConnections` counts PostgreSQL wire-protocol clients only: the [Redshift Data API](redshift-data.md) reaches the database around the proxy, so its connections are not counted. Datapoints older than 15 days are dropped hourly.
+
+```bash
+aws --endpoint-url http://localhost:4566 cloudwatch get-metric-statistics \
+  --namespace AWS/Redshift --metric-name HealthStatus \
+  --dimensions Name=ClusterIdentifier,Value=my-cluster \
+  --start-time "$(date -u -d '-10 minutes' +%FT%TZ)" --end-time "$(date -u +%FT%TZ)" \
+  --period 60 --statistics Sum
+```
+
+Set `FLOCI_SERVICES_REDSHIFT_CLOUDWATCH_METRICS_ENABLED=false` to turn publishing off. Publishing also requires the CloudWatch Metrics service to be enabled.
 
 ## DynamoDB zero-ETL
 
@@ -92,6 +396,32 @@ approximation to indicate that initial backfill is in progress); it becomes `act
 exhausted. The landing table is an append-only log, so an item changed while its table is still being
 backfilled can appear twice: once from the scan and once from the stream.
 
+### EventBridge events
+
+As an integration changes state, Floci sends `aws.redshift` events to the default EventBridge bus
+of the integration's account and Region, as AWS does for zero-ETL integrations. No subscription is
+needed: a rule on `source = aws.redshift` receives them. The `detail-type` is
+`Redshift Integration Monitoring`, and the event IDs, severities and messages follow the
+[AWS event table](https://docs.aws.amazon.com/redshift/latest/mgmt/integration-event-notifications.html).
+`resources` holds the integration ARN.
+
+| Event ID | Severity | Sent when |
+| --- | --- | --- |
+| `REDSHIFT-INTEGRATION-EVENT-0003` | INFO | The integration starts or resumes synchronizing (`syncing`) |
+| `REDSHIFT-INTEGRATION-EVENT-0000` | INFO | The initial backfill finishes and the integration becomes `active` |
+| `REDSHIFT-INTEGRATION-EVENT-0013` | INFO | The integration returns to `active` after a failure |
+| `REDSHIFT-INTEGRATION-EVENT-0007` | ERROR | The consumer fails to write and the integration becomes `failed` |
+| `REDSHIFT-INTEGRATION-EVENT-0002` | INFO | `DeleteIntegration` starts |
+| `REDSHIFT-INTEGRATION-EVENT-0001` | INFO | `DeleteIntegration` finishes |
+
+The `detail` object carries `eventId`, `severity`, `category`, `message` and `integrationArn`.
+AWS does not publish a JSON example of the `detail` of these events, so these field names are
+Floci's representation of the table's columns, not a claim of byte-for-byte AWS parity.
+Floci sends only the events its DynamoDB integration can raise: the Aurora, primary-key,
+data-type, pause and resume, serverless restore and modification events do not occur here. Delivery
+is best effort. It is skipped when the EventBridge service is disabled, a refused or failed
+delivery is logged, and neither changes the outcome of the Redshift operation.
+
 Serverless Redshift targets, schema inference, and relational projection are not supported in this
 first implementation.
 
@@ -113,6 +443,31 @@ For `AWS::Redshift::Cluster`:
 
 Replacement occurs if `ClusterIdentifier`, `DBName`, `MasterUsername`, or `ClusterSubnetGroupName` changes. Other properties (such as `NodeType`, `MasterUserPassword`, `ClusterParameterGroupName`, and `VpcSecurityGroupIds`) update in place.
 
+`SnapshotIdentifier` restores the snapshot's SQL dump into the new cluster rather than creating
+an empty database. The snapshot must exist in the current account. The restored cluster inherits
+the snapshot's admin username and password, so `MasterUserPassword` can be omitted. The template's
+`MasterUsername` and `MasterUserPassword` do not override snapshot credentials during creation;
+a later in-place update can change the password. `ManageMasterPassword` instead generates a new
+password and stores it in a Redshift-owned Secrets Manager secret.
+
+Changing, adding, or removing `SnapshotIdentifier` replaces the cluster. Updates that keep the
+same snapshot modify the existing cluster without replaying the dump, preserving rows written
+since restoration. A failed replacing update restores the original physical id and attributes
+through the existing replacement rollback mechanism. `Ref`, `Endpoint.Address`, `Endpoint.Port`,
+and `ClusterNamespaceArn` identify the restored cluster.
+
+```yaml
+Warehouse:
+  Type: AWS::Redshift::Cluster
+  Properties:
+    ClusterIdentifier: restored-warehouse
+    NodeType: ra3.large
+    ClusterType: single-node
+    DBName: dev
+    MasterUsername: admin
+    SnapshotIdentifier: warehouse-backup
+```
+
 For `AWS::Redshift::ClusterParameterGroup`, `Parameters` is applied via `ModifyClusterParameterGroup` on both create and update. `Description` and `ParameterGroupFamily` are replacement properties, matching AWS: changing either creates a new parameter group instead of reusing the prior one.
 
 ### Gaps and Limitations
@@ -122,8 +477,12 @@ For `AWS::Redshift::ClusterParameterGroup`, `Parameters` is applied via `ModifyC
 - `NumberOfNodes` is not stored on cluster create: every emulated cluster is backed by a single PostgreSQL container.
 - `ManageMasterPassword` creates a Redshift-owned Secrets Manager secret. The secret contains the
   managed username, password, endpoint, port, and database name. `MasterPasswordSecretKmsKeyId`
-  selects the KMS key used for the secret metadata and is validated through KMS.
-- `SnapshotIdentifier` is ignored: a fresh cluster is created instead of restoring from a snapshot.
+  selects the KMS key used for the secret metadata and is validated through KMS. Switching managed
+  password mode or its KMS key in place is not implemented. `RotateSecret` and scheduled rotation
+  update both the cluster's master password and its secret value; rotation requires an available
+  cluster and does not use a Lambda function.
+- Snapshot restoration has the same limitations as `RestoreFromClusterSnapshot`: snapshots are
+  local SQL dumps, not cross-account backups or a full Redshift engine image.
 - `AWS::Redshift::ClusterSecurityGroup` is accepted as metadata: Floci does not emulate the legacy EC2-Classic security group model.
 
 ## Configuration
@@ -131,6 +490,11 @@ For `AWS::Redshift::ClusterParameterGroup`, `Parameters` is applied via `ModifyC
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FLOCI_SERVICES_REDSHIFT_ENABLED` | `true` | Enable or disable Redshift |
+| `FLOCI_SERVICES_REDSHIFT_AUTOMATED_SNAPSHOTS_ENABLED` | `true` | Run background automated snapshot and retention sweeps |
+| `FLOCI_SERVICES_REDSHIFT_CLOUDWATCH_METRICS_ENABLED` | `true` | Publish the `AWS/Redshift` metrics of available clusters to CloudWatch once a minute, see [CloudWatch metrics](#cloudwatch-metrics) |
+| `FLOCI_SERVICES_REDSHIFT_SNAPSHOT_SWEEP_INTERVAL_SECONDS` | `60` | Delay between background snapshot sweeps |
+| `FLOCI_SERVICES_REDSHIFT_SNAPSHOT_COPY_ENABLED` | `true` | Run the background sweep that copies snapshots of copy-enabled clusters to their destination Region |
+| `FLOCI_SERVICES_REDSHIFT_SNAPSHOT_COPY_SWEEP_INTERVAL_SECONDS` | `60` | Delay between snapshot copy sweeps |
 | `FLOCI_SERVICES_REDSHIFT_IMAGE_VERSION` | `postgres:15-alpine` | PostgreSQL Docker image backing each cluster |
 | `FLOCI_SERVICES_REDSHIFT_DEFAULT_PORT` | `5439` | Reported Redshift port hint (the real host port is dynamic and comes from `DescribeClusters`) |
 | `FLOCI_SERVICES_REDSHIFT_PROXY_BASE_PORT` | `7100` | Lowest host port the per-cluster auth proxies bind |
@@ -138,7 +502,7 @@ For `AWS::Redshift::ClusterParameterGroup`, `Parameters` is applied via `ModifyC
 | `FLOCI_SERVICES_REDSHIFT_ENDPOINT_HOST` | _(unset)_ | Hostname advertised in `DescribeClusters`; unset resolves from the Docker host |
 | `FLOCI_SERVICES_REDSHIFT_PROXY_HANDSHAKE_TIMEOUT_MILLIS` | `10000` | Max time a client has to complete the startup/auth handshake before the proxy drops it |
 | `FLOCI_SERVICES_REDSHIFT_PROXY_BACKEND_CONNECT_TIMEOUT_MILLIS` | `5000` | Max time the proxy waits for the backend TCP connect |
-| `FLOCI_SERVICES_REDSHIFT_PROXY_MAX_CONNECTIONS` | `100` | Max concurrent connections per proxy before new ones are refused |
+| `FLOCI_SERVICES_REDSHIFT_PROXY_MAX_CONNECTIONS` | `2000` | Max concurrent connections per proxy before new ones are refused |
 
 Redshift needs the Docker socket so it can launch PostgreSQL containers. Each cluster's container is published on a dynamically assigned host port, returned by `DescribeClusters`.
 
@@ -251,7 +615,8 @@ CREATE EXTERNAL TABLE <schema>.<table> (<name> <type>, ...)
 ```
 
 Supported column types are `VARCHAR`, `CHAR`, `INTEGER`, `BIGINT`, `DECIMAL`, `BOOLEAN`, `DATE`,
-and `TIMESTAMP`. CSV reads support `DELIMITER`, `QUOTE`, `ESCAPE`, `NULL AS`, and
+and `TIMESTAMP`. `CHAR` defaults to length 1 and `VARCHAR` defaults to length 256 when no length
+is specified. CSV reads support `DELIMITER`, `QUOTE`, `ESCAPE`, `NULL AS`, and
 `skip.header.line.count`. Objects under the location are read in lexicographic key order.
 
 The query path supports `SELECT *`, explicit column projections, and simple `WHERE` predicates
@@ -270,6 +635,109 @@ the role or evaluate its IAM policy for Spectrum reads. S3 authorization therefo
 current S3 emulator authorization mode, and role-specific Spectrum access enforcement is a
 future phase. Parquet, JSON, Avro, ORC, partition discovery, `ALTER`, and `DROP` lifecycle
 operations are not supported in Phase 1.
+
+### Relational queries over Glue-backed external CSV tables
+
+An external schema bound to an existing local Glue database supports JOINs between external and
+internal tables, multiple external tables, aliases, bound predicates, GROUP BY, HAVING, ORDER BY
+and LIMIT. PostgreSQL evaluates the original SQL after Floci loads the referenced external
+relations. Simple Query, JDBC Extended Query and the Redshift Data API share this preparation path.
+Extended Query uses native PostgreSQL descriptions and cursors, including fetch-size cursors.
+
+Create the Glue database first, or use `CREATE EXTERNAL DATABASE IF NOT EXISTS`:
+
+```sql
+CREATE EXTERNAL SCHEMA lake FROM DATA CATALOG
+DATABASE 'analytics' IAM_ROLE '<associated-role-arn>'
+CREATE EXTERNAL DATABASE IF NOT EXISTS;
+
+CREATE EXTERNAL TABLE lake.events (customer_id INTEGER, amount INTEGER)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+STORED AS TEXTFILE LOCATION 's3://analytics/events/';
+
+SELECT c.country, SUM(e.amount) AS total
+FROM lake.events e JOIN public.customers c ON e.customer_id = c.id
+GROUP BY c.country ORDER BY total DESC;
+```
+
+This path needs Docker for PostgreSQL and the existing floci-duck runtime used to read external
+data. Use the `floci.duck` configuration described under [Athena](athena.md) to supply a reachable
+runtime when container management is unsuitable. This iteration validates CSV relational reads;
+it does not add new file formats or partition pruning.
+
+Materialized relations are cached in the cluster database. Each new query checks the associated
+role, trust policy and S3 access before using cached data, following the existing S3 enforcement
+configuration. Changes to Glue metadata or S3 objects reload the data. A missing Glue table is an
+error even if its previous contents remain cached. New prepared-statement bindings revalidate
+the data; repeated fetches from one active cursor retain that cursor's result. Loads inside a
+caller transaction do not publish a reusable fingerprint because the transaction may roll back.
+Temporary transfer objects and staging tables are cleaned up independently of cached relations.
+Extended Query loads retain a connection-local fingerprint until its transaction completes;
+the fingerprint becomes shared only after confirmed commit and is discarded on rollback.
+Creating an external schema or table
+inside a transaction, including a Data API batch (which runs as one transaction), is rejected before changing the catalogs: AWS does not allow `CREATE EXTERNAL TABLE` inside a transaction block (SQLSTATE `25001`).
+Cold loads and reloads require database privileges to maintain the materialized table and catalog;
+ordinary users with schema USAGE and table SELECT can read an existing committed cache entry.
+Role association and trust are checked before every read, cached or not, and S3 policy checks follow
+the configured enforcement mode. With `FLOCI_SERVICES_S3_ENFORCE_AUTH=true` the floci-duck transfer of
+a cold load or reload is signed with the role's own short-lived session (access key, secret key and
+session token), so the role's identity policy and the bucket policy are evaluated for the transfer
+itself, and a deny stops it with SQLSTATE `42501`. The transfer writes its result to Floci's internal
+scratch bucket; because AWS Spectrum performs no S3 write and realistic role policies, permissions
+boundaries or SCPs follow AWS's read-only permissions on source data, this internal scratch write
+is authorized ahead of the role's policies directly for the minted transfer session key and scratch key,
+verifying Floci's internal tag on the bucket. Reads of the scratch bucket and every other bucket stay under
+normal policy evaluation.
+
+Writes to external relations are rejected. AWS prohibits external UPDATE/DELETE but supports
+some external INSERT operations; external INSERT is an intentional Floci limitation here. Use
+schema-qualified external table names. Full Glue IAM enforcement, Lake Formation, role chaining
+and `IAM_ROLE SESSION` are outside this implementation. Metadata is exposed through
+`svv_external_schemas`, `svv_external_tables`, `svv_external_columns` and `svv_external_partitions`.
+
+Schemas created without a matching Glue database retain the legacy Phase 1 path described above.
+Its single-table query restrictions still apply. PostgreSQL materialization approximates Spectrum
+execution and does not reproduce AWS distributed planning or a cross-service transaction snapshot.
+
+### Glue-backed external table lifecycle
+
+Glue-backed schemas support these statements through the Simple Query protocol, JDBC Extended
+Query, and the Redshift Data API:
+
+```sql
+ALTER TABLE lake.events ADD IF NOT EXISTS
+PARTITION (dt='2026-10-17') LOCATION 's3://analytics/events/dt=2026-10-17/';
+
+DROP TABLE IF EXISTS lake.events;
+DROP SCHEMA IF EXISTS lake CASCADE;
+```
+
+`ADD PARTITION` registers partitions in Glue, preserves the declared partition-key order, refreshes
+`svv_external_partitions`, and invalidates cached rows. Multiple partition clauses are supported.
+The entire partition list is validated before registration. A duplicate partition fails unless
+`IF NOT EXISTS` is specified; that clause keeps the existing partition location unchanged.
+If registration or metadata refresh fails, Floci attempts to remove only the partitions created
+by that statement. A failed cleanup is logged while the original error remains the response.
+
+`DROP TABLE` removes the Glue table and its partitions, drops any materialized PostgreSQL table,
+and refreshes the external catalog views. The default `RESTRICT` preserves the Glue definition
+if a local view depends on its materialized table; `CASCADE` also drops those dependent objects.
+No S3 objects are deleted. `IF EXISTS` also removes a stale materialization if the Glue table
+has already been deleted.
+
+`DROP SCHEMA` unregisters the local external schema and clears its materializations and catalog
+view rows. It preserves the Glue database, Glue tables and partitions, and S3 objects. The default
+`RESTRICT` refuses a schema containing Glue tables, including tables that have never been queried.
+If the Glue database was already deleted, the remaining local schema can still be dropped.
+`CASCADE` removes the local schema and its dependent objects. `DROP EXTERNAL DATABASE` and
+multi-object DROP statements are outside this implementation.
+
+Run these catalog changes outside explicit transactions and Data API batches. Floci rejects them
+with SQLSTATE `25001` before changing Glue or PostgreSQL because it cannot roll back Glue changes
+with a PostgreSQL transaction. The schema transaction restriction is an emulator limitation.
+Glue and PostgreSQL updates do not form a distributed transaction: an infrastructure failure after
+one store changes can require retrying the command. The legacy Phase 1 catalog does not gain these
+lifecycle operations.
 
 ### COPY from S3
 
@@ -298,24 +766,71 @@ order) through its own S3 service and streams the rows into the backing PostgreS
   compatible with output from `UNLOAD ... MANIFEST`. Missing files marked `mandatory: true` abort the load.
   When `mandatory` is omitted, it defaults to `false`. All entries in the manifest must reside in the same S3
   bucket as the manifest file itself; cross-bucket manifest entries are rejected as an intentional deviation.
-- `IGNOREHEADER` and `HEADER` skip lines from the first resolved object only.
+- `IGNOREHEADER` and `HEADER` skip lines from the start of every resolved object, as AWS does for a parallel load of several files.
 - `GZIP` is the only input compression recognized; `BZIP2`, `LZOP` and `ZSTD` are not.
 - `IAM_ROLE '<role-arn>'` is supported. The role must be associated with the cluster (at
   `CreateCluster` or through `ModifyClusterIamRoles`; connections opened before a change keep the
   roles they started with), exist in
-  the local IAM service, and trust Redshift to assume it. With
+  the local IAM service under that ARN, path included, and trust Redshift to assume it. With
   `FLOCI_SERVICES_S3_ENFORCE_AUTH` off, S3 policy checks are skipped. With it on, the role's
   identity policy must allow the required S3 actions, and any bucket policy must not deny the
-  request. `IAM_ROLE default` is not supported.
+  request. `IAM_ROLE default` uses the cluster's default role with the same permission checks.
+- `REGION '<region>'` is accepted and ignored: Floci has one S3.
+- `CREDENTIALS 'aws_iam_role=<arn>'` behaves like `IAM_ROLE`. `ACCESS_KEY_ID` with `SECRET_ACCESS_KEY`
+  (and an optional `SESSION_TOKEN`), or `CREDENTIALS 'aws_access_key_id=...;aws_secret_access_key=...'`,
+  are accepted but never verified or stored: S3 is read as an unsigned request, the same as with no
+  authorization clause. Combining key credentials with `IAM_ROLE`, or giving only one of the pair, is
+  not intercepted, and neither is a blank key, secret, token or role.
+- `EMPTYASNULL`, `BLANKSASNULL`, `REMOVEQUOTES` (not with `CSV` or `JSON`), `ACCEPTINVCHARS [AS 'c']`
+  (default `?`, one ASCII character) and `TRUNCATECOLUMNS` rewrite field content before loading. Field
+  level options need a single-byte `DELIMITER`, are not combined with `FORMAT AS JSON`, and normalise
+  `CRLF` line endings to `LF`. A nulled field is written as the `NULL AS` string, or `\N` in text
+  mode and an empty unquoted field in CSV mode. `TRUNCATECOLUMNS` cuts a value to the declared
+  `CHAR`/`VARCHAR` length in bytes (Redshift's meaning of the declared length, so `éééé` into
+  `VARCHAR(3)` loads `é`), never inside a multi-byte character or a backslash escape. Its column
+  lengths come from the database catalog, so it works only over the **Simple Query protocol** (`preferQueryMode=simple`);
+  over Extended Query the COPY fails with an error that names this requirement. A field-level option
+  buffers each decompressed object in memory, so an object over 64 MiB, or a heap budget shared
+  across connections that is used up, fails the COPY instead of exhausting the emulator.
+- `DATEFORMAT [AS] 'format'` reads the fields of `DATE` columns and `TIMEFORMAT [AS] 'format'` those of
+  `TIMESTAMP` columns, using the dateparts and timeparts `YY`, `YYYY`, `MM`, `MON`, `DD`, `HH`/`HH24`, `HH12`,
+  `MI`, `SS` (with up to six fractional digits) and `AM`/`PM`, with any other punctuation as separators.
+  `TIMEFORMAT` also takes `'epochsecs'` and `'epochmillisecs'`, read as UTC. A `DATEFORMAT` may name a time
+  of day, which is dropped; a `TIMEFORMAT` without one gives midnight. A format that names a time zone, or
+  any other text, is not recognized and the statement is forwarded to PostgreSQL. A value that does not
+  match its format fails the COPY, as it does with Redshift's default `MAXERROR` of 0; the message names the
+  column and the format, and Floci writes no `stl_load_errors` row. `ACCEPTANYDATE` loads such a value as
+  `NULL` instead; when no format is given it reads the ISO form of a date, with an optional time of day, and
+  turns anything else into `NULL`. Numeric parts with no separator between them, as in `YYYYMMDD`, need their
+  full width, a part may be named once, and `HH12` needs `AM` or `PM`; any other format string is not
+  recognized.
+  Like `TRUNCATECOLUMNS`, these read column types from the catalog, so they work only over the Simple Query
+  protocol and are not combined with `FORMAT AS JSON`. Floci deviations: `'auto'` is accepted but converts
+  nothing, leaving every value to PostgreSQL, which reads ISO 8601, Julian and `YYYYMMDD HHMISS` but not every
+  form Redshift recognizes (for example `BC` dates and `YYYY.DDD`), and with it `ACCEPTANYDATE` cannot turn a
+  value into `NULL`, so a value PostgreSQL rejects fails the COPY; `TIMESTAMPTZ` columns are read by
+  PostgreSQL whatever the format, since AWS requires `'auto'` for a format other than its default there; a
+  two-digit `YY` year below 70 means 20YY and otherwise 19YY, which AWS does not document.
+- `FILLRECORD` loads a text or CSV record that stops short of the last columns: the missing columns of a
+  `VARCHAR` or `TEXT` type get a zero-length string, as in AWS, and every other missing column gets
+  `NULL`. With `EMPTYASNULL`, or `NULL AS ''`, which behaves the same, the missing character columns get `NULL`
+  too. A column that does not allow `NULL` fails the COPY as it would without `FILLRECORD`, and a record with
+  too many fields still fails. The number and types of the columns come from the catalog (generated columns
+  left out), or from the column list, in which a name that matches no column counts as a non-character column.
+  A domain over a character type counts as a non-character column. It works only over the Simple Query
+  protocol, and it is not combined with `FORMAT AS JSON`.
 - Any other clause (`FIXEDWIDTH`, `PARQUET`, `AVRO`, `ORC`, `MAXERROR`,
-  `DATEFORMAT`, `TIMEFORMAT`, `REGION`, `ENCODING`, `ESCAPE`, `REMOVEQUOTES`, `BLANKSASNULL`,
-  `EMPTYASNULL`, `TRUNCATECOLUMNS`, `ACCEPTINVCHARS`, `CREDENTIALS`, and so on) is not
-  recognized: the statement is forwarded unchanged and PostgreSQL returns its own error.
+  `ENCODING`, `ESCAPE`, `ENCRYPTED`, `MASTER_SYMMETRIC_KEY`,
+  `KMS_KEY_ID`, and so on) is not recognized: the statement is forwarded unchanged and PostgreSQL
+  returns its own error.
 - A multi-statement query whose COPY is followed by another statement is not intercepted; send the
   COPY on its own.
 - Extended Query COPY is supported when the complete statement is present in `Parse` and has no
   bind parameters. Zero-parameter JDBC `PreparedStatement` calls therefore work with pgjdbc's
   default extended mode. Statements containing bind parameters are forwarded unchanged.
+
+Firehose delivery streams with a Redshift destination use this same path: Firehose stages each batch in S3 and
+runs the `COPY` over a connection to the cluster proxy. See [Firehose](firehose.md#redshift-destination).
 
 ### Limitations
 
@@ -349,6 +864,32 @@ the result to S3 as one or more objects under `<prefix>`.
 - A zero-row result still writes one object (empty, or the header row alone when
   `HEADER` is set).
 - `GZIP` compresses each object and appends `.gz` to its key.
+- `EXTENSION '<ext>'` is appended to each data object key, with a `.` inserted when the value does not
+  start with one: `EXTENSION 'csv'` and `EXTENSION '.csv'` both give `<prefix>0000_part_00.csv`. As in
+  AWS, the compression suffix is added only when no extension is given, so `EXTENSION 'txt.gz' GZIP`
+  gives `<prefix>0000_part_00.txt.gz`. The value is not validated; an empty value or one containing
+  `/` is not intercepted. AWS does not document whether it inserts the dot itself.
+- `REGION` and the credential clauses (`CREDENTIALS`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`,
+  `SESSION_TOKEN`) behave as described for COPY.
+- `ESCAPE` is accepted and relies on PostgreSQL text framing, which already escapes the backslash,
+  newline, carriage return and the delimiter. It is only valid with text framing: combined with
+  `CSV`, `ADDQUOTES` or `HEADER` (which switch the framing to CSV here) the statement is not
+  intercepted. Unlike Redshift, PostgreSQL also writes a tab as `\t`.
+- `CLEANPATH` deletes every object whose key starts with the target prefix. The objects are listed and
+  every delete is authorized up front, like the writes (with `FLOCI_SERVICES_S3_ENFORCE_AUTH` on, the
+  role needs list and delete permission, and a denial fails the UNLOAD before anything is removed or
+  written). The deletes themselves run when the first output arrives, so a query that PostgreSQL
+  rejects leaves the previous export in place. They run on a fresh listing of the prefix, authorized
+  and deleted under one bucket lock, so an object uploaded in the meantime does not survive. Objects
+  already deleted are not restored if the UNLOAD fails later. The match is a plain string prefix, so `TO 's3://b/sales_' CLEANPATH` also removes
+  `sales_archive/...`; end the prefix with `/` to limit it to one folder. It cannot be combined with
+  `ALLOWOVERWRITE`, and an empty prefix (the bucket root) is not intercepted so a typo cannot wipe a
+  bucket.
+- `ENCRYPTED AUTO` is accepted and writes objects as usual. `ENCRYPTED KMS_KEY_ID '<key>'` stores the
+  data and manifest objects with `aws:kms` server-side encryption and that key id; Floci does not
+  encrypt the data beyond what its S3 service does for those headers. Bare `ENCRYPTED` (server-side
+  encryption with the default S3 key) and the client-side `MASTER_SYMMETRIC_KEY` form are not
+  intercepted.
 - `MANIFEST` writes `<prefix>manifest` listing every object with its
   `content_length`.
 - Without `ALLOWOVERWRITE`, a non-empty target prefix fails with SQL error XX000 and the select
@@ -357,12 +898,12 @@ the result to S3 as one or more objects under `<prefix>`.
   so they are not deleted); a `MANIFEST` request that fails this way can leave data objects without
   a manifest, and rerunning the same statement overwrites them.
 - `IAM_ROLE '<role-arn>'` is supported. The role must be associated with the cluster, exist in
-  the local IAM service, and trust Redshift to assume it. With
+  the local IAM service under that ARN, path included, and trust Redshift to assume it. With
   `FLOCI_SERVICES_S3_ENFORCE_AUTH` off, S3 policy checks are skipped. With it on, the role's
   identity policy must allow the required S3 actions, and any bucket policy must not deny the
-  request. `IAM_ROLE default` is not supported.
-- Any other option (`PARQUET`, `ENCRYPTED`, `REGION`, `CREDENTIALS`,
-  `ZSTD`, `EXTENSION`, `CLEANPATH`, `PARTITION`, and so on) is not intercepted; the
+  request. `IAM_ROLE default` uses the cluster's default role with the same permission checks.
+- Any other option (`PARQUET`, `JSON`, `FIXEDWIDTH`, `MASTER_SYMMETRIC_KEY`, `MANIFEST VERBOSE`,
+  `ZSTD`, `BZIP2`, `PARTITION`, and so on) is not intercepted; the
   statement is forwarded and PostgreSQL reports its own error.
 - Extended Query UNLOAD is supported when the complete statement is present in `Parse` and has no
   bind parameters. Parameterized statements are forwarded unchanged.
@@ -397,11 +938,12 @@ These views expose the documented Redshift column names, types, and ordering map
 - Real Redshift SQL semantics: the data plane is stock PostgreSQL. Redshift-only table DDL keywords (DISTSTYLE / DISTKEY / SORTKEY / ENCODE) are stripped so CREATE TABLE / ALTER TABLE executes (see [SQL Interceptor](#sql-interceptor)), but the distribution/sort behavior they request is not; SUPER and Spectrum features outside the documented [Phase 1 subset](#redshift-spectrum-phase-1) are not emulated.
 - Multi-node clusters: `NodeType` and `NumberOfNodes` are stored as metadata; every cluster is a single PostgreSQL container.
 - Parameter groups apply no real engine settings; values are stored and echoed back only.
-- Subnet groups, VPC routing, and security groups are metadata only.
-- Resize, pause/resume, IAM authentication, snapshot schedules, and cross-region snapshot copy.
-- `IAM_ROLE default` and cross-account role ARNs are not supported for COPY or UNLOAD.
+- Subnet groups, VPC routing, and security groups are metadata only. A subnet group still records its tags, and takes its VPC and each subnet's availability zone from EC2 when the subnets exist there; subnets EC2 does not know are kept as given.
+- Resize, pause/resume, and IAM authentication.
+- Cross-account role ARNs are not supported for COPY or UNLOAD.
 - The auth proxy validates the master user's password and any live `GetClusterCredentials` credential. Other non-master users pass straight through to PostgreSQL, which remains the authority for their credentials.
 - A cluster using `ManageMasterPassword` keeps its generated password in sync with the
   Redshift-owned Secrets Manager secret. Updating `MasterUserPassword` through `ModifyCluster`
-  updates the current secret version as well.
+  updates the current secret version as well. Service-managed `RotateSecret` and scheduled rotation
+  change the backend password and publish the matching secret version without invoking Lambda.
 - IAM database authentication over the wire, and `sslmode=verify-full` against the self-signed proxy certificate.

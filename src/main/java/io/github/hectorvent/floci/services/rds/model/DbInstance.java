@@ -11,7 +11,7 @@ import java.util.Map;
 @RegisterForReflection
 public class DbInstance {
 
-    /** The only storage type Floci models, and the one DescribeDBInstances reports. */
+    /** The fallback for existing records and requests that do not name a storage type. */
     public static final String DEFAULT_STORAGE_TYPE = "gp2";
 
     private String dbInstanceIdentifier;
@@ -25,6 +25,11 @@ public class DbInstance {
     private String dbName;
     private String dbInstanceClass;
     private int allocatedStorage;
+    private String storageType;
+    /** The RDS certificate authority for the instance; null on one stored before it was recorded. */
+    private String caCertificateIdentifier;
+    /** The license model the request named; null means the engine's default. */
+    private String licenseModel;
     private DbInstanceStatus status;
     private DbEndpoint endpoint;
     private boolean iamDatabaseAuthenticationEnabled;
@@ -67,6 +72,7 @@ public class DbInstance {
     private String masterUserSecretStatus;
     private String masterUserSecretKmsKeyId;
     private Map<String, String> tags = new LinkedHashMap<>();
+    private List<DbRoleAssociation> associatedRoles = new ArrayList<>();
     private Instant createdAt;
     private int proxyPort;
     // Read replication links, kept on both ends the way DescribeDBInstances reports them: a
@@ -76,6 +82,8 @@ public class DbInstance {
     // gone.
     private String readReplicaSourceDbInstanceIdentifier;
     private List<String> readReplicaDbInstanceIdentifiers = new ArrayList<>();
+    /** The ARNs of this instance's automated backups replicated to other Regions. */
+    private List<String> automatedBackupReplicationArns = new ArrayList<>();
     private String readReplicationStatus;
 
     private String dockerVolumeName;
@@ -131,6 +139,16 @@ public class DbInstance {
 
     public String getDbInstanceClass() { return dbInstanceClass; }
     public void setDbInstanceClass(String dbInstanceClass) { this.dbInstanceClass = dbInstanceClass; }
+
+    public String getStorageType() { return storageType != null ? storageType : DEFAULT_STORAGE_TYPE; }
+    public void setStorageType(String storageType) { this.storageType = storageType; }
+
+    public String getLicenseModel() { return licenseModel; }
+    public void setLicenseModel(String licenseModel) { this.licenseModel = licenseModel; }
+    public String getCaCertificateIdentifier() { return caCertificateIdentifier; }
+    public void setCaCertificateIdentifier(String caCertificateIdentifier) {
+        this.caCertificateIdentifier = caCertificateIdentifier;
+    }
 
     public int getAllocatedStorage() { return allocatedStorage; }
     public void setAllocatedStorage(int allocatedStorage) { this.allocatedStorage = allocatedStorage; }
@@ -231,6 +249,12 @@ public class DbInstance {
         this.readReplicaSourceDbInstanceIdentifier = readReplicaSourceDbInstanceIdentifier;
     }
 
+    public List<String> getAutomatedBackupReplicationArns() { return automatedBackupReplicationArns; }
+    public void setAutomatedBackupReplicationArns(List<String> automatedBackupReplicationArns) {
+        this.automatedBackupReplicationArns = automatedBackupReplicationArns != null
+                ? new ArrayList<>(automatedBackupReplicationArns) : new ArrayList<>();
+    }
+
     public List<String> getReadReplicaDbInstanceIdentifiers() { return readReplicaDbInstanceIdentifiers; }
     public void setReadReplicaDbInstanceIdentifiers(List<String> readReplicaDbInstanceIdentifiers) {
         this.readReplicaDbInstanceIdentifiers = readReplicaDbInstanceIdentifiers != null
@@ -244,6 +268,11 @@ public class DbInstance {
     public boolean hasReadReplicaSource() {
         return readReplicaSourceDbInstanceIdentifier != null
                 && !readReplicaSourceDbInstanceIdentifier.isBlank();
+    }
+
+    public List<DbRoleAssociation> getAssociatedRoles() { return associatedRoles; }
+    public void setAssociatedRoles(List<DbRoleAssociation> associatedRoles) {
+        this.associatedRoles = associatedRoles != null ? new ArrayList<>(associatedRoles) : new ArrayList<>();
     }
 
     public Map<String, String> getTags() { return tags; }

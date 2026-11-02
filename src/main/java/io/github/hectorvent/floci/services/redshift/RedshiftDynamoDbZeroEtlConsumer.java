@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
@@ -23,9 +24,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -136,6 +134,9 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
     }
 
     private void poll(Integration integration) {
+        if (targetPaused(integration)) {
+            return;
+        }
         writer.createLandingTable(integration.getAccountId(), integration.getTargetClusterIdentifier(),
                 integration.getLandingTableName());
         if (!integration.isBackfillCompleted()) {
@@ -147,8 +148,28 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
                 ignored -> ConcurrentHashMap.newKeySet());
         // ponytail: a shard whose read or write throws ends the tick for the shards after it; the next
         // tick starts over from committed progress, so it only delays them.
+        boolean checkpointPersisted = false;
         for (DynamoDbStreamReader.Shard shard : DynamoDbStreamReader.readable(streamReader.shards(stream), finished)) {
-            pollShard(integration, stream, shard.shardId(), finished);
+            if (pollShard(integration, stream, shard.shardId(), finished)) {
+                checkpointPersisted = true;
+            }
+        }
+        if (!checkpointPersisted) {
+            redshiftService.recoverIntegrationRuntime(integration.getAccountId(), integration.getIntegrationArn());
+        }
+    }
+
+    private boolean targetPaused(Integration integration) {
+        try {
+            return redshiftService.describeClustersForAccount(integration.getAccountId(),
+                            integration.getTargetClusterIdentifier()).stream()
+                    .anyMatch(cluster -> "paused".equals(cluster.getClusterStatus()));
+        } catch (AwsException expected) {
+            if (!"ClusterNotFound".equals(expected.getErrorCode())) {
+                throw expected;
+            }
+            // A missing target is a polling failure, not an intentional pause; let the writer report it.
+            return false;
         }
     }
 
@@ -156,7 +177,7 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
      * Writes one batch after the shard's committed sequence and commits it only once written, so a
      * failed write is read and written again next poll.
      */
-    private void pollShard(Integration integration, DynamoDbStreamReader.Stream stream, String shardId,
+    private boolean pollShard(Integration integration, DynamoDbStreamReader.Stream stream, String shardId,
                            Set<String> finished) {
         Map<String, String> committed = integration.getShardSequenceNumbers();
         DynamoDbStreamReader.RecordsPage page;
@@ -173,7 +194,7 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
             if (page.closed()) {
                 finished.add(shardId);
             }
-            return;
+            return false;
         }
         writer.writeBatch(integration.getAccountId(), integration.getTargetClusterIdentifier(),
                 integration.getLandingTableName(),
@@ -181,6 +202,7 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
         committed.put(shardId, records.get(records.size() - 1).sequenceNumber());
         redshiftService.updateIntegrationRuntime(integration.getAccountId(), integration.getIntegrationArn(),
                 committed, true, null);
+        return true;
     }
 
     private void pollBackfillPage(Integration integration) {
@@ -220,7 +242,7 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
             }
         }
         ObjectNode record = objectMapper.createObjectNode()
-                .put("eventID", "backfill#" + integration.getIntegrationArn() + "#" + sha256Hex(keys.toString()))
+                .put("eventID", "backfill#" + integration.getIntegrationArn() + "#" + Digests.sha256Hex(keys.toString()))
                 .put("eventName", "INSERT");
         ObjectNode dynamodb = record.putObject("dynamodb").put("SequenceNumber", "backfill");
         dynamodb.set("Keys", keys);
@@ -251,19 +273,6 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
         } catch (JsonProcessingException e) {
             throw new AwsException("InternalFailure",
                     "Could not persist a zero-ETL backfill checkpoint.", 500);
-        }
-    }
-
-    private static String sha256Hex(String value) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is not available", e);
         }
     }
 
@@ -366,10 +375,14 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
         try {
             unlessQuiesced(submittedAt, () -> poll(integration));
         } catch (Exception e) {
-            LOG.warnv(e, "Zero-ETL polling failed for integration {0}", integration.getIntegrationArn());
             try {
-                unlessQuiesced(submittedAt, () -> redshiftService.updateIntegrationRuntime(integration.getAccountId(),
-                        integration.getIntegrationArn(), integration.getShardSequenceNumbers(), false, e.getMessage()));
+                unlessQuiesced(submittedAt, () -> {
+                    if (!targetPaused(integration)) {
+                        LOG.warnv(e, "Zero-ETL polling failed for integration {0}", integration.getIntegrationArn());
+                        redshiftService.updateIntegrationRuntime(integration.getAccountId(), integration.getIntegrationArn(),
+                                integration.getShardSequenceNumbers(), false, e.getMessage());
+                    }
+                });
             } catch (Exception updateError) {
                 LOG.warnv(updateError, "Could not persist zero-ETL failure for integration {0}",
                         integration.getIntegrationArn());

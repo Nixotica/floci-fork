@@ -1,17 +1,21 @@
 package io.github.hectorvent.floci.services.ssoadmin;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.services.ssoadmin.model.Assignment;
-import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentOperation;
-import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentDeletionOperation;
+import io.github.hectorvent.floci.services.identitystore.IdentityStoreService;
+import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAccessScope;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAssignment;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAuthenticationMethod;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationGrant;
+import io.github.hectorvent.floci.services.ssoadmin.model.Assignment;
+import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentDeletionOperation;
+import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentOperation;
 import io.github.hectorvent.floci.services.ssoadmin.model.InstanceAccessControlAttributeConfiguration;
 import io.github.hectorvent.floci.services.ssoadmin.model.InstanceUpdateState;
 import io.github.hectorvent.floci.services.ssoadmin.model.PermissionSet;
@@ -21,10 +25,9 @@ import io.github.hectorvent.floci.services.ssoadmin.model.RegionMetadata;
 import io.github.hectorvent.floci.services.ssoadmin.model.SsoApplication;
 import io.github.hectorvent.floci.services.ssoadmin.model.SsoInstance;
 import io.github.hectorvent.floci.services.ssoadmin.model.TrustedTokenIssuer;
-import io.github.hectorvent.floci.services.identitystore.IdentityStoreService;
-import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,8 +56,8 @@ class SsoAdminServiceTest {
 
     @BeforeEach
     void setUp() {
-        identityStoreService = org.mockito.Mockito.mock(IdentityStoreService.class);
-        organizationsService = org.mockito.Mockito.mock(OrganizationsService.class);
+        identityStoreService = Mockito.mock(IdentityStoreService.class);
+        organizationsService = Mockito.mock(OrganizationsService.class);
         applicationAccessScopes = new InMemoryStorage<>();
         applicationAuthenticationMethods = new InMemoryStorage<>();
         applicationGrants = new InMemoryStorage<>();
@@ -227,7 +230,7 @@ class SsoAdminServiceTest {
 
         ObjectNode tooMany = mapper.createObjectNode();
         tooMany.put("InstanceArn", service.getInstanceArn());
-        var attributes = tooMany.putObject("InstanceAccessControlAttributeConfiguration")
+        ArrayNode attributes = tooMany.putObject("InstanceAccessControlAttributeConfiguration")
                 .putArray("AccessControlAttributes");
         for (int i = 0; i < 51; i++) {
             attributes.addObject().put("Key", "Key" + i).putObject("Value").putArray("Source").add("value");
@@ -378,7 +381,7 @@ class SsoAdminServiceTest {
         request.put("InstanceArn", instance.instanceArn());
         emptyService.deleteInstance(request, ACCOUNT_ID);
         assertError("ResourceNotFoundException", () -> emptyService.getApplication(createdApplication.applicationArn()));
-        org.mockito.Mockito.verify(identityStoreService).deleteIdentityStore(instance.identityStoreId());
+        Mockito.verify(identityStoreService).deleteIdentityStore(instance.identityStoreId());
     }
 
     @Test
@@ -503,7 +506,7 @@ class SsoAdminServiceTest {
 
     @Test
     void createInstanceRejectsOrganizationsManagementAccounts() {
-        org.mockito.Mockito.when(organizationsService.isManagementAccount(ACCOUNT_ID)).thenReturn(true);
+        Mockito.when(organizationsService.isManagementAccount(ACCOUNT_ID)).thenReturn(true);
         SsoAdminService emptyService = emptyService();
 
         assertError("AccessDeniedException",
@@ -533,7 +536,7 @@ class SsoAdminServiceTest {
         ObjectNode request = mapper.createObjectNode();
         request.put("InstanceArn", service.getInstanceArn());
         request.put("MaxResults", 1);
-        var firstPage = service.listApplications(request, ACCOUNT_ID);
+        PaginatedResult<SsoApplication> firstPage = service.listApplications(request, ACCOUNT_ID);
         assertEquals(1, firstPage.items().size());
         assertNotNull(firstPage.nextToken());
         request.put("NextToken", firstPage.nextToken());
@@ -544,7 +547,7 @@ class SsoAdminServiceTest {
         providerFilter.putObject("Filter")
                 .put("ApplicationProvider", "arn:aws:sso::aws:applicationProvider/custom")
                 .put("ApplicationAccount", ACCOUNT_ID);
-        assertTrue(service.listApplications(providerFilter, ACCOUNT_ID).items().containsAll(java.util.List.of(first, second)));
+        assertTrue(service.listApplications(providerFilter, ACCOUNT_ID).items().containsAll(List.of(first, second)));
 
         ObjectNode memberWithoutFilter = mapper.createObjectNode().put("InstanceArn", service.getInstanceArn());
         assertError("AccessDeniedException",
@@ -627,12 +630,12 @@ class SsoAdminServiceTest {
 
         ApplicationAccessScope created = service.putApplicationAccessScope(request);
         assertEquals("api:read", created.scope());
-        assertEquals(java.util.List.of(service.getInstanceArn()), created.authorizedTargets());
+        assertEquals(List.of(service.getInstanceArn()), created.authorizedTargets());
         assertEquals(created, service.getApplicationAccessScope(request));
 
         request.putArray("AuthorizedTargets").add(application.applicationArn());
         ApplicationAccessScope updated = service.putApplicationAccessScope(request);
-        assertEquals(java.util.List.of(application.applicationArn()), updated.authorizedTargets());
+        assertEquals(List.of(application.applicationArn()), updated.authorizedTargets());
 
         ObjectNode invalid = request.deepCopy();
         invalid.putArray("AuthorizedTargets").add("not-an-arn");
@@ -643,7 +646,7 @@ class SsoAdminServiceTest {
     void listApplicationAccessScopesPaginatesScopesForTheRequestedApplication() {
         SsoApplication application = createApplication("List Scope App", "list-scope-app-token");
         SsoApplication otherApplication = createApplication("Other Scope App", "other-scope-app-token");
-        for (String scope : java.util.List.of("api:read", "api:write")) {
+        for (String scope : List.of("api:read", "api:write")) {
             ObjectNode put = mapper.createObjectNode();
             put.put("ApplicationArn", application.applicationArn());
             put.put("Scope", scope);
@@ -659,14 +662,14 @@ class SsoAdminServiceTest {
         ObjectNode request = mapper.createObjectNode();
         request.put("ApplicationArn", application.applicationArn());
         request.put("MaxResults", 1);
-        var first = service.listApplicationAccessScopes(request);
+        PaginatedResult<ApplicationAccessScope> first = service.listApplicationAccessScopes(request);
         assertEquals(1, first.items().size());
         assertEquals("api:read", first.items().get(0).scope());
-        assertEquals(java.util.List.of(service.getInstanceArn()), first.items().get(0).authorizedTargets());
+        assertEquals(List.of(service.getInstanceArn()), first.items().get(0).authorizedTargets());
         assertNotNull(first.nextToken());
 
         request.put("NextToken", first.nextToken());
-        var second = service.listApplicationAccessScopes(request);
+        PaginatedResult<ApplicationAccessScope> second = service.listApplicationAccessScopes(request);
         assertEquals(1, second.items().size());
         assertEquals("api:write", second.items().get(0).scope());
         assertNull(second.nextToken());
@@ -688,7 +691,7 @@ class SsoAdminServiceTest {
         String scope = "api:read";
         String key = SsoAdminService.applicationAccessScopeKey(application.applicationArn(), scope);
         applicationAccessScopes.put(key, new ApplicationAccessScope(
-                application.applicationArn(), scope, java.util.List.of(service.getInstanceArn())));
+                application.applicationArn(), scope, List.of(service.getInstanceArn())));
 
         ObjectNode request = mapper.createObjectNode();
         request.put("ApplicationArn", application.applicationArn());
@@ -738,7 +741,7 @@ class SsoAdminServiceTest {
                 new ApplicationAuthenticationMethod(otherApplication.applicationArn(), "IAM", method.deepCopy()));
 
         ObjectNode request = mapper.createObjectNode().put("ApplicationArn", application.applicationArn());
-        var result = service.listApplicationAuthenticationMethods(request);
+        PaginatedResult<ApplicationAuthenticationMethod> result = service.listApplicationAuthenticationMethods(request);
         assertEquals(1, result.items().size());
         assertEquals("IAM", result.items().get(0).authenticationMethodType());
         assertEquals(method, result.items().get(0).authenticationMethod());
@@ -758,7 +761,7 @@ class SsoAdminServiceTest {
         method.putObject("Iam").putObject("ActorPolicy").put("Version", "2012-10-17");
 
         service.putApplicationAuthenticationMethod(request);
-        var stored = service.getApplicationAuthenticationMethod(request);
+        ApplicationAuthenticationMethod stored = service.getApplicationAuthenticationMethod(request);
         assertEquals(method, stored.authenticationMethod());
 
         method.withObject("Iam").withObject("ActorPolicy").put("Id", "updated");
@@ -875,7 +878,7 @@ class SsoAdminServiceTest {
                 new ApplicationGrant(otherApplication.applicationArn(), "refresh_token", refreshToken.deepCopy()));
 
         ObjectNode request = mapper.createObjectNode().put("ApplicationArn", application.applicationArn());
-        var result = service.listApplicationGrants(request);
+        PaginatedResult<ApplicationGrant> result = service.listApplicationGrants(request);
         assertEquals(2, result.items().size());
         assertEquals("authorization_code", result.items().get(0).grantType());
         assertEquals("refresh_token", result.items().get(1).grantType());
@@ -1041,8 +1044,8 @@ class SsoAdminServiceTest {
     @Test
     void listApplicationProvidersReturnsCustomProviderAndValidatesPagination() {
         ObjectNode request = mapper.createObjectNode();
-        var page = service.listApplicationProviders(request, "us-east-1");
-        assertEquals(java.util.List.of("arn:aws:sso::aws:applicationProvider/custom"), page.items());
+        PaginatedResult<String> page = service.listApplicationProviders(request, "us-east-1");
+        assertEquals(List.of("arn:aws:sso::aws:applicationProvider/custom"), page.items());
         assertEquals(null, page.nextToken());
 
         ObjectNode invalidMaxResults = mapper.createObjectNode().put("MaxResults", 101);
@@ -1065,12 +1068,12 @@ class SsoAdminServiceTest {
         ObjectNode request = mapper.createObjectNode();
         request.put("ApplicationArn", application.applicationArn());
         request.put("MaxResults", 1);
-        var first = service.listApplicationAssignments(request);
+        PaginatedResult<ApplicationAssignment> first = service.listApplicationAssignments(request);
         assertEquals(1, first.items().size());
         assertNotNull(first.nextToken());
 
         request.put("NextToken", first.nextToken());
-        var second = service.listApplicationAssignments(request);
+        PaginatedResult<ApplicationAssignment> second = service.listApplicationAssignments(request);
         assertEquals(1, second.items().size());
         assertNull(second.nextToken());
 
@@ -1088,14 +1091,14 @@ class SsoAdminServiceTest {
         groupAssignment.put("PrincipalId", groupId);
         groupAssignment.put("PrincipalType", "GROUP");
         service.createApplicationAssignment(groupAssignment);
-        org.mockito.Mockito.when(identityStoreService.groupIdsForUser(service.getIdentityStoreId(), PRINCIPAL_ID))
+        Mockito.when(identityStoreService.groupIdsForUser(service.getIdentityStoreId(), PRINCIPAL_ID))
                 .thenReturn(Set.of(groupId));
 
         ObjectNode request = mapper.createObjectNode();
         request.put("InstanceArn", service.getInstanceArn());
         request.put("PrincipalId", PRINCIPAL_ID);
         request.put("PrincipalType", "USER");
-        var page = service.listApplicationAssignmentsForPrincipal(request, ACCOUNT_ID);
+        PaginatedResult<ApplicationAssignment> page = service.listApplicationAssignmentsForPrincipal(request, ACCOUNT_ID);
         assertEquals(1, page.items().size());
         assertEquals(application.applicationArn(), page.items().get(0).applicationArn());
         assertEquals(PRINCIPAL_ID, page.items().get(0).principalId());
@@ -1244,7 +1247,7 @@ class SsoAdminServiceTest {
         ObjectNode listRequest = mapper.createObjectNode();
         listRequest.put("InstanceArn", service.getInstanceArn());
         listRequest.put("MaxResults", 1);
-        var firstPage = service.listRegions(listRequest);
+        PaginatedResult<RegionMetadata> firstPage = service.listRegions(listRequest);
         assertEquals(1, firstPage.items().size());
         assertNotNull(firstPage.nextToken());
         listRequest.put("NextToken", firstPage.nextToken());
@@ -1296,7 +1299,7 @@ class SsoAdminServiceTest {
 
     @Test
     void addRegionEnforcesTheDocumentedSixRegionQuotaIncludingPrimary() {
-        for (String region : java.util.List.of("us-west-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-south-1")) {
+        for (String region : List.of("us-west-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-south-1")) {
             ObjectNode request = mapper.createObjectNode();
             request.put("InstanceArn", service.getInstanceArn());
             request.put("RegionName", region);
@@ -1314,7 +1317,7 @@ class SsoAdminServiceTest {
         ObjectNode create = mapper.createObjectNode();
         create.put("InstanceArn", service.getInstanceArn());
         create.put("Name", "TaggedAdmins");
-        var tags = create.putArray("Tags");
+        ArrayNode tags = create.putArray("Tags");
         tags.addObject().put("Key", "Environment").put("Value", "test");
         tags.addObject().put("Key", "Owner").put("Value", "platform");
         PermissionSet permissionSet = service.createPermissionSet(create);
@@ -1322,7 +1325,7 @@ class SsoAdminServiceTest {
         ObjectNode request = mapper.createObjectNode();
         request.put("ResourceArn", permissionSet.arn());
         request.put("InstanceArn", service.getInstanceArn());
-        var page = service.listTagsForResource(request);
+        PaginatedResult<Map.Entry<String, String>> page = service.listTagsForResource(request);
         assertEquals(2, page.items().size());
         assertEquals("Environment", page.items().get(0).getKey());
         assertEquals("test", page.items().get(0).getValue());
@@ -1335,13 +1338,13 @@ class SsoAdminServiceTest {
         tag.putArray("Tags")
                 .addObject().put("Key", "Environment").put("Value", "prod");
         service.tagResource(tag);
-        var updated = service.listTagsForResource(request);
+        PaginatedResult<Map.Entry<String, String>> updated = service.listTagsForResource(request);
         assertEquals(2, updated.items().size());
         assertEquals("prod", updated.items().get(0).getValue());
 
         ObjectNode fillToQuota = mapper.createObjectNode();
         fillToQuota.put("ResourceArn", permissionSet.arn());
-        var quotaTags = fillToQuota.putArray("Tags");
+        ArrayNode quotaTags = fillToQuota.putArray("Tags");
         for (int i = 0; i < 73; i++) {
             quotaTags.addObject().put("Key", "K" + i).put("Value", "v");
         }
@@ -1488,7 +1491,7 @@ class SsoAdminServiceTest {
 
         ObjectNode firstRequest = managedPoliciesRequest(permissionSet.arn());
         firstRequest.put("MaxResults", 1);
-        var first = service.listManagedPolicies(firstRequest);
+        PaginatedResult<Map.Entry<String, String>> first = service.listManagedPolicies(firstRequest);
 
         assertEquals(1, first.items().size());
         assertNotNull(first.nextToken());
@@ -1496,7 +1499,7 @@ class SsoAdminServiceTest {
         ObjectNode secondRequest = managedPoliciesRequest(permissionSet.arn());
         secondRequest.put("MaxResults", 1);
         secondRequest.put("NextToken", first.nextToken());
-        var second = service.listManagedPolicies(secondRequest);
+        PaginatedResult<Map.Entry<String, String>> second = service.listManagedPolicies(secondRequest);
 
         assertEquals(1, second.items().size());
         assertNotNull(second.nextToken());
@@ -1556,12 +1559,12 @@ class SsoAdminServiceTest {
         request.put("PrincipalType", "GROUP");
         request.put("MaxResults", 1);
 
-        var firstPage = service.listAssignmentsForPrincipal(request, ACCOUNT_ID);
+        PaginatedResult<Assignment> firstPage = service.listAssignmentsForPrincipal(request, ACCOUNT_ID);
         assertEquals(1, firstPage.items().size());
         assertNotNull(firstPage.nextToken());
 
         request.put("NextToken", firstPage.nextToken());
-        var secondPage = service.listAssignmentsForPrincipal(request, ACCOUNT_ID);
+        PaginatedResult<Assignment> secondPage = service.listAssignmentsForPrincipal(request, ACCOUNT_ID);
         assertEquals(1, secondPage.items().size());
         assertTrue(secondPage.nextToken() == null);
 
@@ -1616,7 +1619,7 @@ class SsoAdminServiceTest {
         listStatus.put("InstanceArn", service.getInstanceArn());
         listStatus.put("MaxResults", 1);
         listStatus.putObject("Filter").put("Status", "SUCCEEDED");
-        var statusPage = service.listPermissionSetProvisioningStatus(listStatus);
+        PaginatedResult<PermissionSetProvisioningOperation> statusPage = service.listPermissionSetProvisioningStatus(listStatus);
         assertEquals(1, statusPage.items().size());
         assertNotNull(statusPage.nextToken());
         listStatus.putObject("Filter").put("Status", "INVALID");
@@ -1641,7 +1644,7 @@ class SsoAdminServiceTest {
     void listPermissionSetsProvisionedToAccountFiltersCurrentAndStaleProvisioning() {
         PermissionSet first = createPermissionSet("ProvisionedListOne");
         PermissionSet second = createPermissionSet("ProvisionedListTwo");
-        for (PermissionSet permissionSet : java.util.List.of(first, second)) {
+        for (PermissionSet permissionSet : List.of(first, second)) {
             ObjectNode provision = mapper.createObjectNode();
             provision.put("InstanceArn", service.getInstanceArn());
             provision.put("PermissionSetArn", permissionSet.arn());
@@ -1654,7 +1657,7 @@ class SsoAdminServiceTest {
         request.put("InstanceArn", service.getInstanceArn());
         request.put("AccountId", ACCOUNT_ID);
         request.put("MaxResults", 1);
-        var firstPage = service.listPermissionSetsProvisionedToAccount(request);
+        PaginatedResult<String> firstPage = service.listPermissionSetsProvisionedToAccount(request);
         assertEquals(1, firstPage.items().size());
         assertNotNull(firstPage.nextToken());
 
@@ -1671,7 +1674,7 @@ class SsoAdminServiceTest {
         assertEquals(1, service.listPermissionSetsProvisionedToAccount(request).items().size());
 
         request.put("ProvisioningStatus", "LATEST_PERMISSION_SET_NOT_PROVISIONED");
-        assertEquals(java.util.List.of(first.arn()), service.listPermissionSetsProvisionedToAccount(request).items());
+        assertEquals(List.of(first.arn()), service.listPermissionSetsProvisionedToAccount(request).items());
 
         request.put("ProvisioningStatus", "FAILED");
         assertError("ValidationException", () -> service.listPermissionSetsProvisionedToAccount(request));
@@ -1680,7 +1683,7 @@ class SsoAdminServiceTest {
     @Test
     void listAccountsForProvisionedPermissionSetFiltersCurrentAndStaleAccounts() {
         PermissionSet permissionSet = createPermissionSet("ProvisionedAccountsList");
-        for (String accountId : java.util.List.of(ACCOUNT_ID, "210987654321")) {
+        for (String accountId : List.of(ACCOUNT_ID, "210987654321")) {
             ObjectNode provision = mapper.createObjectNode();
             provision.put("InstanceArn", service.getInstanceArn());
             provision.put("PermissionSetArn", permissionSet.arn());
@@ -1693,7 +1696,7 @@ class SsoAdminServiceTest {
         request.put("InstanceArn", service.getInstanceArn());
         request.put("PermissionSetArn", permissionSet.arn());
         request.put("MaxResults", 1);
-        var firstPage = service.listAccountsForProvisionedPermissionSet(request);
+        PaginatedResult<String> firstPage = service.listAccountsForProvisionedPermissionSet(request);
         assertEquals(1, firstPage.items().size());
         assertNotNull(firstPage.nextToken());
 
@@ -1727,7 +1730,7 @@ class SsoAdminServiceTest {
         ObjectNode listStatus = mapper.createObjectNode();
         listStatus.put("InstanceArn", service.getInstanceArn());
         listStatus.putObject("Filter").put("Status", "SUCCEEDED");
-        var statusPage = service.listAccountAssignmentCreationStatus(listStatus);
+        PaginatedResult<AssignmentOperation> statusPage = service.listAccountAssignmentCreationStatus(listStatus);
         assertEquals(1, statusPage.items().size());
         assertEquals(created.requestId(), statusPage.items().get(0).requestId());
         listStatus.putObject("Filter");
@@ -1758,7 +1761,7 @@ class SsoAdminServiceTest {
         ObjectNode listStatus = mapper.createObjectNode();
         listStatus.put("InstanceArn", service.getInstanceArn());
         listStatus.putObject("Filter").put("Status", "SUCCEEDED");
-        var statusPage = service.listAccountAssignmentDeletionStatus(listStatus);
+        PaginatedResult<AssignmentDeletionOperation> statusPage = service.listAccountAssignmentDeletionStatus(listStatus);
         assertEquals(1, statusPage.items().size());
         assertEquals(deleted.requestId(), statusPage.items().get(0).requestId());
         listStatus.putObject("Filter").put("Status", "INVALID");

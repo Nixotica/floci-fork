@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.dynamodb;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 
 import java.util.regex.Pattern;
 
@@ -11,7 +12,7 @@ import java.util.regex.Pattern;
  */
 public final class DynamoDbTableNames {
 
-    private static final Pattern TABLE_NAME_CHARS = Pattern.compile("[a-zA-Z0-9_.\\-]+");
+    static final Pattern TABLE_NAME_CHARS = Pattern.compile("[a-zA-Z0-9_.\\-]+");
     private static final Pattern ACCOUNT_PATTERN = Pattern.compile("\\d{12}");
 
     private DynamoDbTableNames() {}
@@ -32,14 +33,13 @@ public final class DynamoDbTableNames {
                     "The parameter 'TableName' is required but was not present in the request", 400);
         }
         if (input.isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + input
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3", 400);
+            throw SmithyValidationErrors.validationException(
+                    SmithyValidationErrors.lengthOutOfRange("tableName", input, 3, 255));
         }
-        if (input.startsWith("arn:")) {
+        if (AwsArnUtils.looksLikeArn(input)) {
             throw invalid("TableName must be a short name, not an ARN: " + input);
         }
-        validateTableNameForCreate(input);
+        validateTableName(input);
         return input;
     }
 
@@ -53,17 +53,17 @@ public final class DynamoDbTableNames {
 
     private static ResolvedTableRef resolveInternal(String input) {
         if (input == null) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400);
+            throw SmithyValidationErrors.validationException(
+                    SmithyValidationErrors.notNull("tableName"));
         }
         if (input.isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1", 400);
+            throw SmithyValidationErrors.validationException(
+                    SmithyValidationErrors.lengthOutOfRange("tableName", input, 1, 255));
         }
-        if (input.startsWith("arn:")) {
+        if (AwsArnUtils.looksLikeArn(input)) {
             return parseArn(input);
         }
-        validateTableNameForOps(input);
+        validateTableName(input);
         return new ResolvedTableRef(input, null);
     }
 
@@ -104,45 +104,19 @@ public final class DynamoDbTableNames {
             throw invalid("Invalid table ARN: " + input);
         }
 
-        validateTableNameForOps(tableName);
+        validateTableName(tableName);
         return new ResolvedTableRef(tableName, region);
     }
 
-    // Validation for CreateTable: min length 3, max 255, pattern
-    private static void validateTableNameForCreate(String tableName) {
-        if (tableName.length() < 3) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3", 400);
-        }
-        if (tableName.length() > 255) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400);
+    private static void validateTableName(String tableName) {
+        String lengthViolation = SmithyValidationErrors.lengthOutOfRange("tableName", tableName, 3, 255);
+        if (lengthViolation != null) {
+            throw SmithyValidationErrors.validationException(lengthViolation);
         }
         if (!TABLE_NAME_CHARS.matcher(tableName).matches()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400);
-        }
-    }
-
-    // Validation for other operations (PutItem, GetItem, etc.): min length 3, max 255, pattern
-    private static void validateTableNameForOps(String tableName) {
-        if (tableName.length() < 3) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3", 400);
-        }
-        if (tableName.length() > 255) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400);
-        }
-        if (!TABLE_NAME_CHARS.matcher(tableName).matches()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + tableName
+                    + "' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+");
         }
     }
 

@@ -4,35 +4,36 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerHandle;
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager;
 import io.github.hectorvent.floci.services.docdb.model.DocDbCluster;
-import io.github.hectorvent.floci.services.docdb.model.DocDbInstance;
-import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.inject.Inject;
-import org.jboss.logging.Logger;
-
-import java.time.Instant;
-import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.services.docdb.model.DocDbClusterSettings;
+import io.github.hectorvent.floci.services.docdb.model.DocDbInstance;
 import io.github.hectorvent.floci.services.docdb.model.DocDbInstanceSettings;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.kms.model.KmsKey;
 import io.github.hectorvent.floci.services.rds.RdsService;
 import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 @ApplicationScoped
@@ -240,7 +241,8 @@ public class DocDbService {
                 // A cluster record is metadata: its identifier, ARN and tags need no Docker, so the
                 // cluster is created and reaches 'available' even when no daemon is reachable. Only
                 // connecting to the database needs the container.
-                DocDbContainerHandle handle = containerManager.tryStart(id, image, masterUsername, masterPassword);
+                DocDbContainerHandle handle = containerManager.tryStart(id, image, masterUsername, masterPassword,
+                        region);
                 if (handle != null) {
                     cluster.setEndpoint(handle.getHost());
                     cluster.setReaderEndpoint(handle.getHost());
@@ -557,7 +559,7 @@ public class DocDbService {
      * name in one comparison, as the db-cluster-id filter already does.
      */
     public boolean hasResourceWithArn(String arn) {
-        if (arn == null || !arn.startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(arn)) {
             return false;
         }
         return clusters.scan(k -> true).stream()
@@ -584,7 +586,7 @@ public class DocDbService {
             // full ARN against each cluster's stored ARN rather than reducing it to
             // the bare identifier, so a cross-account or cross-region ARN does not
             // resolve a same-named local cluster.
-            if (filterId.startsWith("arn:")) {
+            if (AwsArnUtils.looksLikeArn(filterId)) {
                 return inRegion(clusters, region, DocDbCluster::getDbClusterIdentifier).stream()
                         .map(c -> filled(c, region))
                         .filter(c -> filterId.equalsIgnoreCase(c.getDbClusterArn()))
@@ -744,7 +746,7 @@ public class DocDbService {
         if (filterId != null && !filterId.isBlank()) {
             // The db-instance-id filter accepts ARNs as well as identifiers; see
             // listDbClusters for why the match is against the stored ARN.
-            if (filterId.startsWith("arn:")) {
+            if (AwsArnUtils.looksLikeArn(filterId)) {
                 return inRegion(instances, region, DocDbInstance::getDbInstanceIdentifier).stream()
                         .map(i -> filled(i, region))
                         .filter(i -> filterId.equalsIgnoreCase(i.getDbInstanceArn()))
@@ -812,7 +814,7 @@ public class DocDbService {
 
     /** A resolved tag target: the record's key, its tags, and a sink that persists an update. */
     private record TagTarget(String lockKey, Map<String, String> tags,
-                             java.util.function.Consumer<Map<String, String>> save) {}
+                             Consumer<Map<String, String>> save) {}
 
     public Map<String, String> listTagsForResource(String resourceName) {
         return Map.copyOf(resolveTagTarget(resourceName).tags());
@@ -827,7 +829,7 @@ public class DocDbService {
         updateTags(resourceName, current -> tagKeys.forEach(current::remove));
     }
 
-    private void updateTags(String resourceName, java.util.function.Consumer<Map<String, String>> change) {
+    private void updateTags(String resourceName, Consumer<Map<String, String>> change) {
         // Resolve once to learn which record is meant, then do the read-modify-write under that
         // record's monitor and resolve again inside it: the record can be deleted in between, and
         // saving what the first read returned would put it back.

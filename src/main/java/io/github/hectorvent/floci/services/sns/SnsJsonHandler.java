@@ -1,16 +1,19 @@
 package io.github.hectorvent.floci.services.sns;
 
-import io.github.hectorvent.floci.core.common.AwsErrorResponse;
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.services.sns.model.PlatformApplication;
-import io.github.hectorvent.floci.services.sns.model.PlatformEndpoint;
-import io.github.hectorvent.floci.services.sns.model.Subscription;
-import io.github.hectorvent.floci.services.sns.model.Topic;
-import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.services.sns.model.PlatformApplication;
+import io.github.hectorvent.floci.services.sns.model.PlatformEndpoint;
+import io.github.hectorvent.floci.services.sns.model.SmsSandboxPhoneNumber;
+import io.github.hectorvent.floci.services.sns.model.Subscription;
+import io.github.hectorvent.floci.services.sns.model.Topic;
+import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -44,8 +47,18 @@ public class SnsJsonHandler {
             case "ListTopics" -> handleListTopics(request, region);
             case "GetTopicAttributes" -> handleGetTopicAttributes(request, region);
             case "SetTopicAttributes" -> handleSetTopicAttributes(request, region);
+            case "AddPermission" -> handleAddPermission(request, region);
+            case "RemovePermission" -> handleRemovePermission(request, region);
             case "SetSMSAttributes" -> handleSetSmsAttributes(request, region);
             case "GetSMSAttributes" -> handleGetSmsAttributes(request, region);
+            case "GetSMSSandboxAccountStatus" -> handleGetSmsSandboxAccountStatus();
+            case "CreateSMSSandboxPhoneNumber" -> handleCreateSmsSandboxPhoneNumber(request, region);
+            case "VerifySMSSandboxPhoneNumber" -> handleVerifySmsSandboxPhoneNumber(request, region);
+            case "DeleteSMSSandboxPhoneNumber" -> handleDeleteSmsSandboxPhoneNumber(request, region);
+            case "ListSMSSandboxPhoneNumbers" -> handleListSmsSandboxPhoneNumbers(request, region);
+            case "CheckIfPhoneNumberIsOptedOut" -> handleCheckIfPhoneNumberIsOptedOut(request);
+            case "ListPhoneNumbersOptedOut" -> handleListPhoneNumbersOptedOut();
+            case "OptInPhoneNumber" -> handleOptInPhoneNumber(request);
             case "Subscribe" -> handleSubscribe(request, region);
             case "Unsubscribe" -> handleUnsubscribe(request, region);
             case "ListSubscriptions" -> handleListSubscriptions(request, region);
@@ -113,7 +126,7 @@ public class SnsJsonHandler {
         Map<String, String> attrs = snsService.getTopicAttributes(topicArn, region);
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode attrsNode = response.putObject("Attributes");
-        for (var entry : attrs.entrySet()) {
+        for (Map.Entry<String, String> entry : attrs.entrySet()) {
             attrsNode.put(entry.getKey(), entry.getValue());
         }
         return Response.ok(response).build();
@@ -124,6 +137,18 @@ public class SnsJsonHandler {
         String attributeName = request.path("AttributeName").asText(null);
         String attributeValue = request.path("AttributeValue").asText(null);
         snsService.setTopicAttributes(topicArn, attributeName, attributeValue, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleAddPermission(JsonNode request, String region) {
+        snsService.addPermission(request.path("TopicArn").asText(null), request.path("Label").asText(null),
+                stringList(request.path("AWSAccountId")), stringList(request.path("ActionName")), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleRemovePermission(JsonNode request, String region) {
+        snsService.removePermission(request.path("TopicArn").asText(null), request.path("Label").asText(null),
+                region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -150,6 +175,64 @@ public class SnsJsonHandler {
             attributes.put(entry.getKey(), entry.getValue());
         }
         return Response.ok(response).build();
+    }
+
+    private Response handleGetSmsSandboxAccountStatus() {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("IsInSandbox", snsService.isInSmsSandbox());
+        return Response.ok(response).build();
+    }
+
+    private Response handleCreateSmsSandboxPhoneNumber(JsonNode request, String region) {
+        snsService.createSmsSandboxPhoneNumber(request.path("PhoneNumber").asText(null),
+                request.path("LanguageCode").asText(null), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleVerifySmsSandboxPhoneNumber(JsonNode request, String region) {
+        snsService.verifySmsSandboxPhoneNumber(request.path("PhoneNumber").asText(null),
+                request.path("OneTimePassword").asText(null), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleDeleteSmsSandboxPhoneNumber(JsonNode request, String region) {
+        snsService.deleteSmsSandboxPhoneNumber(request.path("PhoneNumber").asText(null), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleListSmsSandboxPhoneNumbers(JsonNode request, String region) {
+        PaginatedResult<SmsSandboxPhoneNumber> page = snsService.listSmsSandboxPhoneNumbers(
+                Pagination.parseMaxResults(request.path("MaxResults").asText(null), "InvalidParameter"),
+                request.path("NextToken").asText(null), region);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode numbers = response.putArray("PhoneNumbers");
+        for (SmsSandboxPhoneNumber number : page.items()) {
+            numbers.addObject()
+                    .put("PhoneNumber", number.getPhoneNumber())
+                    .put("Status", number.getStatus());
+        }
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleCheckIfPhoneNumberIsOptedOut(JsonNode request) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("isOptedOut", snsService.isPhoneNumberOptedOut(request.path("phoneNumber").asText(null)));
+        return Response.ok(response).build();
+    }
+
+    private Response handleListPhoneNumbersOptedOut() {
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode phoneNumbers = response.putArray("phoneNumbers");
+        snsService.listPhoneNumbersOptedOut().forEach(phoneNumbers::add);
+        return Response.ok(response).build();
+    }
+
+    private Response handleOptInPhoneNumber(JsonNode request) {
+        snsService.optInPhoneNumber(request.path("phoneNumber").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private Response handleSubscribe(JsonNode request, String region) {
@@ -240,7 +323,7 @@ public class SnsJsonHandler {
         Map<String, String> tags = snsService.listTagsForResource(resourceArn, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode tagsArray = response.putArray("Tags");
-        for (var entry : tags.entrySet()) {
+        for (Map.Entry<String, String> entry : tags.entrySet()) {
             ObjectNode tag = objectMapper.createObjectNode();
             tag.put("Key", entry.getKey());
             tag.put("Value", entry.getValue());
@@ -311,7 +394,7 @@ public class SnsJsonHandler {
         Map<String, String> attrs = snsService.getSubscriptionAttributes(subscriptionArn, region);
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode attrsNode = response.putObject("Attributes");
-        for (var entry : attrs.entrySet()) {
+        for (Map.Entry<String, String> entry : attrs.entrySet()) {
             attrsNode.put(entry.getKey(), entry.getValue());
         }
         return Response.ok(response).build();
@@ -366,7 +449,7 @@ public class SnsJsonHandler {
         Map<String, String> attrs = snsService.getPlatformApplicationAttributes(arn, region);
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode attrsNode = response.putObject("Attributes");
-        for (var entry : attrs.entrySet()) {
+        for (Map.Entry<String, String> entry : attrs.entrySet()) {
             attrsNode.put(entry.getKey(), entry.getValue());
         }
         return Response.ok(response).build();
@@ -387,7 +470,7 @@ public class SnsJsonHandler {
             ObjectNode node = objectMapper.createObjectNode();
             node.put("PlatformApplicationArn", app.getArn());
             ObjectNode attrsNode = node.putObject("Attributes");
-            for (var entry : app.getAttributes().entrySet()) {
+            for (Map.Entry<String, String> entry : app.getAttributes().entrySet()) {
                 attrsNode.put(entry.getKey(), entry.getValue());
             }
             arr.add(node);
@@ -417,7 +500,7 @@ public class SnsJsonHandler {
         Map<String, String> attrs = snsService.getEndpointAttributes(arn, region);
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode attrsNode = response.putObject("Attributes");
-        for (var entry : attrs.entrySet()) {
+        for (Map.Entry<String, String> entry : attrs.entrySet()) {
             attrsNode.put(entry.getKey(), entry.getValue());
         }
         return Response.ok(response).build();
@@ -439,12 +522,22 @@ public class SnsJsonHandler {
             ObjectNode node = objectMapper.createObjectNode();
             node.put("EndpointArn", ep.getArn());
             ObjectNode attrsNode = node.putObject("Attributes");
-            for (var entry : ep.getAttributes().entrySet()) {
+            for (Map.Entry<String, String> entry : ep.getAttributes().entrySet()) {
                 attrsNode.put(entry.getKey(), entry.getValue());
             }
             arr.add(node);
         }
         return Response.ok(response).build();
+    }
+
+    private static List<String> stringList(JsonNode node) {
+        List<String> values = new ArrayList<>();
+        if (node.isArray()) {
+            for (JsonNode value : node) {
+                values.add(value.asText());
+            }
+        }
+        return values;
     }
 
     private Map<String, String> jsonNodeToMap(JsonNode node) {

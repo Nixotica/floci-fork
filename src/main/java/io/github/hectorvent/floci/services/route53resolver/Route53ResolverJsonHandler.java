@@ -5,10 +5,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
+
+import java.util.Optional;
 
 /**
  * JSON 1.1 handler for Route 53 Resolver operations.
@@ -48,6 +51,8 @@ public class Route53ResolverJsonHandler {
                 case "GetResolverEndpoint" -> resolverEndpointResponse(
                         service.getResolverEndpoint(text(request, "ResolverEndpointId")));
                 case "ListResolverEndpoints" -> handleListResolverEndpoints();
+                case "ListResolverEndpointIpAddresses" -> handleListResolverEndpointIpAddresses(
+                        text(request, "ResolverEndpointId"));
                 case "UpdateResolverEndpoint" -> resolverEndpointResponse(
                         service.updateResolverEndpoint(text(request, "ResolverEndpointId"), request));
 
@@ -69,12 +74,24 @@ public class Route53ResolverJsonHandler {
                         service.getResolverRuleAssociation(text(request, "ResolverRuleAssociationId")));
                 case "ListResolverRuleAssociations" -> handleListResolverRuleAssociations();
 
+                case "TagResource" -> {
+                    service.tagResource(text(request, "ResourceArn"), request.get("Tags"), region, accountId);
+                    yield Response.ok(objectMapper.createObjectNode()).build();
+                }
+                case "UntagResource" -> {
+                    service.untagResource(text(request, "ResourceArn"), request.get("TagKeys"), region, accountId);
+                    yield Response.ok(objectMapper.createObjectNode()).build();
+                }
+                case "ListTagsForResource" -> Response.ok(service.listTagsForResource(
+                        text(request, "ResourceArn"), request.get("MaxResults"),
+                        text(request, "NextToken"), region, accountId)).build();
+
                 default -> Response.status(400)
                         .entity(new AwsErrorResponse("UnknownOperationException",
                                 "Unknown operation: Route53Resolver." + action))
                         .build();
             };
-        } catch (io.github.hectorvent.floci.core.common.AwsException e) {
+        } catch (AwsException e) {
             return Response.status(e.getHttpStatus())
                     .entity(new AwsErrorResponse(e.jsonType(), e.getMessage())).build();
         }
@@ -106,7 +123,7 @@ public class Route53ResolverJsonHandler {
 
     private Response handleGetFirewallDomainList(JsonNode request, String region) {
         String id = text(request, "FirewallDomainListId");
-        var custom = service.getCustomFirewallDomainList(id);
+        Optional<ObjectNode> custom = service.getCustomFirewallDomainList(id);
         if (custom.isPresent()) {
             return firewallDomainListResponse(custom.get());
         }
@@ -139,6 +156,12 @@ public class Route53ResolverJsonHandler {
         for (ObjectNode endpoint : service.listResolverEndpoints()) {
             endpoints.add(endpoint);
         }
+        return Response.ok(result).build();
+    }
+
+    private Response handleListResolverEndpointIpAddresses(String endpointId) {
+        ObjectNode result = objectMapper.createObjectNode();
+        result.putArray("IpAddresses").addAll(service.listResolverEndpointIpAddresses(endpointId));
         return Response.ok(result).build();
     }
 

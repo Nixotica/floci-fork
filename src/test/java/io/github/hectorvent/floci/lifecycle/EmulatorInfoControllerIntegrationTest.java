@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.lifecycle;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.FlociVersion;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
@@ -10,6 +11,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.util.List;
 import java.util.UUID;
 
@@ -55,7 +60,7 @@ class EmulatorInfoControllerIntegrationTest {
         JsonNode tree = MAPPER.readTree(body);
         assertEquals("community", tree.get("edition").asText());
         assertEquals("floci-always-free", tree.get("original_edition").asText());
-        assertEquals("dev", tree.get("version").asText());
+        assertEquals(FlociVersion.current(), tree.get("version").asText());
 
         JsonNode services = tree.get("services");
         assertNotNull(services, "services field must be present");
@@ -63,6 +68,26 @@ class EmulatorInfoControllerIntegrationTest {
             assertEquals("running", services.path(service).asText(),
                     "Service '" + service + "' must be running");
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/_floci/info", "/_localstack/info"})
+    void info_isTheConsoleContractManifestOnBothPaths(String path) {
+        given()
+            .when().get(path)
+            .then()
+                .statusCode(200)
+                .contentType("application/json")
+                .body("manifest_version", equalTo(1))
+                .body("console_contract", equalTo(2))
+                .body("cloud", equalTo("aws"))
+                .body("health_url", equalTo("/_floci/health"))
+                .body("services.s3", equalTo("enabled"))
+                .body("defaults.region", equalTo("us-east-1"))
+                .body("defaults.account_id", equalTo("000000000000"))
+                .body("ui.port", equalTo(4500))
+                .body("version", equalTo(FlociVersion.current()))
+                .body("dynamodb_backend", notNullValue());
     }
 
     @ParameterizedTest
@@ -92,7 +117,7 @@ class EmulatorInfoControllerIntegrationTest {
                 .statusCode(200)
                 .contentType("application/json")
                 .body("edition", equalTo("community"))
-                .body("version", notNullValue())
+                .body("version", allOf(equalTo(FlociVersion.current()), not(equalTo("dev"))))
                 .body("dynamodb_backend", equalTo("native"));
     }
 
@@ -118,8 +143,8 @@ class EmulatorInfoControllerIntegrationTest {
                 .contentType(startsWith("text/plain"))
                 .extract().body().asString();
 
-        var cert = (java.security.cert.X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509")
-                .generateCertificate(new java.io.ByteArrayInputStream(pem.getBytes(java.nio.charset.StandardCharsets.US_ASCII)));
+        X509Certificate cert = (X509Certificate) CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(pem.getBytes(StandardCharsets.US_ASCII)));
         assertTrue(cert.getBasicConstraints() >= 0, "must be a CA certificate");
         assertEquals(cert.getSubjectX500Principal(), cert.getIssuerX500Principal());
         assertEquals(pem, given().when().get("/_floci/ca.pem").then().extract().body().asString(),

@@ -1,13 +1,18 @@
 package io.github.hectorvent.floci.services.ses;
 
+import io.github.hectorvent.floci.testutil.SesMailbox;
 import io.quarkus.test.junit.QuarkusTest;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.not;
 
 /**
  * Integration tests for the SES V2 {@code SendEmail} {@code ListManagementOptions} wiring through the
@@ -23,6 +28,15 @@ class SesListManagementOptionsV2IntegrationTest {
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-west-2/ses/aws4_request";
     private static final String LIST = "lmo-newsletter";
     private static final String FROM = "lmo-sender@floci.test";
+
+    @Test
+    @Order(0)
+    void setup_verifySender() {
+        given().contentType("application/x-www-form-urlencoded").header("Authorization", AUTH)
+                .formParam("Action", "VerifyEmailIdentity")
+                .formParam("EmailAddress", FROM)
+        .when().post("/").then().statusCode(200);
+    }
 
     @Test
     @Order(0)
@@ -96,7 +110,7 @@ class SesListManagementOptionsV2IntegrationTest {
 
     @Test
     @Order(4)
-    void listManagementOptionsWithNonStringTopicName_returns400() {
+    void listManagementOptionsWithNonStringTopicName_returnsSerializationException() {
         given().contentType("application/json").header("Authorization", AUTH)
                 .body("""
                     {
@@ -107,7 +121,8 @@ class SesListManagementOptionsV2IntegrationTest {
                     }
                     """.formatted(FROM, LIST))
         .when().post("/v2/email/outbound-emails").then().statusCode(400)
-                .body("__type", equalTo("BadRequestException"));
+                .body("__type", equalTo("SerializationException"))
+                .body("message", equalTo("NUMBER_VALUE can not be converted to a String"));
     }
 
     @Test
@@ -127,14 +142,13 @@ class SesListManagementOptionsV2IntegrationTest {
         .when().post("/v2/email/outbound-emails").then().statusCode(200);
 
         // The stored message body has the placeholder replaced with a functional Floci unsubscribe URL.
-        given().header("Authorization", AUTH).queryParam("email", recipient)
-        .when().get("/_aws/ses").then().statusCode(200)
-                .body(org.hamcrest.Matchers.containsString("/_aws/ses/unsubscribe?"))
-                .body(org.hamcrest.Matchers.containsString("contactList=" + LIST))
-                .body(org.hamcrest.Matchers.containsString("topic=Sports"))
-                .body(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("amazonSESUnsubscribeUrl")))
-                // the stored message also carries the List-Unsubscribe header
-                .body(org.hamcrest.Matchers.containsString("List-Unsubscribe"));
+        String stored = SesMailbox.messagesTo(recipient).toString();
+        assertThat(stored, containsString("/_aws/ses/unsubscribe?"));
+        assertThat(stored, containsString("contactList=" + LIST));
+        assertThat(stored, containsString("topic=Sports"));
+        assertThat(stored, not(containsString("amazonSESUnsubscribeUrl")));
+        // the stored message also carries the List-Unsubscribe header
+        assertThat(stored, containsString("List-Unsubscribe"));
     }
 
     @Test
@@ -176,12 +190,12 @@ class SesListManagementOptionsV2IntegrationTest {
                 .queryParam("region", "us-west-2").queryParam("contactList", LIST)
                 .queryParam("topic", "Sports").queryParam("address", recipient)
         .when().get("/_aws/ses/unsubscribe").then().statusCode(200)
-                .body(org.hamcrest.Matchers.containsString("<form method=\"post\""))
-                .body(org.hamcrest.Matchers.containsString("Unsubscribe"))
+                .body(Matchers.containsString("<form method=\"post\""))
+                .body(Matchers.containsString("Unsubscribe"))
                 // The form action escapes '&' as '&amp;' for valid HTML, and carries the RFC 8058
                 // one-click parameter so its POST body matches the advertised header.
-                .body(org.hamcrest.Matchers.containsString("&amp;contactList="))
-                .body(org.hamcrest.Matchers.containsString(
+                .body(Matchers.containsString("&amp;contactList="))
+                .body(Matchers.containsString(
                         "<input type=\"hidden\" name=\"List-Unsubscribe\" value=\"One-Click\">"));
 
         given().header("Authorization", AUTH)
@@ -211,11 +225,10 @@ class SesListManagementOptionsV2IntegrationTest {
                     """.formatted(FROM, recipient))
         .when().post("/v2/email/outbound-emails").then().statusCode(200);
 
-        given().header("Authorization", AUTH).queryParam("email", recipient)
-        .when().get("/_aws/ses").then().statusCode(200)
-                .body(org.hamcrest.Matchers.containsString("X-Safe"))
-                .body(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("X-Evil")))
-                .body(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("attacker@evil.com")));
+        String stored = SesMailbox.messagesTo(recipient).toString();
+        assertThat(stored, containsString("X-Safe"));
+        assertThat(stored, not(containsString("X-Evil")));
+        assertThat(stored, not(containsString("attacker@evil.com")));
     }
 
     @Test
@@ -235,9 +248,9 @@ class SesListManagementOptionsV2IntegrationTest {
                     """.formatted(FROM))
         .when().post("/v2/email/outbound-emails").then().statusCode(400)
                 .body("__type", equalTo("BadRequestException"))
-                .body("message", org.hamcrest.Matchers.containsString(
+                .body("message", Matchers.containsString(
                         "content.simple.headers.1.member.value"))
-                .body("message", org.hamcrest.Matchers.containsString("Member must not be null"));
+                .body("message", Matchers.containsString("Member must not be null"));
     }
 
     @Test
@@ -254,9 +267,9 @@ class SesListManagementOptionsV2IntegrationTest {
                     """.formatted(FROM))
         .when().post("/v2/email/outbound-emails").then().statusCode(400)
                 .body("__type", equalTo("BadRequestException"))
-                .body("message", org.hamcrest.Matchers.containsString(
+                .body("message", Matchers.containsString(
                         "content.simple.headers.1.member.name"))
-                .body("message", org.hamcrest.Matchers.containsString("Member must not be null"));
+                .body("message", Matchers.containsString("Member must not be null"));
     }
 
     @Test

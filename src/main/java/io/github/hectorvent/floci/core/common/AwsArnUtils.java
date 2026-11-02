@@ -31,9 +31,11 @@ public final class AwsArnUtils {
          * <p>A blank region says nothing about the partition, so it falls back to {@code aws}.
          * A regionless ARN is minted through {@link #global} or
          * {@link RegionResolver#buildGlobalArn} instead; {@code make partition-check} fails a call
-         * that passes a literal blank region here.
+         * that passes a literal blank region here, and {@link BlankRegionGuard} one whose blank
+         * region arrives at run time.
          */
         public static Arn of(String service, String region, String accountId, String resource) {
+            BlankRegionGuard.check(region, service, resource);
             return new Arn(AwsRegions.partitionFor(region), service, region, accountId, resource);
         }
 
@@ -49,7 +51,7 @@ public final class AwsArnUtils {
 
         @Override
         public String toString() {
-            return "arn:" + partition + ":" + service + ":" + region + ":" + accountId + ":" + resource;
+            return "arn:" + partition + ":" + service + ":" + region + ":" + accountId + ":" + resource; // partition-literal: the one ARN formatter
         }
     }
 
@@ -63,7 +65,7 @@ public final class AwsArnUtils {
         if (arn == null || arn.isBlank()) {
             throw new IllegalArgumentException("ARN must not be null or blank");
         }
-        String[] parts = arn.split(":", 6);
+        String[] parts = arn.split(":", 6); // partition-literal: the one ARN parser
         if (parts.length < 6 || !"arn".equals(parts[0])) {
             throw new IllegalArgumentException("Invalid ARN: " + arn);
         }
@@ -141,6 +143,17 @@ public final class AwsArnUtils {
     }
 
     /**
+     * True when {@code value} is meant as an ARN: it starts with {@code arn:}, whether or not the
+     * rest is well formed. For a parameter that takes a name or an ARN, where AWS answers a
+     * malformed ARN with its own error (an {@code InvalidParameterValue}, a {@code ValidationError},
+     * a not-found) instead of looking it up as a name. {@link #isArn} needs all six segments, so it
+     * would send {@code arn:aws:rds} down the name path and change the error the caller sees.
+     */
+    public static boolean looksLikeArn(String value) {
+        return value != null && value.startsWith("arn:"); // partition-literal: the one attempted-ARN check
+    }
+
+    /**
      * True when {@code value} is an ARN naming {@code service}, in any partition. The common use
      * is telling an identifier that may be either a bare name or a full ARN apart, e.g. a
      * DynamoDB {@code TableName} that clients are allowed to give either way.
@@ -160,6 +173,20 @@ public final class AwsArnUtils {
             return Optional.empty();
         }
         return Optional.of(value.split(":", 6)[5]);
+    }
+
+    /**
+     * The parsed ARN when {@code value} is an ARN naming {@code service} in {@code region} and that
+     * region's partition, e.g. a stored key belonging to the region a list call was made in; empty
+     * otherwise.
+     */
+    public static Optional<Arn> parseIfArnIn(String value, String service, String region) {
+        if (!isArnFor(value, service)) {
+            return Optional.empty();
+        }
+        Arn arn = parse(value);
+        return arn.region().equals(region) && arn.partition().equals(AwsRegions.partitionFor(region))
+                ? Optional.of(arn) : Optional.empty();
     }
 
     /**

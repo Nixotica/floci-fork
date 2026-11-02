@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.appsync.graphql.auth;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -13,6 +14,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -51,7 +53,7 @@ public class LambdaAuthorizerValidator {
             throw AppSyncAuth.unauthorized();
         }
 
-        var cached = cache.get(apiId, authorizationToken);
+        Optional<LambdaAuthorizerResult> cached = cache.get(apiId, authorizationToken);
         if (cached.isPresent()) {
             return requireAuthorized(cached.get());
         }
@@ -157,7 +159,7 @@ public class LambdaAuthorizerValidator {
             if (size > MAX_RESOLVER_CONTEXT_BYTES) {
                 throw AppSyncAuth.unauthorized();
             }
-        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+        } catch (JsonProcessingException e) {
             throw AppSyncAuth.unauthorized();
         }
         return flat;

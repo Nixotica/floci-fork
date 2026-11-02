@@ -1,13 +1,16 @@
 package io.github.hectorvent.floci.services.eks;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.AmiImageResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2ContainerManager;
@@ -18,11 +21,12 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
+import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
 import io.github.hectorvent.floci.services.eks.model.ClusterOidcKey;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
-import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.eks.model.CreateFargateProfileRequest;
 import io.github.hectorvent.floci.services.eks.model.CreateNodeGroupRequest;
@@ -30,17 +34,15 @@ import io.github.hectorvent.floci.services.eks.model.EncryptionConfig;
 import io.github.hectorvent.floci.services.eks.model.FargateProfile;
 import io.github.hectorvent.floci.services.eks.model.FargateProfileStatus;
 import io.github.hectorvent.floci.services.eks.model.KubernetesNetworkConfig;
-import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.LogSetup;
 import io.github.hectorvent.floci.services.eks.model.Logging;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import io.github.hectorvent.floci.services.eks.model.NodegroupScalingConfig;
 import io.github.hectorvent.floci.services.eks.model.NodegroupStatus;
+import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import io.github.hectorvent.floci.services.eks.model.Provider;
 import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import io.github.hectorvent.floci.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -49,19 +51,25 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -168,6 +176,10 @@ class EksServiceTest {
     }
 
     private Ec2Service realEc2Service() {
+        return realEc2Service(new HashMap<>());
+    }
+
+    private Ec2Service realEc2Service(Map<String, AccountAwareStorageBackend<?>> stores) {
         EmulatorConfig ec2Config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2ServiceConfig = mock(EmulatorConfig.Ec2ServiceConfig.class);
@@ -175,12 +187,15 @@ class EksServiceTest {
         when(ec2Config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2ServiceConfig);
         when(ec2ServiceConfig.mock()).thenReturn(true);
+        when(ec2ServiceConfig.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
 
         StorageFactory storageFactory = new StorageFactory(null, null) {
             @Override
             public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
                     TypeReference<Map<String, V>> typeReference) {
-                return AccountAwareStorageBackend.inMemory("000000000000");
+                AccountAwareStorageBackend<V> store = AccountAwareStorageBackend.inMemory("000000000000");
+                stores.put(fileName, store);
+                return store;
             }
         };
 
@@ -273,6 +288,28 @@ class EksServiceTest {
         String issuer = migrated.getIdentity().getOidc().getIssuer();
         assertTrue(issuer.matches("https://oidc\\.eks\\.us-east-1\\.amazonaws\\.com/id/[A-F0-9]{32}"));
         assertTrue(oidcService.findVerificationKey(issuer).isPresent());
+    }
+
+    @Test
+    void initBackfillsTheOidcIssuerInTheClustersOwnRegion() {
+        StorageBackend<String, Cluster> clusterStore = new InMemoryStorage<>();
+        StorageBackend<String, ClusterOidcKey> keyStore = new InMemoryStorage<>();
+
+        Cluster legacy = new Cluster();
+        legacy.setName("eu-legacy-cluster");
+        legacy.setArn("arn:aws:eks:eu-west-1:000000000000:cluster/eu-legacy-cluster");
+        legacy.setStatus(ClusterStatus.ACTIVE);
+        clusterStore.put("eu-legacy-cluster", legacy);
+
+        EksOidcService oidcService = new EksOidcService(
+                fixedStorageFactory(keyStore), new ObjectMapper());
+        EksService restarted = new EksService(fixedStorageFactory(clusterStore), testConfig(),
+                new RegionResolver("us-east-1", "000000000000"), null, null, oidcService,
+                mock(EksAccessEntryService.class), mock(EksPodIdentityAssociationService.class));
+        restarted.init();
+
+        String issuer = clusterStore.get("eu-legacy-cluster").orElseThrow().getIdentity().getOidc().getIssuer();
+        assertTrue(issuer.startsWith("https://oidc.eks.eu-west-1.amazonaws.com/id/"), issuer);
     }
 
     @Test
@@ -519,6 +556,53 @@ class EksServiceTest {
 
         verify(clusterManager).stopCluster(cluster);
         verify(clusterManager, never()).detachCluster(any(Cluster.class));
+    }
+
+    @Test
+    void aDeleteOverlappingOneStillInProgressIsRejectedAndCannotReviveTheCluster() {
+        Cluster cluster = activeCluster();
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        EksService service = serviceWithCluster(cluster, clusterManager, false);
+        AwsException[] overlapping = new AwsException[1];
+        doAnswer(firstDelete -> {
+            // Nested on the same thread, so the reentrant capacity lock lets it through and the
+            // clustersBeingDeleted check refuses it. Another thread waits instead; see
+            // aSecondDeleteWaitsAndFindsTheClusterGone.
+            overlapping[0] = assertThrows(AwsException.class, () -> service.deleteCluster("running-cluster"));
+            return null;
+        }).when(clusterManager).stopCluster(cluster);
+
+        service.deleteCluster("running-cluster");
+
+        assertEquals("ResourceInUseException", overlapping[0].getErrorCode());
+        assertThrows(AwsException.class, () -> service.describeCluster("running-cluster"));
+    }
+
+    @Test
+    void aClusterLeftDeletingCanBeDeletedAgainOnceTheEarlierDeleteFinished() {
+        Cluster cluster = activeCluster();
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        EksService service = serviceWithCluster(cluster, clusterManager, false);
+        doThrow(new IllegalStateException("Failed to remove container"))
+                .doNothing()
+                .when(clusterManager).stopCluster(cluster);
+        assertThrows(IllegalStateException.class, () -> service.deleteCluster("running-cluster"));
+
+        service.deleteCluster("running-cluster");
+
+        assertThrows(AwsException.class, () -> service.describeCluster("running-cluster"));
+    }
+
+    @Test
+    void aDeleteThatCouldNotRemoveTheClusterContainerLeavesTheClusterActive() {
+        Cluster cluster = activeCluster();
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        EksService service = serviceWithCluster(cluster, clusterManager, false);
+        doThrow(new IllegalStateException("Failed to remove container")).when(clusterManager).stopCluster(cluster);
+
+        assertThrows(IllegalStateException.class, () -> service.deleteCluster("running-cluster"));
+
+        assertEquals(ClusterStatus.ACTIVE, service.describeCluster("running-cluster").getStatus());
     }
 
     private static Cluster activeCluster() {
@@ -910,23 +994,192 @@ class EksServiceTest {
 
     @Test
     void firstNodeGroupSelectsAndRestartsTheSharedNodeOnce() {
-        EksClusterManager clusterManager = mock(EksClusterManager.class);
-        when(clusterManager.tryStartCluster(any())).thenReturn(true);
-        when(clusterManager.selectNodeInstanceType("t3.medium")).thenReturn("t3.medium");
-        when(clusterManager.restartForNodeCapacity(any(), anyString())).thenReturn(true);
+        EksClusterManager clusterManager = capacitySwapManager(true);
         EksService service = newService(clusterManager, false);
-        CreateClusterRequest request = new CreateClusterRequest();
-        request.setName("capacity-cluster");
-        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
-        Cluster cluster = service.createCluster(request);
-        cluster.setContainerId("existing-container");
+        Cluster cluster = activeClusterWithRunningNode(service, "capacity-cluster");
 
         service.createNodeGroup("capacity-cluster", nodeGroupRequest("first"));
         assertEquals("t3.medium", cluster.getNodeInstanceType());
+        assertEquals(ClusterStatus.ACTIVE, cluster.getStatus());
+        assertEquals(ClusterStatus.ACTIVE, service.describeCluster("capacity-cluster").getStatus());
         verify(clusterManager).restartForNodeCapacity(cluster, "m5.large");
 
         service.createNodeGroup("capacity-cluster", nodeGroupRequest("second"));
+        assertEquals(ClusterStatus.ACTIVE, cluster.getStatus());
+        assertEquals(ClusterStatus.ACTIVE, service.describeCluster("capacity-cluster").getStatus());
         verify(clusterManager).restartForNodeCapacity(cluster, "m5.large");
+    }
+
+    @Test
+    void readinessPollerFinalizesTheReplacedNodeOfAnActiveCluster() {
+        EksClusterManager clusterManager = capacitySwapManager(true);
+        EksService service = newService(clusterManager, false);
+        Cluster cluster = activeClusterWithRunningNode(service, "replaced-node");
+
+        service.createNodeGroup("replaced-node", nodeGroupRequest("first"));
+        assertTrue(cluster.isFinalizePending());
+
+        service.pollClusterReadiness();
+        verify(clusterManager, never()).finalizeCluster(cluster);
+        assertTrue(cluster.isFinalizePending());
+        assertEquals(ClusterStatus.ACTIVE, service.describeCluster("replaced-node").getStatus());
+
+        when(clusterManager.isReady(cluster)).thenReturn(true);
+        service.pollClusterReadiness();
+        verify(clusterManager).finalizeCluster(cluster);
+        assertFalse(cluster.isFinalizePending());
+        assertEquals(ClusterStatus.ACTIVE, service.describeCluster("replaced-node").getStatus());
+
+        service.pollClusterReadiness();
+        verify(clusterManager).finalizeCluster(cluster);
+    }
+
+    @Test
+    void failedNodeReplacementStillHasThePreviousNodeVerified() {
+        EksClusterManager clusterManager = capacitySwapManager(false);
+        EksService service = newService(clusterManager, false);
+        Cluster cluster = activeClusterWithRunningNode(service, "restored-node");
+
+        Nodegroup nodeGroup = service.createNodeGroup("restored-node", nodeGroupRequest("first"));
+
+        assertEquals(NodegroupStatus.CREATE_FAILED, nodeGroup.getStatus());
+        assertEquals(ClusterStatus.ACTIVE, service.describeCluster("restored-node").getStatus());
+        assertTrue(cluster.isFinalizePending());
+    }
+
+    @Test
+    void readinessPollerDoesNotWriteBackAClusterDeletedWhileItsNodeIsProbed() {
+        EksClusterManager clusterManager = capacitySwapManager(true);
+        EksService service = newService(clusterManager, false);
+        Cluster cluster = activeClusterWithRunningNode(service, "deleted-node");
+        service.createNodeGroup("deleted-node", nodeGroupRequest("first"));
+        when(clusterManager.isReady(cluster)).thenAnswer(invocation -> {
+            service.deleteCluster("deleted-node");
+            return true;
+        });
+
+        service.pollClusterReadiness();
+
+        assertEquals(ClusterStatus.DELETING, cluster.getStatus());
+        assertThrows(AwsException.class, () -> service.describeCluster("deleted-node"));
+    }
+
+    @Test
+    void deleteIssuedDuringTheFirstNodeGroupSwapWaitsAndThenDeletesCleanly() throws Exception {
+        EksClusterManager clusterManager = capacitySwapManager(true);
+        EksService service = newService(clusterManager, false);
+        activeClusterWithRunningNode(service, "deleted-during-swap");
+        List<String> stoppedContainers = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> {
+            stoppedContainers.add(String.valueOf(invocation.<Cluster>getArgument(0).getContainerId()));
+            return null;
+        }).when(clusterManager).stopCluster(any());
+        AtomicReference<Throwable> deleteError = new AtomicReference<>();
+        AtomicReference<Thread.State> deleterDuringSwap = new AtomicReference<>();
+        Thread deleter = deleteThread(service, "deleted-during-swap", deleteError);
+        when(clusterManager.restartForNodeCapacity(any(), anyString())).thenAnswer(invocation -> {
+            // As replaceClusterContainer does: no container while the replacement starts.
+            Cluster swapping = invocation.getArgument(0);
+            swapping.setContainerId(null);
+            deleter.start();
+            deleterDuringSwap.set(awaitBlockedOrTerminated(deleter, "the delete during the swap"));
+            swapping.setContainerId("replacement-container");
+            return true;
+        });
+
+        Nodegroup group = service.createNodeGroup("deleted-during-swap", nodeGroupRequest("first"));
+        deleter.join(5000);
+
+        assertEquals(Thread.State.BLOCKED, deleterDuringSwap.get());
+        assertFalse(deleter.isAlive());
+        assertNull(deleteError.get());
+        assertEquals(NodegroupStatus.ACTIVE, group.getStatus());
+        assertTrue(createdStorage("eks-clusters.json").get("deleted-during-swap").isEmpty());
+        assertEquals(List.of("replacement-container"), stoppedContainers);
+    }
+
+    @Test
+    void aSecondDeleteWaitsAndFindsTheClusterGone() throws Exception {
+        EksClusterManager clusterManager = capacitySwapManager(true);
+        EksService service = newService(clusterManager, false);
+        activeClusterWithRunningNode(service, "deleted-twice");
+        CountDownLatch firstStopping = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            firstStopping.countDown();
+            assertTrue(releaseFirst.await(5, TimeUnit.SECONDS));
+            return null;
+        }).when(clusterManager).stopCluster(any());
+        AtomicReference<Throwable> firstError = new AtomicReference<>();
+        AtomicReference<Throwable> secondError = new AtomicReference<>();
+        Thread first = deleteThread(service, "deleted-twice", firstError);
+        Thread second = deleteThread(service, "deleted-twice", secondError);
+
+        first.start();
+        assertTrue(firstStopping.await(5, TimeUnit.SECONDS));
+        second.start();
+        Thread.State secondWhileFirstRuns = awaitBlockedOrTerminated(second, "the second delete");
+        releaseFirst.countDown();
+        first.join(5000);
+        second.join(5000);
+
+        assertEquals(Thread.State.BLOCKED, secondWhileFirstRuns);
+        assertFalse(first.isAlive());
+        assertFalse(second.isAlive());
+        assertNull(firstError.get());
+        assertTrue(secondError.get() instanceof AwsException e
+                && "ResourceNotFoundException".equals(e.getErrorCode()), String.valueOf(secondError.get()));
+        verify(clusterManager, times(1)).stopCluster(any());
+        assertTrue(createdStorage("eks-clusters.json").get("deleted-twice").isEmpty());
+    }
+
+    /** An unstarted thread that deletes {@code name} and keeps what it threw in {@code error}. */
+    private static Thread deleteThread(EksService service, String name, AtomicReference<Throwable> error) {
+        return Thread.ofPlatform().unstarted(() -> {
+            try {
+                service.deleteCluster(name);
+            } catch (Throwable e) {
+                error.set(e);
+            }
+        });
+    }
+
+    // BLOCKED on any monitor counts; the assertions after it show the wait was on the capacity lock.
+    private static Thread.State awaitBlockedOrTerminated(Thread thread, String what) {
+        return ThreadStates.awaitState(thread, EnumSet.of(Thread.State.BLOCKED, Thread.State.TERMINATED),
+                Duration.ofSeconds(5), what);
+    }
+
+    @Test
+    void firstNodeGroupSwapOnALiveClusterStoresBoth() {
+        EksClusterManager clusterManager = capacitySwapManager(true);
+        EksService service = newService(clusterManager, false);
+        activeClusterWithRunningNode(service, "kept-during-swap");
+
+        Nodegroup group = service.createNodeGroup("kept-during-swap", nodeGroupRequest("first"));
+
+        assertEquals(NodegroupStatus.ACTIVE, group.getStatus());
+        Cluster stored = (Cluster) createdStorage("eks-clusters.json").get("kept-during-swap").orElseThrow();
+        assertTrue(stored.isFinalizePending());
+        assertTrue(createdStorage("eks-nodegroups.json").get("kept-during-swap/first").isPresent());
+    }
+
+    private static Cluster activeClusterWithRunningNode(EksService service, String name) {
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName(name);
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        Cluster cluster = service.createCluster(request);
+        cluster.setContainerId("existing-container");
+        cluster.setStatus(ClusterStatus.ACTIVE);
+        return cluster;
+    }
+
+    private static EksClusterManager capacitySwapManager(boolean swapSucceeds) {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.tryStartCluster(any())).thenReturn(true);
+        when(clusterManager.selectNodeInstanceType("t3.medium")).thenReturn("t3.medium");
+        when(clusterManager.restartForNodeCapacity(any(), anyString())).thenReturn(swapSucceeds);
+        return clusterManager;
     }
 
     @Test
@@ -989,6 +1242,28 @@ class EksServiceTest {
         assertEquals(NodegroupStatus.DELETING, deleted.getStatus());
         assertThrows(AwsException.class, () -> eksService.describeNodeGroup("my-eks-cluster", "nodegroup-a"));
         assertEquals(List.of("nodegroup-b"), eksService.listNodeGroups("my-eks-cluster"));
+    }
+
+    @Test
+    void createNodeGroupRecordsLabelsAndTaints() {
+        createTestCluster("metadata-cluster");
+        CreateNodeGroupRequest request = nodeGroupRequest("labeled-ng");
+        request.setLabels(Map.of("role", "worker", "tier", "frontend"));
+        request.setTaints(List.of(Map.of("key", "dedicated", "value", "special", "effect", "NO_SCHEDULE")));
+        request.setCapacityType("SPOT");
+
+        Nodegroup nodegroup = eksService.createNodeGroup("metadata-cluster", request);
+        assertEquals("SPOT", nodegroup.getCapacityType());
+        assertEquals("worker", nodegroup.getLabels().get("role"));
+        assertEquals(1, nodegroup.getTaints().size());
+
+        Nodegroup retrieved = eksService.describeNodeGroup("metadata-cluster", "labeled-ng");
+        assertEquals("SPOT", retrieved.getCapacityType());
+        assertEquals("worker", retrieved.getLabels().get("role"));
+        assertEquals(1, retrieved.getTaints().size());
+
+        eksService.deleteNodeGroup("metadata-cluster", "labeled-ng");
+        assertEquals(List.of(), eksService.listNodeGroups("metadata-cluster"));
     }
 
     @Test
@@ -1149,12 +1424,21 @@ class EksServiceTest {
         assertEquals(404, delete.getHttpStatus());
     }
 
+    private final Map<String, AccountAwareStorageBackend<?>> createdStorages = new HashMap<>();
+
+    @SuppressWarnings("unchecked")
+    private <V> AccountAwareStorageBackend<V> createdStorage(String fileName) {
+        return (AccountAwareStorageBackend<V>) createdStorages.get(fileName);
+    }
+
     private EksService newService(EksClusterManager clusterManager, boolean mock) {
         StorageFactory storageFactory = new StorageFactory(null, null) {
             @Override
             public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
                     TypeReference<Map<String, V>> typeReference) {
-                return AccountAwareStorageBackend.inMemory("000000000000");
+                AccountAwareStorageBackend<V> backend = AccountAwareStorageBackend.inMemory("000000000000");
+                createdStorages.put(fileName, backend);
+                return backend;
             }
         };
         return new EksService(storageFactory, testConfig(mock),
@@ -1662,7 +1946,7 @@ class EksServiceTest {
         String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
 
         doThrow(new RuntimeException("Simulated tagging failure"))
-                .when(spyEc2).createTags(any(), any(), any());
+                .when(spyEc2).createSystemTags(any(), any(), any());
 
         StorageFactory storageFactory = fixedStorageFactory(new InMemoryStorage<>());
         RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
@@ -2138,10 +2422,18 @@ class EksServiceTest {
 
     @Test
     void createClusterWithBothDefaultServiceCidrsOverlappingVpcThrowsInvalidParameterException() {
-        Ec2Service ec2 = realEc2Service();
+        // No VPC block CreateVpc accepts (/16 to /28) covers both defaults, so the VPC is created
+        // normally and its block is then widened in the store, as state stored before that check is.
+        Map<String, AccountAwareStorageBackend<?>> ec2Stores = new HashMap<>();
+        Ec2Service ec2 = realEc2Service(ec2Stores);
         ec2.ensureDefaultResources("us-east-1");
-        String vpcId = ec2.createVpc("us-east-1", "0.0.0.0/0", false).getVpcId();
-        String subnetId = ec2.createSubnet("us-east-1", vpcId, "0.0.0.0/24", "us-east-1a").getSubnetId();
+        Vpc vpc = ec2.createVpc("us-east-1", "10.100.0.0/16", false);
+        String vpcId = vpc.getVpcId();
+        String subnetId = ec2.createSubnet("us-east-1", vpcId, "10.100.0.0/24", "us-east-1a").getSubnetId();
+        vpc.setCidrBlock("0.0.0.0/0");
+        @SuppressWarnings("unchecked")
+        AccountAwareStorageBackend<Vpc> vpcStore = (AccountAwareStorageBackend<Vpc>) ec2Stores.get("ec2-vpcs.json");
+        vpcStore.put("us-east-1::" + vpcId, vpc);
 
         EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2,
                 new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),
@@ -2494,5 +2786,95 @@ class EksServiceTest {
                 new RegionResolver("us-east-1", "000000000000"), null, ec2,
                 new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),
                 mock(EksPodIdentityAssociationService.class));
+    }
+
+    @Test
+    void createClusterWithClusterArgsExtractsArgsAndStripsReservedTags() {
+        CreateClusterRequest req = createTestClusterRequest("args-cluster");
+        req.setTags(Map.of(
+                "floci:kubelet-arg:max-pods=250", "true",
+                "floci:kube-apiserver-arg:runtime-config=batch/v1=true", "true",
+                "env", "production"
+        ));
+
+        Cluster created = eksService.createCluster(req);
+        assertNotNull(created.getClusterArgs());
+        assertEquals(2, created.getClusterArgs().size());
+        assertTrue(created.getClusterArgs().contains("--kubelet-arg=max-pods=250"));
+        assertTrue(created.getClusterArgs().contains("--kube-apiserver-arg=runtime-config=batch/v1=true"));
+
+        // Reserved tags must be stripped from public tags
+        assertNotNull(created.getTags());
+        assertEquals(Map.of("env", "production"), created.getTags());
+        assertFalse(created.getTags().containsKey("floci:kubelet-arg:max-pods=250"));
+
+        Cluster described = eksService.describeCluster("args-cluster");
+        assertEquals(Map.of("env", "production"), described.getTags());
+        assertEquals(created.getClusterArgs(), described.getClusterArgs());
+    }
+
+    @Test
+    void createClusterWithCollidingArgThrowsInvalidParameterException() {
+        CreateClusterRequest req = createTestClusterRequest("colliding-cluster");
+        req.setTags(Map.of("floci:kubelet-arg:provider-id", "my-id"));
+
+        AwsException ex = assertThrows(AwsException.class, () -> eksService.createCluster(req));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
+        assertTrue(ex.getMessage().contains("collides with Floci-managed kubelet argument"));
+    }
+
+    @Test
+    void createClusterWithCollidingArgDoesNotLeakSecurityGroup() {
+        Ec2Service ec2 = realEc2Service();
+        ec2.ensureDefaultResources("us-east-1");
+        String vpcId = ec2.createVpc("us-east-1", "172.31.0.0/16", false).getVpcId();
+        String subnetId = ec2.createSubnet("us-east-1", vpcId, "172.31.1.0/24", "us-east-1a").getSubnetId();
+
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2,
+                new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),
+                mock(EksPodIdentityAssociationService.class));
+
+        CreateClusterRequest req = createTestClusterRequest("colliding-sg-leak");
+        ResourcesVpcConfig vpcConfig = new ResourcesVpcConfig();
+        vpcConfig.setSubnetIds(List.of(subnetId));
+        req.setResourcesVpcConfig(vpcConfig);
+        req.setTags(Map.of("floci:kubelet-arg:provider-id", "my-id"));
+
+        AwsException ex = assertThrows(AwsException.class, () -> service.createCluster(req));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+
+        List<SecurityGroup> allSgs = ec2.describeSecurityGroups("us-east-1", List.of(), List.of(), Map.of());
+        boolean leaked = allSgs.stream().anyMatch(sg -> sg.getGroupName().startsWith("eks-cluster-sg-colliding-sg-leak-"));
+        assertFalse(leaked, "Cluster security group should not be created when argument validation fails");
+    }
+
+    @Test
+    void tagResourceWithReservedTagThrowsValidationException() {
+        createTestCluster("tag-resource-cluster");
+        Cluster cluster = eksService.describeCluster("tag-resource-cluster");
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                eksService.tagResource(cluster.getArn(), Map.of("floci:kubelet-arg:max-pods=250", "true")));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
+    }
+
+    @Test
+    void clusterArgsSurviveRestart(@TempDir Path directory) {
+        EksService before = persistentEksService(directory);
+        before.init();
+
+        CreateClusterRequest req = createTestClusterRequest("restart-args-cluster");
+        req.setTags(Map.of("floci:kubelet-arg:max-pods=250", "true", "owner", "ops"));
+        Cluster created = before.createCluster(req);
+        assertEquals(List.of("--kubelet-arg=max-pods=250"), created.getClusterArgs());
+
+        EksService after = persistentEksService(directory);
+        after.init();
+
+        Cluster described = after.describeCluster("restart-args-cluster");
+        assertEquals(List.of("--kubelet-arg=max-pods=250"), described.getClusterArgs());
+        assertEquals(Map.of("owner", "ops"), described.getTags());
     }
 }

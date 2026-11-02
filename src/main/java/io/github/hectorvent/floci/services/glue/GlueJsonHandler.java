@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsJsonTimestamp;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.services.glue.model.*;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.Registry;
@@ -455,12 +457,47 @@ public class GlueJsonHandler {
                 glueService.deleteSecurityConfiguration(request.path("Name").asText(null), region);
                 yield Response.ok(Map.of()).build();
             }
-            // Read-only Glue actions for resources the emulator does not model. The AWS SDK
-            // expects each to return a 200 with its result key present (empty), so we emit the
-            // documented empty shape rather than an InvalidAction 400 that callers can't read.
-            case "ListDataQualityRulesets" -> Response.ok(Map.of("Rulesets", List.of())).build();
-            case "GetSecurityConfigurations" -> Response.ok(Map.of(
-                    "SecurityConfigurations", glueService.getSecurityConfigurations(region))).build();
+            case "GetSecurityConfigurations" -> {
+                GlueService.Page<SecurityConfiguration> page = glueService.getSecurityConfigurations(
+                        region, readMaxResults(request), readNextToken(request));
+                yield Response.ok(pageResponse("SecurityConfigurations", page.items(), page.nextToken())).build();
+            }
+            case "CreateDataQualityRuleset" -> {
+                Map<String, String> tags = request.hasNonNull("Tags")
+                        ? mapper.convertValue(request.get("Tags"), STRING_MAP)
+                        : null;
+                DataQualityRuleset created = glueService.createDataQualityRuleset(
+                        request.path("Name").asText(null), request.path("Description").asText(null),
+                        request.path("Ruleset").asText(null), readTargetTable(request.get("TargetTable")),
+                        request.path("DataQualitySecurityConfiguration").asText(null), tags, region);
+                yield Response.ok(Map.of("Name", created.getName())).build();
+            }
+            case "GetDataQualityRuleset" ->
+                    Response.ok(glueService.getDataQualityRuleset(request.path("Name").asText(null), region)).build();
+            case "UpdateDataQualityRuleset" -> {
+                DataQualityRuleset updated = glueService.updateDataQualityRuleset(request.path("Name").asText(null),
+                        request.path("Description").asText(null), request.path("Ruleset").asText(null), region);
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("Name", updated.getName());
+                putIfNotNull(response, "Description", updated.getDescription());
+                response.put("Ruleset", updated.getRuleset());
+                yield Response.ok(response).build();
+            }
+            case "DeleteDataQualityRuleset" -> {
+                glueService.deleteDataQualityRuleset(request.path("Name").asText(null), region);
+                yield Response.ok(Map.of()).build();
+            }
+            case "ListDataQualityRulesets" -> {
+                Map<String, String> tags = request.hasNonNull("Tags")
+                        ? mapper.convertValue(request.get("Tags"), STRING_MAP)
+                        : null;
+                GlueService.Page<DataQualityRuleset> page = glueService.listDataQualityRulesets(
+                        readDataQualityFilter(request.get("Filter")), tags,
+                        readMaxResults(request), readNextToken(request), region);
+                yield Response.ok(pageResponse("Rulesets",
+                        page.items().stream().map(GlueJsonHandler::dataQualityListItem).toList(),
+                        page.nextToken())).build();
+            }
             case "CreateTrigger" -> {
                 Trigger trigger = toTrigger(request);
                 trigger.setName(request.path("Name").asText(null));
@@ -780,7 +817,7 @@ public class GlueJsonHandler {
         String dbName = request.path("DatabaseName").asText(null);
         String pattern = request.path("Pattern").asText(null);
         String functionType = request.path("FunctionType").asText(null);
-        var page = glueService.getUserDefinedFunctions(
+        GlueService.UserDefinedFunctionPage page = glueService.getUserDefinedFunctions(
                 dbName, pattern, functionType, readMaxResults(request), readNextToken(request));
         return Response.ok(pageResponse("UserDefinedFunctions", page.functions(), page.nextToken())).build();
     }
@@ -818,7 +855,7 @@ public class GlueJsonHandler {
     }
 
     private Response handleListRegistries(JsonNode request) {
-        var page = schemaRegistryService.listRegistries(readMaxResults(request), readNextToken(request));
+        GlueSchemaRegistryService.Page<Registry> page = schemaRegistryService.listRegistries(readMaxResults(request), readNextToken(request));
         return Response.ok(pageResponse("Registries", registryListItems(page.items()), page.nextToken())).build();
     }
 
@@ -869,7 +906,7 @@ public class GlueJsonHandler {
         Map<String, String> tags = request.has("Tags")
                 ? mapper.convertValue(request.get("Tags"), Map.class)
                 : null;
-        var result = schemaRegistryService.createSchema(
+        GlueSchemaRegistryService.SchemaWithFirstVersion result = schemaRegistryService.createSchema(
                 registryId, schemaName, dataFormat, compatibility, description, definition, tags, region);
         Schema schema = result.schema();
         SchemaVersion version = result.firstVersion();
@@ -958,14 +995,14 @@ public class GlueJsonHandler {
 
     private Response handleListSchemas(JsonNode request, String region) throws Exception {
         RegistryId registryId = readRegistryId(request);
-        var page = schemaRegistryService.listSchemas(
+        GlueSchemaRegistryService.Page<Schema> page = schemaRegistryService.listSchemas(
                 registryId, region, readMaxResults(request), readNextToken(request));
         return Response.ok(pageResponse("Schemas", schemaListItems(page.items()), page.nextToken())).build();
     }
 
     private Response handleListSchemaVersions(JsonNode request, String region) throws Exception {
         SchemaId schemaId = readSchemaId(request);
-        var page = schemaRegistryService.listSchemaVersions(
+        GlueSchemaRegistryService.Page<SchemaVersion> page = schemaRegistryService.listSchemaVersions(
                 schemaId, region, readMaxResults(request), readNextToken(request));
         return Response.ok(pageResponse("Schemas", schemaVersionListItems(page.items()), page.nextToken())).build();
     }
@@ -983,10 +1020,10 @@ public class GlueJsonHandler {
     private Response handleDeleteSchemaVersions(JsonNode request, String region) throws Exception {
         SchemaId schemaId = readSchemaId(request);
         String versions = request.path("Versions").asText(null);
-        var results = schemaRegistryService.deleteSchemaVersions(schemaId, versions, region);
+        List<GlueSchemaRegistryService.VersionDeletionResult> results = schemaRegistryService.deleteSchemaVersions(schemaId, versions, region);
 
         List<Map<String, Object>> errors = new ArrayList<>();
-        for (var r : results) {
+        for (GlueSchemaRegistryService.VersionDeletionResult r : results) {
             if (r.errorCode() != null) {
                 Map<String, Object> err = new LinkedHashMap<>();
                 err.put("VersionNumber", r.versionNumber());
@@ -1013,7 +1050,7 @@ public class GlueJsonHandler {
     private Response handleCheckSchemaVersionValidity(JsonNode request) {
         String dataFormat = request.path("DataFormat").asText(null);
         String definition = request.path("SchemaDefinition").asText(null);
-        var result = schemaRegistryService.checkSchemaVersionValidity(dataFormat, definition);
+        GlueSchemaRegistryService.CheckValidityResult result = schemaRegistryService.checkSchemaVersionValidity(dataFormat, definition);
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("Valid", result.valid());
         if (result.error() != null) {
@@ -1110,6 +1147,38 @@ public class GlueJsonHandler {
         }
     }
 
+    private static DataQualityRuleset.TargetTable readTargetTable(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        return new DataQualityRuleset.TargetTable(node.path("TableName").asText(null),
+                node.path("DatabaseName").asText(null), node.path("CatalogId").asText(null));
+    }
+
+    private static GlueService.DataQualityRulesetFilter readDataQualityFilter(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        return new GlueService.DataQualityRulesetFilter(node.path("Name").asText(null),
+                node.path("Description").asText(null),
+                AwsJsonTimestamp.epochSeconds(node, "CreatedBefore", "InvalidInputException"),
+                AwsJsonTimestamp.epochSeconds(node, "CreatedAfter", "InvalidInputException"),
+                AwsJsonTimestamp.epochSeconds(node, "LastModifiedBefore", "InvalidInputException"),
+                AwsJsonTimestamp.epochSeconds(node, "LastModifiedAfter", "InvalidInputException"),
+                readTargetTable(node.get("TargetTable")));
+    }
+
+    private static Map<String, Object> dataQualityListItem(DataQualityRuleset ruleset) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("Name", ruleset.getName());
+        putIfNotNull(item, "Description", ruleset.getDescription());
+        item.put("CreatedOn", EpochSeconds.fromInstant(ruleset.getCreatedOn()));
+        item.put("LastModifiedOn", EpochSeconds.fromInstant(ruleset.getLastModifiedOn()));
+        putIfNotNull(item, "TargetTable", ruleset.getTargetTable());
+        putIfNotNull(item, "RuleCount", GlueService.dataQualityRuleCount(ruleset.getRuleset()));
+        return item;
+    }
+
     private static String iso(Instant instant) {
         return instant != null ? instant.toString() : null;
     }
@@ -1119,7 +1188,7 @@ public class GlueJsonHandler {
         JsonNode kv = request.get("MetadataKeyValue");
         String key = kv != null ? kv.path("MetadataKey").asText(null) : null;
         String value = kv != null ? kv.path("MetadataValue").asText(null) : null;
-        var result = schemaRegistryService.putSchemaVersionMetadata(svId, key, value);
+        GlueSchemaRegistryService.MetadataPutResult result = schemaRegistryService.putSchemaVersionMetadata(svId, key, value);
         return Response.ok(buildMetadataPutResponse(result)).build();
     }
 
@@ -1128,7 +1197,7 @@ public class GlueJsonHandler {
         JsonNode kv = request.get("MetadataKeyValue");
         String key = kv != null ? kv.path("MetadataKey").asText(null) : null;
         String value = kv != null ? kv.path("MetadataValue").asText(null) : null;
-        var result = schemaRegistryService.removeSchemaVersionMetadata(svId, key, value);
+        GlueSchemaRegistryService.MetadataPutResult result = schemaRegistryService.removeSchemaVersionMetadata(svId, key, value);
         return Response.ok(buildMetadataPutResponse(result)).build();
     }
 

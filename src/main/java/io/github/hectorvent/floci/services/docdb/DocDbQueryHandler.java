@@ -4,13 +4,13 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
+import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.core.common.RdsFamilyQuerySupport;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
-import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.services.docdb.model.DocDbCluster;
 import io.github.hectorvent.floci.services.docdb.model.DocDbClusterSettings;
-import io.github.hectorvent.floci.services.docdb.model.DocDbInstanceSettings;
 import io.github.hectorvent.floci.services.docdb.model.DocDbInstance;
+import io.github.hectorvent.floci.services.docdb.model.DocDbInstanceSettings;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -265,7 +265,7 @@ public class DocDbQueryHandler {
     }
 
     private static List<String> memberList(MultivaluedMap<String, String> params, String prefix) {
-        List<String> values = new java.util.ArrayList<>();
+        List<String> values = new ArrayList<>();
         for (int i = 1; ; i++) {
             String value = params.getFirst(prefix + i);
             if (value == null) {

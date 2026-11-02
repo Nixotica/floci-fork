@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import org.bouncycastle.asn1.x509.Extension;
@@ -84,6 +85,11 @@ public class TlsConfigSource implements ConfigSource {
         return List.copyOf(sans);
     }
 
+    /** Default endpoint names shared by HTTP and service-specific TLS listeners. */
+    public static List<String> defaultEndpointHostnames() {
+        return DEFAULT_SAN_HOSTNAMES.stream().filter(host -> !host.contains("*")).toList();
+    }
+
     private static volatile Path resolvedTlsDir;
 
     private final Map<String, String> properties = new HashMap<>();
@@ -110,7 +116,7 @@ public class TlsConfigSource implements ConfigSource {
         String certPath = resolveProperty("floci.tls.cert-path", "");
         String keyPath = resolveProperty("floci.tls.key-path", "");
         String selfSigned = resolveProperty("floci.tls.self-signed", "true");
-        String persistentPath = resolveProperty("floci.storage.persistent-path", "./data");
+        String persistentPath = resolveProperty("floci.storage.persistent-path", HostDataDir.persistentPathDefault());
         Path tlsDir = Path.of(persistentPath, TLS_DIR);
         resolvedTlsDir = tlsDir;
 
@@ -203,6 +209,11 @@ public class TlsConfigSource implements ConfigSource {
         // 2. Environment variable (underscore + uppercase)
         String envKey = key.replace('.', '_').replace('-', '_').toUpperCase();
         value = System.getenv(envKey);
+        if (value != null && !value.isBlank())
+            return value;
+
+        // 3. A LocalStack variable that means the same thing (USE_SSL, CUSTOM_SSL_CERT_PATH)
+        value = LocalStackParity.forCurrentEnvironment().get(key);
         if (value != null && !value.isBlank())
             return value;
 
@@ -392,7 +403,7 @@ public class TlsConfigSource implements ConfigSource {
     private static List<String> servedSans(Path certFile) {
         List<String> sans = new ArrayList<>();
         try {
-            X509Certificate cert = new CertificateGenerator().parseCertificate(Files.readString(certFile));
+            X509Certificate cert = Pem.parseCertificate(Files.readString(certFile));
             if (cert.getSubjectAlternativeNames() != null) {
                 for (List<?> entry : cert.getSubjectAlternativeNames()) {
                     sans.add(String.valueOf(entry.get(1)));
@@ -406,15 +417,23 @@ public class TlsConfigSource implements ConfigSource {
     }
 
     /**
-     * Containers Floci launches get this bundle copied in (Docker) or mounted (Kubernetes). A
-     * failure here must not stop Floci: log it, and containers simply will not trust Floci HTTPS
-     * until a boot manages to write it.
+     * Containers Floci launches get this bundle copied in (Docker) or mounted (Kubernetes), and
+     * those whose workload is Java its trust store too. A failure here must not stop Floci: log it,
+     * and containers simply will not trust Floci HTTPS until a boot manages to write it.
      */
     private static void writeContainerCaBundle(Path tlsDir, Path trustAnchor) {
+        Path bundle;
         try {
-            ContainerCaBundle.write(tlsDir, trustAnchor);
+            bundle = ContainerCaBundle.write(tlsDir, trustAnchor);
         } catch (Exception e) {
             LOG.warnv(e, "TLS: could not write the container CA bundle under {0}: {1}", tlsDir, e.getMessage());
+            return;
+        }
+        try {
+            ContainerCaBundle.writeJavaTrustStore(bundle);
+        } catch (Exception e) {
+            LOG.warnv(e, "TLS: could not write the containers' Java trust store under {0}: {1}", tlsDir,
+                    e.getMessage());
         }
     }
 
@@ -432,7 +451,7 @@ public class TlsConfigSource implements ConfigSource {
      */
     private boolean isValidLocalLeaf(FlociCertificateAuthority ca, Path certFile) {
         try {
-            X509Certificate cert = new CertificateGenerator().parseCertificate(Files.readString(certFile));
+            X509Certificate cert = Pem.parseCertificate(Files.readString(certFile));
             if (!ca.isIssuedByUs(cert)) {
                 LOG.infov("TLS: existing server certificate was not issued by the local CA; regenerating");
                 return false;
@@ -532,7 +551,7 @@ public class TlsConfigSource implements ConfigSource {
     private void persistMetadata(Path tlsDir, List<String> hostnames, List<String> learnedHostnames) {
         Path metadataFile = tlsDir.resolve(SERVER_METADATA_NAME);
         try {
-            String version = resolveFlociVersion();
+            String version = FlociVersion.current();
             CertificateMetadata metadata = CertificateMetadata.create(hostnames, version);
             metadata.setLearnedHostnames(learnedHostnames);
 
@@ -544,19 +563,6 @@ public class TlsConfigSource implements ConfigSource {
             // Log warning but don't fail startup - metadata is for optimization, not critical
             LOG.warnv("TLS: failed to write certificate metadata (will regenerate on next restart): {0}", e.getMessage());
         }
-    }
-
-    /**
-     * Resolves the Floci version from environment variable or defaults to "dev".
-     * 
-     * @return Floci version string
-     */
-    private static String resolveFlociVersion() {
-        String env = System.getenv("FLOCI_VERSION");
-        if (env != null && !env.isBlank()) {
-            return env;
-        }
-        return "dev";
     }
 
     /**

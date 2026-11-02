@@ -12,6 +12,8 @@ import jakarta.inject.Inject;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -142,7 +144,7 @@ public class ControlTowerControlService {
                 operationId, type, SUCCEEDED, control.getControlIdentifier(), control.getArn(), control.getTargetIdentifier()));
         long inScope = operations.keySet().stream().filter(key -> key.startsWith(scopePrefix)).count();
         if (inScope > MAX_OPERATIONS_PER_SCOPE) {
-            var iterator = operations.keySet().iterator();
+            Iterator<String> iterator = operations.keySet().iterator();
             while (iterator.hasNext()) {
                 if (iterator.next().startsWith(scopePrefix)) {
                     iterator.remove();
@@ -225,7 +227,7 @@ public class ControlTowerControlService {
     private static Set<String> stringSet(JsonNode node) {
         if (node == null || node.isNull()) return Set.of();
         if (!node.isArray() || node.size() == 0) throw validation("filter values must be non-empty arrays.");
-        Set<String> result = new java.util.HashSet<>();
+        Set<String> result = new HashSet<>();
         for (JsonNode item : node) {
             if (!item.isTextual() || item.asText().isBlank()) throw validation("filter values must be strings.");
             result.add(item.asText());

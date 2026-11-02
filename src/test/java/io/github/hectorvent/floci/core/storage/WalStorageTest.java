@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.storage;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import io.github.hectorvent.floci.testing.FileSystemAssumptions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,9 +15,14 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 class WalStorageTest {
 
@@ -62,7 +68,7 @@ class WalStorageTest {
         storage.put("a.2", "v2");
         storage.put("b.1", "v3");
 
-        var results = storage.scan(key -> key.startsWith("a."));
+        List<String> results = storage.scan(key -> key.startsWith("a."));
         assertEquals(2, results.size());
     }
 
@@ -70,7 +76,7 @@ class WalStorageTest {
     void scanReturnsMutableList() {
         storage.put("a", "1");
         storage.put("b", "2");
-        var result = storage.scan(key -> true);
+        List<String> result = storage.scan(key -> true);
         assertDoesNotThrow(() -> result.sort(String::compareTo));
         assertDoesNotThrow(() -> result.add("3"));
     }
@@ -89,7 +95,7 @@ class WalStorageTest {
         Path snapshotPath = tempDir.resolve("persist-snapshot.json");
         Path walPath = tempDir.resolve("persist-data.wal");
 
-        var store1 = new WalStorage<>(snapshotPath, walPath,
+        WalStorage<String, String> store1 = new WalStorage<>(snapshotPath, walPath,
                 new TypeReference<Map<String, String>>() {}, 60000);
         store1.load();
         store1.put("key1", "value1");
@@ -97,7 +103,7 @@ class WalStorageTest {
         store1.flush();
         store1.shutdown();
 
-        var store2 = new WalStorage<>(snapshotPath, walPath,
+        WalStorage<String, String> store2 = new WalStorage<>(snapshotPath, walPath,
                 new TypeReference<Map<String, String>>() {}, 60000);
         store2.load();
         assertEquals("value1", store2.get("key1").orElseThrow());
@@ -110,7 +116,7 @@ class WalStorageTest {
         Path snapshotPath = tempDir.resolve("replay-snapshot.json");
         Path walPath = tempDir.resolve("replay-data.wal");
 
-        var store1 = new WalStorage<>(snapshotPath, walPath,
+        WalStorage<String, String> store1 = new WalStorage<>(snapshotPath, walPath,
                 new TypeReference<Map<String, String>>() {}, 600000);
         store1.load();
         store1.put("key1", "value1");
@@ -118,7 +124,7 @@ class WalStorageTest {
         store1.delete("key1");
 
         // Load a second instance from the same WAL (before compaction)
-        var store2 = new WalStorage<>(snapshotPath, walPath,
+        WalStorage<String, String> store2 = new WalStorage<>(snapshotPath, walPath,
                 new TypeReference<Map<String, String>>() {}, 600000);
         store2.load();
         assertTrue(store2.get("key1").isEmpty());
@@ -133,7 +139,7 @@ class WalStorageTest {
         Path walPath = tempDir.resolve("binary-check.wal");
         Path snapshotPath = tempDir.resolve("binary-check-snapshot.json");
 
-        var store = new WalStorage<>(snapshotPath, walPath,
+        WalStorage<String, String> store = new WalStorage<>(snapshotPath, walPath,
                 new TypeReference<Map<String, String>>() {}, 600000);
         store.load();
         store.put("k", "v");
@@ -175,7 +181,7 @@ class WalStorageTest {
         Path walPath = tempDir.resolve("truncated.wal");
         Path snapshotPath = tempDir.resolve("truncated-snapshot.json");
 
-        var store1 = new WalStorage<>(snapshotPath, walPath,
+        WalStorage<String, String> store1 = new WalStorage<>(snapshotPath, walPath,
                 new TypeReference<Map<String, String>>() {}, 600000);
         store1.load();
         store1.put("good", "data");
@@ -188,7 +194,7 @@ class WalStorageTest {
         }
 
         // Load a new instance — should recover the first complete entry
-        var store2 = new WalStorage<>(snapshotPath, walPath,
+        WalStorage<String, String> store2 = new WalStorage<>(snapshotPath, walPath,
                 new TypeReference<Map<String, String>>() {}, 600000);
         store2.load();
         assertEquals("data", store2.get("good").orElseThrow());
@@ -377,6 +383,43 @@ class WalStorageTest {
             assertEquals(unreadableContents, Files.readString(quarantinePath));
         } finally {
             store.shutdown();
+        }
+    }
+
+    @Test
+    void aWalThatCannotBeEmptiedStaysOpenForLaterChanges() throws IOException {
+        // The WAL lives apart from the snapshot, so only emptying the WAL can be made to fail.
+        Path snapshotPath = tempDir.resolve("stuck-snapshot.json");
+        Path walDirectory = Files.createDirectories(tempDir.resolve("stuck-wal"));
+        Path walPath = walDirectory.resolve("data.wal");
+        // The test makes the directory read-only through POSIX permissions, which Windows lacks.
+        FileSystemAssumptions.assumePosixPermissions(walDirectory);
+        Set<PosixFilePermission> original = Files.getPosixFilePermissions(walDirectory);
+
+        WalStorage<String, String> store1 = new WalStorage<>(snapshotPath, walPath,
+                new TypeReference<Map<String, String>>() {}, 600000);
+        store1.load();
+        WalStorage<String, String> store2 = null;
+        try {
+            store1.put("key1", "value1");
+            Files.setPosixFilePermissions(walDirectory, PosixFilePermissions.fromString("r-xr-xr-x"));
+            // A root user writes through the read-only mode, so there is nothing to test there.
+            assumeFalse(Files.isWritable(walDirectory), "the directory stays writable for this user");
+
+            store1.flush();
+            assertTrue(Files.exists(walPath), "the WAL could not be deleted");
+            store1.put("later", "write");
+
+            store2 = new WalStorage<>(snapshotPath, walPath, new TypeReference<Map<String, String>>() {}, 600000);
+            store2.load();
+            assertEquals("value1", store2.get("key1").orElseThrow());
+            assertEquals("write", store2.get("later").orElseThrow());
+        } finally {
+            Files.setPosixFilePermissions(walDirectory, original);
+            store1.shutdown();
+            if (store2 != null) {
+                store2.shutdown();
+            }
         }
     }
 

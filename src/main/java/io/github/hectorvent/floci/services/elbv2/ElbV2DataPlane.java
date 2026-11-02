@@ -4,6 +4,11 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsProxyServer;
+import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
+import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
+import io.github.hectorvent.floci.core.common.Pem;
+import io.github.hectorvent.floci.core.common.WebSocketUpgrades;
+import io.github.hectorvent.floci.core.common.tls.ReloadingKeyManager;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
@@ -15,38 +20,65 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.vertx.core.Future;
+import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
-import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
-import io.vertx.core.http.HttpVersion;
+import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.http.RequestOptions;
+import io.vertx.core.net.JdkSSLEngineOptions;
+import io.vertx.core.net.KeyCertOptions;
+import io.vertx.core.net.NetClient;
+import io.vertx.core.net.NetClientOptions;
+import io.vertx.core.net.NetServer;
+import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.NetSocket;
+import io.vertx.core.net.PemKeyCertOptions;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import javax.naming.InvalidNameException;
+import javax.naming.ldap.LdapName;
+import javax.naming.ldap.Rdn;
+
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @ApplicationScoped
 public class ElbV2DataPlane {
@@ -57,9 +89,21 @@ public class ElbV2DataPlane {
             "connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailers", "proxy-authorization", "proxy-authenticate"
     );
     private static final String PRESERVE_HOST_HEADER_ATTRIBUTE = "routing.http.preserve_host_header.enabled";
+    /*
+     * ALB HTTP header quotas: 64 KB for the request header block, 16 KB for the request line and
+     * 32 KB for the response header block. Vert.x defaults to 8 KB and 4 KB, so a browser carrying
+     * several JWT cookies got 431 from the listener and an oversized target response failed to proxy.
+     */
+    static final int MAX_REQUEST_HEADER_SIZE = 64 * 1024;
+    static final int MAX_REQUEST_LINE_LENGTH = 16 * 1024;
+    static final int MAX_RESPONSE_HEADER_SIZE = 32 * 1024;
     private static final String IDLE_TIMEOUT_ATTRIBUTE = "idle_timeout.timeout_seconds";
+    static final String TCP_IDLE_TIMEOUT_ATTRIBUTE = "tcp.idle_timeout.seconds";
     private static final long DEFAULT_IDLE_TIMEOUT_SECONDS = 60;
     private static final int MAX_LAMBDA_BODY_BYTES = 1024 * 1024;
+    static final int TCP_IDLE_TIMEOUT_SECONDS = 350;
+    static final int MIN_TCP_IDLE_TIMEOUT_SECONDS = 60;
+    static final int MAX_TCP_IDLE_TIMEOUT_SECONDS = 6000;
 
     @Inject
     Vertx vertx;
@@ -83,35 +127,133 @@ public class ElbV2DataPlane {
     Ec2Service ec2Service;
 
     @Inject
+    CertificateReferenceResolver certificateResolver;
+
+    @Inject
     ObjectMapper objectMapper;
 
     private final Map<Integer, HttpServer> servers = new ConcurrentHashMap<>();
-    private final java.util.concurrent.atomic.AtomicBoolean releaseHandlerRegistered =
-            new java.util.concurrent.atomic.AtomicBoolean();
+    private final Map<Integer, NetServer> tcpServers = new ConcurrentHashMap<>();
+    private final Map<Integer, PortState> portStates = new ConcurrentHashMap<>();
+    private volatile boolean stopping;
+
+    private static final class PortState {
+        private int depth;
+        private int closing;
+        private long generation;
+        private ReloadingKeyManager tlsKeyManager;
+        private volatile RoutingView routing = new RoutingView(Map.of(), Map.of());
+    }
+
+    private <T> T onPort(int port, Function<PortState, T> operation) {
+        while (true) {
+            PortState state = portStates.computeIfAbsent(port, ignored -> new PortState());
+            synchronized (state) {
+                if (portStates.get(port) != state) {
+                    continue;
+                }
+                state.depth++;
+                try {
+                    return operation.apply(state);
+                } finally {
+                    if (state.depth == 1) {
+                        refreshRouting(port, state);
+                    }
+                    state.depth--;
+                    retirePortState(port, state);
+                }
+            }
+        }
+    }
+
+    private <T> T onPorts(List<Integer> ports, int index, Supplier<T> operation) {
+        if (index == ports.size()) {
+            return operation.get();
+        }
+        return onPort(ports.get(index), state -> onPorts(ports, index + 1, operation));
+    }
+
+    private void onCurrentPort(int port, PortState state, Runnable operation) {
+        synchronized (state) {
+            if (stopping || portStates.get(port) != state) {
+                return;
+            }
+            state.depth++;
+            try {
+                operation.run();
+            } finally {
+                if (state.depth == 1) {
+                    refreshRouting(port, state);
+                }
+                state.depth--;
+                retirePortState(port, state);
+            }
+        }
+    }
+
+    private void retirePortState(int port, PortState state) {
+        if (state.depth == 0 && state.closing == 0 && !servers.containsKey(port) && !tcpServers.containsKey(port)
+                && !listenersByHostAndPort.containsKey(port)) {
+            portStates.remove(port, state);
+        }
+    }
+
+    private final AtomicBoolean releaseHandlerRegistered =
+            new AtomicBoolean();
     private final Map<Integer, Map<String, String>> listenersByHostAndPort = new ConcurrentHashMap<>();
-    private final Map<String, ListenerBinding> listenerBindings = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, ListenerBinding> listenerBindings;
     private final Map<String, AtomicReference<List<CompiledRule>>> ruleChains = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> rrCounters = new ConcurrentHashMap<>();
     private final Map<String, String> listenerRegions = new ConcurrentHashMap<>();
+    private final ElbV2StickyCookie stickyCookie = new ElbV2StickyCookie();
 
     private HttpClient proxyClient;
+    private NetClient tcpClient;
 
-    private record ListenerBinding(int port, String host, String loadBalancerArn) {}
+    public ElbV2DataPlane() {
+        this(new ConcurrentHashMap<>());
+    }
+
+    ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings) {
+        this.listenerBindings = listenerBindings;
+    }
+
+    record ListenerBinding(int port, String host, String loadBalancerArn,
+                           boolean secure, Set<String> certificateHosts, List<CertificateMaterial> certificates,
+                           boolean tcp) {}
 
     @PostConstruct
     void init() {
         proxyClient = vertx.createHttpClient(new HttpClientOptions()
                 .setMaxPoolSize(100)
                 .setConnectTimeout(5000)
-                .setKeepAlive(true));
+                .setKeepAlive(true)
+                .setMaxHeaderSize(MAX_RESPONSE_HEADER_SIZE));
+        tcpClient = vertx.createNetClient(new NetClientOptions().setConnectTimeout(5000)
+                .setTcpKeepAlive(true));
     }
 
     @PreDestroy
     void shutdown() {
-        for (Map.Entry<Integer, HttpServer> e : servers.entrySet()) {
-            e.getValue().close();
+        stopping = true;
+        for (Map.Entry<Integer, PortState> entry : portStates.entrySet()) {
+            synchronized (entry.getValue()) {
+                HttpServer server = servers.remove(entry.getKey());
+                if (server != null) {
+                    server.close();
+                }
+                NetServer tcpServer = tcpServers.remove(entry.getKey());
+                if (tcpServer != null) {
+                    tcpServer.close();
+                }
+            }
         }
+        portStates.clear();
         servers.clear();
+        tcpServers.clear();
+        if (tcpClient != null) {
+            tcpClient.close();
+        }
         listenersByHostAndPort.clear();
         listenerBindings.clear();
         ruleChains.clear();
@@ -119,68 +261,177 @@ public class ElbV2DataPlane {
         listenerRegions.clear();
     }
 
-    public void startListener(Listener listener, String region, List<Rule> rules) {
-        if (config.services().elbv2().mock()) {
-            return;
-        }
-        String listenerArn = listener.getListenerArn();
-        List<CompiledRule> compiled = compileRules(rules);
-        ruleChains.put(listenerArn, new AtomicReference<>(compiled));
-        listenerRegions.put(listenerArn, region);
-        ListenerBinding binding = binding(listener, region);
-        listenerBindings.put(listenerArn, binding);
-        Map<String, String> listenersOnPort =
-                listenersByHostAndPort.computeIfAbsent(binding.port(), ignored -> new ConcurrentHashMap<>());
-        warnOnSharedPort(binding, listenersOnPort);
-        listenersOnPort.put(binding.host(), listenerArn);
-        ensureReleaseHandlerRegistered();
-        servers.computeIfAbsent(binding.port(), this::startPortServer);
-    }
-
-    public void restartListener(Listener listener, String region, List<Rule> rules) {
-        if (config.services().elbv2().mock()) {
-            return;
-        }
-        String listenerArn = listener.getListenerArn();
-        ListenerBinding newBinding = binding(listener, region);
-        ListenerBinding oldBinding = listenerBindings.get(listenerArn);
-        if (newBinding.equals(oldBinding)) {
-            ruleChains.put(listenerArn, new AtomicReference<>(compileRules(rules)));
-            listenerRegions.put(listenerArn, region);
-            listenersByHostAndPort.computeIfAbsent(newBinding.port(), ignored -> new ConcurrentHashMap<>())
-                    .put(newBinding.host(), listenerArn);
+    boolean publishListener(Listener listener, String region, Integer previousPort,
+                            BooleanSupplier publication, Supplier<List<Rule>> rules,
+                            Function<Supplier<Boolean>, Boolean> admission) {
+        boolean live = !config.services().elbv2().mock() && !stopping && listener.getPort() != null;
+        // Certificate ownership and material resolution must precede every port gate.
+        ListenerBinding prepared = live ? binding(listener, region) : null;
+        String arn = listener.getListenerArn();
+        ListenerBinding expected = listenerBindings.get(arn);
+        Integer runtimePort = expected == null ? previousPort : Integer.valueOf(expected.port());
+        List<Integer> ports = Stream.of(previousPort, runtimePort, listener.getPort())
+                .filter(Objects::nonNull).distinct().sorted().toList();
+        boolean applied = admission.apply(() -> {
+            // Recheck snapshots under the certificate guards, before taking any port gate.
+            if (prepared != null) {
+                for (CertificateMaterial material : prepared.certificates()) {
+                    if (!material.equals(certificateResolver.publishedMaterial(arn, region, material.arn()))) {
+                        return false;
+                    }
+                }
+            }
+            return onPorts(ports, 0, () -> {
+                if (listenerBindings.get(arn) != expected) {
+                    return false;
+                }
+                if (!live) {
+                    return publication.getAsBoolean();
+                }
+                return installBinding(arn, expected, prepared, region,
+                        () -> compileRules(rules.get()), publication, true);
+            });
+        });
+        if (applied && live && !stopping) {
             ensureReleaseHandlerRegistered();
-            servers.computeIfAbsent(newBinding.port(), this::startPortServer);
-            return;
+            onPort(prepared.port(), state -> {
+                if (!stopping && listenerBindings.containsKey(arn)) {
+                    ensurePortServer(prepared.port());
+                }
+                return null;
+            });
         }
-        oldBinding = listenerBindings.remove(listenerArn);
-        if (oldBinding != null) {
-            Map<String, String> listenersByHost = listenersByHostAndPort.get(oldBinding.port());
-            if (listenersByHost != null) {
-                listenersByHost.remove(oldBinding.host(), listenerArn);
-                closePortServerIfUnused(oldBinding.port(), listenersByHost);
-            }
-        }
-        startListener(listener, region, rules);
+        return applied;
     }
 
-    public void stopListener(String listenerArn) {
-        ListenerBinding binding = listenerBindings.remove(listenerArn);
-        if (binding != null) {
-            Map<String, String> listenersByHost = listenersByHostAndPort.get(binding.port());
-            if (listenersByHost != null) {
-                listenersByHost.remove(binding.host(), listenerArn);
-                closePortServerIfUnused(binding.port(), listenersByHost);
-            }
-        }
-        ruleChains.remove(listenerArn);
-        listenerRegions.remove(listenerArn);
+    boolean updateListener(Integer storedPort, BooleanSupplier publication) {
+        return storedPort == null ? publication.getAsBoolean()
+                : onPort(storedPort, state -> publication.getAsBoolean());
     }
 
-    public void recompileRules(String listenerArn, List<Rule> rules) {
-        AtomicReference<List<CompiledRule>> ref = ruleChains.get(listenerArn);
-        if (ref != null) {
-            ref.set(compileRules(rules));
+    boolean removeListener(String arn, Integer storedPort, BooleanSupplier publication) {
+        ListenerBinding expected = listenerBindings.get(arn);
+        Integer runtimePort = expected == null ? storedPort : Integer.valueOf(expected.port());
+        List<Integer> ports = Stream.of(storedPort, runtimePort).filter(Objects::nonNull).distinct().sorted().toList();
+        return onPorts(ports, 0, () -> {
+            if (listenerBindings.get(arn) != expected || !publication.getAsBoolean()) {
+                return false;
+            }
+            if (expected != null) {
+                ruleChains.remove(arn);
+                listenerRegions.remove(arn);
+                listenerBindings.remove(arn, expected);
+                removePortBinding(arn, expected);
+            }
+            return true;
+        });
+    }
+
+    private boolean installBinding(String arn, ListenerBinding expected, ListenerBinding prepared,
+                                   String region, Supplier<List<CompiledRule>> compiled,
+                                   BooleanSupplier publication, boolean preserveRules) {
+        if (stopping) {
+            return publication.getAsBoolean();
+        }
+        if (listenerBindings.get(arn) != expected) {
+            return false;
+        }
+        requireCompatiblePort(prepared, arn);
+        boolean claimed = expected == null
+                ? listenerBindings.putIfAbsent(arn, prepared) == null
+                : listenerBindings.replace(arn, expected, prepared);
+        if (!claimed) {
+            return false;
+        }
+        try {
+            if (!publication.getAsBoolean()) {
+                restoreReservation(arn, expected, prepared);
+                return false;
+            }
+        } catch (RuntimeException failure) {
+            restoreReservation(arn, expected, prepared);
+            throw failure;
+        }
+        if (expected != null) {
+            removeHostBindings(arn, expected);
+            if (expected.port() != prepared.port()) {
+                removePortBinding(arn, expected);
+            }
+        }
+        publishBinding(arn, prepared);
+        if (preserveRules) {
+            ruleChains.computeIfAbsent(arn, ignored -> new AtomicReference<>(compiled.get()));
+        } else {
+            ruleChains.put(arn, new AtomicReference<>(compiled.get()));
+        }
+        listenerRegions.put(arn, region);
+        if (conflictsWithServedListener(prepared.port(), prepared.tcp(), arn)) {
+            LOG.warnv("ELBv2 listener {0} on port {1} is registered but serves no traffic: a TCP listener "
+                    + "needs a dedicated local port and another listener already serves it. It takes over "
+                    + "the port once the serving listener is deleted or moved.", arn, String.valueOf(prepared.port()));
+            return true;
+        }
+        Map<String, String> peers = listenersByHostAndPort.computeIfAbsent(
+                prepared.port(), ignored -> new ConcurrentHashMap<>());
+        warnOnSharedPort(prepared, peers);
+        addHostBindings(arn, prepared);
+        promoteParkedListeners(prepared.port());
+        if (expected != null && expected.port() == prepared.port()
+                && (expected.secure() != prepared.secure() || expected.tcp() != prepared.tcp())) {
+            restartPortServer(prepared.port());
+        } else {
+            HttpServer server = servers.get(prepared.port());
+            if (server == null) {
+                ensurePortServer(prepared.port());
+            } else if (prepared.secure()) {
+                refreshTlsOptions(prepared.port(), server);
+            }
+        }
+        return true;
+    }
+
+    private void restoreReservation(String arn, ListenerBinding expected, ListenerBinding prepared) {
+        if (expected == null) {
+            listenerBindings.remove(arn, prepared);
+        } else {
+            listenerBindings.replace(arn, prepared, expected);
+        }
+    }
+
+    private void removePortBinding(String listenerArn, ListenerBinding binding) {
+        removeHostBindings(listenerArn, binding);
+        Map<String, String> listenersByHost = listenersByHostAndPort.get(binding.port());
+        if ((listenersByHost == null || listenersByHost.isEmpty()) && promoteParkedListeners(binding.port())) {
+            restartPortServer(binding.port());
+        } else if (listenersByHost == null || listenersByHost.isEmpty()) {
+            closePortServerIfUnused(binding.port(), listenersByHost);
+        } else if (binding.secure()) {
+            HttpServer server = servers.get(binding.port());
+            if (server != null) {
+                refreshTlsOptions(binding.port(), server);
+            }
+        }
+    }
+
+    public void recompileRules(String listenerArn, Supplier<List<Rule>> rules) {
+        while (!stopping) {
+            ListenerBinding expected = listenerBindings.get(listenerArn);
+            if (expected == null) {
+                return;
+            }
+            boolean applied = onPort(expected.port(), state -> {
+                if (listenerBindings.get(listenerArn) != expected) {
+                    return false;
+                }
+                AtomicReference<List<CompiledRule>> ref = ruleChains.get(listenerArn);
+                if (ref != null) {
+                    ref.set(compileRules(rules.get()));
+                }
+                return true;
+            });
+            if (applied) {
+                return;
+            }
         }
     }
 
@@ -209,14 +460,66 @@ public class ElbV2DataPlane {
         return tlsProxyServer.reservesPort(port);
     }
 
+    /** Bindings of the listeners that actually serve a port, excluding parked ones. */
+    private Stream<ListenerBinding> servedBindings(int port) {
+        Map<String, String> served = listenersByHostAndPort.getOrDefault(port, Map.of());
+        return served.values().stream()
+                .map(listenerBindings::get)
+                .filter(binding -> binding != null && binding.port() == port);
+    }
+
+    /**
+     * A TCP listener owns its local port outright, so it cannot share it with any other listener.
+     * Only listeners that serve the port count: a parked one must not keep a newcomer off it.
+     */
+    private boolean conflictsWithServedListener(int port, boolean tcp, String listenerArn) {
+        Map<String, String> served = listenersByHostAndPort.getOrDefault(port, Map.of());
+        for (String otherArn : served.values()) {
+            ListenerBinding other = listenerBindings.get(otherArn);
+            if (!otherArn.equals(listenerArn) && other != null && other.port() == port && (other.tcp() || tcp)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Lets parked listeners serve a port that no longer conflicts with them, in ARN order so the
+     * outcome does not depend on map iteration. Returns whether any listener was promoted.
+     */
+    private boolean promoteParkedListeners(int port) {
+        Set<String> served = Set.copyOf(listenersByHostAndPort.getOrDefault(port, Map.of()).values());
+        List<String> parked = listenerBindings.entrySet().stream()
+                .filter(entry -> entry.getValue().port() == port && !served.contains(entry.getKey())
+                        && ruleChains.containsKey(entry.getKey()) && listenerRegions.containsKey(entry.getKey()))
+                .map(Map.Entry::getKey)
+                .sorted()
+                .toList();
+        boolean promoted = false;
+        for (String parkedArn : parked) {
+            ListenerBinding binding = listenerBindings.get(parkedArn);
+            if (binding != null && !conflictsWithServedListener(port, binding.tcp(), parkedArn)) {
+                addHostBindings(parkedArn, binding);
+                LOG.infov("ELBv2 listener {0} now serves port {1}", parkedArn, String.valueOf(port));
+                promoted = true;
+            }
+        }
+        return promoted;
+    }
+
     /**
      * Binds any registered listener whose port the proxy has just released. Yielding a port whose
      * bind had not resolved yet is the safe default, but if that bind then fails nothing else
      * would ever retry the listener, leaving it registered with no data plane and the port free.
      */
     private void bindListenersWaitingOn(int port) {
-        if (listenersByHostAndPort.containsKey(port)) {
-            servers.computeIfAbsent(port, this::startPortServer);
+        PortState state = portStates.get(port);
+        if (state != null) {
+            onCurrentPort(port, state, () -> {
+                if (listenersByHostAndPort.containsKey(port)) {
+                    ensurePortServer(port);
+                }
+            });
         }
     }
 
@@ -237,7 +540,15 @@ public class ElbV2DataPlane {
         }
     }
 
-    private HttpServer startPortServer(int port) {
+    private void ensurePortServer(int port) {
+        PortState state = portStates.get(port);
+        if (!stopping && state != null && state.closing == 0 && !servers.containsKey(port) && !tcpServers.containsKey(port)
+                && listenersByHostAndPort.containsKey(port)) {
+            startPortServer(port, state);
+        }
+    }
+
+    private void startPortServer(int port, PortState state) {
         if (isReservedByFloci(port)) {
             // Returning null leaves `servers` untouched: computeIfAbsent skips a null mapping.
             // The emulator's own port cannot be handed over, so the two cases need different
@@ -247,43 +558,152 @@ public class ElbV2DataPlane {
                     : "Set floci.tls.aws-https-port=0 (or disable TLS) to free it.";
             LOG.warnv("ELBv2 listener port {0} is reserved by Floci itself; the listener is "
                     + "registered but serves no traffic. {1}", String.valueOf(port), remedy);
-            return null;
+            return;
         }
-        HttpServer server = vertx.createHttpServer(new HttpServerOptions()
+        if (servedBindings(port).anyMatch(ListenerBinding::tcp)) {
+            startTcpServer(port, state);
+            return;
+        }
+        boolean secure = portIsSecure(port);
+        HttpServerOptions options = new HttpServerOptions()
                 .setHost("0.0.0.0")
-                .setPort(port));
-        server.requestHandler(req -> handleRequest(req, port));
-        server.listen()
-                .onSuccess(s -> LOG.infov("ELBv2 listener port started on {0}", String.valueOf(port)))
+                .setPort(port)
+                .setMaxHeaderSize(MAX_REQUEST_HEADER_SIZE)
+                .setMaxInitialLineLength(MAX_REQUEST_LINE_LENGTH);
+        if (secure) {
+            state.tlsKeyManager = new ReloadingKeyManager(new ElbV2TlsKeyManager(vertx, tlsKeyCertOptions(port)));
+            options.setSsl(true)
+                    .setSslEngineOptions(new JdkSSLEngineOptions())
+                    .setKeyCertOptions(KeyCertOptions.wrap(state.tlsKeyManager));
+        }
+        HttpServer server = vertx.createHttpServer(options);
+        long generation = ++state.generation;
+        servers.put(port, server);
+        try {
+            server.requestHandler(req -> handleRequest(req, port));
+            server.listen()
+                    .onSuccess(s -> LOG.infov("ELBv2 {0} listener port started on {1}",
+                            secure ? "HTTPS" : "HTTP", String.valueOf(port)))
+                    .onFailure(err -> onCurrentPort(port, state, () -> {
+                        if (state.generation == generation && servers.remove(port, server)) {
+                            clearPortBindings(port);
+                            closeOwnedServer(port, state, server);
+                        } else {
+                            server.close();
+                        }
+                        LOG.warnv("ELBv2 listener port failed to start on {0}: {1}",
+                                String.valueOf(port), err.getMessage());
+                    }));
+        } catch (RuntimeException failure) {
+            if (state.generation == generation && servers.remove(port, server)) {
+                clearPortBindings(port);
+                try {
+                    closeOwnedServer(port, state, server);
+                } catch (RuntimeException cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private void startTcpServer(int port, PortState state) {
+        NetServer server = vertx.createNetServer(new NetServerOptions()
+                .setHost("0.0.0.0").setPort(port).setTcpKeepAlive(true));
+        long generation = ++state.generation;
+        tcpServers.put(port, server);
+        try {
+            server.connectHandler(socket -> handleTcpConnection(socket, state));
+            server.listen().onSuccess(ignored -> LOG.infov("ELBv2 TCP listener port started on {0}", String.valueOf(port)))
+                    .onFailure(err -> onCurrentPort(port, state, () -> {
+                        if (state.generation == generation && tcpServers.remove(port, server)) {
+                            clearPortBindings(port);
+                            closeOwnedServer(port, state, server::close);
+                        } else {
+                            server.close();
+                        }
+                        LOG.warnv("ELBv2 TCP listener port failed to start on {0}: {1}",
+                                String.valueOf(port), err.getMessage());
+                    }));
+        } catch (RuntimeException failure) {
+            if (state.generation == generation && tcpServers.remove(port, server)) {
+                clearPortBindings(port);
+                try {
+                    closeOwnedServer(port, state, server::close);
+                } catch (RuntimeException cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private void handleTcpConnection(NetSocket socket, PortState state) {
+        socket.pause();
+        socket.exceptionHandler(err -> socket.close());
+        RoutingView routing = state.routing;
+        if (routing.listeners().size() != 1) {
+            socket.close();
+            return;
+        }
+        RoutedListener listener = routing.listeners().values().iterator().next();
+        Action action = listener.chain().stream().map(rule -> rule.action)
+                .filter(candidate -> candidate != null && "forward".equals(candidate.getType()))
+                .findFirst().orElse(null);
+        String tgArn = action == null ? null : resolveTgArn(action);
+        TargetGroup tg = tgArn == null ? null : elbV2Service.getTargetGroup(listener.region(), tgArn);
+        if (tg == null || "lambda".equals(tg.getTargetType())) {
+            socket.close();
+            return;
+        }
+        List<TargetDescription> candidates = targetCandidates(tgArn, tg);
+        if (candidates == null) {
+            socket.close();
+            return;
+        }
+        TargetDescription target = pickRoundRobin(tgArn, candidates);
+        int port = ElbV2HealthChecker.effectivePort(target, tg);
+        String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        AtomicBoolean disconnected = new AtomicBoolean();
+        socket.closeHandler(ignored -> disconnected.set(true));
+        vertx.executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
+                .compose(address -> disconnected.get() ? Future.<NetSocket>failedFuture("Client disconnected")
+                        : tcpClient.connect(port, address))
+                .onSuccess(upstream -> {
+                    if (disconnected.get()) {
+                        upstream.close();
+                        return;
+                    }
+                    long idleTimeoutMillis = tcpIdleTimeoutMillis(listener.arn(), listener.region());
+                    tunnel(socket, upstream, idleTimeoutMillis);
+                    socket.resume();
+                })
                 .onFailure(err -> {
-                    servers.remove(port);
-                    clearPortBindings(port);
-                    server.close();
-                    LOG.warnv("ELBv2 listener port failed to start on {0}: {1}", String.valueOf(port), err.getMessage());
+                    LOG.debugv("ELBv2 TCP connection to {0}:{1} failed: {2}", host, port, err.getMessage());
+                    socket.close();
                 });
-        return server;
     }
 
     private void closePortServerIfUnused(int port, Map<String, String> listenersByHost) {
-        if (!listenersByHost.isEmpty()) {
+        if (listenersByHost != null && !listenersByHost.isEmpty()) {
             return;
         }
-        listenersByHostAndPort.remove(port, listenersByHost);
-        HttpServer server = servers.remove(port);
-        if (server != null) {
-            server.close();
+        if (listenersByHost != null) {
+            listenersByHostAndPort.remove(port, listenersByHost);
         }
+        restartPortServer(port);
     }
 
     private void clearPortBindings(int port) {
-        Map<String, String> listenersByHost = listenersByHostAndPort.remove(port);
-        if (listenersByHost == null) {
-            return;
-        }
-        for (String listenerArn : listenersByHost.values()) {
-            listenerBindings.remove(listenerArn);
-            ruleChains.remove(listenerArn);
-            listenerRegions.remove(listenerArn);
+        listenersByHostAndPort.remove(port);
+        for (Map.Entry<String, ListenerBinding> entry : listenerBindings.entrySet()) {
+            if (entry.getValue().port() == port) {
+                // Retain the old binding claim until its metadata is gone. A publisher on
+                // another port cannot install the same listener's new metadata in between.
+                ruleChains.remove(entry.getKey());
+                listenerRegions.remove(entry.getKey());
+                listenerBindings.remove(entry.getKey(), entry.getValue());
+            }
         }
     }
 
@@ -310,93 +730,292 @@ public class ElbV2DataPlane {
         }
     }
 
+    private void publishBinding(String listenerArn, ListenerBinding binding) {
+        listenerBindings.put(listenerArn, binding);
+        if (!binding.secure()) {
+            return;
+        }
+        Map<String, CertificateMaterial> current = new LinkedHashMap<>();
+        for (CertificateMaterial certificate : binding.certificates()) {
+            current.put(certificate.arn(), certificate);
+        }
+        listenerBindings.replaceAll((peerArn, peer) -> {
+            if (peer.port() != binding.port() || !peer.secure()) {
+                return peer;
+            }
+            List<CertificateMaterial> material = new ArrayList<>();
+            Set<String> hosts = new LinkedHashSet<>();
+            for (CertificateMaterial certificate : peer.certificates()) {
+                CertificateMaterial replacement = current.getOrDefault(certificate.arn(), certificate);
+                material.add(replacement);
+                addCertificateHosts(hosts, replacement);
+            }
+            return new ListenerBinding(peer.port(), peer.host(), peer.loadBalancerArn(), true,
+                    Set.copyOf(hosts), List.copyOf(material), false);
+        });
+    }
+
     private ListenerBinding binding(Listener listener, String region) {
         LoadBalancer loadBalancer = elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn());
         String host = loadBalancer != null ? normalizeHost(loadBalancer.getDnsName()) : listener.getLoadBalancerArn();
-        return new ListenerBinding(listener.getPort(), host, listener.getLoadBalancerArn());
+        boolean secure = "HTTPS".equalsIgnoreCase(listener.getProtocol());
+        Set<String> hosts = new LinkedHashSet<>();
+        List<CertificateMaterial> certificates = new ArrayList<>();
+        if (secure) {
+            if (listener.getCertificates() == null || listener.getCertificates().isEmpty()) {
+                throw new IllegalStateException("HTTPS listener has no default certificate");
+            }
+            for (String certificateArn : listener.getCertificates()) {
+                CertificateMaterial certificate = certificateResolver.publishedMaterial(
+                        listener.getListenerArn(), region, certificateArn);
+                try {
+                    if (!Pem.isPair(Pem.parsePrivateKey(certificate.privateKey()),
+                            Pem.parseCertificate(certificate.certificateBody()).getPublicKey())) {
+                        throw new IllegalArgumentException("Certificate and private key do not match");
+                    }
+                } catch (Exception failure) {
+                    throw new IllegalStateException("Certificate " + certificateArn + " has unusable TLS material", failure);
+                }
+                certificates.add(certificate);
+                addCertificateHosts(hosts, certificate);
+            }
+        }
+        return new ListenerBinding(listener.getPort(), host, listener.getLoadBalancerArn(),
+                secure, Set.copyOf(hosts), List.copyOf(certificates), "TCP".equalsIgnoreCase(listener.getProtocol()));
     }
 
-    private void handleRequest(io.vertx.core.http.HttpServerRequest req, int port) {
-        String listenerArn = resolveListenerArn(port, req.host());
-        if (listenerArn == null) {
+    public void requireCompatibleListenerProtocol(String listenerArn, int port, String protocol) {
+        if (config.services().elbv2().mock()) {
+            return;
+        }
+        onPort(port, state -> {
+            requireCompatiblePort(port, "HTTPS".equalsIgnoreCase(protocol), "TCP".equalsIgnoreCase(protocol), listenerArn);
+            return null;
+        });
+    }
+
+    private void requireCompatiblePort(ListenerBinding binding, String listenerArn) {
+        requireCompatiblePort(binding.port(), binding.secure(), binding.tcp(), listenerArn);
+    }
+
+    private void requireCompatiblePort(int port, boolean secure, boolean tcp, String listenerArn) {
+        for (Map.Entry<String, ListenerBinding> entry : listenerBindings.entrySet()) {
+            ListenerBinding existing = entry.getValue();
+            if (!entry.getKey().equals(listenerArn) && existing.port() == port && existing.secure() != secure
+                    && !existing.tcp() && !tcp) {
+                throw new IncompatibleListenerProtocolException(port);
+            }
+        }
+    }
+
+    static final class IncompatibleListenerProtocolException extends IllegalStateException {
+        IncompatibleListenerProtocolException(int port) {
+            super("ELBv2 listeners sharing port " + port + " must use the same front-end protocol");
+        }
+
+        IncompatibleListenerProtocolException(String message) {
+            super(message);
+        }
+    }
+
+    private void addHostBindings(String listenerArn, ListenerBinding binding) {
+        listenersByHostAndPort.computeIfAbsent(binding.port(), ignored -> new ConcurrentHashMap<>())
+                .put(binding.host(), listenerArn);
+    }
+
+    private void removeHostBindings(String listenerArn, ListenerBinding binding) {
+        Map<String, String> listenersByHost = listenersByHostAndPort.get(binding.port());
+        if (listenersByHost != null) {
+            listenersByHost.remove(binding.host(), listenerArn);
+        }
+    }
+
+    private void refreshTlsOptions(int port, HttpServer server) {
+        PortState state = portStates.get(port);
+        if (state != null && servers.get(port) == server && state.tlsKeyManager != null) {
+            try {
+                state.tlsKeyManager.reload(new ElbV2TlsKeyManager(vertx, tlsKeyCertOptions(port)));
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "ELBv2 listener TLS certificates failed to refresh on {0}: {1}",
+                        String.valueOf(port), failure.getMessage());
+            }
+        }
+    }
+
+    private void restartPortServer(int port) {
+        PortState state = portStates.get(port);
+        NetServer tcpServer = tcpServers.remove(port);
+        if (tcpServer != null) {
+            closeOwnedServer(port, state, tcpServer::close);
+            return;
+        }
+        HttpServer server = servers.remove(port);
+        if (server == null) {
+            ensurePortServer(port);
+            return;
+        }
+        closeOwnedServer(port, state, server);
+    }
+
+    private void closeOwnedServer(int port, PortState state, HttpServer server) {
+        closeOwnedServer(port, state, server::close);
+    }
+
+    private void closeOwnedServer(int port, PortState state, Supplier<Future<Void>> close) {
+        long generation = ++state.generation;
+        state.closing++;
+        Future<Void> closed;
+        try {
+            closed = close.get();
+        } catch (RuntimeException failure) {
+            state.closing--;
+            throw failure;
+        }
+        closed.onComplete(ignored -> onCurrentPort(port, state, () -> {
+            state.closing--;
+            if (state.generation == generation) {
+                ensurePortServer(port);
+            }
+        }));
+    }
+
+    private PemKeyCertOptions tlsKeyCertOptions(int port) {
+        Map<String, CertificateMaterial> certificates = new LinkedHashMap<>();
+        for (ListenerBinding binding : servedBindings(port).filter(ListenerBinding::secure).toList()) {
+            for (CertificateMaterial certificate : binding.certificates()) {
+                certificates.putIfAbsent(certificate.arn(), certificate);
+            }
+        }
+        if (certificates.isEmpty()) {
+            throw new IllegalStateException("HTTPS listener port " + port + " has no certificate");
+        }
+        PemKeyCertOptions options = new PemKeyCertOptions();
+        for (CertificateMaterial certificate : certificates.values()) {
+            if (certificate.privateKey() == null || certificate.privateKey().isBlank()
+                    || certificate.certificateBody() == null || certificate.certificateBody().isBlank()) {
+                throw new IllegalStateException("Certificate " + certificate.arn()
+                        + " does not contain TLS key material");
+            }
+            options.addKeyValue(Buffer.buffer(certificate.privateKey()));
+            options.addCertValue(Buffer.buffer(certificatePemChain(certificate)));
+        }
+        return options;
+    }
+
+    private boolean portIsSecure(int port) {
+        return servedBindings(port)
+                .findFirst()
+                .map(ListenerBinding::secure)
+                .orElse(false);
+    }
+
+    private static String certificatePemChain(CertificateMaterial certificate) {
+        String body = certificate.certificateBody().stripTrailing();
+        String chain = certificate.certificateChain();
+        if (chain == null || chain.isBlank()) {
+            return body + "\n";
+        }
+        try {
+            CertificateFactory.getInstance("X.509").generateCertificates(
+                    new ByteArrayInputStream(chain.getBytes(StandardCharsets.US_ASCII)));
+            return body + "\n" + chain.strip() + "\n";
+        } catch (CertificateException e) {
+            LOG.warnv("Certificate {0} has an invalid optional chain; serving its leaf certificate only",
+                    certificate.arn());
+            return body + "\n";
+        }
+    }
+
+    private static void addCertificateHosts(Set<String> hosts, CertificateMaterial certificate) {
+        X509Certificate leaf = Pem.parseCertificate(certificate.certificateBody());
+        try {
+            Set<String> leafHosts = new LinkedHashSet<>();
+            Collection<List<?>> names = leaf.getSubjectAlternativeNames();
+            if (names != null) {
+                for (List<?> name : names) {
+                    if (Integer.valueOf(2).equals(name.get(0)) && name.get(1) instanceof String hostname) {
+                        leafHosts.add(normalizeHost(hostname));
+                    }
+                }
+            }
+            if (leafHosts.isEmpty()) {
+                for (Rdn name : new LdapName(leaf.getSubjectX500Principal().getName()).getRdns()) {
+                    if ("CN".equalsIgnoreCase(name.getType())) {
+                        leafHosts.add(normalizeHost(name.getValue().toString()));
+                    }
+                }
+            }
+            hosts.addAll(leafHosts);
+        } catch (CertificateException | InvalidNameException failure) {
+            throw new IllegalStateException("Unable to read certificate hostnames", failure);
+        }
+    }
+
+    private record RoutedListener(String arn, String region, List<CompiledRule> chain, Set<String> certificateHosts) {}
+
+    private record RoutingView(Map<String, String> hosts, Map<String, RoutedListener> listeners) {}
+
+    /** Publishes membership, region and compiled chain together after a coordinated write. */
+    private void refreshRouting(int port, PortState state) {
+        Map<String, String> hosts = listenersByHostAndPort.getOrDefault(port, Map.of());
+        Map<String, RoutedListener> routes = new HashMap<>();
+        for (String arn : hosts.values()) {
+            ListenerBinding binding = listenerBindings.get(arn);
+            AtomicReference<List<CompiledRule>> chain = ruleChains.get(arn);
+            String region = listenerRegions.get(arn);
+            if (binding != null && binding.port() == port && chain != null && region != null) {
+                routes.put(arn, new RoutedListener(arn, region, chain.get(), binding.certificateHosts()));
+            }
+        }
+        state.routing = new RoutingView(Map.copyOf(hosts), Map.copyOf(routes));
+    }
+
+    private void handleRequest(HttpServerRequest req, int port) {
+        PortState state = portStates.get(port);
+        RoutingView routing = state == null ? null : state.routing;
+        RoutedListener listener = routing == null ? null : resolveListener(routing, req.host());
+        if (listener == null) {
             req.response().setStatusCode(502).end("No listener for host");
             return;
         }
-        String region = listenerRegions.get(listenerArn);
-        if (region == null) {
-            req.response().setStatusCode(502).end("No listener region");
-            return;
-        }
-        AtomicReference<List<CompiledRule>> ref = ruleChains.get(listenerArn);
-        if (ref == null) {
-            req.response().setStatusCode(502).end("No rule chain");
-            return;
-        }
-        List<CompiledRule> chain = ref.get();
-        for (CompiledRule compiled : chain) {
+        for (CompiledRule compiled : listener.chain()) {
             if (compiled.matches(req)) {
-                executeAction(req, compiled.action, region, listenerArn);
+                executeAction(req, compiled.action, listener.region(), listener.arn());
                 return;
             }
         }
         req.response().setStatusCode(502).end("No matching rule");
     }
 
-    /**
-     * Chooses the listener that serves a request arriving on a shared port.
-     *
-     * <p>Real AWS has no such step. Every load balancer gets its own DNS name and addresses, so
-     * the network picks the load balancer and a {@code host-header} rule only picks a rule inside
-     * one listener. Floci serves every load balancer from a single socket per port, so the Host
-     * header has to carry both decisions.
-     *
-     * <p>The load balancer's own DNS name wins first. Failing that, a listener whose rules already
-     * declare the hostname claims it: a deployment that puts two load balancers on port 80 names
-     * them in host-header conditions anyway, so this reuses what the template already says instead
-     * of inventing a Floci-only knob. A lone listener on the port still answers anything, so a
-     * single load balancer needs no hostname at all.
-     */
-    private String resolveListenerArn(int port, String hostHeader) {
-        Map<String, String> listenersByHost = listenersByHostAndPort.get(port);
-        if (listenersByHost == null || listenersByHost.isEmpty()) {
-            return null;
-        }
+    /** Floci's shared socket first uses load-balancer DNS, then unique rule or certificate hosts. */
+    private RoutedListener resolveListener(RoutingView routing, String hostHeader) {
         String host = normalizeHost(hostHeader);
-        String listenerArn = listenersByHost.get(host);
-        if (listenerArn != null) {
-            return listenerArn;
+        String direct = routing.hosts().get(host);
+        if (direct != null) {
+            return routing.listeners().get(direct);
         }
-        List<String> declaring = listenersDeclaringHost(listenersByHost, host);
-        if (declaring.size() == 1) {
-            return declaring.get(0);
+        List<RoutedListener> declaring = routing.listeners().values().stream()
+                .filter(listener -> listener.chain().stream().anyMatch(rule -> rule.declaresHost(host)))
+                .toList();
+        if (!declaring.isEmpty()) {
+            return declaring.size() == 1 ? declaring.getFirst() : null;
         }
-        if (declaring.size() > 1) {
-            LOG.debugv("ELBv2 port {0}: {1} listeners declare Host {2} in a host-header condition, "
-                    + "so none of them can claim it", String.valueOf(port),
-                    String.valueOf(declaring.size()), host);
-            return null;
+        List<RoutedListener> certificates = routing.listeners().values().stream()
+                .filter(listener -> listener.certificateHosts().stream()
+                        .anyMatch(candidate -> candidate.equals(host) || wildcardMatches(candidate, host)))
+                .toList();
+        if (!certificates.isEmpty()) {
+            return certificates.size() == 1 ? certificates.getFirst() : null;
         }
-        if (listenersByHost.size() == 1) {
-            return listenersByHost.values().iterator().next();
-        }
-        return null;
+        return routing.hosts().size() == 1
+                ? routing.listeners().get(routing.hosts().values().iterator().next()) : null;
     }
 
-    private List<String> listenersDeclaringHost(Map<String, String> listenersByHost, String host) {
-        List<String> declaring = new ArrayList<>();
-        for (String listenerArn : listenersByHost.values()) {
-            AtomicReference<List<CompiledRule>> ref = ruleChains.get(listenerArn);
-            if (ref == null) {
-                continue;
-            }
-            for (CompiledRule compiled : ref.get()) {
-                if (compiled.declaresHost(host)) {
-                    declaring.add(listenerArn);
-                    break;
-                }
-            }
-        }
-        return declaring;
+    private static boolean wildcardMatches(String candidate, String host) {
+        return candidate.startsWith("*.")
+                && host.length() > candidate.length() - 1
+                && host.endsWith(candidate.substring(1))
+                && host.indexOf('.') == host.length() - candidate.length() + 1;
     }
 
     private static String normalizeHost(String host) {
@@ -412,7 +1031,7 @@ public class ElbV2DataPlane {
         return normalized;
     }
 
-    private void executeAction(io.vertx.core.http.HttpServerRequest req, Action action, String region, String listenerArn) {
+    private void executeAction(HttpServerRequest req, Action action, String region, String listenerArn) {
         if (action == null) {
             req.response().setStatusCode(502).end("No action");
             return;
@@ -425,7 +1044,8 @@ public class ElbV2DataPlane {
         }
     }
 
-    private void executeForward(io.vertx.core.http.HttpServerRequest req, Action action, String region, String listenerArn) {
+    private void executeForward(HttpServerRequest req, Action action, String region, String listenerArn) {
+        ElbV2TraceHeader.update(req.headers());
         String tgArn = resolveTgArn(action);
         if (tgArn == null) {
             req.response().setStatusCode(502).end("No target group");
@@ -436,6 +1056,11 @@ public class ElbV2DataPlane {
             req.response().setStatusCode(502).end("Target group not found");
             return;
         }
+
+        ElbV2ForwardedHeaders forwarded = ElbV2ForwardedHeaders.of(req,
+                loadBalancerAttribute(listenerArn, region, ElbV2ForwardedHeaders.XFF_MODE_ATTRIBUTE),
+                Boolean.parseBoolean(
+                        loadBalancerAttribute(listenerArn, region, ElbV2ForwardedHeaders.XFF_CLIENT_PORT_ATTRIBUTE)));
 
         if ("lambda".equals(tg.getTargetType())) {
             if (isWebSocketUpgrade(req)) {
@@ -448,31 +1073,33 @@ public class ElbV2DataPlane {
                 return;
             }
             String functionArn = targets.get(0).getId();
-            invokeLambdaTarget(req, functionArn, region);
+            invokeLambdaTarget(req, functionArn, region, forwarded);
             return;
         }
 
-        List<TargetDescription> allTargets = tg.getTargets();
-        List<TargetDescription> healthy = allTargets.stream()
-                .filter(t -> healthChecker.isHealthy(tgArn, t, ElbV2HealthChecker.effectivePort(t, tg)))
-                .collect(Collectors.toList());
-        List<TargetDescription> candidates = healthy.isEmpty() ? allTargets : healthy;
-        if (candidates.isEmpty()) {
+        List<TargetDescription> candidates = targetCandidates(tgArn, tg);
+        if (candidates == null) {
             req.response().setStatusCode(503).end("No targets available");
             return;
         }
-        AtomicInteger counter = rrCounters.computeIfAbsent(tgArn, k -> new AtomicInteger(0));
-        int idx = Math.abs(counter.getAndIncrement() % candidates.size());
-        TargetDescription target = candidates.get(idx);
+        ListenerBinding binding = listenerBindings.get(listenerArn);
+        long duration = ElbV2StickyCookie.durationSeconds(tg);
+        String scope = binding != null ? binding.loadBalancerArn() + "\n" + tgArn : "";
+        TargetDescription target = stickyCookie.target(req.headers().getAll("Cookie"), scope, tg, candidates, duration);
+        if (target == null) {
+            target = pickRoundRobin(tgArn, candidates);
+        }
+        List<String> cookies = duration > 0 ? stickyCookie.headers(scope, tg, target) : List.of();
         int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
         String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
         boolean preserveHostHeader = Boolean.parseBoolean(
                 loadBalancerAttribute(listenerArn, region, PRESERVE_HOST_HEADER_ATTRIBUTE));
         if (isWebSocketUpgrade(req)) {
-            proxyUpgrade(req, host, targetPort, preserveHostHeader, idleTimeoutMillis(listenerArn, region));
+            proxyUpgrade(req, host, targetPort, preserveHostHeader, forwarded,
+                    idleTimeoutMillis(listenerArn, region), cookies);
             return;
         }
-        proxyRequest(req, host, targetPort, preserveHostHeader);
+        proxyRequest(req, host, targetPort, preserveHostHeader, forwarded, cookies);
     }
 
     private String loadBalancerAttribute(String listenerArn, String region, String key) {
@@ -487,22 +1114,57 @@ public class ElbV2DataPlane {
         return loadBalancer.getAttributes().get(key);
     }
 
-    private long idleTimeoutMillis(String listenerArn, String region) {
-        String configured = loadBalancerAttribute(listenerArn, region, IDLE_TIMEOUT_ATTRIBUTE);
-        long seconds = DEFAULT_IDLE_TIMEOUT_SECONDS;
+    private long parseTimeoutMillis(String configured, String attributeKey, long defaultSeconds) {
+        long seconds = defaultSeconds;
         if (configured != null) {
             try {
                 seconds = Long.parseLong(configured.trim());
             } catch (NumberFormatException e) {
-                LOG.debugv("Ignoring non-numeric {0} value {1}", IDLE_TIMEOUT_ATTRIBUTE, configured);
+                LOG.debugv("Ignoring non-numeric {0} value {1}", attributeKey, configured);
             }
         }
-        return Math.max(1, seconds) * 1000;
+        return Math.max(1, seconds) * 1000L;
     }
 
-    private void invokeLambdaTarget(io.vertx.core.http.HttpServerRequest req, String functionArn, String region) {
+    private long idleTimeoutMillis(String listenerArn, String region) {
+        return parseTimeoutMillis(loadBalancerAttribute(listenerArn, region, IDLE_TIMEOUT_ATTRIBUTE),
+                IDLE_TIMEOUT_ATTRIBUTE, DEFAULT_IDLE_TIMEOUT_SECONDS);
+    }
+
+    private String listenerAttribute(String listenerArn, String region, String key) {
+        Listener listener = elbV2Service.getListener(region, listenerArn);
+        if (listener == null || listener.getAttributes() == null) {
+            return null;
+        }
+        return listener.getAttributes().get(key);
+    }
+
+    long tcpIdleTimeoutMillis(String listenerArn, String region) {
+        return parseTimeoutMillis(listenerAttribute(listenerArn, region, TCP_IDLE_TIMEOUT_ATTRIBUTE),
+                TCP_IDLE_TIMEOUT_ATTRIBUTE, TCP_IDLE_TIMEOUT_SECONDS);
+    }
+
+    /** Healthy targets, falling back to all registered ones; null when none are registered at all. */
+    private List<TargetDescription> targetCandidates(String tgArn, TargetGroup tg) {
+        List<TargetDescription> all = tg.getTargets();
+        List<TargetDescription> healthy = all.stream()
+                .filter(t -> healthChecker.isHealthy(tgArn, t, ElbV2HealthChecker.effectivePort(t, tg)))
+                .toList();
+        List<TargetDescription> candidates = healthy.isEmpty() ? all : healthy;
+        return candidates.isEmpty() ? null : candidates;
+    }
+
+    private TargetDescription pickRoundRobin(String tgArn, List<TargetDescription> candidates) {
+        int index = Math.floorMod(
+                rrCounters.computeIfAbsent(tgArn, ignored -> new AtomicInteger()).getAndIncrement(),
+                candidates.size());
+        return candidates.get(index);
+    }
+
+    private void invokeLambdaTarget(HttpServerRequest req, String functionArn, String region,
+                                    ElbV2ForwardedHeaders forwarded) {
         if (req.isEnded()) {
-            invokeLambdaWithBody(req, functionArn, region, Buffer.buffer());
+            invokeLambdaWithBody(req, functionArn, region, forwarded, Buffer.buffer());
             return;
         }
         ByteArrayOutputStream body = new ByteArrayOutputStream();
@@ -527,13 +1189,13 @@ public class ElbV2DataPlane {
             if (rejected.get()) {
                 return;
             }
-            invokeLambdaWithBody(req, functionArn, region, Buffer.buffer(body.toByteArray()));
+            invokeLambdaWithBody(req, functionArn, region, forwarded, Buffer.buffer(body.toByteArray()));
         });
     }
 
-    private void invokeLambdaWithBody(io.vertx.core.http.HttpServerRequest req, String functionArn,
-                                      String region, Buffer body) {
-        Map<String, Object> event = buildAlbEvent(req, body);
+    private void invokeLambdaWithBody(HttpServerRequest req, String functionArn, String region,
+                                      ElbV2ForwardedHeaders forwarded, Buffer body) {
+        Map<String, Object> event = buildAlbEvent(req, forwarded, body);
         // Lambda invocation is synchronous and may take seconds while a cold container
         // boots and polls the Runtime API. The Runtime API itself runs on Vert.x event
         // loops, so blocking the listener's event loop here would deadlock the runtime
@@ -555,7 +1217,7 @@ public class ElbV2DataPlane {
         });
     }
 
-    private void writeLambdaResponse(io.vertx.core.http.HttpServerRequest req, InvokeResult result) throws java.io.IOException {
+    private void writeLambdaResponse(HttpServerRequest req, InvokeResult result) throws IOException {
         if (result.getFunctionError() != null) {
             req.response().setStatusCode(502).end("Lambda function error: " + result.getFunctionError());
             return;
@@ -622,7 +1284,7 @@ public class ElbV2DataPlane {
         }
     }
 
-    private Map<String, Object> buildAlbEvent(io.vertx.core.http.HttpServerRequest req, Buffer body) {
+    Map<String, Object> buildAlbEvent(HttpServerRequest req, ElbV2ForwardedHeaders forwarded, Buffer body) {
         Map<String, Object> event = new HashMap<>();
         event.put("requestContext", Map.of("elb", Map.of("targetGroupArn", "")));
         event.put("httpMethod", req.method().name());
@@ -645,9 +1307,11 @@ public class ElbV2DataPlane {
 
         Map<String, String> headers = new HashMap<>();
         Map<String, List<String>> multiValueHeaders = new HashMap<>();
-        req.headers().forEach(entry -> {
+        MultiMap eventHeaders = MultiMap.caseInsensitiveMultiMap().addAll(req.headers());
+        forwarded.applyTo(req.headers(), eventHeaders);
+        eventHeaders.forEach(entry -> {
             String key = entry.getKey().toLowerCase();
-            headers.putIfAbsent(key, entry.getValue());
+            headers.put(key, entry.getValue());
             multiValueHeaders.computeIfAbsent(key, k -> new ArrayList<>()).add(entry.getValue());
         });
         event.put("headers", headers);
@@ -691,19 +1355,20 @@ public class ElbV2DataPlane {
         return tuples.get(tuples.size() - 1).getTargetGroupArn();
     }
 
-    private void proxyRequest(io.vertx.core.http.HttpServerRequest req, String host, int port,
-                              boolean preserveHostHeader) {
+    private void proxyRequest(HttpServerRequest req, String host, int port, boolean preserveHostHeader,
+                              ElbV2ForwardedHeaders forwarded, List<String> cookies) {
         req.pause();
         if (ElbV2TargetResolver.isIpLiteral(host)) {
             try {
-                proxyRequestTo(req, ElbV2TargetResolver.resolveCheckedAddress(host), host, port, preserveHostHeader);
+                proxyRequestTo(req, ElbV2TargetResolver.resolveCheckedAddress(host), host, port,
+                        preserveHostHeader, forwarded, cookies);
             } catch (IOException e) {
                 rejectTarget(req, host, e);
             }
             return;
         }
         vertx.<String>executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
-                .onSuccess(address -> proxyRequestTo(req, address, host, port, preserveHostHeader))
+                .onSuccess(address -> proxyRequestTo(req, address, host, port, preserveHostHeader, forwarded, cookies))
                 .onFailure(err -> rejectTarget(req, host, err));
     }
 
@@ -714,7 +1379,7 @@ public class ElbV2DataPlane {
     }
 
     private void proxyRequestTo(HttpServerRequest req, String address, String host, int port,
-                                boolean preserveHostHeader) {
+                                boolean preserveHostHeader, ElbV2ForwardedHeaders forwarded, List<String> cookies) {
         RequestOptions opts = new RequestOptions()
                 .setHost(address)
                 .setPort(port)
@@ -724,9 +1389,10 @@ public class ElbV2DataPlane {
                 .onSuccess(clientReq -> {
                     req.headers().forEach(entry -> {
                         if (!HOP_BY_HOP_HEADERS.contains(entry.getKey().toLowerCase())) {
-                            clientReq.putHeader(entry.getKey(), entry.getValue());
+                            clientReq.headers().add(entry.getKey(), entry.getValue());
                         }
                     });
+                    forwarded.applyTo(req.headers(), clientReq.headers());
                     if (!preserveHostHeader) {
                         clientReq.putHeader("Host", ElbV2TargetResolver.hostHeader(host, port));
                     }
@@ -738,11 +1404,8 @@ public class ElbV2DataPlane {
                         }
                         responseStarted.set(true);
                         req.response().setStatusCode(resp.statusCode());
-                        resp.headers().forEach(entry -> {
-                            if (!HOP_BY_HOP_HEADERS.contains(entry.getKey().toLowerCase())) {
-                                req.response().putHeader(entry.getKey(), entry.getValue());
-                            }
-                        });
+                        copyTargetResponseHeaders(resp.headers(), req.response());
+                        cookies.forEach(cookie -> req.response().headers().add("Set-Cookie", cookie));
                         if (resp.getHeader("Content-Length") == null) {
                             req.response().setChunked(true);
                         }
@@ -775,35 +1438,26 @@ public class ElbV2DataPlane {
                 });
     }
 
-    /**
-     * An ALB forwards a WebSocket handshake to an instance or ip target with its upgrade headers
-     * intact, which an ordinary proxied request cannot do: {@code Connection} and {@code Upgrade}
-     * are hop-by-hop and are stripped. AWS only tunnels WebSocket upgrades, over HTTP/1.1.
-     */
-    static boolean isWebSocketUpgrade(HttpServerRequest req) {
-        if (req.version() != HttpVersion.HTTP_1_1 || req.method() != HttpMethod.GET) {
-            return false;
-        }
-        if (!"websocket".equalsIgnoreCase(req.getHeader("Upgrade"))) {
-            return false;
-        }
-        for (String connection : req.headers().getAll("Connection")) {
-            for (String token : connection.split(",")) {
-                if ("upgrade".equalsIgnoreCase(token.trim())) {
-                    return true;
-                }
+    private static void copyTargetResponseHeaders(MultiMap headers, HttpServerResponse response) {
+        for (String name : headers.names()) {
+            if (!HOP_BY_HOP_HEADERS.contains(name.toLowerCase(Locale.ROOT))) {
+                response.putHeader(name, headers.getAll(name));
             }
         }
-        return false;
+    }
+
+    /** An ALB forwards a WebSocket handshake to an instance or ip target with its upgrade headers intact. */
+    static boolean isWebSocketUpgrade(HttpServerRequest req) {
+        return WebSocketUpgrades.isHandshake(req);
     }
 
     private void proxyUpgrade(HttpServerRequest req, String host, int port, boolean preserveHostHeader,
-                              long idleTimeoutMillis) {
+                              ElbV2ForwardedHeaders forwarded, long idleTimeoutMillis, List<String> cookies) {
         req.pause();
         if (ElbV2TargetResolver.isIpLiteral(host)) {
             try {
                 proxyUpgradeTo(req, ElbV2TargetResolver.resolveCheckedAddress(host), host, port,
-                        preserveHostHeader, idleTimeoutMillis);
+                        preserveHostHeader, forwarded, idleTimeoutMillis, cookies);
             } catch (IOException e) {
                 rejectTarget(req, host, e);
             }
@@ -811,7 +1465,7 @@ public class ElbV2DataPlane {
         }
         vertx.<String>executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
                 .onSuccess(address -> proxyUpgradeTo(req, address, host, port, preserveHostHeader,
-                        idleTimeoutMillis))
+                        forwarded, idleTimeoutMillis, cookies))
                 .onFailure(err -> rejectTarget(req, host, err));
     }
 
@@ -821,7 +1475,8 @@ public class ElbV2DataPlane {
      * the target refused the upgrade and is relayed as an ordinary response.
      */
     private void proxyUpgradeTo(HttpServerRequest req, String address, String host, int port,
-                                boolean preserveHostHeader, long idleTimeoutMillis) {
+                                boolean preserveHostHeader, ElbV2ForwardedHeaders forwarded,
+                                long idleTimeoutMillis, List<String> cookies) {
         RequestOptions opts = new RequestOptions()
                 .setHost(address)
                 .setPort(port)
@@ -831,9 +1486,10 @@ public class ElbV2DataPlane {
                 .onSuccess(clientReq -> {
                     req.headers().forEach(entry -> {
                         if (!HOP_BY_HOP_HEADERS.contains(entry.getKey().toLowerCase())) {
-                            clientReq.putHeader(entry.getKey(), entry.getValue());
+                            clientReq.headers().add(entry.getKey(), entry.getValue());
                         }
                     });
+                    forwarded.applyTo(req.headers(), clientReq.headers());
                     clientReq.putHeader("Connection", "Upgrade");
                     clientReq.putHeader("Upgrade", req.getHeader("Upgrade"));
                     if (!preserveHostHeader) {
@@ -842,11 +1498,8 @@ public class ElbV2DataPlane {
                     clientReq.connect()
                             .onSuccess(resp -> {
                                 req.response().setStatusCode(resp.statusCode());
-                                resp.headers().forEach(entry -> {
-                                    if (!HOP_BY_HOP_HEADERS.contains(entry.getKey().toLowerCase())) {
-                                        req.response().putHeader(entry.getKey(), entry.getValue());
-                                    }
-                                });
+                                copyTargetResponseHeaders(resp.headers(), req.response());
+                                cookies.forEach(cookie -> req.response().headers().add("Set-Cookie", cookie));
                                 if (resp.statusCode() != 101) {
                                     req.resume();
                                     if (resp.getHeader("Content-Length") == null) {
@@ -886,7 +1539,8 @@ public class ElbV2DataPlane {
 
     /**
      * Relays bytes both ways until either side closes or no data crosses the tunnel in either
-     * direction for the load balancer's {@code idle_timeout.timeout_seconds}, as an ALB does.
+     * direction for the configured idle timeout (an ALB load balancer's
+     * {@code idle_timeout.timeout_seconds} or an NLB listener's {@code tcp.idle_timeout.seconds}).
      */
     private void tunnel(NetSocket client, NetSocket target, long idleTimeoutMillis) {
         AtomicLong lastActivity = new AtomicLong(System.nanoTime());
@@ -899,8 +1553,9 @@ public class ElbV2DataPlane {
                 target.close();
             }
         };
-        relay(client, target, lastActivity, close);
-        relay(target, client, lastActivity, close);
+        Runnable onData = () -> lastActivity.set(System.nanoTime());
+        WebSocketUpgrades.relay(client, target, onData, close);
+        WebSocketUpgrades.relay(target, client, onData, close);
         scheduleIdleCheck(idleTimeoutMillis, idleTimeoutMillis, lastActivity, timerId, closed, close);
     }
 
@@ -920,21 +1575,7 @@ public class ElbV2DataPlane {
         }));
     }
 
-    private static void relay(NetSocket source, NetSocket destination, AtomicLong lastActivity, Runnable close) {
-        source.handler(buffer -> {
-            lastActivity.set(System.nanoTime());
-            destination.write(buffer);
-            if (destination.writeQueueFull()) {
-                source.pause();
-                destination.drainHandler(ignored -> source.resume());
-            }
-        });
-        source.endHandler(ignored -> close.run());
-        source.closeHandler(ignored -> close.run());
-        source.exceptionHandler(err -> close.run());
-    }
-
-    private void executeRedirect(io.vertx.core.http.HttpServerRequest req, Action action) {
+    private void executeRedirect(HttpServerRequest req, Action action) {
         String reqHost = req.host();
         String reqPort = "";
         if (reqHost != null && reqHost.contains(":")) {
@@ -994,7 +1635,7 @@ public class ElbV2DataPlane {
         return result;
     }
 
-    private void executeFixedResponse(io.vertx.core.http.HttpServerRequest req, Action action) {
+    private void executeFixedResponse(HttpServerRequest req, Action action) {
         int statusCode = 200;
         try {
             if (action.getFixedResponseStatusCode() != null) {
@@ -1085,7 +1726,7 @@ public class ElbV2DataPlane {
             return hostHeaderPatterns.stream().anyMatch(p -> globMatches(p, host));
         }
 
-        boolean matches(io.vertx.core.http.HttpServerRequest req) {
+        boolean matches(HttpServerRequest req) {
             if (rule.isDefault()) {
                 return true;
             }
@@ -1097,7 +1738,7 @@ public class ElbV2DataPlane {
             return true;
         }
 
-        private boolean matchesCondition(RuleCondition condition, io.vertx.core.http.HttpServerRequest req) {
+        private boolean matchesCondition(RuleCondition condition, HttpServerRequest req) {
             String field = condition.getField();
             if (field == null) {
                 return true;
@@ -1153,7 +1794,7 @@ public class ElbV2DataPlane {
         }
 
         private Map<String, String> parseQueryString(String query) {
-            Map<String, String> params = new java.util.LinkedHashMap<>();
+            Map<String, String> params = new LinkedHashMap<>();
             if (query == null || query.isEmpty()) {
                 return params;
             }

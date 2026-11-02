@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.eventbridge;
 
+import io.github.hectorvent.floci.services.eventbridge.model.ArchivedEvent;
 import io.github.hectorvent.floci.services.eventbridge.model.Replay;
 import io.github.hectorvent.floci.services.eventbridge.model.ReplayState;
 import io.vertx.core.Vertx;
@@ -10,9 +11,9 @@ import org.junit.jupiter.api.Test;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -84,9 +85,8 @@ class ReplayDispatcherTest {
         return replay;
     }
 
-    private static io.github.hectorvent.floci.services.eventbridge.model.ArchivedEvent archivedEvent() {
-        io.github.hectorvent.floci.services.eventbridge.model.ArchivedEvent event =
-                new io.github.hectorvent.floci.services.eventbridge.model.ArchivedEvent();
+    private static ArchivedEvent archivedEvent() {
+        ArchivedEvent event = new ArchivedEvent();
         event.setEventTime(Instant.EPOCH.plusSeconds(1));
         return event;
     }

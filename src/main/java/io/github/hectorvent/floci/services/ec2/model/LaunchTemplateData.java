@@ -6,7 +6,9 @@ import com.fasterxml.jackson.annotation.JsonSetter;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The subset of EC2 {@code RequestLaunchTemplateData} / {@code ResponseLaunchTemplateData} that
@@ -348,6 +350,21 @@ public class LaunchTemplateData {
         return fromInterfaces;
     }
 
+    /** The interface a launch from this template attaches at device index 0, or null when it names none. */
+    @JsonIgnore
+    public NetworkInterface primaryNetworkInterface() {
+        return networkInterfaces.stream()
+                .filter(networkInterface -> Integer.valueOf(0).equals(networkInterface.getDeviceIndex()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    @JsonIgnore
+    public Boolean effectiveAssociatePublicIpAddress() {
+        NetworkInterface primary = primaryNetworkInterface();
+        return primary == null ? null : primary.getAssociatePublicIpAddress();
+    }
+
     @RegisterForReflection
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class IamInstanceProfile {
@@ -387,6 +404,42 @@ public class LaunchTemplateData {
 
         public Ebs getEbs() { return ebs; }
         public void setEbs(Ebs ebs) { this.ebs = ebs; }
+
+        /** Whether this entry names an instance store volume: a non-blank {@code VirtualName}. */
+        public boolean namesInstanceStore() {
+            return virtualName != null && !virtualName.isBlank();
+        }
+
+        /**
+         * A launch's mappings, as EC2 documents template overrides: a request entry for a device the
+         * template maps changes only the members it sets, and every other device keeps its own
+         * entry. A device is an EBS volume, an instance store volume or suppressed, so a request
+         * entry naming any of the three replaces the template's choice for that device, an EBS
+         * entry still merging member by member into the template's. The template's stored entries
+         * are never modified.
+         */
+        public static List<BlockDeviceMapping> merge(List<BlockDeviceMapping> template,
+                                                     List<BlockDeviceMapping> request) {
+            Map<String, BlockDeviceMapping> byDevice = new LinkedHashMap<>();
+            template.forEach(m -> byDevice.put(m.deviceName, m));
+            request.forEach(m -> byDevice.merge(m.deviceName, m, BlockDeviceMapping::overlaid));
+            return new ArrayList<>(byDevice.values());
+        }
+
+        private static BlockDeviceMapping overlaid(BlockDeviceMapping base, BlockDeviceMapping override) {
+            BlockDeviceMapping merged = new BlockDeviceMapping();
+            merged.deviceName = base.deviceName;
+            if (override.ebs == null && !override.namesInstanceStore() && override.noDevice == null) {
+                merged.virtualName = base.virtualName;
+                merged.noDevice = base.noDevice;
+                merged.ebs = base.ebs;
+            } else {
+                merged.virtualName = override.virtualName;
+                merged.noDevice = override.noDevice;
+                merged.ebs = override.ebs == null ? null : Ebs.overlaid(base.ebs, override.ebs);
+            }
+            return merged;
+        }
     }
 
     @RegisterForReflection
@@ -424,6 +477,23 @@ public class LaunchTemplateData {
 
         public Integer getThroughput() { return throughput; }
         public void setThroughput(Integer throughput) { this.throughput = throughput; }
+
+        private static Ebs overlaid(Ebs base, Ebs override) {
+            if (base == null || override == null) {
+                return override != null ? override : base;
+            }
+            Ebs merged = new Ebs();
+            merged.encrypted = override.encrypted != null ? override.encrypted : base.encrypted;
+            merged.deleteOnTermination = override.deleteOnTermination != null
+                    ? override.deleteOnTermination : base.deleteOnTermination;
+            merged.iops = override.iops != null ? override.iops : base.iops;
+            merged.kmsKeyId = override.kmsKeyId != null ? override.kmsKeyId : base.kmsKeyId;
+            merged.snapshotId = override.snapshotId != null ? override.snapshotId : base.snapshotId;
+            merged.volumeSize = override.volumeSize != null ? override.volumeSize : base.volumeSize;
+            merged.volumeType = override.volumeType != null ? override.volumeType : base.volumeType;
+            merged.throughput = override.throughput != null ? override.throughput : base.throughput;
+            return merged;
+        }
     }
 
     @RegisterForReflection

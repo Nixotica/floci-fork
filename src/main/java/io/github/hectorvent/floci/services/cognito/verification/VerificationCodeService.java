@@ -1,12 +1,10 @@
 package io.github.hectorvent.floci.services.cognito.verification;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
@@ -72,14 +70,23 @@ public final class VerificationCodeService {
      */
     public String issue(String userPoolId, String username,
                         VerificationCode.Purpose purpose, Duration ttl) {
+        return issueTracked(userPoolId, username, purpose, ttl).code();
+    }
+
+    public record IssuedCode(String code, String hash) {
+    }
+
+    /** Issue a code with an identity that can safely withdraw only this issuance. */
+    public IssuedCode issueTracked(String userPoolId, String username,
+                                  VerificationCode.Purpose purpose, Duration ttl) {
         String key = VerificationCode.storageKey(userPoolId, username, purpose);
         synchronized (lockFor(key)) {
             return issueUnderLock(key, userPoolId, username, purpose, ttl);
         }
     }
 
-    private String issueUnderLock(String key, String userPoolId, String username,
-                                  VerificationCode.Purpose purpose, Duration ttl) {
+    private IssuedCode issueUnderLock(String key, String userPoolId, String username,
+                                      VerificationCode.Purpose purpose, Duration ttl) {
         Optional<VerificationCode> existing = store.get(key);
         if (existing.isPresent() && !existing.get().isConsumed()) {
             Duration since = Duration.between(existing.get().getIssuedAt(), clock.instant());
@@ -90,16 +97,20 @@ public final class VerificationCodeService {
             }
         }
 
-        String code = String.format("%06d", random.nextInt(1_000_000));
+        // Measured on AWS: the code of an email sign-in (USER_AUTH's EMAIL_OTP) has eight digits,
+        // a sign-up, forgotten-password or attribute verification code six.
+        String code = purpose == VerificationCode.Purpose.EMAIL_OTP
+            ? String.format("%08d", random.nextInt(100_000_000))
+            : String.format("%06d", random.nextInt(1_000_000));
         String salt = HexFormat.of().formatHex(randomBytes(SALT_BYTES));
-        String hash = sha256(code + salt);
+        String hash = Digests.sha256Hex(code + salt);
         Instant now = clock.instant();
 
         VerificationCode vc = new VerificationCode(
             userPoolId, username, purpose, hash, salt, now, now.plus(ttl), MAX_ATTEMPTS
         );
         store.put(key, vc);
-        return code;
+        return new IssuedCode(code, hash);
     }
 
     /**
@@ -150,7 +161,7 @@ public final class VerificationCodeService {
                 "Invalid verification code provided, please try again");
         }
 
-        String expectedHash = sha256(code + vc.getSalt());
+        String expectedHash = Digests.sha256Hex(code + vc.getSalt());
         if (!constantTimeEquals(expectedHash, vc.getCodeHash())) {
             vc.decrementAttempts();
             if (vc.getAttemptsRemaining() <= 0) {
@@ -180,6 +191,27 @@ public final class VerificationCodeService {
     public void invalidatePrevious(String userPoolId, String username,
                                    VerificationCode.Purpose purpose) {
         invalidate(VerificationCode.storageKey(userPoolId, username, purpose));
+    }
+
+    public boolean hasUsableCode(String userPoolId, String username,
+                                 VerificationCode.Purpose purpose) {
+        String key = VerificationCode.storageKey(userPoolId, username, purpose);
+        synchronized (lockFor(key)) {
+            return store.get(key).map(code -> !code.isConsumed()
+                    && !code.isExpired(clock.instant())
+                    && code.getAttemptsRemaining() > 0).orElse(false);
+        }
+    }
+
+    /** Withdraw only the code issued by the caller, preserving a newer replacement. */
+    public void invalidateIfCurrent(String userPoolId, String username,
+                                    VerificationCode.Purpose purpose, IssuedCode issued) {
+        String key = VerificationCode.storageKey(userPoolId, username, purpose);
+        synchronized (lockFor(key)) {
+            if (store.get(key).map(current -> current.getCodeHash().equals(issued.hash())).orElse(false)) {
+                store.delete(key);
+            }
+        }
     }
 
     /**
@@ -220,15 +252,6 @@ public final class VerificationCodeService {
         byte[] b = new byte[n];
         random.nextBytes(b);
         return b;
-    }
-
-    private String sha256(String s) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(md.digest(s.getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
     }
 
     private boolean constantTimeEquals(String a, String b) {

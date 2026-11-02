@@ -1,11 +1,12 @@
 package io.github.hectorvent.floci.services.glue;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
 import io.github.hectorvent.floci.services.kms.KmsService;
@@ -14,7 +15,6 @@ import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import java.time.Clock;
 import java.util.Map;
 
@@ -23,9 +23,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Verifies the wire-accurate empty-list responses for an unmodeled Glue action and an
- * empty newly modeled resource collection. Each must return HTTP 200, an empty list
- * under its result key, and omit NextToken.
+ * Verifies the wire-accurate empty-list responses for empty Glue resource collections.
+ * Each must return HTTP 200, an empty list under its result key, and omit NextToken.
  */
 class GlueJsonHandlerEmptyListTest {
 

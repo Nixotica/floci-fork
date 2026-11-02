@@ -2,8 +2,8 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
-import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
@@ -53,6 +53,14 @@ class ContainerPlatformDockerIntegrationTest {
                 .withCmd(List.of("uname", "-m"))
                 .build();
 
+        try (PreservedImageTag ignored = new PreservedImageTag(dockerClient,
+                IMAGE.substring(0, IMAGE.lastIndexOf(':')), IMAGE.substring(IMAGE.lastIndexOf(':') + 1))) {
+            createAndVerify(spec, platform, armHost, hostArchitecture, requestedArchitecture);
+        }
+    }
+
+    private void createAndVerify(ContainerSpec spec, String platform, boolean armHost, String hostArchitecture,
+                                 String requestedArchitecture) {
         String containerId = null;
         try {
             containerId = lifecycleManager.create(spec, platform);

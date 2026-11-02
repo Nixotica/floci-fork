@@ -1,13 +1,16 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -19,11 +22,11 @@ import java.util.function.Consumer;
  */
 public record ProvisionContext(CloudFormationTemplateEngine engine, String region,
                                String accountId, String stackName, String priorPhysicalId,
-                               Consumer<StackEvent> progress) {
+                               Consumer<StackEvent> progress, JsonNode priorProperties) {
 
     public ProvisionContext(CloudFormationTemplateEngine engine, String region,
                             String accountId, String stackName, String priorPhysicalId) {
-        this(engine, region, accountId, stackName, priorPhysicalId, event -> {});
+        this(engine, region, accountId, stackName, priorPhysicalId, event -> {}, null);
     }
 
     /** Intermediate resource events retain the stack pipeline's event IDs and metadata. */
@@ -56,6 +59,45 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
      */
     public boolean isUpdate() {
         return priorPhysicalId != null && !priorPhysicalId.isBlank();
+    }
+
+    /**
+     * Whether the previous template declared {@code name} on this resource, which tells an update
+     * that removes a property apart from one the stack never declared.
+     *
+     * <p>Reads the previous template's properties after its conditions chose each top-level
+     * {@code Fn::If}, so one that chose {@code AWS::NoValue} was not declared. False for a resource
+     * that was never provisioned, which has no prior physical id: a create, a resource the previous
+     * template did not have, and one whose {@code Condition} kept it out.
+     */
+    public boolean previouslyDeclared(String name) {
+        return isUpdate() && priorProperties != null && priorProperties.has(name)
+                && !priorProperties.get(name).isNull();
+    }
+
+    /**
+     * The top-level properties the previous template declared and {@code props}, the properties
+     * this update applies, no longer has: the ones an update that removes a property has to clear.
+     * A property the stack never declared is not in the set, so a value set outside the stack
+     * survives, and a property whose {@code Fn::If} chose {@code AWS::NoValue} on either template
+     * counts as not declared there, as in {@link #previouslyDeclared}. Empty for a create, and for
+     * a resource whose previous template did not declare it.
+     *
+     * <p>The rule only says which names went; what clearing one means is the service's own. A
+     * provisioner clears each by the call its service offers and leaves out the ones AWS keeps
+     * (a create-only property is a replacement question, not a clear).
+     */
+    public Set<String> droppedProperties(JsonNode props) {
+        Set<String> dropped = new LinkedHashSet<>();
+        if (!isUpdate() || priorProperties == null) {
+            return dropped;
+        }
+        priorProperties.fieldNames().forEachRemaining(name -> {
+            if (previouslyDeclared(name) && (props == null || !props.has(name))) {
+                dropped.add(name);
+            }
+        });
+        return dropped;
     }
 
     /**
@@ -106,6 +148,26 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
             return null;
         }
         return engine.resolve(props.get(name));
+    }
+
+    /**
+     * Resolves an optional integer property, or null when it is absent or explicitly null. One an
+     * intrinsic resolves to nothing stays null too: the engine resolves {@code AWS::NoValue} to blank,
+     * which is how the common {@code Fn::If [cond, value, AWS::NoValue]} drops a property. A value
+     * written into the template has to be an integer, a literal blank included, as CloudFormation's
+     * schema type check requires. A {@code Ref} to a parameter whose value is blank cannot be told
+     * apart from {@code AWS::NoValue} here, so it stays null as well.
+     */
+    public Integer resolveOptionalInt(JsonNode props, String name) {
+        String value = resolveOptional(props, name);
+        if (value == null || (value.isBlank() && !props.get(name).isTextual())) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationError", "Value of property " + name + " must be an integer.", 400);
+        }
     }
 
     /**
@@ -210,6 +272,20 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
             }
         }
         return stale;
+    }
+
+    /**
+     * Whether {@code name} has the shape {@link #generatePhysicalName} gives this logical id: the
+     * same prefix and length, ending in a 12-character lowercase hex suffix.
+     */
+    public boolean isGeneratedPhysicalName(String name, String logicalId, int maxLength, boolean lowercase) {
+        String sample = generatePhysicalName(logicalId, maxLength, lowercase);
+        if (name == null || name.length() != sample.length()) {
+            return false;
+        }
+        int prefixLength = sample.length() - 12;
+        return name.startsWith(sample.substring(0, prefixLength))
+                && name.substring(prefixLength).matches("[0-9a-f]{12}");
     }
 
     /** Generates a CloudFormation-style physical name: {@code <stack>-<logicalId>-<suffix>}. */

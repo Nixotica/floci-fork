@@ -47,11 +47,17 @@
   "AWS::ApiGatewayV2::Api": [
     "ProtocolType"
   ],
+  "AWS::ApiGatewayV2::ApiMapping": [
+    "DomainName"
+  ],
   "AWS::ApiGatewayV2::Authorizer": [
     "ApiId"
   ],
   "AWS::ApiGatewayV2::Deployment": [
     "ApiId"
+  ],
+  "AWS::ApiGatewayV2::DomainName": [
+    "DomainName"
   ],
   "AWS::ApiGatewayV2::Integration": [
     "ApiId"
@@ -62,6 +68,23 @@
   "AWS::ApiGatewayV2::Stage": [
     "StageName",
     "ApiId"
+  ],
+  "AWS::ApiGatewayV2::VpcLink": [
+    "SecurityGroupIds",
+    "SubnetIds"
+  ],
+  "AWS::AppConfig::Application": [],
+  "AWS::AppConfig::ConfigurationProfile": [
+    "ApplicationId",
+    "LocationUri",
+    "Type"
+  ],
+  "AWS::AppConfig::DeploymentStrategy": [
+    "Name",
+    "ReplicateTo"
+  ],
+  "AWS::AppConfig::Environment": [
+    "ApplicationId"
   ],
   "AWS::AppSync::ApiKey": [
     "ApiId"
@@ -147,8 +170,13 @@
   ],
   "AWS::CloudFront::CachePolicy": [],
   "AWS::CloudFront::Distribution": [],
+  "AWS::CloudFront::Function": [
+    "Name"
+  ],
+  "AWS::CloudFront::KeyGroup": [],
   "AWS::CloudFront::OriginAccessControl": [],
   "AWS::CloudFront::OriginRequestPolicy": [],
+  "AWS::CloudFront::PublicKey": [],
   "AWS::CloudFront::ResponseHeadersPolicy": [],
   "AWS::CloudTrail::Trail": [
     "TrailName"
@@ -189,6 +217,10 @@
   "AWS::Cognito::UserPoolGroup": [
     "UserPoolId",
     "GroupName"
+  ],
+  "AWS::Cognito::UserPoolResourceServer": [
+    "Identifier",
+    "UserPoolId"
   ],
   "AWS::Config::ConfigRule": [
     "ConfigRuleName"
@@ -241,6 +273,13 @@
     "SubnetId"
   ],
   "AWS::EC2::InternetGateway": [],
+  "AWS::EC2::KeyPair": [
+    "KeyName",
+    "KeyType",
+    "KeyFormat",
+    "PublicKeyMaterial",
+    "Tags"
+  ],
   "AWS::EC2::LaunchTemplate": [
     "LaunchTemplateName"
   ],
@@ -260,6 +299,7 @@
     "RuleNumber",
     "NetworkAclId"
   ],
+  "AWS::EC2::PrefixList": [],
   "AWS::EC2::Route": [
     "RouteTableId",
     "DestinationCidrBlock",
@@ -400,6 +440,14 @@
     "AmiType",
     "Subnets"
   ],
+  "AWS::ElastiCache::ServerlessCache": [
+    "ServerlessCacheName",
+    "KmsKeyId",
+    "SnapshotArnsToRestore",
+    "SubnetIds",
+    "ConnectionType",
+    "NetworkType"
+  ],
   "AWS::ElasticLoadBalancingV2::Listener": [
     "LoadBalancerArn"
   ],
@@ -430,6 +478,7 @@
   "AWS::Events::Rule": [
     "Name"
   ],
+  "AWS::GuardDuty::MalwareProtectionPlan": [],
   "AWS::IAM::AccessKey": [
     "UserName",
     "Serial"
@@ -450,6 +499,10 @@
   ],
   "AWS::IAM::User": [
     "UserName"
+  ],
+  "AWS::IoT::Authorizer": [
+    "SigningDisabled",
+    "AuthorizerName"
   ],
   "AWS::IoT::DomainConfiguration": [
     "DomainConfigurationName",
@@ -541,6 +594,22 @@
     "CodeSha256",
     "ProvisionedConcurrencyConfig",
     "RuntimePolicy"
+  ],
+  "AWS::Lambda::WebFunction": [
+    "FunctionName"
+  ],
+  "AWS::Lambda::WebFunctionEndpoint": [
+    "FunctionName",
+    "EndpointName",
+    "EndpointType",
+    "Regions"
+  ],
+  "AWS::Lambda::WebFunctionRevision": [
+    "FunctionName",
+    "Description",
+    "KmsKeyArn",
+    "BuildConfig",
+    "ServiceConfig"
   ],
   "AWS::Logs::LogGroup": [
     "LogGroupName"
@@ -662,6 +731,10 @@
     "HostedZoneName",
     "HostedZoneId"
   ],
+  "AWS::Route53::RecordSetGroup": [
+    "HostedZoneName",
+    "HostedZoneId"
+  ],
   "AWS::S3::Bucket": [
     "BucketName",
     "BucketNamePrefix",
@@ -670,8 +743,25 @@
   "AWS::S3::BucketPolicy": [
     "Bucket"
   ],
+  "AWS::S3Vectors::Index": [
+    "DataType",
+    "Dimension",
+    "DistanceMetric",
+    "EncryptionConfiguration",
+    "IndexName",
+    "MetadataConfiguration",
+    "VectorBucketArn",
+    "VectorBucketName"
+  ],
+  "AWS::S3Vectors::VectorBucket": [
+    "VectorBucketName",
+    "EncryptionConfiguration"
+  ],
   "AWS::Scheduler::ScheduleGroup": [
     "Name"
+  ],
+  "AWS::SES::EmailIdentity": [
+    "EmailIdentity"
   ],
   "AWS::SecretsManager::Secret": [
     "Name"
@@ -700,6 +790,13 @@
   "AWS::StepFunctions::StateMachine": [
     "StateMachineName",
     "StateMachineType"
+  ],
+  "AWS::WAFv2::IPSet": [
+    "Name",
+    "Scope"
+  ],
+  "AWS::WAFv2::LoggingConfiguration": [
+    "ResourceArn"
   ],
   "AWS::WAFv2::WebACL": [
     "Name",

@@ -3,13 +3,16 @@ package io.github.hectorvent.floci.services.pipes;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbTtlIdentity;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbStreamReader;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
+import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.pipes.model.DesiredState;
 import io.github.hectorvent.floci.services.pipes.model.Pipe;
 import io.github.hectorvent.floci.services.sqs.SqsService;
@@ -49,6 +52,7 @@ public class PipesPoller implements Resettable {
     private final PipesFilterMatcher filterMatcher;
     private final ObjectMapper objectMapper;
     private final String baseUrl;
+    private final String defaultRegion;
     private final ConcurrentHashMap<String, Long> timerIds = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> activePolls = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> kinesisIterators = new ConcurrentHashMap<>();
@@ -79,6 +83,7 @@ public class PipesPoller implements Resettable {
         this.filterMatcher = filterMatcher;
         this.objectMapper = objectMapper;
         this.baseUrl = config.effectiveBaseUrl();
+        this.defaultRegion = config.defaultRegion();
     }
 
     @PreDestroy
@@ -162,7 +167,7 @@ public class PipesPoller implements Resettable {
     void pollSqs(Pipe pipe, String region) {
         String queueUrl = AwsArnUtils.arnToQueueUrl(pipe.getSource(), baseUrl);
         int batchSize = getBatchSize(pipe, "SqsQueueParameters");
-        List<Message> messages = sqsService.receiveMessage(queueUrl, batchSize, 30, 0, region);
+        List<Message> messages = sqsService.receiveMessage(queueUrl, Math.min(10, batchSize), 30, 0, region);
         if (messages.isEmpty()) {
             return;
         }
@@ -241,9 +246,9 @@ public class PipesPoller implements Resettable {
         }
     }
 
-    private void pollKinesis(Pipe pipe, String region) {
+    void pollKinesis(Pipe pipe, String region) {
         String pipeKey = pipeKey(pipe);
-        String streamName = extractResourceName(pipe.getSource());
+        String streamName = kinesisStreamName(pipe.getSource());
         String pipeAccountId = pipe.getAccountId();
         int batchSize = getBatchSize(pipe, "KinesisStreamParameters");
         String iterator = kinesisIterators.get(pipeKey);
@@ -258,10 +263,17 @@ public class PipesPoller implements Resettable {
                     ? kinesisService.getRecordsForAccount(pipeAccountId, iterator, batchSize, region)
                     : kinesisService.getRecords(iterator, batchSize, region);
             String nextIterator = (String) result.get("NextShardIterator");
-            if (nextIterator != null) {
-                kinesisIterators.put(pipeKey, nextIterator);
-            }
             List<?> records = (List<?>) result.get("Records");
+            if (nextIterator == null && records != null && !records.isEmpty()) {
+                KinesisRecord last = (KinesisRecord) records.getLast();
+                nextIterator = pipeAccountId != null
+                        ? kinesisService.getShardIteratorForAccount(pipeAccountId, streamName,
+                                "shardId-000000000000", "AFTER_SEQUENCE_NUMBER", last.getSequenceNumber(), region)
+                        : kinesisService.getShardIterator(streamName, "shardId-000000000000",
+                                "AFTER_SEQUENCE_NUMBER", last.getSequenceNumber(), null, region);
+            }
+            // Remember even the initial exhausted cursor, before filtering or delivery.
+            kinesisIterators.put(pipeKey, nextIterator != null ? nextIterator : iterator);
             if (records == null || records.isEmpty()) {
                 return;
             }
@@ -362,7 +374,7 @@ public class PipesPoller implements Resettable {
         LOG.infov("Pipe {0}: received {1} DynamoDB Stream record(s)", pipe.getName(), records.size());
         List<JsonNode> recordNodes = new ArrayList<>(records.size());
         for (DynamoDbStreamReader.Record record : records) {
-            ObjectNode node = record.awsRecord().deepCopy();
+            ObjectNode node = DynamoDbTtlIdentity.toEventRecord(record.awsRecord());
             node.put("eventSourceARN", pipe.getSource());
             recordNodes.add(node);
         }
@@ -623,7 +635,7 @@ public class PipesPoller implements Resettable {
     }
 
     private String bareArray(List<JsonNode> records) {
-        var arr = objectMapper.createArrayNode();
+        ArrayNode arr = objectMapper.createArrayNode();
         records.forEach(arr::add);
         return arr.toString();
     }
@@ -688,7 +700,7 @@ public class PipesPoller implements Resettable {
 
     private String wrapRecords(List<JsonNode> records) {
         try {
-            var recordsArray = objectMapper.createArrayNode();
+            ArrayNode recordsArray = objectMapper.createArrayNode();
             records.forEach(recordsArray::add);
             ObjectNode root = objectMapper.createObjectNode();
             root.set("Records", recordsArray);
@@ -778,14 +790,14 @@ public class PipesPoller implements Resettable {
             putKafkaBinaryField(node, "key", record.key());
             putKafkaBinaryField(node, "value", record.value());
 
-            var headersNode = node.putArray("headers");
+            ArrayNode headersNode = node.putArray("headers");
             for (KafkaHeaderDto header : record.headers()) {
                 ObjectNode headerNode = objectMapper.createObjectNode();
                 byte[] headerValue = header.value();
                 if (headerValue == null) {
                     headerNode.putNull(header.key());
                 } else {
-                    var values = headerNode.putArray(header.key());
+                    ArrayNode values = headerNode.putArray(header.key());
                     for (byte b : headerValue) {
                         values.add(b & 0xFF);
                     }
@@ -905,16 +917,19 @@ public class PipesPoller implements Resettable {
         return pipe.getArn() + "@" + pipe.getCreationTime();
     }
 
-    private static String extractRegionFromArn(String arn) {
-        return AwsArnUtils.regionOrDefault(arn, "us-east-1"); // partition-literal: fallback only when the record carries no region; no resolver in scope (follow-up)
+    /** The region a source ARN names; a source with none, such as a self-managed Kafka URI, polls in the default. */
+    String extractRegionFromArn(String arn) {
+        return AwsArnUtils.regionOrDefault(arn, defaultRegion);
     }
 
-    private static String extractResourceName(String arn) {
-        int slashIdx = arn.lastIndexOf('/');
-        if (slashIdx >= 0) {
-            return arn.substring(slashIdx + 1);
-        }
-        int colonIdx = arn.lastIndexOf(':');
-        return colonIdx >= 0 ? arn.substring(colonIdx + 1) : arn;
+    /**
+     * The stream a Kinesis source names: the segment after {@code stream/}, so a stream-consumer ARN
+     * ({@code stream/S/consumer/C:123}) still names stream {@code S}.
+     */
+    static String kinesisStreamName(String source) {
+        String resource = AwsArnUtils.resourceIfArnFor(source, "kinesis").orElse(source);
+        String name = resource.startsWith("stream/") ? resource.substring("stream/".length()) : resource;
+        int slash = name.indexOf('/');
+        return slash >= 0 ? name.substring(0, slash) : name;
     }
 }

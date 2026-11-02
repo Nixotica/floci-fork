@@ -1,7 +1,7 @@
 {
   "_source": {
     "generator": "tools/aws/regen_dynamodb_shapes.py",
-    "botocore": "botocore 1.43.98 (installed package)"
+    "botocore": "botocore 1.43.118 (local/aws/botocore)"
   },
   "operations": {
     "BatchExecuteStatement": "BatchExecuteStatementInput",
@@ -524,6 +524,19 @@
         "TableName": "TableArn"
       }
     },
+    "DisassociateReplicationGroupMemberAction": {
+      "type": "structure",
+      "members": {
+        "RegionName": "RegionName",
+        "DisassociationMode": "DisassociationMode"
+      }
+    },
+    "DisassociationMode": {
+      "type": "string"
+    },
+    "DisassociationProtectionEnabled": {
+      "type": "boolean"
+    },
     "DoubleObject": {
       "type": "double"
     },
@@ -591,7 +604,8 @@
         "S3SseKmsKeyId": "S3SseKmsKeyId",
         "ExportFormat": "ExportFormat",
         "ExportType": "ExportType",
-        "IncrementalExportSpecification": "IncrementalExportSpecification"
+        "IncrementalExportSpecification": "IncrementalExportSpecification",
+        "FilterSpecification": "FilterSpecification"
       }
     },
     "ExportTime": {
@@ -617,6 +631,16 @@
     "FilterConditionMap": {
       "type": "map",
       "value": "Condition"
+    },
+    "FilterSpecification": {
+      "type": "structure",
+      "members": {
+        "FilterExpression": "ConditionExpression",
+        "ProjectionExpression": "ProjectionExpression",
+        "KeyConditionExpression": "KeyExpression",
+        "ExpressionAttributeNames": "ExpressionAttributeNameMap",
+        "ExpressionAttributeValues": "ExpressionAttributeValueMap"
+      }
     },
     "Get": {
       "type": "structure",
@@ -1162,7 +1186,8 @@
       "members": {
         "Create": "CreateReplicationGroupMemberAction",
         "Update": "UpdateReplicationGroupMemberAction",
-        "Delete": "DeleteReplicationGroupMemberAction"
+        "Delete": "DeleteReplicationGroupMemberAction",
+        "Disassociate": "DisassociateReplicationGroupMemberAction"
       }
     },
     "ReplicationGroupUpdateList": {
@@ -1584,6 +1609,7 @@
         "OnDemandThroughput": "OnDemandThroughput",
         "WarmThroughput": "WarmThroughput",
         "GlobalTableSettingsReplicationMode": "GlobalTableSettingsReplicationMode",
+        "DisassociationProtectionEnabled": "DisassociationProtectionEnabled",
         "VectorIndexUpdates": "VectorIndexUpdateList"
       }
     },

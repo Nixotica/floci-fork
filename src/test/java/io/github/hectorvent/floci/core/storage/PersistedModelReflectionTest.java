@@ -2,9 +2,12 @@ package io.github.hectorvent.floci.core.storage;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.testing.MainSources;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import org.junit.jupiter.api.Test;
 
+import java.io.File;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.GenericArrayType;
 import java.lang.reflect.Modifier;
@@ -41,7 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class PersistedModelReflectionTest {
 
-    private static final String BASE_PACKAGE = "io.github.hectorvent.floci";
+    private static final String BASE_PACKAGE = MainSources.BASE_PACKAGE;
 
     @Test
     void persistedTypesAreRegisteredForReflection() throws Exception {
@@ -74,7 +77,7 @@ class PersistedModelReflectionTest {
             paths.filter(p -> p.toString().endsWith(".class"))
                     .forEach(p -> {
                         String name = classesDir.relativize(p).toString()
-                                .replace(java.io.File.separatorChar, '.')
+                                .replace(File.separatorChar, '.')
                                 .replaceAll("\\.class$", "");
                         if (!name.startsWith(BASE_PACKAGE)) {
                             return;
@@ -132,7 +135,7 @@ class PersistedModelReflectionTest {
                     return true;
                 }
             }
-            for (var constructor : c.getDeclaredConstructors()) {
+            for (Constructor<?> constructor : c.getDeclaredConstructors()) {
                 for (Class<?> param : constructor.getParameterTypes()) {
                     if (param == StorageFactory.class) {
                         return true;

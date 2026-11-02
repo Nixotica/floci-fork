@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 /**
  * Routes each CloudFormation resource to the per-service provisioner that owns its type, through
@@ -32,6 +33,9 @@ public class CfnResourceDispatcher {
 
     private static final Logger LOG = Logger.getLogger(CfnResourceDispatcher.class);
 
+    /** The prefix of a stub's {@code Arn} attribute: the mark of a resource nothing was created for. */
+    static final String STUB_ARN_PREFIX = "arn:aws:stub:::"; // partition-literal: stub marker for an unowned type, asserted by tests
+
     private final ObjectMapper objectMapper;
     private final CloudFormationResourceRegistry registry;
     private final CfnDynamicReferences dynamicReferences;
@@ -44,6 +48,21 @@ public class CfnResourceDispatcher {
         this.registry = registry;
         this.dynamicReferences = dynamicReferences;
         this.config = config;
+    }
+
+    /**
+     * Whether the generic custom-resource handler serves a type, as the registry routes it; see
+     * {@link CloudFormationResourceRegistry#isCustomResourceType}.
+     */
+    public boolean isCustomResourceType(String resourceType) {
+        return registry.isCustomResourceType(resourceType);
+    }
+
+    /** Resolve an attribute using its resource owner's declared type. */
+    public JsonNode attributeValue(String resourceType, String attributeName, String value) {
+        return registry.forType(resourceType)
+                .map(owner -> owner.attributeValue(resourceType, attributeName, value))
+                .orElseGet(() -> objectMapper.getNodeFactory().textNode(value));
     }
 
     /**
@@ -68,13 +87,18 @@ public class CfnResourceDispatcher {
                                    String stackName, String existingPhysicalId,
                                    Map<String, String> existingAttributes) {
         return provision(logicalId, resourceType, properties, engine, region, accountId, stackName,
-                existingPhysicalId, existingAttributes, event -> {});
+                existingPhysicalId, existingAttributes, event -> {}, null);
     }
 
+    /**
+     * {@code priorProperties} are the resource's properties in the previous template, unresolved,
+     * or null when there is none; see {@link ProvisionContext#previouslyDeclared(String)}.
+     */
     public StackResource provision(String logicalId, String resourceType, JsonNode properties,
                                    CloudFormationTemplateEngine engine, String region, String accountId,
                                    String stackName, String existingPhysicalId,
-                                   Map<String, String> existingAttributes, Consumer<StackEvent> progress) {
+                                   Map<String, String> existingAttributes, Consumer<StackEvent> progress,
+                                   JsonNode priorProperties) {
         StackResource resource = new StackResource();
         resource.setLogicalId(logicalId);
         resource.setResourceType(resourceType);
@@ -85,28 +109,53 @@ public class CfnResourceDispatcher {
             CfnResourceProvisioner owner = registry.forType(resourceType).orElse(null);
             if (owner != null) {
                 owner.provision(resource, properties,
-                        new ProvisionContext(engine, region, accountId, stackName, existingPhysicalId, progress));
+                        new ProvisionContext(engine, region, accountId, stackName, existingPhysicalId, progress,
+                                priorProperties));
+                // A provisioner that migrated a stub without writing its own Arn would leave the
+                // stub's, and the real resource would read as a stub on its next update.
+                String arn = resource.getAttributes().get("Arn");
+                if (arn != null && arn.startsWith(STUB_ARN_PREFIX)) {
+                    resource.getAttributes().remove("Arn");
+                }
+                // The service is back on, so the real resource has every attribute it declares.
+                resource.getAttributes().remove(CloudFormationTemplateEngine.SERVICE_DISABLED_ATTR);
+            } else if (registry.isServiceDisabled(resourceType) && existingPhysicalId != null
+                    && !isStub(existingPhysicalId, resource.getAttributes())) {
+                // A real resource a stack created while the service was on. Stubbing it would
+                // replace its physical id and the stack would lose the entity, so refuse instead.
+                throw new AwsException("ValidationError", "The service for " + resourceType
+                        + " is disabled, so the existing resource " + existingPhysicalId
+                        + " cannot be updated.", 400);
             } else if (!stubUnsupportedResourceTypesAllowed()) {
                 // Before the physical id below is assigned, so the Cloud Control path sees a
                 // resource with none and reports this message rather than a success. On the stack
                 // path the catch below turns it into CREATE_FAILED with the same sentence, which
                 // rolls the stack back.
-                throw new AwsException("ValidationError", unsupportedResourceTypeMessage(resourceType), 400);
+                throw new AwsException("ValidationError", unavailableResourceTypeMessage(resourceType), 400);
             } else {
                 // Warn, not debug, and a status reason on the resource: the stub reports
                 // CREATE_COMPLETE while creating nothing, so without both the stack is
                 // indistinguishable from one where every resource was really provisioned. The
                 // reason reaches DescribeStackEvents through the event CloudFormationService
                 // already builds from it.
-                LOG.warnv("Stubbing unsupported resource type {0} ({1}): nothing is created "
-                                + "for it. Set floci.services.cloudformation."
-                                + "allow-stub-unsupported-resource-types=false to fail the "
-                                + "stack instead.",
-                        resourceType, logicalId);
-                resource.setStatusReason(unsupportedResourceTypeMessage(resourceType)
+                if (registry.isServiceDisabled(resourceType)) {
+                    LOG.warnv("Stubbing resource type {0} ({1}): its service is disabled, so nothing "
+                                    + "is created for it. {2}",
+                            resourceType, logicalId, enableServiceHint(resourceType));
+                } else {
+                    LOG.warnv("Stubbing unsupported resource type {0} ({1}): nothing is created "
+                                    + "for it. Set floci.services.cloudformation."
+                                    + "allow-stub-unsupported-resource-types=false to fail the "
+                                    + "stack instead.",
+                            resourceType, logicalId);
+                }
+                resource.setStatusReason(unavailableResourceTypeMessage(resourceType)
                         + " It was stubbed and nothing was created for it.");
                 resource.setPhysicalId(logicalId + "-" + UUID.randomUUID().toString().substring(0, 8));
-                resource.getAttributes().put("Arn", "arn:aws:stub:::" + logicalId); // partition-literal: stub marker for an unowned type, asserted by tests
+                resource.getAttributes().put("Arn", STUB_ARN_PREFIX + logicalId);
+                if (registry.isServiceDisabled(resourceType)) {
+                    resource.getAttributes().put(CloudFormationTemplateEngine.SERVICE_DISABLED_ATTR, "true");
+                }
             }
             resource.setStatus("CREATE_COMPLETE");
         } catch (Exception e) {
@@ -118,12 +167,50 @@ public class CfnResourceDispatcher {
     }
 
     /**
+     * Whether this resource is a dispatcher stub, which names nothing that exists: a stub {@code Arn},
+     * the stub's own {@code <LogicalId>-<8 hex>} id and internal {@code __Floci} attributes only.
+     * A real resource an older Floci migrated without dropping the stub's {@code Arn} fails the id
+     * or attribute check, so it does not read as one.
+     */
+    static boolean isStub(String physicalId, Map<String, String> attributes) {
+        String arn = attributes.get("Arn");
+        if (arn == null || !arn.startsWith(STUB_ARN_PREFIX)) {
+            return false;
+        }
+        String logicalId = arn.substring(STUB_ARN_PREFIX.length());
+        if (physicalId == null || !physicalId.matches(Pattern.quote(logicalId) + "-[0-9a-f]{8}")) {
+            return false;
+        }
+        for (String key : attributes.keySet()) {
+            if (!"Arn".equals(key) && !key.startsWith("__Floci")) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Whether a resource type with no provisioner may be stubbed. The dispatchers hand-built in
      * unit tests carry no config; absent configuration means the documented default, which here is
      * the lenient behaviour, so the test reads {@code config == null ||}.
      */
     private boolean stubUnsupportedResourceTypesAllowed() {
         return config == null || config.services().cloudformation().allowStubUnsupportedResourceTypes();
+    }
+
+    /** What Floci says about a resource type it will not provision: unsupported, or its service is off. */
+    private String unavailableResourceTypeMessage(String resourceType) {
+        if (!registry.isServiceDisabled(resourceType)) {
+            return unsupportedResourceTypeMessage(resourceType);
+        }
+        return "Resource type " + resourceType + " is not provisioned because its Floci service is disabled. "
+                + enableServiceHint(resourceType);
+    }
+
+    private String enableServiceHint(String resourceType) {
+        String flag = registry.serviceEnabledFlag(resourceType);
+        return flag == null ? "Enable the service to provision it."
+                : "Set " + flag + "=true to provision it.";
     }
 
     /** The one sentence Floci says about a resource type it has no provisioner for. */
@@ -172,6 +259,12 @@ public class CfnResourceDispatcher {
             owner.delete(resource, region);
             return;
         }
+        if (registry.isServiceDisabled(resourceType)
+                && !isStub(resource.getPhysicalId(), resource.getAttributes())) {
+            // Completing this delete would drop the stack's record of an entity still there.
+            throw new AwsException("ValidationError", "The service for " + resourceType
+                    + " is disabled, so " + resource.getPhysicalId() + " cannot be deleted.", 400);
+        }
         delete(resourceType, resource.getPhysicalId(), region);
     }
 
@@ -205,6 +298,19 @@ public class CfnResourceDispatcher {
                 .orElseGet(UpdateCleanupResult::notApplicable);
     }
 
+    /** Cleanup owed by an unfinished update while deleting the enclosing stack. */
+    public UpdateCleanupResult completeDeleteCleanup(StackResource resource) {
+        return registry.forType(resource.getResourceType())
+                .map(owner -> owner.completeDeleteCleanup(resource))
+                .filter(UpdateCleanupResult::applicable)
+                .orElseGet(UpdateCleanupResult::notApplicable);
+    }
+
+    /** Clears completed replacement cleanup without assuming a stack update committed. */
+    public void clearDeleteCleanup(StackResource resource) {
+        registry.forType(resource.getResourceType()).ifPresent(owner -> owner.clearDeleteCleanup(resource));
+    }
+
     /**
      * The physical id this update displaced, announced as DELETE_IN_PROGRESS before the stack
      * update closes. A type whose {@code UpdateReplacePolicy} is {@code Retain} owes no cleanup.
@@ -225,11 +331,31 @@ public class CfnResourceDispatcher {
                 .orElse(false);
     }
 
+    public boolean requiresUpdateRecovery(StackResource resource) {
+        return registry.forType(resource.getResourceType())
+                .map(owner -> owner.requiresUpdateRecovery(resource))
+                .orElse(false);
+    }
+
     /** Whether this update replaced the resource's physical entity, so the stack has cleanup pending. */
     public boolean hasReplacementUpdate(StackResource resource) {
         return registry.forType(resource.getResourceType())
                 .map(owner -> owner.hasReplacementUpdate(resource))
                 .orElse(false);
+    }
+
+    /** Whether the owner of a type says it takes its parent's physical id; see the provisioner hook. */
+    public boolean takesParentPhysicalId(String resourceType) {
+        return registry.forType(resourceType)
+                .map(owner -> owner.takesParentPhysicalId(resourceType))
+                .orElse(false);
+    }
+
+    /** Whether the owner of a type says a prefix of its id can name its parent; see the provisioner hook. */
+    public boolean idPrefixCanNameParent(String resourceType) {
+        return registry.forType(resourceType)
+                .map(owner -> owner.idPrefixCanNameParent(resourceType))
+                .orElse(true);
     }
 
     /** Drops the cleanup bookkeeping this update left on the resource. */
@@ -253,9 +379,10 @@ public class CfnResourceDispatcher {
     }
 
     /**
-     * Carries ownership discovered by a failed update onto the last known-good resource metadata
-     * that CloudFormation restores. Only additive cleanup tracking belongs here; normal attempted
-     * attributes must not overwrite the committed resource state.
+     * Carries ownership discovered by a failed update, and the snapshot of an undo it could not
+     * complete, onto the last known-good resource metadata that CloudFormation restores. Only
+     * additive tracking belongs here; normal attempted attributes must not overwrite the committed
+     * resource state.
      */
     public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
         // Any provisioner using ReplacementCleanup: an entity the failed attempt created and could

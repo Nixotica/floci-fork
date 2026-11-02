@@ -50,6 +50,25 @@ class VerificationCodeServiceTest {
         assertTrue(code.matches("\\d{6}"), "code is digits");
     }
 
+    /**
+     * Measured on AWS (eu-west-1, 2026-10-16), the codes Cognito handed a custom email sender:
+     * an email sign-in code had eight digits, sign-up, resent, forgotten-password and attribute
+     * verification codes six.
+     */
+    @Test
+    void issue_emailSignInCode_hasEightDigits() {
+        for (int i = 0; i < 50; i++) {
+            String signIn = service.issue("pool", "alice-" + i,
+                VerificationCode.Purpose.EMAIL_OTP, Duration.ofMinutes(5));
+            assertTrue(signIn.matches("\\d{8}"), signIn);
+        }
+        for (VerificationCode.Purpose purpose : List.of(VerificationCode.Purpose.PASSWORD_RESET,
+                VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION, VerificationCode.Purpose.EMAIL_MFA)) {
+            String code = service.issue("pool", "bob-" + purpose, purpose, Duration.ofHours(1));
+            assertTrue(code.matches("\\d{6}"), purpose + " " + code);
+        }
+    }
+
     @Test
     void consume_validCode_succeeds() {
         String code = service.issue("pool", "alice",
@@ -156,6 +175,48 @@ class VerificationCodeServiceTest {
         assertDoesNotThrow(() ->
             service.issue("pool", "alice",
                 VerificationCode.Purpose.SIGNUP_CONFIRMATION, Duration.ofHours(24)));
+    }
+
+    @Test
+    void hasUsableCode_excludesWithdrawnAndExpiredCodes() {
+        VerificationCode.Purpose purpose = VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION;
+        assertEquals(false, service.hasUsableCode("pool", "alice", purpose));
+        VerificationCodeService.IssuedCode issued = service.issueTracked(
+                "pool", "alice", purpose, Duration.ofMinutes(15));
+        assertTrue(service.hasUsableCode("pool", "alice", purpose));
+        service.invalidateIfCurrent("pool", "alice", purpose, issued);
+        assertEquals(false, service.hasUsableCode("pool", "alice", purpose));
+
+        service.issueTracked("pool", "alice", purpose, Duration.ofMinutes(15));
+        clock.advance(Duration.ofMinutes(16));
+        assertEquals(false, service.hasUsableCode("pool", "alice", purpose));
+    }
+
+    @Test
+    void invalidateIfCurrent_preservesNewerCode() {
+        VerificationCode.Purpose purpose = VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION;
+        VerificationCodeService.IssuedCode first = service.issueTracked(
+                "pool", "alice", purpose, Duration.ofHours(24));
+        service.invalidatePrevious("pool", "alice", purpose);
+        VerificationCodeService.IssuedCode newer = service.issueTracked(
+                "pool", "alice", purpose, Duration.ofHours(24));
+
+        service.invalidateIfCurrent("pool", "alice", purpose, first);
+
+        assertDoesNotThrow(() -> service.consume("pool", "alice", purpose, newer.code()));
+    }
+
+    @Test
+    void invalidateIfCurrent_withdrawsMatchingCode() {
+        VerificationCode.Purpose purpose = VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION;
+        VerificationCodeService.IssuedCode issued = service.issueTracked(
+                "pool", "alice", purpose, Duration.ofHours(24));
+
+        service.invalidateIfCurrent("pool", "alice", purpose, issued);
+
+        VerificationCodeException failure = assertThrows(VerificationCodeException.class,
+                () -> service.consume("pool", "alice", purpose, issued.code()));
+        assertEquals(VerificationCodeException.Kind.NOT_FOUND, failure.getKind());
     }
 
     @Test

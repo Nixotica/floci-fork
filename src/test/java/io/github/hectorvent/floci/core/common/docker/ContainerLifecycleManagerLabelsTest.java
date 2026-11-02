@@ -22,6 +22,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -57,9 +58,6 @@ class ContainerLifecycleManagerLabelsTest {
 
     @Mock
     ContainerDetector containerDetector;
-
-    @Mock
-    PortAllocator portAllocator;
 
     @Mock
     EmulatorConfig config;
@@ -291,7 +289,7 @@ class ContainerLifecycleManagerLabelsTest {
 
     private ContainerLifecycleManager manager() {
         return new ContainerLifecycleManager(
-                dockerClient, imageCacheService, containerDetector, portAllocator, config);
+                dockerClient, imageCacheService, containerDetector, config);
     }
 
     private static ContainerSpec specWithLabels(Map<String, String> labels) {
@@ -314,10 +312,17 @@ class ContainerLifecycleManagerLabelsTest {
         return createCmd;
     }
 
+    /**
+     * Strips the per-call {@code ContainerLifecycleManager.CREATE_ATTEMPT_LABEL}, a random id
+     * generated fresh on every {@code create()} call for conflict-recovery adoption safety,
+     * orthogonal to the default-label behavior this test file covers.
+     */
     private Map<String, String> capturedLabels(CreateContainerCmd createCmd) {
         ArgumentCaptor<Map<String, String>> labels = labelsCaptor();
         verify(createCmd).withLabels(labels.capture());
-        return labels.getValue();
+        Map<String, String> captured = new HashMap<>(labels.getValue());
+        captured.remove(ContainerLifecycleManager.CREATE_ATTEMPT_LABEL);
+        return captured;
     }
 
     @SuppressWarnings("unchecked")

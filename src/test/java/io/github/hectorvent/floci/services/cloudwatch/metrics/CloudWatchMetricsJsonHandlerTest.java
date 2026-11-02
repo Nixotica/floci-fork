@@ -1,22 +1,27 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.github.hectorvent.floci.services.cloudwatch.metricstreams.CloudWatchMetricStreamsService;
 import jakarta.ws.rs.core.Response;
-import java.math.BigDecimal;
-import java.time.Instant;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Handler-level tests for CloudWatchMetricsJsonHandler.
@@ -36,10 +41,11 @@ class CloudWatchMetricsJsonHandlerTest {
     private static final Instant EPOCH_OLD = EPOCH_NOW.minusSeconds(86400);
 
     private CloudWatchMetricsJsonHandler handler;
+    private CloudWatchMetricsService service;
 
     @BeforeEach
     void setUp() {
-        CloudWatchMetricsService service = new CloudWatchMetricsService(
+        service = new CloudWatchMetricsService(
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new RegionResolver(REGION, "000000000000")
@@ -146,6 +152,114 @@ class CloudWatchMetricsJsonHandlerTest {
                 "metric stored with 24h-ago timestamp must not appear in a 20-second window around now");
     }
 
+    // The CloudWatch Agent sends an empty top-level MetricData and nests every datum under
+    // EntityMetricData, floci-io/floci#6066.
+    @Test
+    void putMetricData_entityMetricDataOnly_storesNestedDatumsUnderTheRequestNamespace() {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("Namespace", "CWAgent");
+        req.putArray("MetricData");
+        ObjectNode entityMetricData = req.putArray("EntityMetricData").addObject();
+        ObjectNode entity = entityMetricData.putObject("Entity");
+        entity.putObject("KeyAttributes")
+                .put("Type", "AWS::Resource")
+                .put("ResourceType", "AWS::EC2::Instance")
+                .put("Identifier", "i-0123456789abcdef0");
+        entity.putObject("Attributes");
+        ObjectNode datum = entityMetricData.putArray("MetricData").addObject();
+        datum.put("MetricName", "mem_used_percent");
+        datum.put("Value", 6.43);
+        datum.put("Unit", "Percent");
+        datum.put("StorageResolution", 60);
+        datum.put("Timestamp", sdkTimestamp(EPOCH_NOW));
+        datum.putArray("Dimensions").addObject().put("Name", "host").put("Value", "h1");
+        req.put("StrictEntityValidation", false);
+
+        assertEquals(200, handler.handle("PutMetricData", req, REGION).getStatus());
+
+        ObjectNode stats = getStats("CWAgent", "mem_used_percent", "host", "h1",
+                EPOCH_NOW.minusSeconds(60), EPOCH_NOW.plusSeconds(60), 60);
+        assertEquals(1, stats.get("Datapoints").size());
+        assertEquals(6.43, stats.get("Datapoints").get(0).get("Sum").asDouble());
+    }
+
+    @Test
+    void putMetricData_topLevelAndEntityMetricData_storesBoth() {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("Namespace", "Mixed");
+        req.putArray("MetricData").addObject()
+                .put("MetricName", "TopLevel").put("Value", 1.0);
+        ArrayNode entityMetricData = req.putArray("EntityMetricData");
+        entityMetricData.addObject().putArray("MetricData").addObject()
+                .put("MetricName", "FirstEntity").put("Value", 2.0);
+        entityMetricData.addObject().putArray("MetricData").addObject()
+                .put("MetricName", "SecondEntity").put("Value", 3.0);
+
+        assertEquals(200, handler.handle("PutMetricData", req, REGION).getStatus());
+
+        ObjectNode listReq = MAPPER.createObjectNode();
+        listReq.put("Namespace", "Mixed");
+        ObjectNode listed = (ObjectNode) handler.handle("ListMetrics", listReq, REGION).getEntity();
+        List<String> names = new ArrayList<>();
+        listed.get("Metrics").forEach(m -> names.add(m.get("MetricName").asText()));
+        assertEquals(List.of("FirstEntity", "SecondEntity", "TopLevel"), names.stream().sorted().toList());
+    }
+
+    @Test
+    void putMetricData_entityDatumWithoutMetricName_rejectsTheWholeRequest() {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("Namespace", "Invalid");
+        req.putArray("MetricData").addObject()
+                .put("MetricName", "TopLevel").put("Value", 1.0);
+        ArrayNode nested = req.putArray("EntityMetricData").addObject().putArray("MetricData");
+        nested.addObject().put("MetricName", "Valid").put("Value", 2.0);
+        nested.addObject().put("Value", 3.0);
+
+        AwsException e = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", req, REGION));
+        assertEquals("MissingParameter", e.getErrorCode());
+        assertEquals("MissingRequiredParameterException", e.jsonType());
+        assertEquals(400, e.getHttpStatus());
+        assertEquals("The parameter EntityMetricData.member.1.MetricData.member.2.MetricName is required.",
+                e.getMessage());
+        assertEquals(0, listMetricNames("Invalid").size());
+    }
+
+    @Test
+    void putMetricData_topLevelDatumWithEmptyMetricName_rejectsTheWholeRequest() {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("Namespace", "InvalidTop");
+        ArrayNode data = req.putArray("MetricData");
+        data.addObject().put("MetricName", "Valid").put("Value", 1.0);
+        data.addObject().put("MetricName", "").put("Value", 2.0);
+
+        AwsException e = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", req, REGION));
+        assertEquals("MissingParameter", e.getErrorCode());
+        assertEquals("The parameter MetricData.member.2.MetricName is required.", e.getMessage());
+        assertEquals(0, listMetricNames("InvalidTop").size());
+    }
+
+    // AWS constrains MetricName to 1 to 255 characters with no pattern, so whitespace is a name.
+    @Test
+    void putMetricData_whitespaceMetricName_isStored() {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("Namespace", "WhitespaceName");
+        req.putArray("MetricData").addObject().put("MetricName", " ").put("Value", 1.0);
+
+        assertEquals(200, handler.handle("PutMetricData", req, REGION).getStatus());
+        assertEquals(List.of(" "), listMetricNames("WhitespaceName"));
+    }
+
+    private List<String> listMetricNames(String namespace) {
+        ObjectNode listReq = MAPPER.createObjectNode();
+        listReq.put("Namespace", namespace);
+        ObjectNode listed = (ObjectNode) handler.handle("ListMetrics", listReq, REGION).getEntity();
+        List<String> names = new ArrayList<>();
+        listed.get("Metrics").forEach(m -> names.add(m.get("MetricName").asText()));
+        return names;
+    }
+
     @Test
     void setAlarmState_updatesFieldsCorrectly() {
         putMetric("NS", "M", "type", "current", 100.0, EPOCH_NOW);
@@ -232,6 +346,49 @@ class CloudWatchMetricsJsonHandlerTest {
         assertEquals(2, alarm.get("DatapointsToAlarm").asInt());
         assertEquals("breaching", alarm.get("TreatMissingData").asText());
         assertEquals("Count", alarm.get("Unit").asText());
+    }
+
+    @Test
+    void describeAlarms_reportsStateTransitionedTimestampForBothAlarmKinds() {
+        handler.handle("PutMetricAlarm", alarmRequest("TransitionedMetric"), REGION);
+        ObjectNode composite = MAPPER.createObjectNode();
+        composite.put("AlarmName", "TransitionedComposite");
+        composite.put("AlarmRule", "ALARM(TransitionedMetric)");
+        handler.handle("PutCompositeAlarm", composite, REGION);
+        ObjectNode describe = MAPPER.createObjectNode();
+        describe.putArray("AlarmTypes").add("MetricAlarm").add("CompositeAlarm");
+
+        ObjectNode response = (ObjectNode) handler.handle("DescribeAlarms", describe, REGION).getEntity();
+
+        for (String kind : List.of("MetricAlarms", "CompositeAlarms")) {
+            JsonNode alarm = response.get(kind).get(0);
+            assertTrue(alarm.has("StateTransitionedTimestamp"), kind + ": " + alarm);
+            assertEquals(alarm.get("StateUpdatedTimestamp").asLong(), alarm.get("StateTransitionedTimestamp").asLong());
+        }
+
+        service.describeAlarms(List.of("TransitionedMetric"), null, REGION).getFirst().setStateTransitionedTimestamp(100);
+        service.describeCompositeAlarms(List.of("TransitionedComposite"), null, REGION).getFirst()
+                .setStateTransitionedTimestamp(100);
+        response = (ObjectNode) handler.handle("DescribeAlarms", describe, REGION).getEntity();
+        for (String kind : List.of("MetricAlarms", "CompositeAlarms")) {
+            assertEquals(100, response.get(kind).get(0).get("StateTransitionedTimestamp").asLong(), kind);
+        }
+    }
+
+    // AWS sends every alarm collection even when it is empty. The CLI's text output writes a
+    // None line for each paginator result key missing from the page (floci-io/floci#6362).
+    @Test
+    void describeAlarms_returnsEmptyCompositeAndLogAlarmCollections() {
+        handler.handle("PutMetricAlarm", alarmRequest("MetricOnly"), REGION);
+
+        ObjectNode response = (ObjectNode) handler.handle("DescribeAlarms", MAPPER.createObjectNode(), REGION)
+                .getEntity();
+
+        assertEquals(1, response.get("MetricAlarms").size());
+        assertTrue(response.get("CompositeAlarms").isArray());
+        assertTrue(response.get("CompositeAlarms").isEmpty());
+        assertTrue(response.get("LogAlarms").isArray());
+        assertTrue(response.get("LogAlarms").isEmpty());
     }
 
     // An alarm the caller never gave an M for reports no DatapointsToAlarm at all. AWS omits the
@@ -326,5 +483,64 @@ class CloudWatchMetricsJsonHandlerTest {
         ObjectNode body = (ObjectNode) resp.getEntity();
         assertTrue(body.get("MetricDataResults").get(0).get("Values").size() > 0,
                 "an explicit JSON null Unit must not filter every datapoint out");
+    }
+
+    @Test
+    void describeAlarmHistoryReturnsAwsShapedItemsAndPages() {
+        handler.handle("PutMetricAlarm", MAPPER.createObjectNode().put("AlarmName", "json-history"), REGION);
+        for (String state : List.of("OK", "ALARM", "OK")) {
+            handler.handle("SetAlarmState", MAPPER.createObjectNode().put("AlarmName", "json-history")
+                    .put("StateValue", state).put("StateReason", "manual"), REGION);
+        }
+        ObjectNode request = MAPPER.createObjectNode().put("AlarmName", "json-history")
+                .put("HistoryItemType", "StateUpdate").put("MaxRecords", 2);
+        request.putArray("AlarmTypes").add("MetricAlarm");
+
+        Response response = handler.handle("DescribeAlarmHistory", request, REGION);
+        assertEquals(200, response.getStatus());
+        ObjectNode body = (ObjectNode) response.getEntity();
+        JsonNode items = body.get("AlarmHistoryItems");
+        assertEquals(2, items.size());
+        JsonNode newest = items.get(0);
+        List<String> fields = new ArrayList<>();
+        newest.fieldNames().forEachRemaining(fields::add);
+        assertEquals(List.of("AlarmName", "AlarmType", "HistoryData", "HistoryItemType", "HistorySummary", "Timestamp"),
+                fields);
+        assertEquals("json-history", newest.get("AlarmName").asText());
+        assertEquals("MetricAlarm", newest.get("AlarmType").asText());
+        assertEquals("StateUpdate", newest.get("HistoryItemType").asText());
+        assertEquals("Alarm updated from ALARM to OK", newest.get("HistorySummary").asText());
+        assertTrue(newest.get("HistoryData").asText().startsWith("{\"version\":\"1.0\",\"oldState\""));
+        assertTrue(newest.get("Timestamp").isDouble());
+        assertTrue(Math.abs(newest.get("Timestamp").asDouble() - Instant.now().getEpochSecond()) < 60);
+        assertTrue(body.get("NextToken").isTextual());
+
+        request.put("NextToken", body.get("NextToken").asText());
+        ObjectNode last = (ObjectNode) handler.handle("DescribeAlarmHistory", request, REGION).getEntity();
+        assertEquals("Alarm updated from INSUFFICIENT_DATA to OK",
+                last.get("AlarmHistoryItems").get(0).get("HistorySummary").asText());
+        assertFalse(last.has("NextToken"));
+
+        ObjectNode future = MAPPER.createObjectNode().put("AlarmName", "json-history")
+                .put("StartDate", sdkTimestamp(Instant.now().plusSeconds(3600)));
+        assertEquals(0, ((ObjectNode) handler.handle("DescribeAlarmHistory", future, REGION).getEntity())
+                .get("AlarmHistoryItems").size());
+
+        ObjectNode distant = MAPPER.createObjectNode().put("AlarmName", "json-history")
+                .put("HistoryItemType", "StateUpdate").put("EndDate", 253402300799L);
+        assertEquals(3, ((ObjectNode) handler.handle("DescribeAlarmHistory", distant, REGION).getEntity())
+                .get("AlarmHistoryItems").size(), "9999-12-31 is after every item");
+    }
+
+    @Test
+    void describeAlarmHistoryRejectsAStartDateAfterTheEndDate() {
+        ObjectNode request = MAPPER.createObjectNode()
+                .put("StartDate", sdkTimestamp(Instant.parse("2026-10-26T16:23:10Z")))
+                .put("EndDate", sdkTimestamp(Instant.parse("2026-10-26T16:22:10Z")));
+        AwsException e = assertThrows(AwsException.class,
+                () -> handler.handle("DescribeAlarmHistory", request, REGION));
+        assertEquals("InvalidParameterValueException", e.jsonType());
+        assertEquals("Start date Mon Oct 26 16:23:10 UTC 2026 must be before end date Mon Oct 26 16:22:10 UTC 2026",
+                e.getMessage());
     }
 }

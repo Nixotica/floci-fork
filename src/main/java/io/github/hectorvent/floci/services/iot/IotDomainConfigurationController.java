@@ -1,11 +1,9 @@
 package io.github.hectorvent.floci.services.iot;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.iot.model.IotDomainConfiguration;
 import io.github.hectorvent.floci.services.iot.model.IotDomainConfiguration.AuthorizerConfig;
@@ -55,7 +53,8 @@ public class IotDomainConfigurationController {
                                               @PathParam("domainConfigurationName") String domainConfigurationName,
                                               String body) {
         IotDomainConfiguration created = domainConfigurationService.createDomainConfiguration(
-                domainConfigurationName, readJson(body), regionResolver.resolveRegion(headers));
+                domainConfigurationName, IotRequestBody.read(objectMapper, body),
+                regionResolver.resolveRegion(headers));
         return Response.ok(nameAndArn(created)).build();
     }
 
@@ -74,7 +73,8 @@ public class IotDomainConfigurationController {
                                               @PathParam("domainConfigurationName") String domainConfigurationName,
                                               String body) {
         IotDomainConfiguration updated = domainConfigurationService.updateDomainConfiguration(
-                domainConfigurationName, readJson(body), regionResolver.resolveRegion(headers));
+                domainConfigurationName, IotRequestBody.read(objectMapper, body),
+                regionResolver.resolveRegion(headers));
         return Response.ok(nameAndArn(updated)).build();
     }
 
@@ -138,7 +138,7 @@ public class IotDomainConfigurationController {
         response.put("serviceType", configuration.getServiceType());
         response.put("domainType", configuration.getDomainType());
         if (configuration.getLastStatusChangeDate() != null) {
-            response.put("lastStatusChangeDate", configuration.getLastStatusChangeDate().toEpochMilli() / 1000.0);
+            response.put("lastStatusChangeDate", EpochSeconds.fromInstant(configuration.getLastStatusChangeDate()));
         }
         if (configuration.getTlsConfig() != null) {
             putIfPresent(response.putObject("tlsConfig"), "securityPolicy", configuration.getTlsConfig().securityPolicy());
@@ -164,14 +164,6 @@ public class IotDomainConfigurationController {
     private static void putIfPresent(ObjectNode node, String field, String value) {
         if (value != null) {
             node.put(field, value);
-        }
-    }
-
-    private JsonNode readJson(String body) {
-        try {
-            return objectMapper.readTree(body == null || body.isBlank() ? "{}" : body);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("InvalidRequestException", e.getMessage(), 400);
         }
     }
 }

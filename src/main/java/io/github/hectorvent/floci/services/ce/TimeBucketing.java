@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.ce;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -9,6 +11,7 @@ import java.time.OffsetDateTime;
 import java.time.YearMonth;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -25,22 +28,22 @@ final class TimeBucketing {
 
     static Granularity parseGranularity(String value) {
         if (value == null || value.isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value at 'Granularity' failed to satisfy constraint: Member must not be null.", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value at 'Granularity' failed to satisfy constraint: Member must not be null.");
         }
         return switch (value) {
             case "HOURLY" -> Granularity.HOURLY;
             case "DAILY" -> Granularity.DAILY;
             case "MONTHLY" -> Granularity.MONTHLY;
-            default -> throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + value + "' at 'Granularity' failed to satisfy constraint: Member must satisfy enum value set: [DAILY, MONTHLY, HOURLY]", 400);
+            default -> throw SmithyValidationErrors.validationException(
+                    "Value '" + value + "' at 'Granularity' failed to satisfy constraint: Member must satisfy enum value set: [DAILY, MONTHLY, HOURLY]");
         };
     }
 
     static Instant parseDate(String value, String field) {
         if (value == null || value.isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value at '" + field + "' failed to satisfy constraint: Member must not be null.", 400);
+            throw SmithyValidationErrors.validationException(
+                    "Value at '" + field + "' failed to satisfy constraint: Member must not be null.");
         }
         // AWS accepts "YYYY-MM-DD" (most common) and ISO-8601 timestamps.
         try {
@@ -82,8 +85,8 @@ final class TimeBucketing {
 
     private static Instant floor(Instant instant, Granularity granularity) {
         return switch (granularity) {
-            case HOURLY -> instant.truncatedTo(java.time.temporal.ChronoUnit.HOURS);
-            case DAILY -> instant.truncatedTo(java.time.temporal.ChronoUnit.DAYS);
+            case HOURLY -> instant.truncatedTo(ChronoUnit.HOURS);
+            case DAILY -> instant.truncatedTo(ChronoUnit.DAYS);
             case MONTHLY -> YearMonth.from(instant.atOffset(ZoneOffset.UTC))
                     .atDay(1).atStartOfDay(ZoneOffset.UTC).toInstant();
         };
@@ -96,7 +99,7 @@ final class TimeBucketing {
         }
         return switch (granularity) {
             case HOURLY -> floored.plusSeconds(3600);
-            case DAILY -> floored.plus(java.time.Duration.ofDays(1));
+            case DAILY -> floored.plus(Duration.ofDays(1));
             case MONTHLY -> YearMonth.from(floored.atOffset(ZoneOffset.UTC))
                     .plusMonths(1).atDay(1).atStartOfDay(ZoneOffset.UTC).toInstant();
         };
@@ -117,7 +120,7 @@ final class TimeBucketing {
         List<Bucket> out = new ArrayList<>();
         Instant cursor = start;
         while (cursor.isBefore(end)) {
-            Instant next = cursor.plus(java.time.Duration.ofDays(1));
+            Instant next = cursor.plus(Duration.ofDays(1));
             out.add(new Bucket(cursor, next.isAfter(end) ? end : next));
             cursor = next;
         }

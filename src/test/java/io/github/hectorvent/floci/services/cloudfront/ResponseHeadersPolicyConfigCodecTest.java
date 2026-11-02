@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -84,7 +85,7 @@ class ResponseHeadersPolicyConfigCodecTest {
 
     @Test
     void removeHeadersConfigIsCaptured() {
-        var directives = ResponseHeadersPolicyConfigCodec.directives(
+        ResponseHeadersPolicyConfigCodec.Directives directives = ResponseHeadersPolicyConfigCodec.directives(
                 ResponseHeadersPolicyConfigCodec.parse(XML));
         assertEquals(List.of("Server"), directives.remove());
     }
@@ -163,18 +164,18 @@ class ResponseHeadersPolicyConfigCodecTest {
         cors.put("OriginOverride", "false");
         Map<String, Object> config = Map.of("CorsConfig", cors);
 
-        var simple = ResponseHeadersPolicyConfigCodec.directives(
+        ResponseHeadersPolicyConfigCodec.Directives simple = ResponseHeadersPolicyConfigCodec.directives(
                 config, "https://viewer.example", false, true, null);
         Map<String, String> simpleHeaders = simple.add().stream().collect(
-                java.util.stream.Collectors.toMap(
+                Collectors.toMap(
                         ResponseHeadersPolicyConfigCodec.PolicyHeader::name,
                         ResponseHeadersPolicyConfigCodec.PolicyHeader::value));
         assertEquals(Map.of("Access-Control-Allow-Origin", "*"), simpleHeaders);
 
-        var preflight = ResponseHeadersPolicyConfigCodec.directives(
+        ResponseHeadersPolicyConfigCodec.Directives preflight = ResponseHeadersPolicyConfigCodec.directives(
                 config, "https://viewer.example", true, true, null);
         Map<String, String> preflightHeaders = preflight.add().stream().collect(
-                java.util.stream.Collectors.toMap(
+                Collectors.toMap(
                         ResponseHeadersPolicyConfigCodec.PolicyHeader::name,
                         ResponseHeadersPolicyConfigCodec.PolicyHeader::value));
         assertEquals("*", preflightHeaders.get("Access-Control-Allow-Origin"));

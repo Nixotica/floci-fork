@@ -3,12 +3,15 @@ package io.github.hectorvent.floci.services.detective;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.services.detective.model.DetectiveMember;
 import io.github.hectorvent.floci.services.detective.model.DetectiveState;
 import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.organizations.model.OrganizationAccount;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -41,7 +44,7 @@ class DetectiveServiceTest {
         OrganizationAccount member = new OrganizationAccount();
         member.setId(MEMBER_ACCOUNT);
         when(organizationsService.describeOrganization(MANAGEMENT_ACCOUNT)).thenReturn(organization);
-        when(organizationsService.listAccounts(MANAGEMENT_ACCOUNT)).thenReturn(java.util.List.of(management, member));
+        when(organizationsService.listAccounts(MANAGEMENT_ACCOUNT)).thenReturn(List.of(management, member));
 
         service = new DetectiveService(
                 AccountAwareStorageBackend.inMemory(MANAGEMENT_ACCOUNT), regionResolver, organizationsService);
@@ -62,7 +65,7 @@ class DetectiveServiceTest {
         when(regionResolver.getAccountId()).thenReturn(ADMIN_ACCOUNT);
         String graphArn = service.graphArn(REGION);
 
-        var member = service.createMember(REGION, graphArn, MEMBER_ACCOUNT, null);
+        DetectiveMember member = service.createMember(REGION, graphArn, MEMBER_ACCOUNT, null);
 
         assertEquals(MEMBER_ACCOUNT, member.getAccountId());
         assertNull(member.getEmailAddress());

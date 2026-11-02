@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.apigatewayv2;
 
 import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -55,7 +56,8 @@ class ApiGatewayV2AlbIntegrationTest {
         stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         stub.createContext("/", exchange -> {
             String reqPath = exchange.getRequestURI().getPath();
-            byte[] body = ("{\"status\":\"ok\",\"path\":\"" + reqPath + "\"}").getBytes(StandardCharsets.UTF_8);
+            String rawPath = exchange.getRequestURI().getRawPath();
+            byte[] body = ("{\"status\":\"ok\",\"path\":\"" + reqPath + "\",\"rawPath\":\"" + rawPath + "\"}").getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, body.length);
             try (OutputStream os = exchange.getResponseBody()) {
@@ -81,6 +83,8 @@ class ApiGatewayV2AlbIntegrationTest {
                 .formParam("Name", "apigw-alb-test")
                 .formParam("Type", "application")
                 .formParam("Scheme", "internet-facing")
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
                 .header("Authorization", AUTH)
             .when()
                 .post("/")
@@ -329,6 +333,29 @@ class ApiGatewayV2AlbIntegrationTest {
 
     @Test
     @Order(12)
+    void albListenerIgnoresUnknownVpcLinkConnectionId() {
+        patchConnectionId("vpclink-missing");
+        try {
+            given().when().get("/execute-api/" + apiId + "/$default/health")
+                    .then().statusCode(200).body("path", equalTo("/health"));
+        } finally {
+            patchConnectionId(vpcLinkId);
+        }
+    }
+
+    private static void patchConnectionId(String connectionId) {
+        given()
+                .contentType(ContentType.JSON)
+                .body("""
+                        {"connectionId":"%s"}
+                        """.formatted(connectionId))
+                .when().patch("/v2/apis/" + apiId + "/integrations/" + integrationId)
+                .then()
+                .statusCode(200);
+    }
+
+    @Test
+    @Order(13)
     void unresolvableListenerArnReturns502() {
         // Replace the integrationUri with a listener ARN that doesn't exist.
         // The ALB resolver must return a clean 502, not crash.
@@ -346,6 +373,34 @@ class ApiGatewayV2AlbIntegrationTest {
                 .when().get("/execute-api/" + apiId + "/$default/health")
                 .then()
                 .statusCode(502);
+    }
+
+    @Test
+    @Order(14)
+    void albTargetReceivesEncodedPathAndTrailingSlashAsTheCallerSentThem() {
+        given().contentType(ContentType.JSON)
+                .body("{\"integrationUri\":\"" + listenerArn + "\"}")
+                .when().patch("/v2/apis/" + apiId + "/integrations/" + integrationId)
+                .then().statusCode(200);
+        given().contentType(ContentType.JSON)
+                .body("{\"routeKey\":\"GET /{proxy+}\",\"target\":\"integrations/" + integrationId + "\"}")
+                .when().post("/v2/apis/" + apiId + "/routes").then().statusCode(201);
+
+        given().urlEncodingEnabled(false).when().get("/execute-api/" + apiId + "/$default/a%3Fb")
+                .then().statusCode(200).body("rawPath", equalTo("/a%3Fb"));
+        given().urlEncodingEnabled(false).when().get("/execute-api/" + apiId + "/$default/x/")
+                .then().statusCode(200).body("rawPath", equalTo("/x/"));
+    }
+
+    @Test
+    @Order(15)
+    void albTargetReceivesTheNamedStageInThePathButNotTheDefaultStage() {
+        given().urlEncodingEnabled(false).when().get("/execute-api/" + apiId + "/prod/a%3Fb")
+                .then().statusCode(200).body("rawPath", equalTo("/prod/a%3Fb"));
+        given().urlEncodingEnabled(false).when().get("/execute-api/" + apiId + "/prod/x/")
+                .then().statusCode(200).body("rawPath", equalTo("/prod/x/"));
+        given().urlEncodingEnabled(false).when().get("/execute-api/" + apiId + "/$default/a%3Fb")
+                .then().statusCode(200).body("rawPath", equalTo("/a%3Fb"));
     }
 
     @Test

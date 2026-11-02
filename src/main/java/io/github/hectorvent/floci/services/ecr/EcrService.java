@@ -1,43 +1,67 @@
 package io.github.hectorvent.floci.services.ecr;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectReader;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.concurrent.KeyedWriteLocks;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ecr.model.AuthorizationData;
+import io.github.hectorvent.floci.services.ecr.model.Image;
 import io.github.hectorvent.floci.services.ecr.model.ImageDetail;
 import io.github.hectorvent.floci.services.ecr.model.ImageFailure;
 import io.github.hectorvent.floci.services.ecr.model.ImageIdentifier;
 import io.github.hectorvent.floci.services.ecr.model.ImageMetadata;
-import io.github.hectorvent.floci.services.ecr.model.Image;
 import io.github.hectorvent.floci.services.ecr.model.PullThroughCacheRule;
+import io.github.hectorvent.floci.services.ecr.model.RegistrySettings;
 import io.github.hectorvent.floci.services.ecr.model.Repository;
+import io.github.hectorvent.floci.services.ecr.model.RepositoryCreationTemplate;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecr.registry.RegistryHttpClient;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class EcrService implements ResourceProvider {
+
+    /**
+     * A private ECR registry host in any partition, {@code <account>.dkr.ecr.<region>.<dnsSuffix>},
+     * matched the same way {@code EcrRegistryManager} recognises an ECR image URI.
+     */
+    private static final Pattern ECR_UPSTREAM_HOST = Pattern.compile(
+            "[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\." + AwsPartitions.dnsSuffixRegex());
 
     private static final Logger LOG = Logger.getLogger(EcrService.class);
     private static final Pattern REPO_NAME = Pattern.compile(
@@ -46,6 +70,12 @@ public class EcrService implements ResourceProvider {
             "(?:[a-z0-9]+(?:(?:\\.|_|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+"
                     + "(?:(?:\\.|_|__|-+)[a-z0-9]+)*)*/?|ROOT)");
     private static final Pattern REGISTRY_ID = Pattern.compile("[0-9]{12}");
+    private static final Pattern LAYER_DIGEST = Pattern.compile("[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+");
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /** ECR's imageTag rule, which the service model bounds at 300 characters. */
+    private static final Pattern ECR_IMAGE_TAG = Pattern.compile("[a-zA-Z0-9_.-]+");
+    /** The OCI distribution spec's tag grammar, which the backing registry's manifest URL takes. */
+    private static final Pattern REGISTRY_IMAGE_TAG = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9._-]{0,127}");
     private static final Pattern CREDENTIAL_ARN = Pattern.compile(
             "arn:" + AwsArnUtils.PARTITION_REGEX + ":secretsmanager:[a-zA-Z0-9-:]+:secret:ecr-pullthroughcache/"
                     + "[a-zA-Z0-9/_+=.@-]+");
@@ -53,15 +83,26 @@ public class EcrService implements ResourceProvider {
             "ecr", "ecr-public", "quay", "k8s", "docker-hub",
             "github-container-registry", "azure-container-registry",
             "gitlab-container-registry", "chainguard");
+    private static final ObjectReader SINGLE_JSON_VALUE =
+            MAPPER.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private static final int MAX_REPO_NAME_LENGTH = 256;
+    private static final int MAX_PULL_TIME_EXCLUSIONS = 100;
     private static final int MAX_PULL_THROUGH_CACHE_PREFIX_LENGTH = 30;
+    private static final Map<String, String> ACCOUNT_SETTING_DEFAULTS = Map.of(
+            "BASIC_SCAN_TYPE_VERSION", "AWS_NATIVE", "REGISTRY_POLICY_SCOPE", "V2", "BLOB_MOUNTING", "DISABLED");
 
     private final StorageBackend<String, Repository> repoStore;
     private final StorageBackend<String, ImageMetadata> imageMetaStore;
     private final StorageBackend<String, PullThroughCacheRule> pullThroughCacheRuleStore;
+    private final StorageBackend<String, RegistrySettings> registrySettingsStore;
+    private final Map<String, Object> registryLocks = new ConcurrentHashMap<>();
+    private final StorageBackend<String, RepositoryCreationTemplate> templateStore;
     private final EcrRegistryManager registryManager;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
+    private final EcrLayerUploads layerUploads = new EcrLayerUploads(this::discardUpload);
+    private final Set<String> inFlightImmutableTags = ConcurrentHashMap.newKeySet();
+    private final KeyedWriteLocks<String> repositoryWriteLocks = new KeyedWriteLocks<>();
 
     @Inject
     public EcrService(StorageFactory factory,
@@ -74,6 +115,10 @@ public class EcrService implements ResourceProvider {
                         new TypeReference<Map<String, ImageMetadata>>() {}),
                 factory.create("ecr", "pull-through-cache-rules.json",
                         new TypeReference<Map<String, PullThroughCacheRule>>() {}),
+                factory.create("ecr", "registry-settings.json",
+                        new TypeReference<Map<String, RegistrySettings>>() {}),
+                factory.create("ecr", "repository-creation-templates.json",
+                        new TypeReference<Map<String, RepositoryCreationTemplate>>() {}),
                 registryManager, config, regionResolver);
     }
 
@@ -83,13 +128,31 @@ public class EcrService implements ResourceProvider {
                EcrRegistryManager registryManager,
                EmulatorConfig config,
                RegionResolver regionResolver) {
+        this(repoStore, imageMetaStore, pullThroughCacheRuleStore, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                registryManager, config, regionResolver);
+    }
+
+    EcrService(StorageBackend<String, Repository> repoStore,
+               StorageBackend<String, ImageMetadata> imageMetaStore,
+               StorageBackend<String, PullThroughCacheRule> pullThroughCacheRuleStore,
+               StorageBackend<String, RegistrySettings> registrySettingsStore,
+               StorageBackend<String, RepositoryCreationTemplate> templateStore,
+               EcrRegistryManager registryManager,
+               EmulatorConfig config,
+               RegionResolver regionResolver) {
         this.repoStore = repoStore;
         this.imageMetaStore = imageMetaStore;
         this.pullThroughCacheRuleStore = pullThroughCacheRuleStore;
+        this.registrySettingsStore = registrySettingsStore;
+        this.templateStore = templateStore;
         this.registryManager = registryManager;
         this.config = config;
         this.regionResolver = regionResolver;
         this.registryManager.setReconcileHook(this::reconcileFromCatalog);
+    }
+
+    public boolean isDisabled() {
+        return !config.services().ecr().enabled();
     }
 
     // ============================================================
@@ -236,7 +299,7 @@ public class EcrService implements ResourceProvider {
             String defaultAccount = regionResolver.getAccountId();
             String defaultRegion = regionResolver.getDefaultRegion();
             String legacyKey = key(defaultRegion, defaultAccount, registryRepositoryName);
-            var legacyRepository = repoStore.get(legacyKey);
+            Optional<Repository> legacyRepository = repoStore.get(legacyKey);
             if (legacyRepository.isPresent()) {
                 Repository repo = legacyRepository.get();
                 repo.setRepositoryUri(registryManager.getRepositoryUri(
@@ -252,7 +315,7 @@ public class EcrService implements ResourceProvider {
             String region = namespaced ? parts[1] : defaultRegion;
             String repoName = namespaced ? parts[2] : registryRepositoryName;
             String key = key(region, account, repoName);
-            var existing = repoStore.get(key);
+            Optional<Repository> existing = repoStore.get(key);
             if (existing.isPresent()) {
                 Repository repo = existing.get();
                 repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repoName));
@@ -277,6 +340,181 @@ public class EcrService implements ResourceProvider {
         if (recreated > 0) {
             LOG.infov("Reconciled {0} ECR repository metadata entries from registry catalog", recreated);
         }
+    }
+
+    // ============================================================
+    // Repository creation templates
+    // ============================================================
+
+    /**
+     * Stores a template under its prefix. Fields left null take ECR's defaults: AES256 encryption
+     * and mutable tags.
+     */
+    public RepositoryCreationTemplate createRepositoryCreationTemplate(RepositoryCreationTemplate requested,
+                                                                       String region) {
+        validateTemplateFields(requested);
+        String account = regionResolver.getAccountId();
+        String key = templateKey(region, account, requested.getPrefix());
+        synchronized (registryLock(region)) {
+            if (templateStore.get(key).isPresent()) {
+                throw new AwsException("TemplateAlreadyExistsException",
+                        "The repository creation template with prefix '" + requested.getPrefix()
+                                + "' already exists in the registry with id '" + account + "'", 400);
+            }
+            RepositoryCreationTemplate template = new RepositoryCreationTemplate();
+            template.setPrefix(requested.getPrefix());
+            template.setEncryptionConfiguration(new RepositoryCreationTemplate.EncryptionConfiguration("AES256", null));
+            template.setImageTagMutability("MUTABLE");
+            applyTemplateFields(template, requested);
+            Instant now = Instant.now();
+            template.setCreatedAt(now);
+            template.setUpdatedAt(now);
+            templateStore.put(key, template);
+            return template;
+        }
+    }
+
+    /**
+     * Every template in the account and Region, or those named in {@code prefixes}; a prefix with
+     * no template is left out, as the model lists no not-found error for this action.
+     */
+    public PaginatedResult<RepositoryCreationTemplate> describeRepositoryCreationTemplates(
+            List<String> prefixes, Integer maxResults, String nextToken, String region) {
+        String account = regionResolver.getAccountId();
+        List<RepositoryCreationTemplate> templates;
+        if (prefixes == null || prefixes.isEmpty()) {
+            String keyPrefix = region + "::" + account + "::";
+            templates = templateStore.scan(key -> key.startsWith(keyPrefix));
+        } else {
+            Set<String> keys = new LinkedHashSet<>();
+            for (String prefix : prefixes) {
+                keys.add(templateKey(region, account, prefix));
+            }
+            templates = new ArrayList<>();
+            for (String key : keys) {
+                templateStore.get(key).ifPresent(templates::add);
+            }
+        }
+        return Pagination.paginate(templates, RepositoryCreationTemplate::getPrefix,
+                maxResults, nextToken, 100, 1000, "InvalidParameterException");
+    }
+
+    /** Replaces each field the request sets; an empty string or list clears it. */
+    public RepositoryCreationTemplate updateRepositoryCreationTemplate(RepositoryCreationTemplate requested,
+                                                                       String region) {
+        validateTemplateFields(requested);
+        String key = templateKey(region, regionResolver.getAccountId(), requested.getPrefix());
+        synchronized (registryLock(region)) {
+            RepositoryCreationTemplate template = templateStore.get(key)
+                    .orElseThrow(() -> templateNotFound(requested.getPrefix()));
+            applyTemplateFields(template, requested);
+            // Exclusion filters mean nothing outside a *_WITH_EXCLUSION mode. Terraform leaves the
+            // member out when the filters are removed, so they go when the mode no longer takes them.
+            if (!template.getImageTagMutability().endsWith("_WITH_EXCLUSION")) {
+                template.setImageTagMutabilityExclusionFilters(null);
+            }
+            template.setUpdatedAt(Instant.now());
+            templateStore.put(key, template);
+            return template;
+        }
+    }
+
+    public RepositoryCreationTemplate deleteRepositoryCreationTemplate(String prefix, String region) {
+        String key = templateKey(region, regionResolver.getAccountId(), prefix);
+        synchronized (registryLock(region)) {
+            RepositoryCreationTemplate template = templateStore.get(key).orElseThrow(() -> templateNotFound(prefix));
+            templateStore.delete(key);
+            return template;
+        }
+    }
+
+    /** The registry the templates belong to: the caller's account. */
+    public String templateRegistryId() {
+        return regionResolver.getAccountId();
+    }
+
+    /**
+     * The template rules the ECR model can't state; {@code EcrRequestShapes} has already checked
+     * the request against the model's types, lengths, patterns and enums.
+     */
+    private static void validateTemplateFields(RepositoryCreationTemplate t) {
+        if (t.getAppliedFor() != null && t.getAppliedFor().isEmpty()) {
+            throw invalidTemplate("appliedFor must name at least one of REPLICATION, PULL_THROUGH_CACHE "
+                    + "or CREATE_ON_PUSH");
+        }
+        requireJsonObject(t.getRepositoryPolicy(), "repositoryPolicy");
+        requireJsonObject(t.getLifecyclePolicy(), "lifecyclePolicy");
+    }
+
+    private static void requireJsonObject(String text, String field) {
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        if (!isJsonObject(text)) {
+            throw invalidTemplate(field + " must be a JSON object");
+        }
+    }
+
+    /** Whether {@code text} is one JSON object with nothing after it, so {@code {} x} is not. */
+    private static boolean isJsonObject(String text) {
+        try {
+            return SINGLE_JSON_VALUE.readTree(text).isObject();
+        } catch (JsonProcessingException e) {
+            return false;
+        }
+    }
+
+    /** Copies the fields the request sets; an empty string or list clears the stored value. */
+    private static void applyTemplateFields(RepositoryCreationTemplate template, RepositoryCreationTemplate requested) {
+        if (requested.getDescription() != null) {
+            template.setDescription(emptyToNull(requested.getDescription()));
+        }
+        if (requested.getEncryptionConfiguration() != null) {
+            RepositoryCreationTemplate.EncryptionConfiguration e = requested.getEncryptionConfiguration();
+            template.setEncryptionConfiguration(new RepositoryCreationTemplate.EncryptionConfiguration(
+                    e.encryptionType(), emptyToNull(e.kmsKey())));
+        }
+        if (requested.getResourceTags() != null) {
+            template.setResourceTags(List.copyOf(requested.getResourceTags()));
+        }
+        if (requested.getImageTagMutability() != null) {
+            template.setImageTagMutability(requested.getImageTagMutability());
+        }
+        if (requested.getImageTagMutabilityExclusionFilters() != null) {
+            template.setImageTagMutabilityExclusionFilters(List.copyOf(requested.getImageTagMutabilityExclusionFilters()));
+        }
+        if (requested.getRepositoryPolicy() != null) {
+            template.setRepositoryPolicy(emptyToNull(requested.getRepositoryPolicy()));
+        }
+        if (requested.getLifecyclePolicy() != null) {
+            template.setLifecyclePolicy(emptyToNull(requested.getLifecyclePolicy()));
+        }
+        if (requested.getAppliedFor() != null) {
+            template.setAppliedFor(List.copyOf(new LinkedHashSet<>(requested.getAppliedFor())));
+        }
+        if (requested.getCustomRoleArn() != null) {
+            template.setCustomRoleArn(emptyToNull(requested.getCustomRoleArn()));
+        }
+    }
+
+    private static String emptyToNull(String value) {
+        return value == null || value.isEmpty() ? null : value;
+    }
+
+    /** ECR assumes a {@code /} after every prefix, so {@code prod} and {@code prod/} are one template. */
+    private static String templateKey(String region, String account, String prefix) {
+        String namespace = prefix.endsWith("/") ? prefix.substring(0, prefix.length() - 1) : prefix;
+        return region + "::" + account + "::" + namespace;
+    }
+
+    private static AwsException invalidTemplate(String message) {
+        return new AwsException("InvalidParameterException", message, 400);
+    }
+
+    private AwsException templateNotFound(String prefix) {
+        return new AwsException("TemplateNotFoundException",
+                "The repository creation template with prefix '" + prefix
+                        + "' does not exist in the registry with id '" + regionResolver.getAccountId() + "'", 400);
     }
 
     // ============================================================
@@ -354,6 +592,28 @@ public class EcrService implements ResourceProvider {
             out.add(refreshRepositoryUri(repo, region));
         }
         return out;
+    }
+
+    public record ScanningConfigurationFailure(String repositoryName, String failureCode, String failureReason) {}
+
+    public record BatchScanningConfigurationResult(List<Repository> repositories,
+                                                    List<ScanningConfigurationFailure> failures) {}
+
+    public BatchScanningConfigurationResult batchGetRepositoryScanningConfiguration(
+            List<String> repositoryNames, String registryId, String region) {
+        String account = effectiveAccount(registryId);
+        List<Repository> repositories = new ArrayList<>();
+        List<ScanningConfigurationFailure> failures = new ArrayList<>();
+        for (String name : repositoryNames) {
+            Optional<Repository> repository = repoStore.get(key(region, account, name));
+            if (repository.isPresent()) {
+                repositories.add(refreshRepositoryUri(repository.get(), region));
+            } else {
+                failures.add(new ScanningConfigurationFailure(name, "REPOSITORY_NOT_FOUND",
+                        notFound(name, account).getMessage()));
+            }
+        }
+        return new BatchScanningConfigurationResult(repositories, failures);
     }
 
     // ============================================================
@@ -442,23 +702,35 @@ public class EcrService implements ResourceProvider {
     // ListImages / DescribeImages / BatchGetImage / BatchDeleteImage
     // ============================================================
 
-    public List<ImageIdentifier> listImages(String repositoryName, String registryId, String region) {
+    public PaginatedResult<ImageIdentifier> listImages(String repositoryName, String registryId, String region,
+                                                       Integer maxResults, String nextToken) {
+        int limit = maxResults != null ? maxResults : 100;
+        if (limit < 1 || limit > 1000) {
+            throw new AwsException("InvalidParameterException", "maxResults must be between 1 and 1000", 400);
+        }
+        String namespace = "ListImages:" + region + ":" + effectiveAccount(registryId) + ":" + repositoryName;
         Repository repo = requireRepo(repositoryName, registryId, region);
         requireRegistry();
         String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         try {
             RegistryHttpClient http = registryManager.httpClient();
-            List<String> tags = http.listTags(internal);
-            List<ImageIdentifier> out = new ArrayList<>();
-            for (String tag : tags) {
-                String digest = http.headManifestDigest(internal, tag, null);
-                out.add(new ImageIdentifier(tag, digest));
-            }
-            return out;
-        } catch (Exception e) {
+            PaginatedResult<String> page = Pagination.paginate(http.listTags(internal), Function.identity(),
+                    limit, nextToken, namespace,
+                    token -> new AwsException("InvalidParameterException", "Invalid nextToken", 400));
+            return new PaginatedResult<>(imageIdentifiers(http, internal, page.items()), page.nextToken());
+        } catch (IOException | InterruptedException e) {
             LOG.warnv("ListImages registry query failed for {0}: {1}", repositoryName, e.getMessage());
-            return List.of();
+            return new PaginatedResult<>(List.of(), null);
         }
+    }
+
+    private static List<ImageIdentifier> imageIdentifiers(RegistryHttpClient http, String internal, List<String> tags)
+            throws IOException, InterruptedException {
+        List<ImageIdentifier> identifiers = new ArrayList<>();
+        for (String tag : tags) {
+            identifiers.add(new ImageIdentifier(tag, http.headManifestDigest(internal, tag, null)));
+        }
+        return identifiers;
     }
 
     public DescribeImagesResult describeImages(String repositoryName,
@@ -590,21 +862,16 @@ public class EcrService implements ResourceProvider {
         if (imageIds == null) imageIds = List.of();
         for (ImageIdentifier id : imageIds) {
             try {
-                String digest = id.getImageDigest();
-                if (digest == null && id.getImageTag() != null) {
-                    digest = http.headManifestDigest(internal, id.getImageTag(), null);
+                lockRepositoryWrites(internal);
+                try {
+                    if (id.getImageDigest() == null && id.getImageTag() != null) {
+                        deleteImageTag(repo, repositoryName, internal, http, id, region, deleted, failures);
+                    } else {
+                        deleteImageDigest(repo, repositoryName, internal, http, id, region, deleted, failures);
+                    }
+                } finally {
+                    unlockRepositoryWrites(internal);
                 }
-                if (digest == null) {
-                    failures.add(new ImageFailure(id, "ImageNotFound", "Image not found"));
-                    continue;
-                }
-                boolean ok = http.deleteManifest(internal, digest);
-                if (!ok) {
-                    failures.add(new ImageFailure(id, "ImageNotFound", "Image not found"));
-                    continue;
-                }
-                deleted.add(new ImageIdentifier(id.getImageTag(), digest));
-                imageMetaStore.delete(imageMetaKey(region, repo.getRegistryId(), repositoryName, digest));
             } catch (Exception e) {
                 failures.add(new ImageFailure(id, "ImageNotFound", e.getMessage()));
             }
@@ -612,9 +879,747 @@ public class EcrService implements ResourceProvider {
         return new BatchDeleteImageResult(deleted, failures);
     }
 
+    /**
+     * Deletes one tag as BatchDeleteImage does on AWS: the manifest goes with it only when no
+     * other tag still references the shared digest. The backing registry deletes manifests by
+     * digest only, and that untags every tag the digest has, so while another tag remains the
+     * manifest is dropped and immediately written back under the surviving tags from a copy
+     * read before the drop, which restores the identical digest. The repository's write lock
+     * (see {@link #lockRepositoryWrites}) is held across the whole sequence, so a manifest
+     * pushed to the repository between the drop and the write-back cannot be overwritten by
+     * the restore, and the drop and the restore run under the registry manager's monitor,
+     * the monitor {@code /_floci/ecr/gc} holds while it runs, so a concurrent GC cannot see
+     * the manifest's layers as unreferenced in that window and reclaim them out from under
+     * the restore.
+     */
+    private void deleteImageTag(Repository repo, String repositoryName, String internal,
+                                RegistryHttpClient http, ImageIdentifier id, String region,
+                                List<ImageIdentifier> deleted, List<ImageFailure> failures)
+            throws Exception {
+        String digest = http.headManifestDigest(internal, id.getImageTag(), null);
+        if (digest == null) {
+            failures.add(new ImageFailure(id, "ImageNotFound", "Image not found"));
+            return;
+        }
+        List<String> survivingTags;
+        try {
+            survivingTags = tagsReferencing(internal, http, digest, id.getImageTag());
+        } catch (Exception e) {
+            failures.add(new ImageFailure(id, "ServerException",
+                    "The tags of '" + repositoryName + "' could not be listed before deleting tag '"
+                            + id.getImageTag() + "': " + e.getMessage()));
+            return;
+        }
+        if (survivingTags.isEmpty()) {
+            if (!http.deleteManifest(internal, digest)) {
+                failures.add(new ImageFailure(id, "ImageNotFound", "Image not found"));
+                return;
+            }
+            deleted.add(new ImageIdentifier(id.getImageTag(), digest));
+            imageMetaStore.delete(imageMetaKey(region, repo.getRegistryId(), repositoryName, digest));
+            return;
+        }
+        RegistryHttpClient.ManifestResult manifest = http.getManifest(internal, digest, null);
+        if (manifest == null || manifest.body() == null || manifest.mediaType() == null) {
+            failures.add(new ImageFailure(id, "ImageNotFound", "Image not found"));
+            return;
+        }
+        synchronized (registryManager) {
+            if (!http.deleteManifest(internal, digest)) {
+                failures.add(new ImageFailure(id, "ImageNotFound", "Image not found"));
+                return;
+            }
+            for (String survivingTag : survivingTags) {
+                restoreTag(internal, http, digest, manifest, survivingTag, id.getImageTag(), repositoryName);
+            }
+        }
+        deleted.add(new ImageIdentifier(id.getImageTag(), digest));
+    }
+
+    /**
+     * Deletes a manifest with every tag that references it, reporting one imageId per removed
+     * tag the way the API reference's example response does.
+     */
+    private void deleteImageDigest(Repository repo, String repositoryName, String internal,
+                                   RegistryHttpClient http, ImageIdentifier id, String region,
+                                   List<ImageIdentifier> deleted, List<ImageFailure> failures)
+            throws Exception {
+        String digest = id.getImageDigest();
+        if (digest == null) {
+            failures.add(new ImageFailure(id, "ImageNotFound", "Image not found"));
+            return;
+        }
+        List<String> removedTags;
+        try {
+            removedTags = tagsReferencing(internal, http, digest, null);
+        } catch (Exception e) {
+            failures.add(new ImageFailure(id, "ServerException",
+                    "The tags of '" + repositoryName + "' could not be listed before deleting manifest '"
+                            + digest + "': " + e.getMessage()));
+            return;
+        }
+        if (!http.deleteManifest(internal, digest)) {
+            failures.add(new ImageFailure(id, "ImageNotFound", "Image not found"));
+            return;
+        }
+        if (removedTags.isEmpty()) {
+            deleted.add(new ImageIdentifier(id.getImageTag(), digest));
+        } else {
+            for (String removedTag : removedTags) {
+                deleted.add(new ImageIdentifier(removedTag, digest));
+            }
+        }
+        imageMetaStore.delete(imageMetaKey(region, repo.getRegistryId(), repositoryName, digest));
+    }
+
+    /**
+     * The repository's tags, other than {@code exclude}, that resolve to {@code digest}. Both
+     * calls are strict, so a registry that answers an error fails the delete instead of quietly
+     * dropping a surviving tag from the set to restore.
+     */
+    private List<String> tagsReferencing(String internal, RegistryHttpClient http,
+                                         String digest, String exclude) throws Exception {
+        List<String> referencing = new ArrayList<>();
+        for (String tag : http.listTagsStrict(internal)) {
+            if (tag.equals(exclude)) {
+                continue;
+            }
+            if (digest.equals(http.headManifestDigestStrict(internal, tag, null))) {
+                referencing.add(tag);
+            }
+        }
+        return referencing;
+    }
+
+    /**
+     * Writes a manifest back under one of its tags after the digest-addressed delete removed
+     * them all. The requested tag is already gone when this runs, so its delete is reported as
+     * done; a restore that fails leaves the surviving tag broken, which is logged for the
+     * operator because no imageId can say it.
+     */
+    private void restoreTag(String internal, RegistryHttpClient http, String digest,
+                            RegistryHttpClient.ManifestResult manifest, String survivingTag,
+                            String deletedTag, String repositoryName) {
+        try {
+            String restored = http.putManifest(internal, survivingTag, manifest.mediaType(), manifest.body());
+            if (restored != null && !restored.equals(digest)) {
+                LOG.warnv("Restoring ECR tag {0} in repository {1} rewrote manifest {2} as {3}",
+                        survivingTag, repositoryName, digest, restored);
+            }
+        } catch (Exception e) {
+            LOG.warnv("Restoring ECR tag {0} of manifest {1} in repository {2} failed after deleting tag {3}: {4}",
+                    survivingTag, digest, repositoryName, deletedTag, e.getMessage());
+        }
+    }
+
+    // ============================================================
+    // Image push through the API (PutImage and the layer API)
+    // ============================================================
+
+    public record LayerAvailability(String layerDigest, String availability, Long layerSize) {}
+    public record LayerFailure(String layerDigest, String failureCode, String failureReason) {}
+    public record BatchCheckLayerAvailabilityResult(List<LayerAvailability> layers, List<LayerFailure> failures) {}
+    public record LayerUpload(String registryId, String repositoryName, String uploadId) {}
+
+    /**
+     * Writes a manifest to the registry under its tag, or under its digest when no tag is given, so
+     * {@code docker pull} and {@code BatchGetImage} see it as they see a pushed image.
+     */
+    public Image putImage(String repositoryName, String imageManifest, String imageManifestMediaType,
+                          String imageTag, String imageDigest, String registryId, String region) {
+        Repository repo = requireRepo(repositoryName, registryId, region);
+        if (imageManifest == null || imageManifest.isEmpty()) {
+            throw new AwsException("InvalidParameterException", "imageManifest must not be empty", 400);
+        }
+        if (imageTag != null) {
+            requireImageTag(imageTag);
+        }
+        String mediaType = manifestMediaType(imageManifest, imageManifestMediaType);
+        String digest = "sha256:" + Digests.sha256Hex(imageManifest.getBytes(StandardCharsets.UTF_8));
+        if (imageDigest != null && !imageDigest.isEmpty() && !imageDigest.equals(digest)) {
+            throw new AwsException("ImageDigestDoesNotMatchException",
+                    "Invalid parameter at 'imageDigest' failed to satisfy constraint: 'specified digest "
+                            + imageDigest + " does not match the calculated digest " + digest + "'", 400);
+        }
+        requireRegistry();
+        String storage = registryRepositoryName(repo, region);
+        RegistryHttpClient http = registryManager.httpClient();
+
+        String guarded = imageTag != null && "IMMUTABLE".equals(repo.getImageTagMutability())
+                ? immutableTagKey(repo.getRegistryId(), region, repositoryName, imageTag) : null;
+        if (guarded != null && !claimImmutableTag(guarded)) {
+            throw imageTagAlreadyExists(imageTag, repositoryName);
+        }
+        try {
+            lockRepositoryWrites(storage);
+            try {
+                return callRegistry(() -> writeManifest(repo, repositoryName, storage, http, imageManifest, mediaType,
+                        imageTag, digest, guarded, region), EcrService::putImageError);
+            } finally {
+                unlockRepositoryWrites(storage);
+            }
+        } finally {
+            if (guarded != null) {
+                releaseImmutableTag(guarded);
+            }
+        }
+    }
+
+    private Image writeManifest(Repository repo, String repositoryName, String storage, RegistryHttpClient http,
+                                String imageManifest, String mediaType, String imageTag, String digest,
+                                String guarded, String region) throws Exception {
+        String existing = http.headManifestDigestStrict(storage, imageTag != null ? imageTag : digest, null);
+        if (digest.equals(existing)) {
+            throw new AwsException("ImageAlreadyExistsException",
+                    "Image with digest '" + digest + "'" + (imageTag != null ? " and tag '" + imageTag + "'" : "")
+                            + " already exists in the repository with name '" + repositoryName
+                            + "' in registry with id '" + repo.getRegistryId() + "'", 400);
+        }
+        if (existing != null && guarded != null) {
+            throw imageTagAlreadyExists(imageTag, repositoryName);
+        }
+        String stored = http.putManifest(storage, imageTag != null ? imageTag : digest, mediaType, imageManifest);
+        String finalDigest = stored != null ? stored : digest;
+        // A retag keeps the image's first push time, as DescribeImages records it.
+        String metaKey = imageMetaKey(region, repo.getRegistryId(), repositoryName, finalDigest);
+        if (imageMetaStore.get(metaKey).isEmpty()) {
+            imageMetaStore.put(metaKey, new ImageMetadata(finalDigest, Instant.now()));
+        }
+
+        Image image = new Image();
+        image.setRegistryId(repo.getRegistryId());
+        image.setRepositoryName(repositoryName);
+        image.setImageId(new ImageIdentifier(imageTag, finalDigest));
+        image.setImageManifest(imageManifest);
+        image.setImageManifestMediaType(mediaType);
+        return image;
+    }
+
+    /**
+     * Refuses a tag ECR refuses, with ECR's message, then a tag ECR takes but the backing registry
+     * cannot hold: one starting with '.' or '-', or longer than 128 characters.
+     */
+    private static void requireImageTag(String imageTag) {
+        if (imageTag.length() > 300) {
+            throw new AwsException("InvalidParameterException", "Invalid parameter at 'imageTag' failed to satisfy"
+                    + " constraint: 'Member must have length less than or equal to 300'", 400);
+        }
+        if (!ECR_IMAGE_TAG.matcher(imageTag).matches()) {
+            throw new AwsException("InvalidParameterException", "Invalid parameter at 'imageTag' failed to satisfy"
+                    + " constraint: 'must satisfy regular expression '[a-zA-Z0-9-_.]+''", 400);
+        }
+        if (!REGISTRY_IMAGE_TAG.matcher(imageTag).matches()) {
+            throw new AwsException("InvalidParameterException", "Floci's backing registry cannot hold the tag '"
+                    + imageTag + "': it must start with a letter, digit or underscore and be at most 128"
+                    + " characters", 400);
+        }
+    }
+
+    /** Reports which of the given layers the repository holds, with their sizes. */
+    public BatchCheckLayerAvailabilityResult batchCheckLayerAvailability(String repositoryName,
+                                                                         List<String> layerDigests,
+                                                                         String registryId,
+                                                                         String region) {
+        Repository repo = requireRepo(repositoryName, registryId, region);
+        if (layerDigests == null || layerDigests.isEmpty() || layerDigests.size() > 100) {
+            throw new AwsException("InvalidParameterException", "layerDigests must hold 1 to 100 digests", 400);
+        }
+        requireRegistry();
+        String storage = registryRepositoryName(repo, region);
+        RegistryHttpClient http = registryManager.httpClient();
+        List<LayerAvailability> layers = new ArrayList<>();
+        List<LayerFailure> failures = new ArrayList<>();
+        for (String digest : layerDigests) {
+            if (digest == null || !LAYER_DIGEST.matcher(digest).matches()) {
+                failures.add(new LayerFailure(digest, "InvalidLayerDigest", "Invalid layer digest"));
+                continue;
+            }
+            Long size = headBlob(http, storage, digest);
+            if (size == null) {
+                failures.add(new LayerFailure(digest, "MissingLayerDigest", "Could not find layer"));
+            } else {
+                layers.add(new LayerAvailability(digest, "AVAILABLE", size));
+            }
+        }
+        return new BatchCheckLayerAvailabilityResult(layers, failures);
+    }
+
+    /** The address a layer can be fetched from: Floci's registry endpoint, which needs no credentials. */
+    public String getDownloadUrlForLayer(String repositoryName, String layerDigest, String registryId, String region) {
+        Repository repo = requireRepo(repositoryName, registryId, region);
+        requireLayerDigest(layerDigest);
+        requireRegistry();
+        Long size = headBlob(registryManager.httpClient(), registryRepositoryName(repo, region), layerDigest);
+        if (size == null) {
+            throw layersNotFound(layerDigest, repositoryName, repo.getRegistryId());
+        }
+        return registryManager.blobUrl(repo.getRepositoryUri(), layerDigest);
+    }
+
+    /** Cancels the registry upload session of a layer upload left idle for a day. */
+    private void discardUpload(String location) {
+        registryManager.httpClient().cancelUpload(location);
+    }
+
+    /** Opens a registry upload session for one layer. */
+    public LayerUpload initiateLayerUpload(String repositoryName, String registryId, String region) {
+        Repository repo = requireRepo(repositoryName, registryId, region);
+        requireRegistry();
+        String location = callRegistry(
+                () -> registryManager.httpClient().startUpload(registryRepositoryName(repo, region)),
+                EcrService::registryUnavailable);
+        String uploadId = layerUploads.open(key(region, repo.getRegistryId(), repositoryName), location);
+        return new LayerUpload(repo.getRegistryId(), repositoryName, uploadId);
+    }
+
+    /** Sends one part of a layer, returning the last byte received. */
+    public long uploadLayerPart(String repositoryName, String uploadId, Long partFirstByte, Long partLastByte,
+                                byte[] layerPartBlob, String registryId, String region) {
+        Repository repo = requireRepo(repositoryName, registryId, region);
+        if (partFirstByte == null || partLastByte == null || layerPartBlob == null
+                || partFirstByte < 0 || partLastByte < 0) {
+            throw new AwsException("InvalidParameterException",
+                    "partFirstByte, partLastByte and layerPartBlob are required and must not be negative", 400);
+        }
+        EcrLayerUploads.Session session = layerUploads.require(
+                key(region, repo.getRegistryId(), repositoryName), uploadId, repositoryName);
+        synchronized (session) {
+            EcrLayerUploads.checkPart(session, partFirstByte, partLastByte, layerPartBlob.length,
+                    repo.getRegistryId(), repositoryName, uploadId);
+            requireRegistry();
+            String next = callRegistry(
+                    () -> registryManager.httpClient().patchUpload(session.location(), layerPartBlob, partFirstByte),
+                    e -> uploadError(e, uploadId, repositoryName));
+            session.accept(layerPartBlob.length, next, layerUploads.now());
+            return partLastByte;
+        }
+    }
+
+    /** Closes an upload, storing its bytes under the digest given, and returns that digest. */
+    public String completeLayerUpload(String repositoryName, String uploadId, List<String> layerDigests,
+                                      String registryId, String region) {
+        Repository repo = requireRepo(repositoryName, registryId, region);
+        if (layerDigests == null || layerDigests.isEmpty() || layerDigests.size() > 100) {
+            throw new AwsException("InvalidParameterException", "layerDigests must hold 1 to 100 digests", 400);
+        }
+        // An upload holds one layer, so every digest given must name it.
+        String digest = layerDigests.get(0);
+        for (String d : layerDigests) {
+            requireLayerDigest(d);
+            if (!digest.equals(d)) {
+                throw new AwsException("InvalidParameterException",
+                        "layerDigests must all name the one layer the upload holds", 400);
+            }
+        }
+        EcrLayerUploads.Session session = layerUploads.require(
+                key(region, repo.getRegistryId(), repositoryName), uploadId, repositoryName);
+        synchronized (session) {
+            EcrLayerUploads.checkComplete(session);
+            requireRegistry();
+            RegistryHttpClient http = registryManager.httpClient();
+            String storage = registryRepositoryName(repo, region);
+            if (headBlob(http, storage, digest) != null) {
+                http.cancelUpload(session.location());
+                layerUploads.close(uploadId);
+                throw new AwsException("LayerAlreadyExistsException",
+                        "Layer " + digest + " already exists in the repository with name '" + repositoryName
+                                + "' in registry with id '" + repo.getRegistryId() + "'", 400);
+            }
+            callRegistry(() -> {
+                http.finishUpload(session.location(), digest);
+                return null;
+            }, e -> {
+                layerUploads.close(uploadId);
+                if ("DIGEST_INVALID".equals(e.code())) {
+                    return new AwsException("InvalidLayerException",
+                            "The layer digest calculated for the upload does not match " + digest, 400);
+                }
+                return uploadError(e, uploadId, repositoryName);
+            });
+            layerUploads.close(uploadId);
+            return digest;
+        }
+    }
+
+    /** The registry ID a request names, or the caller's account when it names none. */
+    public String registryIdFor(String registryId) {
+        return effectiveAccount(registryId);
+    }
+
+    /** The key both the registry data plane and {@code PutImage} hold while writing an immutable tag. */
+    public static String immutableTagKey(String account, String region, String repositoryName, String tag) {
+        return account + "/" + region + "/" + repositoryName + ":" + tag;
+    }
+
+    /** Claims an immutable tag for one write; false if another write holds it. */
+    public boolean claimImmutableTag(String key) {
+        return inFlightImmutableTags.add(key);
+    }
+
+    public void releaseImmutableTag(String key) {
+        inFlightImmutableTags.remove(key);
+    }
+
+    /**
+     * The write lock every manifest write to one backing registry repository takes: the data
+     * plane's manifest PUTs and deletes, {@code PutImage}, and the BatchDeleteImage sequence
+     * that drops a shared manifest by digest and writes it back under its surviving tags. A
+     * write that lands between that sequence's steps would otherwise be overwritten by the
+     * restore of the older manifest. Keyed by the repository name as the backing registry
+     * stores it, the only namespace in which two writes address the same manifests. The
+     * lock's entry counting, its cross-thread release and its interruption behavior are
+     * {@link KeyedWriteLocks}' contract; the interruption surfaces here as a
+     * {@code ServerException}.
+     */
+    public void lockRepositoryWrites(String storageRepositoryName) {
+        try {
+            repositoryWriteLocks.acquire(storageRepositoryName);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AwsException("ServerException",
+                    "Interrupted while waiting for the write lock on " + storageRepositoryName, 500);
+        }
+    }
+
+    /**
+     * One try at {@link #lockRepositoryWrites}, for callers that must not block a thread. The
+     * caller that succeeds owns the lock until its {@code unlockRepositoryWrites}.
+     */
+    public boolean tryLockRepositoryWrites(String storageRepositoryName) {
+        return repositoryWriteLocks.tryAcquire(storageRepositoryName);
+    }
+
+    /**
+     * Ends one writer's hold of the repository's write lock; see
+     * {@link #lockRepositoryWrites}.
+     */
+    public void unlockRepositoryWrites(String storageRepositoryName) {
+        repositoryWriteLocks.release(storageRepositoryName);
+    }
+
+    /** The repository write lock entries still counting writers, for tests. */
+    int liveRepositoryWriteLocks() {
+        return repositoryWriteLocks.size();
+    }
+
+    /** The media type sent, else the manifest's own {@code mediaType}; with neither, the request is refused. */
+    private static String manifestMediaType(String manifest, String given) {
+        JsonNode root;
+        try {
+            root = MAPPER.readTree(manifest);
+        } catch (Exception e) {
+            root = null;
+        }
+        if (root == null || !root.isObject()) {
+            throw new AwsException("InvalidParameterException", "imageManifest is not a valid JSON manifest", 400);
+        }
+        if (given != null && !given.isEmpty()) {
+            return given;
+        }
+        String own = root.path("mediaType").asText("");
+        if (own.isEmpty()) {
+            throw new AwsException("InvalidParameterException",
+                    "imageManifestMediaType is required when the manifest has no mediaType", 400);
+        }
+        return own;
+    }
+
+    private Long headBlob(RegistryHttpClient http, String storage, String digest) {
+        return callRegistry(() -> http.headBlob(storage, digest), EcrService::registryUnavailable);
+    }
+
+    /** One call to the backing registry. */
+    @FunctionalInterface
+    private interface RegistryCall<T> {
+        T call() throws Exception;
+    }
+
+    /**
+     * Runs a call to the backing registry, answering a refusal the registry gives with what
+     * {@code refused} maps it to and any other failure with {@code ServerException}.
+     */
+    private static <T> T callRegistry(RegistryCall<T> call,
+                                      Function<RegistryHttpClient.RegistryErrorException, AwsException> refused) {
+        try {
+            return call.call();
+        } catch (AwsException e) {
+            throw e;
+        } catch (RegistryHttpClient.RegistryErrorException e) {
+            throw refused.apply(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw registryUnavailable(e);
+        } catch (Exception e) {
+            throw registryUnavailable(e);
+        }
+    }
+
+    private static void requireLayerDigest(String digest) {
+        if (digest == null || !LAYER_DIGEST.matcher(digest).matches()) {
+            throw new AwsException("InvalidParameterException", "Invalid layer digest: " + digest, 400);
+        }
+    }
+
+    private static AwsException putImageError(RegistryHttpClient.RegistryErrorException e) {
+        String code = e.code() == null ? "" : e.code();
+        return switch (code) {
+            case "MANIFEST_BLOB_UNKNOWN", "BLOB_UNKNOWN" -> new AwsException("LayersNotFoundException",
+                    "The image references layers that are not in the repository: " + e.getMessage(), 400);
+            case "MANIFEST_INVALID", "MANIFEST_UNVERIFIED", "DIGEST_INVALID", "TAG_INVALID", "NAME_INVALID" ->
+                    new AwsException("InvalidParameterException", "The registry refused the manifest: " + e.getMessage(), 400);
+            default -> registryUnavailable(e);
+        };
+    }
+
+    private static AwsException uploadError(RegistryHttpClient.RegistryErrorException e, String uploadId,
+                                            String repositoryName) {
+        if ("BLOB_UPLOAD_UNKNOWN".equals(e.code()) || e.status() == 404) {
+            return new AwsException("UploadNotFoundException",
+                    "Upload with id '" + uploadId + "' is not found for repository '" + repositoryName + "'", 400);
+        }
+        if ("BLOB_UPLOAD_INVALID".equals(e.code()) || e.status() == 416) {
+            return new AwsException("InvalidLayerPartException", "The registry refused the part: " + e.getMessage(), 400);
+        }
+        return registryUnavailable(e);
+    }
+
+    private static AwsException imageTagAlreadyExists(String tag, String repositoryName) {
+        return new AwsException("ImageTagAlreadyExistsException",
+                "The image tag '" + tag + "' already exists in the '" + repositoryName
+                        + "' repository and cannot be overwritten because the repository is immutable.", 400);
+    }
+
+    private static AwsException layersNotFound(String digest, String repositoryName, String registryId) {
+        return new AwsException("LayersNotFoundException",
+                "The specified layer " + digest + " could not be found in the repository with name '"
+                        + repositoryName + "' in the registry with id '" + registryId + "'", 400);
+    }
+
+    private static AwsException registryUnavailable(Exception e) {
+        return new AwsException("ServerException", "The ECR backing registry failed: " + e.getMessage(), 500);
+    }
+
+    // ============================================================
+    // Registry settings (policy, replication, scanning)
+    // ============================================================
+
+    /**
+     * Stores the registry policy. Its length is checked against the model before this is reached;
+     * text that is not a JSON object is refused here, as the model cannot say so.
+     */
+    public String putRegistryPolicy(String policyText, String region) {
+        if (policyText == null || !isJsonObject(policyText)) {
+            throw new AwsException("InvalidParameterException", "Invalid parameter at 'PolicyText' failed to satisfy "
+                    + "constraint: 'Invalid registry policy provided'", 400);
+        }
+        updateRegistrySettings(region, settings -> {
+            settings.setPolicyText(policyText);
+            return null;
+        });
+        return policyText;
+    }
+
+    public String getRegistryPolicy(String region) {
+        String policy = registrySettings(region).getPolicyText();
+        if (policy == null) {
+            throw registryPolicyNotFound();
+        }
+        return policy;
+    }
+
+    /** Removes the registry policy and returns what it was. */
+    public String deleteRegistryPolicy(String region) {
+        return updateRegistrySettings(region, settings -> {
+            String policy = settings.getPolicyText();
+            if (policy == null) {
+                throw registryPolicyNotFound();
+            }
+            settings.setPolicyText(null);
+            return policy;
+        });
+    }
+
+    public RegistrySettings.PullTimeUpdateExclusion registerPullTimeUpdateExclusion(String principalArn, String region) {
+        return updateRegistrySettings(region, settings -> {
+            List<RegistrySettings.PullTimeUpdateExclusion> exclusions = pullTimeExclusions(settings);
+            if (exclusions.stream().anyMatch(exclusion -> exclusion.principalArn().equals(principalArn))) {
+                throw new AwsException("ExclusionAlreadyExistsException", "The exclusion already exists.", 400);
+            }
+            if (exclusions.size() >= MAX_PULL_TIME_EXCLUSIONS) {
+                throw new AwsException("LimitExceededException", "A registry can have at most 100 exclusions.", 400);
+            }
+            RegistrySettings.PullTimeUpdateExclusion exclusion =
+                    new RegistrySettings.PullTimeUpdateExclusion(principalArn, Instant.now());
+            List<RegistrySettings.PullTimeUpdateExclusion> updated = new ArrayList<>(exclusions);
+            updated.add(exclusion);
+            settings.setPullTimeUpdateExclusions(List.copyOf(updated));
+            return exclusion;
+        });
+    }
+
+    public String deregisterPullTimeUpdateExclusion(String principalArn, String region) {
+        return updateRegistrySettings(region, settings -> {
+            List<RegistrySettings.PullTimeUpdateExclusion> exclusions = pullTimeExclusions(settings);
+            List<RegistrySettings.PullTimeUpdateExclusion> remaining = exclusions.stream()
+                    .filter(exclusion -> !exclusion.principalArn().equals(principalArn)).toList();
+            if (remaining.size() == exclusions.size()) {
+                throw new AwsException("ExclusionNotFoundException", "The exclusion was not found.", 400);
+            }
+            settings.setPullTimeUpdateExclusions(remaining);
+            return principalArn;
+        });
+    }
+
+    public PaginatedResult<String> listPullTimeUpdateExclusions(Integer maxResults, String nextToken, String region) {
+        synchronized (registryLock(region)) {
+            List<String> principals = pullTimeExclusions(registrySettings(region)).stream()
+                    .map(RegistrySettings.PullTimeUpdateExclusion::principalArn).toList();
+            return Pagination.paginate(principals, Function.identity(), maxResults == null ? 100 : maxResults,
+                    nextToken, "ecr-pull-time:" + registrySettingsKey(region),
+                    token -> new AwsException("InvalidParameterException", "Invalid nextToken.", 400));
+        }
+    }
+
+    private static List<RegistrySettings.PullTimeUpdateExclusion> pullTimeExclusions(RegistrySettings settings) {
+        return settings.getPullTimeUpdateExclusions() == null ? List.of() : settings.getPullTimeUpdateExclusions();
+    }
+
+    /**
+     * Stores the replication rules; an empty list clears them. The rules are checked against the
+     * model before this is reached. Floci does not replicate images.
+     */
+    public List<RegistrySettings.ReplicationRule> putReplicationConfiguration(
+            List<RegistrySettings.ReplicationRule> rules, String region) {
+        updateRegistrySettings(region, settings -> {
+            settings.setReplicationRules(rules.isEmpty() ? null : List.copyOf(rules));
+            return null;
+        });
+        return replicationRules(region);
+    }
+
+    /** The stored replication rules, empty when none are set. */
+    public List<RegistrySettings.ReplicationRule> replicationRules(String region) {
+        List<RegistrySettings.ReplicationRule> rules = registrySettings(region).getReplicationRules();
+        return rules == null ? List.of() : rules;
+    }
+
+    /**
+     * Stores the scanning configuration. The model's constraints are checked before this is
+     * reached; {@code CONTINUOUS_SCAN} is refused here with {@code BASIC}, as the API reference
+     * offers it only with enhanced scanning and the model cannot say so. Floci does not scan images.
+     */
+    public RegistrySettings putRegistryScanningConfiguration(String scanType, List<RegistrySettings.ScanningRule> rules,
+                                                             String region) {
+        String type = scanType == null ? "BASIC" : scanType;
+        List<RegistrySettings.ScanningRule> given = rules == null ? List.of() : rules;
+        for (RegistrySettings.ScanningRule rule : given) {
+            if ("BASIC".equals(type) && "CONTINUOUS_SCAN".equals(rule.scanFrequency())) {
+                throw new AwsException("InvalidParameterException",
+                        "CONTINUOUS_SCAN is supported only with the ENHANCED scan type", 400);
+            }
+        }
+        updateRegistrySettings(region, settings -> {
+            settings.setScanType(type);
+            settings.setScanningRules(List.copyOf(given));
+            return null;
+        });
+        return registryScanningConfiguration(region);
+    }
+
+    /** The scanning configuration, {@code BASIC} with no rules until one is put. */
+    public RegistrySettings registryScanningConfiguration(String region) {
+        RegistrySettings stored = registrySettings(region);
+        RegistrySettings view = new RegistrySettings();
+        view.setScanType(stored.getScanType() == null ? "BASIC" : stored.getScanType());
+        view.setScanningRules(stored.getScanningRules() == null ? List.of() : stored.getScanningRules());
+        return view;
+    }
+
+    /** The registry ID of the caller's account. */
+    public String registryId() {
+        return regionResolver.getAccountId();
+    }
+
+    public String getAccountSetting(String name, String region) {
+        String defaultValue = accountSettingDefault(name);
+        synchronized (registryLock(region)) {
+            Map<String, String> values = registrySettings(region).getAccountSettings();
+            return values == null ? defaultValue : values.getOrDefault(name, defaultValue);
+        }
+    }
+
+    public String putAccountSetting(String name, String value, String region) {
+        String defaultValue = accountSettingDefault(name);
+        boolean valid = "BLOB_MOUNTING".equals(name)
+                ? "ENABLED".equals(value) || "DISABLED".equals(value) : defaultValue.equals(value);
+        if (!valid) {
+            throw new AwsException("ValidationException", "Invalid value for account setting " + name + ".", 400);
+        }
+        return updateRegistrySettings(region, settings -> {
+            Map<String, String> values = settings.getAccountSettings() == null
+                    ? new HashMap<>() : new HashMap<>(settings.getAccountSettings());
+            values.put(name, value);
+            settings.setAccountSettings(Map.copyOf(values));
+            return value;
+        });
+    }
+
+    private static String accountSettingDefault(String name) {
+        if (name == null || !ACCOUNT_SETTING_DEFAULTS.containsKey(name)) {
+            throw new AwsException("ValidationException", "Unsupported account setting name.", 400);
+        }
+        return ACCOUNT_SETTING_DEFAULTS.get(name);
+    }
+
+    private RegistrySettings registrySettings(String region) {
+        return registrySettingsStore.get(registrySettingsKey(region)).orElseGet(RegistrySettings::new);
+    }
+
+    /**
+     * Reads the registry's settings, changes them and writes them back under the registry's lock.
+     * The settings are one record, and Terraform puts the policy, replication and scanning
+     * configuration in parallel: unlocked, two writers could start from the same record and the
+     * later write would drop the other's field.
+     */
+    private <T> T updateRegistrySettings(String region, Function<RegistrySettings, T> change) {
+        String key = registrySettingsKey(region);
+        synchronized (registryLock(region)) {
+            RegistrySettings settings = registrySettings(region);
+            T result = change.apply(settings);
+            registrySettingsStore.put(key, settings);
+            return result;
+        }
+    }
+
+    /**
+     * One lock per registry for every read and write back of its settings and creation templates:
+     * unlocked, two creates of one template prefix could both succeed, and an update could write
+     * back a template a delete had just removed.
+     */
+    private Object registryLock(String region) {
+        return registryLocks.computeIfAbsent(registrySettingsKey(region), k -> new Object());
+    }
+
+    private String registrySettingsKey(String region) {
+        return region + "::" + regionResolver.getAccountId();
+    }
+
+    private AwsException registryPolicyNotFound() {
+        return new AwsException("RegistryPolicyNotFoundException",
+                "Registry policy does not exist in the registry with id '" + regionResolver.getAccountId() + "'", 400);
+    }
+
     // ============================================================
     // Tag mutability + resource tags + policies (metadata round-trip)
     // ============================================================
+
+    public Repository putImageScanningConfiguration(String repositoryName, String registryId,
+                                                    boolean scanOnPush, String region) {
+        Repository repo = requireRepo(repositoryName, registryId, region);
+        repo.setScanOnPush(scanOnPush);
+        repoStore.put(key(region, repo.getRegistryId(), repositoryName), repo);
+        return repo;
+    }
 
     public Repository putImageTagMutability(String repositoryName, String registryId,
                                             String mutability, String region) {
@@ -1014,7 +2019,7 @@ public class EcrService implements ResourceProvider {
         if (host.equals("cgr.dev")) {
             return "chainguard";
         }
-        if (host.matches("[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com(?:\\.cn)?")) {
+        if (ECR_UPSTREAM_HOST.matcher(host).matches()) {
             return "ecr";
         }
         throw unsupportedUpstreamRegistry(upstreamRegistryUrl);

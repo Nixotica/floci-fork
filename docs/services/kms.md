@@ -24,6 +24,8 @@
 | `ReEncrypt` | Re-encrypt under a different key |
 | `GenerateDataKey` | Generate a data key (plaintext + encrypted) |
 | `GenerateDataKeyWithoutPlaintext` | Generate only the encrypted data key |
+| `GenerateDataKeyPair` | Generate an asymmetric data key pair (plaintext + encrypted private key, public key) |
+| `GenerateDataKeyPairWithoutPlaintext` | Generate an asymmetric data key pair (encrypted private key, public key) |
 | `Sign` | Sign a message with an asymmetric key |
 | `Verify` | Verify a signature |
 | `GenerateMac` | Generate a MAC with an HMAC key |
@@ -173,9 +175,64 @@ own the material and cannot rotate it.
   already has key material is rejected with `UnsupportedOperationException`, and
   `ListKeyRotations` is not implemented.
 
+## AWS Managed Keys
+
+Every AWS account has a per-region AWS managed key for each service that encrypts data on the
+account's behalf, published under the reserved `alias/aws/<service>` alias: `alias/aws/s3`,
+`alias/aws/ebs`, `alias/aws/rds` and so on. Nothing creates them, so no template declares them,
+but a module that leaves a service's encryption at its default resolves one through a data
+source. Floci ships the same catalog.
+
+The catalog holds only **AWS managed** keys, which live in your account and do have that alias.
+It deliberately excludes services that encrypt with an **AWS owned** key, which lives in an
+AWS-owned account and has no alias in yours: EKS API-data envelope encryption is the clearest
+case. Resolving an alias AWS does not publish would be worse than not having it, since the call
+would succeed here and fail against a real account.
+
+```bash
+aws kms list-aliases --query 'Aliases[?starts_with(AliasName, `alias/aws/`)].AliasName' \
+  --endpoint-url $AWS_ENDPOINT_URL
+
+aws kms describe-key --key-id alias/aws/s3 \
+  --query KeyMetadata.KeyManager --endpoint-url $AWS_ENDPOINT_URL   # -> "AWS"
+```
+
+A region's AWS managed keys are minted the first time anything reads that region's key or alias
+namespace: `ListKeys`, `ListAliases`, or a lookup naming one of the reserved aliases. An entry is
+skipped only when its alias is present *and* targets an AWS managed key, so a lost or
+quarantined `kms-keys.json` rebuilds from the catalog rather than leaving every alias dangling,
+and a reserved alias persisted on a customer key is re-pointed. A lost `kms-aliases.json`
+re-aliases the surviving AWS managed keys instead of minting a second set.
+They behave as AWS's keys, not the account's:
+
+- `DescribeKey` reports `KeyManager: AWS`, and `GetKeyRotationStatus` reports `true`, since AWS
+  rotates them and the customer cannot turn that off.
+- They encrypt and decrypt like any other symmetric key.
+- Every administrative operation is refused with `AccessDeniedException`: `ScheduleKeyDeletion`,
+  `CancelKeyDeletion`, `PutKeyPolicy`, `UpdateKeyDescription`, `EnableKey`, `DisableKey`,
+  `EnableKeyRotation`, `DisableKeyRotation`, `RotateKeyOnDemand`, `TagResource`,
+  `UntagResource` and `CreateGrant` (AWS's key policy allows grants only via the owning service).
+- The `alias/aws/` namespace is reserved. `CreateAlias` under it is rejected with
+  `InvalidAliasNameException`, and `UpdateAlias` or `DeleteAlias` against one of these aliases is
+  rejected with `AccessDeniedException`.
+- They cannot be given a second alias. `CreateAlias` or `UpdateAlias` naming an AWS managed key as
+  the target is rejected with `AccessDeniedException`.
+
+Two deliberate simplifications: the key policy is the standard account-root policy rather than
+the service-principal policy with a `kms:ViaService` condition that AWS attaches, and AWS
+distinguishes some of the refusals above as unsupported operations rather than access denials.
+The catalog itself is `src/main/resources/kms/aws-managed-keys.yaml`; adding a service is a line
+there.
+
 ## Grant Support Scope
 
 Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, `RevokeGrant`, `RetireGrant`) are supported. However, grant lifecycle support **does not** imply grant-based authorization enforcement on cryptographic operations (`Encrypt`, `Decrypt`, `Sign`, `Verify`, `GenerateDataKey`, etc.). Grants are stored and queryable but are not evaluated during crypto operations.
+
+## IAM Enforcement
+
+With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, an operation that names a key is evaluated against that key's ARN, as on AWS. A `KeyId` given as a key id, an alias name, an alias ARN or a key ARN resolves to the key it names, so a policy scoped to one key ARN allows that key and no other, and a `Deny` scoped to one fires for that key. A `Decrypt` that names no `KeyId` is evaluated against the key that encrypted its `CiphertextBlob`.
+
+`CreateAlias`, `UpdateAlias` and `DeleteAlias` are evaluated against the alias ARN and the key it points at, `UpdateAlias` also against the key it will point at, the two resource types the Service Authorization Reference lists for them. `ReEncrypt` is evaluated against both keys it acts on, under the single `kms:ReEncrypt` action: the source its `SourceKeyId` names, or when it names none the key that encrypted its `CiphertextBlob` (never a `KeyId`, which the operation does not read), and the destination its `DestinationKeyId` names. AWS authorizes the two halves separately as `kms:ReEncryptFrom` and `kms:ReEncryptTo`, which Floci does not split yet. The grant operations name the key the grant they act on belongs to: a `RetireGrant` carrying a `GrantToken` the key that grant belongs to, since the handler finds the grant by the token alone, and a `RetireGrant` or `RevokeGrant` identifying its grant by `KeyId` and `GrantId` the key it names together with the key that grant belongs to. A request nothing resolves keeps the permissive `key/*` pattern, and the operation then fails with its own error. `CreateKey`, `GenerateRandom`, `ListKeys`, `ListAliases` and `ListRetirableGrants` name no key resource and are evaluated against `*`, the resource a policy must name for them on AWS too.
 
 ## Configuration
 

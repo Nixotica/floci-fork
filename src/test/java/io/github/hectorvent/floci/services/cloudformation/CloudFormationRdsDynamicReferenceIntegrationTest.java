@@ -1,13 +1,24 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RdsMockProfile;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static io.github.hectorvent.floci.testing.RdsRequests.rds;
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -36,13 +47,73 @@ class CloudFormationRdsDynamicReferenceIntegrationTest {
         RestAssuredJsonUtils.configureAwsContentTypes();
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"MasterUsername", "MasterUserPassword"})
+    void memberCreationRejectsExplicitCredentialsAndAllowsOmittedRetry(String credential) throws Exception {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String clusterId = "cfn-credential-cluster-" + suffix;
+        String memberId = "cfn-credential-member-" + suffix;
+        String rejectedStack = "cfn-member-input-" + suffix;
+        String validStack = rejectedStack + "-valid";
+        rds("CreateDBCluster").formParam("DBClusterIdentifier", clusterId)
+                .formParam("Engine", "aurora-postgresql").formParam("MasterUsername", "clusteradmin")
+                .formParam("MasterUserPassword", "ClusterPassword!").post("/").then().statusCode(200);
+        boolean rejectedCreated = false;
+        boolean validCreated = false;
+        try {
+            Map<String, Object> properties = new LinkedHashMap<>();
+            properties.put("DBInstanceIdentifier", memberId);
+            properties.put("DBClusterIdentifier", clusterId);
+            properties.put("Engine", "aurora-postgresql");
+            properties.put("DBInstanceClass", "db.serverless");
+            properties.put(credential, "MasterUsername".equals(credential) ? "clusteradmin" : "ClusterPassword!");
+            ObjectMapper mapper = new ObjectMapper();
+            createStack(rejectedStack, mapper.writeValueAsString(Map.of("Resources", Map.of("Member",
+                    Map.of("Type", "AWS::RDS::DBInstance", "Properties", properties)))));
+            rejectedCreated = true;
+            assertEquals("ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(rejectedStack, CFN_AUTH).status());
+            String events = given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
+                    .formParam("Action", "DescribeStackEvents").formParam("StackName", rejectedStack)
+                    .post("/").then().statusCode(200).extract().asString();
+            assertTrue(events.contains("will be a member of a DB Cluster"), events);
+            rds("DescribeDBInstances").formParam("DBInstanceIdentifier", memberId)
+                    .post("/").then().statusCode(404);
+            properties.remove(credential);
+            createStack(validStack, mapper.writeValueAsString(Map.of("Resources", Map.of("Member",
+                    Map.of("Type", "AWS::RDS::DBInstance", "Properties", properties)))));
+            validCreated = true;
+            assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(validStack, CFN_AUTH).status());
+            assertEquals("clusteradmin", rds("DescribeDBInstances").formParam("DBInstanceIdentifier", memberId)
+                    .post("/").then().statusCode(200).extract().xmlPath()
+                    .getString("DescribeDBInstancesResponse.DescribeDBInstancesResult.DBInstances.DBInstance.MasterUsername"));
+        } finally {
+            try {
+                try {
+                    if (validCreated) {
+                        deleteStack(validStack);
+                        CfnStackWaits.awaitStackDeleted(validStack);
+                    }
+                } finally {
+                    if (rejectedCreated) {
+                        deleteStack(rejectedStack);
+                        CfnStackWaits.awaitStackDeleted(rejectedStack);
+                    }
+                }
+            } finally {
+                rds("DeleteDBCluster").formParam("DBClusterIdentifier", clusterId).formParam("SkipFinalSnapshot", true)
+                        .post("/").then().statusCode(200);
+            }
+        }
+    }
+
     /**
      * The regression gate. A master password reading from an SSM {@code SecureString} must reach
      * {@code CREATE_COMPLETE}. If the credential properties stop opting out of the general stage,
      * that stage rejects the reference and the stack rolls back instead.
      */
-    @Test
-    void createStack_rdsMasterPasswordResolvesSsmSecureDynamicReference() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"literal", "if", "select", "sub"})
+    void createStack_rdsMasterPasswordResolvesSsmSecureDynamicReference(String form) throws Exception {
         String suffix = Long.toString(System.nanoTime(), 36);
         String parameterName = "/cfn-rds-dynref/secure-password-" + suffix;
         String stackName = "cfn-rds-dynref-secure-stack-" + suffix;
@@ -51,8 +122,19 @@ class CloudFormationRdsDynamicReferenceIntegrationTest {
         boolean stackCreated = false;
 
         try {
-            createStack(stackName, template(databaseId,
-                    "{{resolve:ssm-secure:" + parameterName + "}}"));
+            ObjectMapper mapper = new ObjectMapper();
+            String reference = "{{resolve:ssm-secure:" + parameterName + "}}";
+            Object password = switch (form) {
+                case "if" -> Map.of("Fn::If", List.of("Chosen", reference, "unused"));
+                case "select" -> Map.of("Fn::Select", List.of(0, List.of(reference)));
+                case "sub" -> Map.of("Fn::Sub", List.of("${Password}", Map.of("Password", reference)));
+                default -> reference;
+            };
+            ObjectNode document = (ObjectNode) mapper.readTree(template(databaseId, "placeholder"));
+            document.set("Conditions", mapper.valueToTree(Map.of("Chosen", Map.of("Fn::Equals", List.of("yes", "yes")))));
+            ((ObjectNode) document.path("Resources").path("Database").path("Properties"))
+                    .set("MasterUserPassword", mapper.valueToTree(password));
+            createStack(stackName, mapper.writeValueAsString(document));
             stackCreated = true;
 
             String describeXml = describeStack(stackName);

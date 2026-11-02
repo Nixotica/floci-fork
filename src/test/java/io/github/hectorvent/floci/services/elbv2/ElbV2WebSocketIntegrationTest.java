@@ -18,10 +18,20 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import static io.github.hectorvent.floci.testing.AlbFixtures.createListener;
+import static io.github.hectorvent.floci.testing.AlbFixtures.createLoadBalancer;
+import static io.github.hectorvent.floci.testing.AlbFixtures.createTargetGroup;
+import static io.github.hectorvent.floci.testing.AlbFixtures.deleteListener;
+import static io.github.hectorvent.floci.testing.AlbFixtures.deleteLoadBalancer;
+import static io.github.hectorvent.floci.testing.AlbFixtures.deleteTargetGroup;
+import static io.github.hectorvent.floci.testing.AlbFixtures.exchange;
+import static io.github.hectorvent.floci.testing.AlbFixtures.forwardDefaultActionTo;
+import static io.github.hectorvent.floci.testing.AlbFixtures.registerTarget;
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.anyOf;
@@ -61,7 +71,14 @@ class ElbV2WebSocketIntegrationTest {
                     if (!"websocket".equalsIgnoreCase(request.getHeader("Upgrade"))) {
                         request.response().setStatusCode(400).end("not an upgrade");
                     } else if (!request.path().startsWith("/socket.io/")) {
-                        request.response().setStatusCode(404).end();
+                        request.response().headers()
+                                .add("Set-Cookie", "a=1; Path=/")
+                                .add("Set-Cookie", "b=2; Path=/")
+                                .add("Set-Cookie", "c=3; Path=/")
+                                .add("X-Multi", "one")
+                                .add("X-Multi", "two")
+                                .add("Keep-Alive", "timeout=5");
+                        request.response().setStatusCode(404).end("upgrade refused");
                     } else {
                         String query = request.query();
                         request.toWebSocket().onSuccess(socket -> socket.textMessageHandler(
@@ -73,10 +90,10 @@ class ElbV2WebSocketIntegrationTest {
                 .toCompletableFuture()
                 .get(2, TimeUnit.SECONDS);
         client = vertx.createHttpClient();
-        loadBalancerArn = createLoadBalancer();
+        loadBalancerArn = createLoadBalancer("websocket-lb");
         targetGroupArn = createTargetGroup("websocket-tg", "ip", backend.actualPort());
         registerTarget(targetGroupArn, "127.0.0.1", backend.actualPort());
-        listenerArn = createListener(loadBalancerArn, targetGroupArn);
+        listenerArn = createListener(loadBalancerArn, targetGroupArn, LISTENER_PORT);
         await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> given()
                 .baseUri("http://127.0.0.1")
                 .port(LISTENER_PORT)
@@ -137,6 +154,11 @@ class ElbV2WebSocketIntegrationTest {
 
         UpgradeRejectedException rejected = assertInstanceOf(UpgradeRejectedException.class, failure.getCause());
         assertEquals(404, rejected.getStatus());
+        assertEquals(List.of("a=1; Path=/", "b=2; Path=/", "c=3; Path=/"),
+                rejected.getHeaders().getAll("Set-Cookie"));
+        assertEquals(List.of("one", "two"), rejected.getHeaders().getAll("X-Multi"));
+        assertEquals(List.of(), rejected.getHeaders().getAll("Keep-Alive"));
+        assertEquals("upgrade refused", rejected.getBody().toString());
     }
 
     @Test
@@ -228,19 +250,6 @@ class ElbV2WebSocketIntegrationTest {
         return targetGroupArn;
     }
 
-    private static void forwardDefaultActionTo(String listenerArn, String targetGroupArn) {
-        given()
-                .formParam("Action", "ModifyListener")
-                .formParam("ListenerArn", listenerArn)
-                .formParam("DefaultActions.member.1.Type", "forward")
-                .formParam("DefaultActions.member.1.TargetGroupArn", targetGroupArn)
-                .header("Authorization", AUTH)
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200);
-    }
-
     private WebSocket connect(String uri) throws Exception {
         return client.webSocket(new WebSocketConnectOptions()
                         .setHost("127.0.0.1")
@@ -249,74 +258,6 @@ class ElbV2WebSocketIntegrationTest {
                 .toCompletionStage()
                 .toCompletableFuture()
                 .get(5, TimeUnit.SECONDS);
-    }
-
-    private static String exchange(WebSocket socket, String text) throws Exception {
-        CompletableFuture<String> reply = new CompletableFuture<>();
-        socket.textMessageHandler(reply::complete);
-        socket.writeTextMessage(text);
-        return reply.get(5, TimeUnit.SECONDS);
-    }
-
-    private static String createLoadBalancer() {
-        return given()
-                .formParam("Action", "CreateLoadBalancer")
-                .formParam("Name", "websocket-lb")
-                .formParam("Type", "application")
-                .header("Authorization", AUTH)
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract()
-                .path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn");
-    }
-
-    private static String createTargetGroup(String name, String targetType, int backendPort) {
-        return given()
-                .formParam("Action", "CreateTargetGroup")
-                .formParam("Name", name)
-                .formParam("Protocol", "HTTP")
-                .formParam("Port", backendPort)
-                .formParam("TargetType", targetType)
-                .formParam("HealthCheckEnabled", "false")
-                .header("Authorization", AUTH)
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract()
-                .path("CreateTargetGroupResponse.CreateTargetGroupResult.TargetGroups.member.TargetGroupArn");
-    }
-
-    private static void registerTarget(String targetGroupArn, String targetId, int backendPort) {
-        given()
-                .formParam("Action", "RegisterTargets")
-                .formParam("TargetGroupArn", targetGroupArn)
-                .formParam("Targets.member.1.Id", targetId)
-                .formParam("Targets.member.1.Port", backendPort)
-                .header("Authorization", AUTH)
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200);
-    }
-
-    private static String createListener(String loadBalancerArn, String targetGroupArn) {
-        return given()
-                .formParam("Action", "CreateListener")
-                .formParam("LoadBalancerArn", loadBalancerArn)
-                .formParam("Protocol", "HTTP")
-                .formParam("Port", LISTENER_PORT)
-                .formParam("DefaultActions.member.1.Type", "forward")
-                .formParam("DefaultActions.member.1.TargetGroupArn", targetGroupArn)
-                .header("Authorization", AUTH)
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract()
-                .path("CreateListenerResponse.CreateListenerResult.Listeners.member.ListenerArn");
     }
 
     private static void setIdleTimeout(String loadBalancerArn, int seconds) {
@@ -332,42 +273,4 @@ class ElbV2WebSocketIntegrationTest {
                 .statusCode(200);
     }
 
-    private static void deleteListener(String listenerArn) {
-        if (listenerArn != null) {
-            given()
-                    .formParam("Action", "DeleteListener")
-                    .formParam("ListenerArn", listenerArn)
-                    .header("Authorization", AUTH)
-                .when()
-                    .post("/")
-                .then()
-                    .statusCode(anyOf(equalTo(200), equalTo(204)));
-        }
-    }
-
-    private static void deleteTargetGroup(String targetGroupArn) {
-        if (targetGroupArn != null) {
-            given()
-                    .formParam("Action", "DeleteTargetGroup")
-                    .formParam("TargetGroupArn", targetGroupArn)
-                    .header("Authorization", AUTH)
-                .when()
-                    .post("/")
-                .then()
-                    .statusCode(anyOf(equalTo(200), equalTo(204)));
-        }
-    }
-
-    private static void deleteLoadBalancer(String loadBalancerArn) {
-        if (loadBalancerArn != null) {
-            given()
-                    .formParam("Action", "DeleteLoadBalancer")
-                    .formParam("LoadBalancerArn", loadBalancerArn)
-                    .header("Authorization", AUTH)
-                .when()
-                    .post("/")
-                .then()
-                    .statusCode(anyOf(equalTo(200), equalTo(204)));
-        }
-    }
 }

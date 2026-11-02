@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.iot.model.IotCertificate;
 import io.github.hectorvent.floci.services.iot.model.IotJob;
@@ -112,21 +113,31 @@ public class IotController {
     public Response updateThing(@PathParam("thingName") String thingName,
                                 @Context HttpHeaders headers,
                                 String body) {
-        String region = regionResolver.resolveRegion(headers);
-        Thing thing = iotService.updateThing(thingName, parseAttributes(body), parseExpectedVersion(body), region);
-        ObjectNode response = objectMapper.createObjectNode();
-        response.put("thingName", thing.getThingName());
-        response.put("thingArn", thing.getThingArn());
-        response.put("version", thing.getVersion());
-        return Response.ok(response).build();
+        try {
+            JsonNode request = objectMapper.readTree(body == null || body.isBlank() ? "{}" : body);
+            JsonNode payload = request.path("attributePayload");
+            Map<String, String> attributes = payload.path("attributes").isObject() ? parseAttributes(body) : null;
+            Long expectedVersion = request.hasNonNull("expectedVersion") ? request.path("expectedVersion").asLong() : null;
+            Thing thing = iotService.updateThing(thingName, attributes, payload.path("merge").asBoolean(),
+                    request.path("thingTypeName").asText(null), request.path("removeThingType").asBoolean(),
+                    expectedVersion, regionResolver.resolveRegion(headers));
+            ObjectNode response = objectMapper.createObjectNode();
+            response.put("thingName", thing.getThingName());
+            response.put("thingArn", thing.getThingArn());
+            response.put("version", thing.getVersion());
+            return Response.ok(response).build();
+        } catch (JsonProcessingException e) {
+            throw new AwsException("InvalidRequestException", e.getMessage(), 400);
+        }
     }
 
     @DELETE
     @Path("/things/{thingName}")
     public Response deleteThing(@PathParam("thingName") String thingName,
+                                @QueryParam("expectedVersion") Long expectedVersion,
                                 @Context HttpHeaders headers) {
         String region = regionResolver.resolveRegion(headers);
-        iotService.deleteThing(thingName, region);
+        iotService.deleteThing(thingName, expectedVersion, region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -179,6 +190,23 @@ public class IotController {
         }
     }
 
+    @POST
+    @Path("/certificate/register-no-ca")
+    public Response registerCertificateWithoutCa(@Context HttpHeaders headers, String body) {
+        try {
+            JsonNode request = objectMapper.readTree(body == null || body.isBlank() ? "{}" : body);
+            IotCertificate certificate = iotService.registerCertificateWithoutCa(
+                    request.path("certificatePem").asText(null), request.path("status").asText(null),
+                    regionResolver.resolveRegion(headers));
+            ObjectNode response = objectMapper.createObjectNode();
+            response.put("certificateArn", certificate.getCertificateArn());
+            response.put("certificateId", certificate.getCertificateId());
+            return Response.ok(response).build();
+        } catch (JsonProcessingException e) {
+            throw new AwsException("InvalidRequestException", e.getMessage(), 400);
+        }
+    }
+
     @GET
     @Path("/certificates/{certificateId}")
     public Response describeCertificate(@Context HttpHeaders headers,
@@ -199,6 +227,7 @@ public class IotController {
             item.put("certificateArn", certificate.getCertificateArn());
             item.put("certificateId", certificate.getCertificateId());
             item.put("status", certificate.getStatus());
+            item.put("certificateMode", certificateMode(certificate));
             putEpoch(item, "creationDate", certificate.getCreationDate());
         }
         return Response.ok(response).build();
@@ -447,6 +476,30 @@ public class IotController {
         ArrayNode things = response.putArray("things");
         iotService.listPrincipalThings(principalHeader != null ? principalHeader : principal, regionResolver.resolveRegion(headers)).forEach(things::add);
         return Response.ok(response).build();
+    }
+
+    @GET
+    @Path("/things/{thingName}/principals-v2")
+    public Response listThingPrincipalsV2(@Context HttpHeaders headers,
+                                          @PathParam("thingName") String thingName,
+                                          @QueryParam("thingPrincipalType") String thingPrincipalType,
+                                          @QueryParam("maxResults") Integer maxResults,
+                                          @QueryParam("nextToken") String nextToken) {
+        return Response.ok(buildThingPrincipalPage(iotService.listThingPrincipalsV2(
+                thingName, thingPrincipalType, regionResolver.resolveRegion(headers), maxResults, nextToken),
+                "thingPrincipalObjects", "principal")).build();
+    }
+
+    @GET
+    @Path("/principals/things-v2")
+    public Response listPrincipalThingsV2(@Context HttpHeaders headers,
+                                          @HeaderParam("x-amzn-principal") String principal,
+                                          @QueryParam("thingPrincipalType") String thingPrincipalType,
+                                          @QueryParam("maxResults") Integer maxResults,
+                                          @QueryParam("nextToken") String nextToken) {
+        return Response.ok(buildThingPrincipalPage(iotService.listPrincipalThingsV2(
+                principal, thingPrincipalType, regionResolver.resolveRegion(headers), maxResults, nextToken),
+                "principalThingObjects", "thingName")).build();
     }
 
     @POST
@@ -853,15 +906,6 @@ public class IotController {
         }
     }
 
-    private Long parseExpectedVersion(String body) {
-        try {
-            JsonNode request = objectMapper.readTree(body == null || body.isBlank() ? "{}" : body);
-            return request.hasNonNull("expectedVersion") ? request.path("expectedVersion").asLong() : null;
-        } catch (JsonProcessingException e) {
-            throw new AwsException("InvalidRequestException", e.getMessage(), 400);
-        }
-    }
-
     private String parseThingTypeName(String body) {
         try {
             JsonNode request = objectMapper.readTree(body == null || body.isBlank() ? "{}" : body);
@@ -939,13 +983,32 @@ public class IotController {
         return response;
     }
 
+    private ObjectNode buildThingPrincipalPage(IotService.Page<String> page, String arrayName, String itemField) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode objects = response.putArray(arrayName);
+        for (String item : page.items()) {
+            objects.addObject()
+                    .put(itemField, item)
+                    .put("thingPrincipalType", IotService.NON_EXCLUSIVE_THING);
+        }
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
+        }
+        return response;
+    }
+
+    /** Records stored before the mode was kept are {@code DEFAULT}, as every certificate then was. */
+    private static String certificateMode(IotCertificate certificate) {
+        return certificate.getCertificateMode() != null ? certificate.getCertificateMode() : "DEFAULT";
+    }
+
     private ObjectNode buildCertificateDescription(IotCertificate certificate) {
         ObjectNode description = objectMapper.createObjectNode();
         description.put("certificateArn", certificate.getCertificateArn());
         description.put("certificateId", certificate.getCertificateId());
         description.put("certificatePem", certificate.getCertificatePem());
         description.put("status", certificate.getStatus());
-        description.put("certificateMode", "DEFAULT");
+        description.put("certificateMode", certificateMode(certificate));
         putEpoch(description, "creationDate", certificate.getCreationDate());
         if (certificate.getNotBefore() != null && certificate.getNotAfter() != null) {
             ObjectNode validity = description.putObject("validity");
@@ -1162,7 +1225,7 @@ public class IotController {
 
     private void putEpoch(ObjectNode node, String field, Instant instant) {
         if (instant != null) {
-            node.put(field, instant.toEpochMilli() / 1000.0);
+            node.put(field, EpochSeconds.fromInstant(instant));
         }
     }
 

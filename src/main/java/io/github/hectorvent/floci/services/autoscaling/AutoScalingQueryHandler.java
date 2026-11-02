@@ -3,8 +3,11 @@ package io.github.hectorvent.floci.services.autoscaling;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.autoscaling.model.*;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -55,6 +58,9 @@ public class AutoScalingQueryHandler {
                 case "DescribeInstanceRefreshes"    -> handleDescribeInstanceRefreshes(p, region);
                 case "CreateOrUpdateTags"           -> handleCreateOrUpdateTags(p, region);
                 case "DeleteTags"                   -> handleDeleteTags(p, region);
+                case "DescribeTags"                 -> handleDescribeTags(p, region);
+                case "EnableMetricsCollection"      -> handleEnableMetricsCollection(p, region);
+                case "DisableMetricsCollection"     -> handleDisableMetricsCollection(p, region);
                 // Instances
                 case "DescribeAutoScalingInstances" -> handleDescribeAutoScalingInstances(p, region);
                 case "SetInstanceProtection"        -> handleSetInstanceProtection(p, region);
@@ -62,6 +68,8 @@ public class AutoScalingQueryHandler {
                 case "AttachInstances"              -> handleAttachInstances(p, region);
                 case "DetachInstances"              -> handleDetachInstances(p, region);
                 case "TerminateInstanceInAutoScalingGroup" -> handleTerminateInstance(p, region);
+                case "EnterStandby"                 -> handleEnterStandby(p, region);
+                case "ExitStandby"                  -> handleExitStandby(p, region);
                 // Load balancer attachment
                 case "AttachLoadBalancerTargetGroups"    -> handleAttachLoadBalancerTargetGroups(p, region);
                 case "DetachLoadBalancerTargetGroups"    -> handleDetachLoadBalancerTargetGroups(p, region);
@@ -119,13 +127,31 @@ public class AutoScalingQueryHandler {
                 p.getFirst("IamInstanceProfile"),
                 nullableBoolParam(p, "AssociatePublicIpAddress"),
                 nullableBoolParam(p, "InstanceMonitoring.Enabled"),
-                parseLaunchConfigurationBlockDeviceMappings(p));
+                parseLaunchConfigurationBlockDeviceMappings(p), parseMetadataOptions(p));
         String xml = new XmlBuilder()
                 .start("CreateLaunchConfigurationResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
                 .end("CreateLaunchConfigurationResponse")
                 .build();
         return ok(xml);
+    }
+
+    private static LaunchTemplateData.MetadataOptions parseMetadataOptions(MultivaluedMap<String, String> p) {
+        if (p.keySet().stream().noneMatch(name -> name.startsWith("MetadataOptions."))) {
+            return null;
+        }
+        LaunchTemplateData.MetadataOptions options = new LaunchTemplateData.MetadataOptions();
+        options.setHttpTokens(p.getFirst("MetadataOptions.HttpTokens"));
+        options.setHttpEndpoint(p.getFirst("MetadataOptions.HttpEndpoint"));
+        String hopLimit = p.getFirst("MetadataOptions.HttpPutResponseHopLimit");
+        if (hopLimit != null) {
+            try {
+                options.setHttpPutResponseHopLimit(Integer.valueOf(hopLimit));
+            } catch (NumberFormatException invalid) {
+                throw new AwsException("MalformedInput", "HttpPutResponseHopLimit must be an integer.", 400);
+            }
+        }
+        return options;
     }
 
     private Response handleDescribeLaunchConfigurations(MultivaluedMap<String, String> p, String region) {
@@ -159,6 +185,15 @@ public class AutoScalingQueryHandler {
                .elem("Enabled", String.valueOf(
                        lc.getInstanceMonitoringEnabled() != null ? lc.getInstanceMonitoringEnabled() : Boolean.TRUE))
                .end("InstanceMonitoring");
+            if (lc.getMetadataOptions() != null) {
+                LaunchTemplateData.MetadataOptions metadata = LaunchTemplateData.MetadataOptions.merge(
+                        LaunchTemplateData.MetadataOptions.launchDefaults(), lc.getMetadataOptions());
+                xml.start("MetadataOptions")
+                   .elem("HttpTokens", metadata.getHttpTokens())
+                   .elem("HttpEndpoint", metadata.getHttpEndpoint())
+                   .elem("HttpPutResponseHopLimit", String.valueOf(metadata.getHttpPutResponseHopLimit()))
+                   .end("MetadataOptions");
+            }
             writeLaunchConfigurationBlockDeviceMappings(xml, lc.getBlockDeviceMappings());
             xml.end("member");
         }
@@ -287,6 +322,13 @@ public class AutoScalingQueryHandler {
         if (asg.getDefaultInstanceWarmup() != null) {
             xml.elem("DefaultInstanceWarmup", String.valueOf(asg.getDefaultInstanceWarmup()));
         }
+        if (asg.getServiceLinkedRoleArn() != null) {
+            xml.elem("ServiceLinkedRoleARN", asg.getServiceLinkedRoleArn());
+        }
+        appendInstanceMaintenancePolicyXml(xml, asg.getInstanceMaintenancePolicy());
+        appendAvailabilityZoneDistributionXml(xml, asg.getAvailabilityZoneDistribution());
+        appendCapacityReservationSpecificationXml(xml, asg.getCapacityReservationSpecification());
+        appendEnabledMetricsXml(xml, asg.getEnabledMetrics());
         if (asg.getLaunchConfigurationName() != null) {
             xml.elem("LaunchConfigurationName", asg.getLaunchConfigurationName());
         }
@@ -331,8 +373,14 @@ public class AutoScalingQueryHandler {
         xml.end("TerminationPolicies");
 
         xml.start("SuspendedProcesses");
-        for (String sp : asg.getSuspendedProcesses()) {
-            xml.start("member").elem("ProcessName", sp).end("member");
+        AutoScalingGroup.SuspensionState suspension = asg.suspensionState();
+        for (String sp : suspension.processes()) {
+            xml.start("member").elem("ProcessName", sp);
+            Instant suspendedAt = suspension.times().get(sp);
+            if (suspendedAt != null) {
+                xml.elem("SuspensionReason", "User suspended at " + suspendedAt);
+            }
+            xml.end("member");
         }
         xml.end("SuspendedProcesses");
 
@@ -482,6 +530,67 @@ public class AutoScalingQueryHandler {
                 .end("CreateOrUpdateTagsResponse").build());
     }
 
+    private Response handleDescribeTags(MultivaluedMap<String, String> p, String region) {
+        List<Map.Entry<String, List<String>>> filters = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String prefix = "Filters.member." + i;
+            String name = p.getFirst(prefix + ".Name");
+            boolean hasValues = p.containsKey(prefix + ".Values") || p.containsKey(prefix + ".Values.member.1");
+            if (name == null && !hasValues) { break; }
+            filters.add(new AbstractMap.SimpleImmutableEntry<>(name,
+                    hasValues ? memberList(p, prefix + ".Values") : null));
+        }
+        String maxRecords = p.getFirst("MaxRecords");
+        Integer limit = null;
+        if (maxRecords != null) {
+            try {
+                limit = Integer.parseInt(maxRecords);
+            } catch (NumberFormatException e) {
+                throw new AwsException("MalformedInput", "MaxRecords '" + maxRecords + "' is not a valid integer.", 400);
+            }
+        }
+        PaginatedResult<AutoScalingService.TagDescription> page = service.describeTags(region, filters,
+                limit, p.getFirst("NextToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeTagsResponse", NS)
+                  .start("DescribeTagsResult")
+                    .start("Tags");
+        for (AutoScalingService.TagDescription tag : page.items()) {
+            xml.start("member")
+               .elem("ResourceId", tag.resourceId())
+               .elem("ResourceType", "auto-scaling-group")
+               .elem("Key", tag.key())
+               .elem("Value", tag.value())
+               .elem("PropagateAtLaunch", String.valueOf(tag.propagateAtLaunch()))
+               .end("member");
+        }
+        xml.end("Tags");
+        if (page.nextToken() != null) {
+            xml.elem("NextToken", page.nextToken());
+        }
+        xml.end("DescribeTagsResult")
+           .raw(AwsQueryResponse.responseMetadata())
+           .end("DescribeTagsResponse");
+        return ok(xml.build());
+    }
+
+    private Response handleEnableMetricsCollection(MultivaluedMap<String, String> p, String region) {
+        service.enableMetricsCollection(region, p.getFirst("AutoScalingGroupName"),
+                memberList(p, "Metrics"), p.getFirst("Granularity"));
+        return ok(new XmlBuilder()
+                .start("EnableMetricsCollectionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("EnableMetricsCollectionResponse").build());
+    }
+
+    private Response handleDisableMetricsCollection(MultivaluedMap<String, String> p, String region) {
+        service.disableMetricsCollection(region, p.getFirst("AutoScalingGroupName"), memberList(p, "Metrics"));
+        return ok(new XmlBuilder()
+                .start("DisableMetricsCollectionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DisableMetricsCollectionResponse").build());
+    }
+
     private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
         for (TagRequest tag : parseTagRequests(p)) {
             service.deleteTags(region, tag.resourceId(), tag.resourceType(), List.of(tag.key()));
@@ -495,18 +604,23 @@ public class AutoScalingQueryHandler {
     // ── Instances ─────────────────────────────────────────────────────────────
 
     private Response handleDescribeAutoScalingInstances(MultivaluedMap<String, String> p, String region) {
-        List<AsgInstance> instances = service.describeAutoScalingInstances(
+        List<AutoScalingService.AutoScalingInstanceDetails> instances = service.describeAutoScalingInstances(
                 region, memberList(p, "InstanceIds"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeAutoScalingInstancesResponse", NS)
                   .start("DescribeAutoScalingInstancesResult")
                     .start("AutoScalingInstances");
-        for (AsgInstance inst : instances) {
+        for (AutoScalingService.AutoScalingInstanceDetails details : instances) {
+            AsgInstance inst = details.instance();
+            // AWS's samples of this API spell health HEALTHY, and UNHEALTHY follows the same rule.
+            // DescribeAutoScalingGroups and SetInstanceHealth use the stored Healthy and Unhealthy.
+            String healthStatus = inst.getHealthStatus() == null ? null : inst.getHealthStatus().toUpperCase(Locale.ROOT);
             xml.start("member")
                .elem("InstanceId", inst.getInstanceId())
+               .elem("AutoScalingGroupName", details.autoScalingGroupName())
                .elem("AvailabilityZone", inst.getAvailabilityZone())
                .elem("LifecycleState", inst.getLifecycleState())
-               .elem("HealthStatus", inst.getHealthStatus())
+               .elem("HealthStatus", healthStatus)
                .elem("ProtectedFromScaleIn", String.valueOf(inst.isProtectedFromScaleIn()));
             if (inst.getLaunchConfigurationName() != null) {
                 xml.elem("LaunchConfigurationName", inst.getLaunchConfigurationName());
@@ -524,7 +638,7 @@ public class AutoScalingQueryHandler {
 
     private Response handleSetInstanceProtection(MultivaluedMap<String, String> p, String region) {
         String groupName = p.getFirst("AutoScalingGroupName");
-        List<String> instanceIds = memberList(p, "InstanceIds");
+        List<String> instanceIds = indexedMembers(p, "InstanceIds");
         boolean protectedFromScaleIn = requiredBoolParam(p, "ProtectedFromScaleIn");
         service.setInstanceProtection(region, groupName, instanceIds, protectedFromScaleIn);
         return ok(new XmlBuilder()
@@ -565,6 +679,74 @@ public class AutoScalingQueryHandler {
         xml.end("LaunchTemplate");
     }
 
+    private static void appendInstanceMaintenancePolicyXml(XmlBuilder xml, InstanceMaintenancePolicy policy) {
+        if (policy == null) {
+            return;
+        }
+        xml.start("InstanceMaintenancePolicy");
+        if (policy.getMinHealthyPercentage() != null) {
+            xml.elem("MinHealthyPercentage", String.valueOf(policy.getMinHealthyPercentage()));
+        }
+        if (policy.getMaxHealthyPercentage() != null) {
+            xml.elem("MaxHealthyPercentage", String.valueOf(policy.getMaxHealthyPercentage()));
+        }
+        xml.end("InstanceMaintenancePolicy");
+    }
+
+    private static void appendAvailabilityZoneDistributionXml(XmlBuilder xml,
+                                                              AvailabilityZoneDistribution distribution) {
+        if (distribution == null || distribution.getCapacityDistributionStrategy() == null) {
+            return;
+        }
+        xml.start("AvailabilityZoneDistribution")
+           .elem("CapacityDistributionStrategy", distribution.getCapacityDistributionStrategy())
+           .end("AvailabilityZoneDistribution");
+    }
+
+    private static void appendCapacityReservationSpecificationXml(XmlBuilder xml,
+                                                                  CapacityReservationSpecification specification) {
+        if (specification == null) {
+            return;
+        }
+        xml.start("CapacityReservationSpecification");
+        if (specification.getCapacityReservationPreference() != null) {
+            xml.elem("CapacityReservationPreference", specification.getCapacityReservationPreference());
+        }
+        if (specification.hasTarget()) {
+            xml.start("CapacityReservationTarget");
+            if (!specification.getCapacityReservationIds().isEmpty()) {
+                xml.start("CapacityReservationIds");
+                for (String id : specification.getCapacityReservationIds()) {
+                    xml.elem("member", id);
+                }
+                xml.end("CapacityReservationIds");
+            }
+            if (!specification.getCapacityReservationResourceGroupArns().isEmpty()) {
+                xml.start("CapacityReservationResourceGroupArns");
+                for (String arn : specification.getCapacityReservationResourceGroupArns()) {
+                    xml.elem("member", arn);
+                }
+                xml.end("CapacityReservationResourceGroupArns");
+            }
+            xml.end("CapacityReservationTarget");
+        }
+        xml.end("CapacityReservationSpecification");
+    }
+
+    private static void appendEnabledMetricsXml(XmlBuilder xml, List<String> enabledMetrics) {
+        if (enabledMetrics == null || enabledMetrics.isEmpty()) {
+            return;
+        }
+        xml.start("EnabledMetrics");
+        for (String metric : enabledMetrics) {
+            xml.start("member")
+               .elem("Metric", metric)
+               .elem("Granularity", AutoScalingService.METRICS_GRANULARITY)
+               .end("member");
+        }
+        xml.end("EnabledMetrics");
+    }
+
     private static void appendMixedInstancesPolicyXml(XmlBuilder xml, MixedInstancesPolicy policy) {
         if (policy == null) {
             return;
@@ -580,6 +762,9 @@ public class AutoScalingQueryHandler {
                     xml.start("member");
                     if (override.getInstanceType() != null) {
                         xml.elem("InstanceType", override.getInstanceType());
+                    }
+                    if (override.getWeightedCapacity() != null) {
+                        xml.elem("WeightedCapacity", override.getWeightedCapacity());
                     }
                     appendInstanceRequirementsXml(xml, override.getInstanceRequirements());
                     xml.end("member");
@@ -708,7 +893,7 @@ public class AutoScalingQueryHandler {
     }
 
     private Response handleAttachInstances(MultivaluedMap<String, String> p, String region) {
-        service.attachInstances(region, p.getFirst("AutoScalingGroupName"), memberList(p, "InstanceIds"));
+        service.attachInstances(region, p.getFirst("AutoScalingGroupName"), indexedMembers(p, "InstanceIds"));
         return ok(new XmlBuilder()
                 .start("AttachInstancesResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
@@ -717,7 +902,7 @@ public class AutoScalingQueryHandler {
 
     private Response handleDetachInstances(MultivaluedMap<String, String> p, String region) {
         service.detachInstances(region, p.getFirst("AutoScalingGroupName"),
-                memberList(p, "InstanceIds"),
+                indexedMembers(p, "InstanceIds"),
                 "true".equalsIgnoreCase(p.getFirst("ShouldDecrementDesiredCapacity")));
         return ok(new XmlBuilder()
                 .start("DetachInstancesResponse", NS)
@@ -738,6 +923,49 @@ public class AutoScalingQueryHandler {
                   .end("TerminateInstanceInAutoScalingGroupResult")
                   .raw(AwsQueryResponse.responseMetadata())
                 .end("TerminateInstanceInAutoScalingGroupResponse").build());
+    }
+
+    private Response handleEnterStandby(MultivaluedMap<String, String> p, String region) {
+        String groupName = p.getFirst("AutoScalingGroupName");
+        String decrement = p.getFirst("ShouldDecrementDesiredCapacity");
+        List<String> missing = new ArrayList<>();
+        if (groupName == null) {
+            missing.add(SmithyValidationErrors.notNull("autoScalingGroupName"));
+        }
+        if (decrement == null || decrement.isBlank()) {
+            missing.add(SmithyValidationErrors.notNull("shouldDecrementDesiredCapacity"));
+        }
+        if (!missing.isEmpty()) {
+            throw SmithyValidationErrors.validationError(missing);
+        }
+        boolean shouldDecrement = requiredBoolParam(p, "ShouldDecrementDesiredCapacity",
+                "shouldDecrementDesiredCapacity");
+        return ok(activitiesResponse("EnterStandby",
+                service.enterStandby(region, groupName, indexedMembers(p, "InstanceIds"), shouldDecrement)));
+    }
+
+    private Response handleExitStandby(MultivaluedMap<String, String> p, String region) {
+        String groupName = p.getFirst("AutoScalingGroupName");
+        if (groupName == null) {
+            throw SmithyValidationErrors.validationError(SmithyValidationErrors.notNull("autoScalingGroupName"));
+        }
+        return ok(activitiesResponse("ExitStandby",
+                service.exitStandby(region, groupName, indexedMembers(p, "InstanceIds"))));
+    }
+
+    private static String activitiesResponse(String action, List<ScalingActivity> activities) {
+        XmlBuilder xml = new XmlBuilder()
+                .start(action + "Response", NS)
+                  .start(action + "Result")
+                    .start("Activities");
+        for (ScalingActivity activity : activities) {
+            appendActivityXml(xml, activity);
+        }
+        xml.end("Activities")
+           .end(action + "Result")
+           .raw(AwsQueryResponse.responseMetadata())
+           .end(action + "Response");
+        return xml.build();
     }
 
     // ── Load balancer attachment ───────────────────────────────────────────────
@@ -1189,23 +1417,27 @@ public class AutoScalingQueryHandler {
                   .start("DescribeScalingActivitiesResult")
                     .start("Activities");
         for (ScalingActivity a : activities) {
-            xml.start("member")
-               .elem("ActivityId", a.getActivityId())
-               .elem("AutoScalingGroupName", a.getAutoScalingGroupName())
-               .elem("StatusCode", a.getStatusCode())
-               .elem("Progress", String.valueOf(a.getProgress()))
-               .elem("StartTime", ISO_FMT.format(a.getStartTime()));
-            if (a.getDescription() != null) { xml.elem("Description", a.getDescription()); }
-            if (a.getCause() != null) { xml.elem("Cause", a.getCause()); }
-            if (a.getEndTime() != null) { xml.elem("EndTime", ISO_FMT.format(a.getEndTime())); }
-            if (a.getStatusMessage() != null) { xml.elem("StatusMessage", a.getStatusMessage()); }
-            xml.end("member");
+            appendActivityXml(xml, a);
         }
         xml.end("Activities")
            .end("DescribeScalingActivitiesResult")
            .raw(AwsQueryResponse.responseMetadata())
            .end("DescribeScalingActivitiesResponse");
         return ok(xml.build());
+    }
+
+    private static void appendActivityXml(XmlBuilder xml, ScalingActivity a) {
+        xml.start("member")
+           .elem("ActivityId", a.getActivityId())
+           .elem("AutoScalingGroupName", a.getAutoScalingGroupName())
+           .elem("StatusCode", a.getStatusCode())
+           .elem("Progress", String.valueOf(a.getProgress()))
+           .elem("StartTime", ISO_FMT.format(a.getStartTime()));
+        if (a.getDescription() != null) { xml.elem("Description", a.getDescription()); }
+        if (a.getCause() != null) { xml.elem("Cause", a.getCause()); }
+        if (a.getEndTime() != null) { xml.elem("EndTime", ISO_FMT.format(a.getEndTime())); }
+        if (a.getStatusMessage() != null) { xml.elem("StatusMessage", a.getStatusMessage()); }
+        xml.end("member");
     }
 
     // ── Metadata responses ────────────────────────────────────────────────────
@@ -1386,6 +1618,7 @@ public class AutoScalingQueryHandler {
             MixedInstancesPolicy.LaunchTemplateOverride override =
                     new MixedInstancesPolicy.LaunchTemplateOverride();
             override.setInstanceType(p.getFirst(prefix + ".InstanceType"));
+            override.setWeightedCapacity(p.getFirst(prefix + ".WeightedCapacity"));
             override.setInstanceRequirements(parseInstanceRequirements(p, prefix + ".InstanceRequirements"));
             result.add(override);
         }
@@ -1455,7 +1688,53 @@ public class AutoScalingQueryHandler {
                 p.getFirst("DesiredCapacityType"),
                 nullableBoolParam(p, "CapacityRebalance"),
                 parseOptionalInt(p.getFirst("MaxInstanceLifetime"), "MaxInstanceLifetime"),
-                parseOptionalInt(p.getFirst("DefaultInstanceWarmup"), "DefaultInstanceWarmup"));
+                parseOptionalInt(p.getFirst("DefaultInstanceWarmup"), "DefaultInstanceWarmup"),
+                p.getFirst("ServiceLinkedRoleARN"),
+                parseInstanceMaintenancePolicy(p),
+                parseAvailabilityZoneDistribution(p),
+                parseCapacityReservationSpecification(p));
+    }
+
+    private InstanceMaintenancePolicy parseInstanceMaintenancePolicy(MultivaluedMap<String, String> p) {
+        if (!hasAnyPrefix(p, "InstanceMaintenancePolicy.")) {
+            return null;
+        }
+        return new InstanceMaintenancePolicy(
+                parseOptionalInt(p.getFirst("InstanceMaintenancePolicy.MinHealthyPercentage"),
+                        "InstanceMaintenancePolicy.MinHealthyPercentage"),
+                parseOptionalInt(p.getFirst("InstanceMaintenancePolicy.MaxHealthyPercentage"),
+                        "InstanceMaintenancePolicy.MaxHealthyPercentage"));
+    }
+
+    private AvailabilityZoneDistribution parseAvailabilityZoneDistribution(MultivaluedMap<String, String> p) {
+        String strategy = p.getFirst("AvailabilityZoneDistribution.CapacityDistributionStrategy");
+        return strategy != null ? new AvailabilityZoneDistribution(strategy) : null;
+    }
+
+    private CapacityReservationSpecification parseCapacityReservationSpecification(
+            MultivaluedMap<String, String> p) {
+        String prefix = "CapacityReservationSpecification.";
+        if (!hasAnyPrefix(p, prefix)) {
+            return null;
+        }
+        CapacityReservationSpecification specification = new CapacityReservationSpecification();
+        specification.setCapacityReservationPreference(p.getFirst(prefix + "CapacityReservationPreference"));
+        specification.setCapacityReservationIds(
+                indexedMembers(p, prefix + "CapacityReservationTarget.CapacityReservationIds"));
+        specification.setCapacityReservationResourceGroupArns(
+                indexedMembers(p, prefix + "CapacityReservationTarget.CapacityReservationResourceGroupArns"));
+        return specification;
+    }
+
+    private List<String> indexedMembers(MultivaluedMap<String, String> params, String prefix) {
+        String memberPrefix = prefix + ".member.";
+        return params.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(memberPrefix))
+                .filter(entry -> entry.getKey().substring(memberPrefix.length()).matches("[1-9][0-9]*"))
+                .sorted(Comparator.comparingInt((Map.Entry<String, List<String>> entry) -> entry.getKey().length())
+                        .thenComparing(Map.Entry::getKey))
+                .flatMap(entry -> entry.getValue().stream())
+                .toList();
     }
 
     private ParsedTags parseTags(MultivaluedMap<String, String> p) {
@@ -1778,9 +2057,8 @@ public class AutoScalingQueryHandler {
                 break;
             }
             if (deviceName == null || deviceName.isBlank()) {
-                throw new AwsException("ValidationError",
-                        "1 validation error detected: Value null at '" + prefix
-                                + ".DeviceName' failed to satisfy constraint: Member must not be null", 400);
+                throw SmithyValidationErrors.validationError(
+                        SmithyValidationErrors.notNull(prefix + ".DeviceName"));
             }
             LaunchConfigurationBlockDeviceMapping mapping = new LaunchConfigurationBlockDeviceMapping();
             mapping.setDeviceName(deviceName);
@@ -1854,16 +2132,20 @@ public class AutoScalingQueryHandler {
 
     /** A required boolean member must be present and exactly "true"/"false" — never silently coerced to false. */
     private boolean requiredBoolParam(MultivaluedMap<String, String> p, String key) {
+        return requiredBoolParam(p, key, key);
+    }
+
+    /** As {@link #requiredBoolParam(MultivaluedMap, String)}, naming the member {@code path} in the error. */
+    private boolean requiredBoolParam(MultivaluedMap<String, String> p, String key, String path) {
         String val = p.getFirst(key);
         if (val == null || val.isBlank()) {
-            throw new AwsException("ValidationError",
-                    "1 validation error detected: Value null at '" + key
-                            + "' failed to satisfy constraint: Member must not be null", 400);
+            throw SmithyValidationErrors.validationError(
+                    SmithyValidationErrors.notNull(path));
         }
         if (!"true".equalsIgnoreCase(val) && !"false".equalsIgnoreCase(val)) {
-            throw new AwsException("ValidationError",
-                    "1 validation error detected: Value '" + val + "' at '" + key
-                            + "' failed to satisfy constraint: Member must be a valid boolean", 400);
+            throw SmithyValidationErrors.validationError(
+                    "Value '" + val + "' at '" + path
+                            + "' failed to satisfy constraint: Member must be a valid boolean");
         }
         return parseOptionalBoolean(val, key);
     }

@@ -1,5 +1,9 @@
 package io.github.hectorvent.floci.services.ecs;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.services.ecs.model.Attribute;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.CapacityProvider;
@@ -39,9 +43,6 @@ import io.github.hectorvent.floci.services.ecs.model.TaskOverride;
 import io.github.hectorvent.floci.services.ecs.model.TaskSet;
 import io.github.hectorvent.floci.services.ecs.model.Volume;
 import io.github.hectorvent.floci.services.ecs.model.VolumeFrom;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -300,7 +301,7 @@ public class EcsResponseWriter {
                 ObjectNode mpNode = objectMapper.createObjectNode();
                 mpNode.put("sourceVolume", mp.sourceVolume());
                 mpNode.put("containerPath", mp.containerPath());
-                mpNode.put("readOnly", mp.readOnly());
+                if (mp.readOnly() != null) { mpNode.put("readOnly", mp.readOnly()); }
                 mps.add(mpNode);
             }
             n.set("mountPoints", mps);
@@ -310,7 +311,7 @@ public class EcsResponseWriter {
             for (VolumeFrom volumeFrom : def.getVolumesFrom()) {
                 ObjectNode volumeFromNode = objectMapper.createObjectNode();
                 volumeFromNode.put("sourceContainer", volumeFrom.sourceContainer());
-                volumeFromNode.put("readOnly", volumeFrom.readOnly());
+                if (volumeFrom.readOnly() != null) { volumeFromNode.put("readOnly", volumeFrom.readOnly()); }
                 volumesFrom.add(volumeFromNode);
             }
             n.set("volumesFrom", volumesFrom);
@@ -798,8 +799,8 @@ public class EcsResponseWriter {
         return n;
     }
 
-    public ObjectNode containerInstanceNode(ContainerInstance ci) {
-        return containerInstanceNode(ci, true, true);
+    public ObjectNode containerInstanceNode(ContainerInstance ci, String clusterRef, String region) {
+        return containerInstanceNode(ci, clusterRef, region, true, true);
     }
 
     /**
@@ -809,14 +810,32 @@ public class EcsResponseWriter {
      *                      omitted, tags and container instance health status aren't included in
      *                      the response."
      */
-    public ObjectNode containerInstanceNode(ContainerInstance ci, boolean includeTags,
-                                             boolean includeHealth) {
+    public ObjectNode containerInstanceNode(ContainerInstance ci, String clusterRef, String region,
+                                             boolean includeTags, boolean includeHealth) {
+        return containerInstanceNode(ci, service.runningTaskCountForInstance(
+                clusterRef, ci.getContainerInstanceArn(), region), includeTags, includeHealth);
+    }
+
+    public ArrayNode containerInstanceNodes(List<ContainerInstance> instances, String clusterRef, String region,
+                                             boolean includeTags, boolean includeHealth) {
+        ArrayNode nodes = objectMapper.createArrayNode();
+        if (instances.isEmpty()) {
+            return nodes;
+        }
+        Map<String, Long> runningCounts = service.runningTaskCountsForCluster(clusterRef, region);
+        instances.forEach(ci -> nodes.add(containerInstanceNode(ci,
+                runningCounts.getOrDefault(ci.getContainerInstanceArn(), 0L), includeTags, includeHealth)));
+        return nodes;
+    }
+
+    private ObjectNode containerInstanceNode(ContainerInstance ci, long runningTaskCount,
+                                              boolean includeTags, boolean includeHealth) {
         ObjectNode n = objectMapper.createObjectNode();
         n.put("containerInstanceArn", ci.getContainerInstanceArn());
         n.put("ec2InstanceId", ci.getEc2InstanceId());
         n.put("status", ci.getStatus());
         if (ci.getStatusReason() != null) { n.put("statusReason", ci.getStatusReason()); }
-        n.put("runningTasksCount", ci.getRunningTasksCount());
+        n.put("runningTasksCount", runningTaskCount);
         n.put("pendingTasksCount", ci.getPendingTasksCount());
         n.put("agentConnected", ci.isAgentConnected());
         if (ci.getAgentUpdateStatus() != null) { n.put("agentUpdateStatus", ci.getAgentUpdateStatus()); }
@@ -970,6 +989,22 @@ public class EcsResponseWriter {
                     .forEach(arn -> sources.add(serviceRevisionSummaryNode(arn, d.getServiceArn())));
         }
         n.set("sourceServiceRevisions", sources);
+        if (d.getRollbackTargetServiceRevisionArn() != null) {
+            ObjectNode rollback = n.putObject("rollback");
+            rollback.put("serviceRevisionArn", d.getRollbackTargetServiceRevisionArn());
+            rollback.put("reason", d.getRollbackReason());
+            putInstant(rollback, "startedAt", d.getRollbackStartedAt());
+        }
+        if (d.getAlarmNames() != null) {
+            ObjectNode alarms = n.putObject("alarms");
+            ArrayNode alarmNames = alarms.putArray("alarmNames");
+            d.getAlarmNames().forEach(alarmNames::add);
+            ArrayNode triggered = alarms.putArray("triggeredAlarmNames");
+            if (d.getTriggeredAlarmNames() != null) {
+                d.getTriggeredAlarmNames().forEach(triggered::add);
+            }
+            alarms.put("status", d.getAlarmStatus());
+        }
         return n;
     }
 
@@ -1133,7 +1168,7 @@ public class EcsResponseWriter {
     /** ECS timestamps go on the wire as epoch seconds with a fractional part. */
     private static void putInstant(ObjectNode target, String field, Instant value) {
         if (value != null) {
-            target.put(field, value.toEpochMilli() / 1000.0);
+            target.put(field, EpochSeconds.fromInstant(value));
         }
     }
 }

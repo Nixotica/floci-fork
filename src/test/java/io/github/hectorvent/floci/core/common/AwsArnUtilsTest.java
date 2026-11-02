@@ -1,9 +1,9 @@
 package io.github.hectorvent.floci.core.common;
 
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
 import io.github.hectorvent.floci.testing.PartitionMatrix;
 import io.github.hectorvent.floci.testing.PartitionMatrix.PartitionCase;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -143,13 +143,43 @@ class AwsArnUtilsTest {
     }
 
     /**
-     * A regionless {@code Arn.of} keeps the commercial partition: nothing in the region argument
-     * can say otherwise. Call sites that know the request's partition use {@link AwsArnUtils.Arn#global}.
+     * A regionless {@code Arn.of} keeps the commercial partition outside the test build: nothing in
+     * the region argument can say otherwise, and an untested path must keep its response. Call
+     * sites that know the request's partition use {@link AwsArnUtils.Arn#global}.
      */
     @Test
-    void aRegionlessArnStaysInTheCommercialPartition() {
-        assertEquals("arn:aws:iam::000000000000:role/r",
-                AwsArnUtils.Arn.of("iam", "", "000000000000", "role/r").toString());
+    void aRegionlessArnStaysInTheCommercialPartitionOutsideTheTestBuild() {
+        String previous = System.clearProperty(BlankRegionGuard.FAIL_PROPERTY);
+        try {
+            assertEquals("arn:aws:iam::000000000000:role/r",
+                    AwsArnUtils.Arn.of("iam", "", "000000000000", "role/r").toString());
+        } finally {
+            if (previous != null) {
+                System.setProperty(BlankRegionGuard.FAIL_PROPERTY, previous);
+            }
+        }
+    }
+
+    /** The test build sets the guard's property, so a blank-region mint fails the test that reached it. */
+    @Test
+    void theTestBuildFailsABlankRegionMint() {
+        assertEquals("true", System.getProperty(BlankRegionGuard.FAIL_PROPERTY));
+
+        IllegalStateException blank = assertThrows(IllegalStateException.class,
+                () -> AwsArnUtils.Arn.of("sqs", "", "000000000000", "q"));
+        assertThrows(IllegalStateException.class, () -> AwsArnUtils.Arn.of("sqs", null, "000000000000", "q"));
+        assertThrows(IllegalStateException.class, () -> AwsArnUtils.Arn.of("sqs", "  ", "000000000000", "q"));
+        assertTrue(blank.getMessage().contains(AwsArnUtilsTest.class.getName()), blank.getMessage());
+    }
+
+    /** A regionless ARN minted the intended way is not a blank-region mint. */
+    @Test
+    void globalArnsDoNotTripTheGuard() {
+        assertEquals("arn:aws-cn:iam::000000000000:role/r",
+                AwsArnUtils.Arn.global("aws-cn", "iam", "000000000000", "role/r").toString());
+        RegionResolver resolver = new RegionResolver("us-gov-west-1", "000000000000");
+        assertEquals("arn:aws-us-gov:iam::000000000000:role/r", resolver.buildGlobalArn("iam", "role/r"));
+        assertEquals("arn:aws-us-gov:iam::000000000000:role/r", resolver.buildArn("iam", "", "role/r"));
     }
 
     @ParameterizedTest
@@ -174,6 +204,23 @@ class AwsArnUtilsTest {
         assertTrue(AwsArnUtils.resourceIfArnFor(null, "s3").isEmpty());
         assertTrue(AwsArnUtils.resourceIfArnFor("bucket", "s3").isEmpty());
         assertTrue(AwsArnUtils.resourceIfArnFor("arn:aws:s3", "s3").isEmpty());
+    }
+
+    @Test
+    void parseIfArnInMatchesOnlyTheServiceInTheRegionAndItsPartition() {
+        String arn = "arn:aws-cn:states:cn-north-1:000000000000:stateMachine:m";
+        assertEquals("stateMachine:m", AwsArnUtils.parseIfArnIn(arn, "states", "cn-north-1").orElseThrow().resource());
+        assertTrue(AwsArnUtils.parseIfArnIn(arn, "states", "cn-northwest-1").isEmpty());
+        assertTrue(AwsArnUtils.parseIfArnIn(arn, "sqs", "cn-north-1").isEmpty());
+        assertTrue(AwsArnUtils.parseIfArnIn("arn:aws:states:cn-north-1:000000000000:stateMachine:m",
+                "states", "cn-north-1").isEmpty());
+    }
+
+    @Test
+    void parseIfArnInIsEmptyForNonArns() {
+        assertTrue(AwsArnUtils.parseIfArnIn(null, "states", "us-east-1").isEmpty());
+        assertTrue(AwsArnUtils.parseIfArnIn("m", "states", "us-east-1").isEmpty());
+        assertTrue(AwsArnUtils.parseIfArnIn("arn:aws:states", "states", "us-east-1").isEmpty());
     }
 
     @Test
@@ -216,6 +263,29 @@ class AwsArnUtilsTest {
     @Test
     void isArnRejectsNullRatherThanThrowing() {
         assertFalse(AwsArnUtils.isArn(null));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"arn:aws:sqs:us-east-1:000000000000:q", "arn:aws-cn:rds", "arn:"})
+    void looksLikeArnAcceptsAnyValueMeantAsAnArn(String value) {
+        assertTrue(AwsArnUtils.looksLikeArn(value));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"my-queue", "", "  ", "ARN:aws:sqs:us-east-1:000000000000:q", " arn:aws:sqs"})
+    void looksLikeArnRejectsNames(String value) {
+        assertFalse(AwsArnUtils.looksLikeArn(value));
+    }
+
+    @Test
+    void looksLikeArnRejectsNullRatherThanThrowing() {
+        assertFalse(AwsArnUtils.looksLikeArn(null));
+    }
+
+    @Test
+    void looksLikeArnAcceptsAMalformedArnThatIsArnRejects() {
+        assertTrue(AwsArnUtils.looksLikeArn("arn:aws:rds:us-east-1"));
+        assertFalse(AwsArnUtils.isArn("arn:aws:rds:us-east-1"));
     }
 
     /**

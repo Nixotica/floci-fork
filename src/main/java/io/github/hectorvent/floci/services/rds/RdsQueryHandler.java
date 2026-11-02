@@ -1,35 +1,46 @@
 package io.github.hectorvent.floci.services.rds;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsErrorMessages;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
+import io.github.hectorvent.floci.core.common.AwsQueryLists;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
+import io.github.hectorvent.floci.core.common.AwsRegionFacts;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
-import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
-import io.github.hectorvent.floci.services.rds.model.DbCluster;
-import io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot;
-import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
-import io.github.hectorvent.floci.services.rds.model.DbEndpoint;
 import io.github.hectorvent.floci.services.docdb.DocDbQueryHandler;
 import io.github.hectorvent.floci.services.neptune.NeptuneQueryHandler;
+import io.github.hectorvent.floci.services.rds.export.RdsExportTaskService;
+import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
+import io.github.hectorvent.floci.services.rds.model.DbCluster;
+import io.github.hectorvent.floci.services.rds.model.DbClusterAutomatedBackup;
+import io.github.hectorvent.floci.services.rds.model.DbClusterEndpoint;
+import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
+import io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot;
+import io.github.hectorvent.floci.services.rds.model.DbEndpoint;
 import io.github.hectorvent.floci.services.rds.model.DbInstance;
-import io.github.hectorvent.floci.services.rds.model.EventSubscription;
+import io.github.hectorvent.floci.services.rds.model.DbInstanceAutomatedBackup;
 import io.github.hectorvent.floci.services.rds.model.DbInstanceScalingChanges;
 import io.github.hectorvent.floci.services.rds.model.DbInstanceSettings;
-import io.github.hectorvent.floci.services.rds.model.LogExportChanges;
 import io.github.hectorvent.floci.services.rds.model.DbInstanceStatus;
 import io.github.hectorvent.floci.services.rds.model.DbParameterGroup;
 import io.github.hectorvent.floci.services.rds.model.DbProxy;
 import io.github.hectorvent.floci.services.rds.model.DbProxyAuth;
+import io.github.hectorvent.floci.services.rds.model.DbProxyEndpoint;
 import io.github.hectorvent.floci.services.rds.model.DbProxyTarget;
 import io.github.hectorvent.floci.services.rds.model.DbProxyTargetGroup;
+import io.github.hectorvent.floci.services.rds.model.DbRoleAssociation;
 import io.github.hectorvent.floci.services.rds.model.DbSnapshot;
 import io.github.hectorvent.floci.services.rds.model.DbSubnetGroup;
+import io.github.hectorvent.floci.services.rds.model.EventSubscription;
+import io.github.hectorvent.floci.services.rds.model.ExportTask;
 import io.github.hectorvent.floci.services.rds.model.GlobalCluster;
 import io.github.hectorvent.floci.services.rds.model.GlobalClusterMember;
+import io.github.hectorvent.floci.services.rds.model.LogExportChanges;
 import io.github.hectorvent.floci.services.rds.model.OptionGroup;
 import io.github.hectorvent.floci.services.rds.model.OptionGroupOption;
+import io.github.hectorvent.floci.services.rds.model.PointInTimeRestoreRequest;
 import io.github.hectorvent.floci.services.rds.model.RdsEvent;
 import io.github.hectorvent.floci.services.rds.model.ReadReplicaRequest;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -38,12 +49,19 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.function.BiFunction;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Query-protocol handler for all RDS actions (form-encoded POST, XML response).
@@ -51,16 +69,21 @@ import java.util.function.BiFunction;
 @ApplicationScoped
 public class RdsQueryHandler {
 
+    // Route 53 resolves aliases by DNS name; use the captured us-east-1 zone when no regional fact exists.
+    private static final String UNSOURCED_RDS_HOSTED_ZONE_ID = "Z2R2ITUGPM61AM"; // partition-literal: RDS fallback for uncaptured regions
+
     private static final Logger LOG = Logger.getLogger(RdsQueryHandler.class);
 
     private final RdsService service;
+    private final RdsExportTaskService exportTaskService;
     private final DocDbQueryHandler docDbQueryHandler;
     private final NeptuneQueryHandler neptuneQueryHandler;
     private final EmulatorConfig config;
 
     @Inject
-    public RdsQueryHandler(RdsService service, EmulatorConfig config, DocDbQueryHandler docDbQueryHandler,
-                           NeptuneQueryHandler neptuneQueryHandler) {
+    public RdsQueryHandler(RdsService service, RdsExportTaskService exportTaskService, EmulatorConfig config,
+                           DocDbQueryHandler docDbQueryHandler, NeptuneQueryHandler neptuneQueryHandler) {
+        this.exportTaskService = exportTaskService;
         this.docDbQueryHandler = docDbQueryHandler;
         this.neptuneQueryHandler = neptuneQueryHandler;
         this.service = service;
@@ -89,12 +112,32 @@ public class RdsQueryHandler {
                 case "PromoteReadReplica" -> handlePromoteReadReplica(params, region);
                 case "SwitchoverReadReplica" -> handleSwitchoverReadReplica(params, region);
                 case "PromoteReadReplicaDBCluster" -> handlePromoteReadReplicaDbCluster(params, region);
+                case "DescribeDBEngineVersions" -> handleDescribeDbEngineVersions(params);
+                case "DescribeEngineDefaultParameters" -> handleDescribeEngineDefaultParameters(params,
+                        "DescribeEngineDefaultParameters");
+                case "DescribeEngineDefaultClusterParameters" -> handleDescribeEngineDefaultParameters(params,
+                        "DescribeEngineDefaultClusterParameters");
+                case "DescribeValidDBInstanceModifications" -> handleDescribeValidDbInstanceModifications(params, region);
                 case "DescribeOrderableDBInstanceOptions" -> handleDescribeOrderableDbInstanceOptions(params);
                 case "DescribeEvents" -> handleDescribeEvents(params, region);
+                case "DescribeCertificates" -> handleDescribeCertificates(params, region);
+                case "ModifyCertificates" -> handleModifyCertificates(params, region);
                 case "CreateEventSubscription" -> handleCreateEventSubscription(params, region);
                 case "DescribeEventSubscriptions" -> handleDescribeEventSubscriptions(params, region);
                 case "ModifyEventSubscription" -> handleModifyEventSubscription(params, region);
                 case "DeleteEventSubscription" -> handleDeleteEventSubscription(params, region);
+                case "CreateDBClusterEndpoint" -> handleCreateDbClusterEndpoint(params, region);
+                case "DescribeDBClusterEndpoints" -> handleDescribeDbClusterEndpoints(params, region);
+                case "ModifyDBClusterEndpoint" -> handleModifyDbClusterEndpoint(params, region);
+                case "DeleteDBClusterEndpoint" -> handleDeleteDbClusterEndpoint(params, region);
+                case "EnableHttpEndpoint" -> handleSetHttpEndpoint("EnableHttpEndpoint", params, region, true);
+                case "DisableHttpEndpoint" -> handleSetHttpEndpoint("DisableHttpEndpoint", params, region, false);
+                case "DescribeDBLogFiles" -> handleDescribeDbLogFiles(params, region);
+                case "DownloadDBLogFilePortion" -> handleDownloadDbLogFilePortion(params, region);
+                case "AddRoleToDBCluster" -> handleAddRoleToDbCluster(params, region);
+                case "RemoveRoleFromDBCluster" -> handleRemoveRoleFromDbCluster(params, region);
+                case "AddRoleToDBInstance" -> handleAddRoleToDbInstance(params, region);
+                case "RemoveRoleFromDBInstance" -> handleRemoveRoleFromDbInstance(params, region);
                 case "AddSourceIdentifierToSubscription" ->
                         handleAddSourceIdentifierToSubscription(params, region);
                 case "RemoveSourceIdentifierFromSubscription" ->
@@ -131,6 +174,13 @@ public class RdsQueryHandler {
                 case "CopyDBSnapshot" -> handleCopyDbSnapshot(params, region);
                 case "ModifyDBSnapshot" -> handleModifyDbSnapshot(params, region);
                 case "RestoreDBInstanceFromDBSnapshot" -> handleRestoreDbInstanceFromDbSnapshot(params, region);
+                case "RestoreDBInstanceToPointInTime" -> handleRestoreDbInstanceToPointInTime(params, region);
+                case "DescribeDBInstanceAutomatedBackups" -> handleDescribeDbInstanceAutomatedBackups(params, region);
+                case "DeleteDBInstanceAutomatedBackup" -> handleDeleteDbInstanceAutomatedBackup(params, region);
+                case "StartDBInstanceAutomatedBackupsReplication" ->
+                        handleStartDbInstanceAutomatedBackupsReplication(params, region);
+                case "StopDBInstanceAutomatedBackupsReplication" ->
+                        handleStopDbInstanceAutomatedBackupsReplication(params, region);
                 case "DescribeDBSnapshots" -> handleDescribeDbSnapshots(params, region);
                 case "DescribeDBSnapshotAttributes" -> handleDescribeDbSnapshotAttributes(params, region);
                 case "ModifyDBSnapshotAttribute" -> handleModifyDbSnapshotAttribute(params, region);
@@ -138,6 +188,10 @@ public class RdsQueryHandler {
                 case "CreateDBProxy" -> handleCreateDbProxy(params, region);
                 case "ModifyDBProxy" -> handleModifyDbProxy(params, region);
                 case "DeleteDBProxy" -> handleDeleteDbProxy(params, region);
+                case "CreateDBProxyEndpoint" -> handleCreateDbProxyEndpoint(params, region);
+                case "DescribeDBProxyEndpoints" -> handleDescribeDbProxyEndpoints(params, region);
+                case "ModifyDBProxyEndpoint" -> handleModifyDbProxyEndpoint(params, region);
+                case "DeleteDBProxyEndpoint" -> handleDeleteDbProxyEndpoint(params, region);
                 case "RegisterDBProxyTargets" -> handleRegisterDbProxyTargets(params, region);
                 case "DeregisterDBProxyTargets" -> handleDeregisterDbProxyTargets(params, region);
                 case "DescribeDBProxyTargetGroups" -> handleDescribeDbProxyTargetGroups(params, region);
@@ -148,8 +202,14 @@ public class RdsQueryHandler {
                 case "DeleteDBClusterSnapshot" -> handleDeleteDbClusterSnapshot(params, region);
                 case "CopyDBClusterSnapshot" -> handleCopyDbClusterSnapshot(params, region);
                 case "RestoreDBClusterFromSnapshot" -> handleRestoreDbClusterFromSnapshot(params, region);
+                case "RestoreDBClusterToPointInTime" -> handleRestoreDbClusterToPointInTime(params, region);
+                case "DescribeDBClusterAutomatedBackups" -> handleDescribeDbClusterAutomatedBackups(params, region);
+                case "DeleteDBClusterAutomatedBackup" -> handleDeleteDbClusterAutomatedBackup(params, region);
                 case "DescribeDBClusterSnapshotAttributes" -> handleDescribeDbClusterSnapshotAttributes(params, region);
                 case "ModifyDBClusterSnapshotAttribute" -> handleModifyDbClusterSnapshotAttribute(params, region);
+                case "StartExportTask" -> handleStartExportTask(params, region);
+                case "DescribeExportTasks" -> handleDescribeExportTasks(params, region);
+                case "CancelExportTask" -> handleCancelExportTask(params, region);
                 case "DescribeGlobalClusters" -> handleDescribeGlobalClusters(params);
                 case "CreateGlobalCluster" -> handleCreateGlobalCluster(params, region);
                 case "ModifyGlobalCluster" -> handleModifyGlobalCluster(params);
@@ -190,22 +250,27 @@ public class RdsQueryHandler {
         String dbInstanceClass = params.getFirst("DBInstanceClass");
         String allocatedStorageStr = params.getFirst("AllocatedStorage");
         int allocatedStorage = allocatedStorageStr != null ? parseIntSafe(allocatedStorageStr, 20) : 20;
-        boolean iamEnabled = "true".equalsIgnoreCase(params.getFirst("EnableIAMDatabaseAuthentication"));
+        boolean iamEnabled;
         String paramGroupName = params.getFirst("DBParameterGroupName");
         String optionGroupName = params.getFirst("OptionGroupName");
         String dbSubnetGroupName = params.getFirst("DBSubnetGroupName");
         String dbClusterIdentifier = params.getFirst("DBClusterIdentifier");
-        boolean manageMasterUserPassword = "true".equalsIgnoreCase(params.getFirst("ManageMasterUserPassword"));
+        boolean manageMasterUserPassword;
         String masterUserSecretKmsKeyId = params.getFirst("MasterUserSecretKmsKeyId");
         Map<String, String> tags = parseTags(params);
         String availabilityZone = params.getFirst("AvailabilityZone");
-        boolean multiAz = "true".equalsIgnoreCase(params.getFirst("MultiAZ"));
+        boolean multiAz;
         // AWS defaults this to true when the request omits it - unlike most boolean flags here,
         // which default to false.
-        boolean autoMinorVersionUpgrade = !"false".equalsIgnoreCase(params.getFirst("AutoMinorVersionUpgrade"));
+        boolean autoMinorVersionUpgrade;
         Boolean publiclyAccessible;
         Boolean deletionProtection;
         try {
+            iamEnabled = Boolean.TRUE.equals(parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"));
+            manageMasterUserPassword = Boolean.TRUE.equals(parseOptionalBoolean(params, "ManageMasterUserPassword"));
+            multiAz = Boolean.TRUE.equals(parseOptionalBoolean(params, "MultiAZ"));
+            Boolean requestedAutoMinorVersionUpgrade = parseOptionalBoolean(params, "AutoMinorVersionUpgrade");
+            autoMinorVersionUpgrade = requestedAutoMinorVersionUpgrade == null || requestedAutoMinorVersionUpgrade;
             publiclyAccessible = parseOptionalBoolean(params, "PubliclyAccessible");
             deletionProtection = parseOptionalBoolean(params, "DeletionProtection");
         } catch (AwsException e) {
@@ -299,7 +364,7 @@ public class RdsQueryHandler {
                 params.getFirst("SourceType"),
                 memberList(params, "SourceIds"),
                 memberList(params, "EventCategories"),
-                optionalBoolean(params.getFirst("Enabled")),
+                parseOptionalBoolean(params, "Enabled"),
                 parseTags(params));
         return Response.ok(AwsQueryResponse.envelope("CreateEventSubscription", AwsNamespaces.RDS,
                 new XmlBuilder().raw(eventSubscriptionXml(subscription)).build())).build();
@@ -311,7 +376,7 @@ public class RdsQueryHandler {
                 params.getFirst("SnsTopicArn"),
                 params.getFirst("SourceType"),
                 memberList(params, "EventCategories"),
-                optionalBoolean(params.getFirst("Enabled")));
+                parseOptionalBoolean(params, "Enabled"));
         return Response.ok(AwsQueryResponse.envelope("ModifyEventSubscription", AwsNamespaces.RDS,
                 new XmlBuilder().raw(eventSubscriptionXml(subscription)).build())).build();
     }
@@ -337,6 +402,203 @@ public class RdsQueryHandler {
                 params.getFirst("SubscriptionName"));
         return Response.ok(AwsQueryResponse.envelope("DeleteEventSubscription", AwsNamespaces.RDS,
                 new XmlBuilder().raw(eventSubscriptionXml(subscription)).build())).build();
+    }
+
+    private Response handleSetHttpEndpoint(String action, MultivaluedMap<String, String> params, String region,
+                                           boolean enabled) {
+        DbCluster cluster = service.setHttpEndpointByArn(region, params.getFirst("ResourceArn"), enabled);
+        String result = new XmlBuilder()
+                .elem("ResourceArn", cluster.getDbClusterArn())
+                .elem("HttpEndpointEnabled", cluster.isHttpEndpointEnabled())
+                .build();
+        return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.RDS, result)).build();
+    }
+
+    private Response handleDescribeDbLogFiles(MultivaluedMap<String, String> params, String region) {
+        RdsService.LogFilePage page = service.describeDbLogFiles(region,
+                params.getFirst("DBInstanceIdentifier"),
+                params.getFirst("FilenameContains"),
+                optionalLong(params, "FileLastWritten"),
+                optionalLong(params, "FileSize"),
+                optionalInt(params.getFirst("MaxRecords")),
+                params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder().start("DescribeDBLogFiles");
+        for (RdsLogFiles.LogFile file : page.files()) {
+            xml.start("DescribeDBLogFilesDetails")
+               .elem("LogFileName", file.name())
+               .elem("LastWritten", file.lastWritten().toEpochMilli())
+               .elem("Size", file.size())
+               .end("DescribeDBLogFilesDetails");
+        }
+        xml.end("DescribeDBLogFiles");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBLogFiles", AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    private Response handleDownloadDbLogFilePortion(MultivaluedMap<String, String> params, String region) {
+        RdsLogFiles.Portion portion = service.downloadDbLogFilePortion(region,
+                params.getFirst("DBInstanceIdentifier"),
+                params.getFirst("LogFileName"),
+                params.getFirst("Marker"),
+                optionalInt(params.getFirst("NumberOfLines")));
+        String result = new XmlBuilder()
+                .elem("LogFileData", portion.data())
+                .elem("Marker", portion.marker())
+                .elem("AdditionalDataPending", portion.additionalDataPending())
+                .build();
+        return Response.ok(AwsQueryResponse.envelope("DownloadDBLogFilePortion", AwsNamespaces.RDS, result)).build();
+    }
+
+    private static Long optionalLong(MultivaluedMap<String, String> params, String name) {
+        String value = params.getFirst(name);
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidParameterValue", name + " must be a number: " + value, 400);
+        }
+    }
+
+    private Response handleAddRoleToDbCluster(MultivaluedMap<String, String> params, String region) {
+        service.addRoleToDbCluster(region, params.getFirst("DBClusterIdentifier"),
+                params.getFirst("RoleArn"), params.getFirst("FeatureName"));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("AddRoleToDBCluster", AwsNamespaces.RDS)).build();
+    }
+
+    private Response handleRemoveRoleFromDbCluster(MultivaluedMap<String, String> params, String region) {
+        service.removeRoleFromDbCluster(region, params.getFirst("DBClusterIdentifier"),
+                params.getFirst("RoleArn"), params.getFirst("FeatureName"));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("RemoveRoleFromDBCluster", AwsNamespaces.RDS)).build();
+    }
+
+    private Response handleAddRoleToDbInstance(MultivaluedMap<String, String> params, String region) {
+        service.addRoleToDbInstance(region, params.getFirst("DBInstanceIdentifier"),
+                params.getFirst("RoleArn"), params.getFirst("FeatureName"));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("AddRoleToDBInstance", AwsNamespaces.RDS)).build();
+    }
+
+    private Response handleRemoveRoleFromDbInstance(MultivaluedMap<String, String> params, String region) {
+        service.removeRoleFromDbInstance(region, params.getFirst("DBInstanceIdentifier"),
+                params.getFirst("RoleArn"), params.getFirst("FeatureName"));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("RemoveRoleFromDBInstance", AwsNamespaces.RDS)).build();
+    }
+
+    /**
+     * The {@code AssociatedRoles} a {@code CreateDBCluster} request names. botocore and the Java SDK
+     * send the model's member name ({@code AssociatedRoles.DBClusterAssociatedRole.N.RoleArn});
+     * {@code .member.N} is read too, as the other RDS lists accept it.
+     */
+    private static List<DbRoleAssociation> parseAssociatedRoles(MultivaluedMap<String, String> params) {
+        List<DbRoleAssociation> roles = new ArrayList<>();
+        for (String prefix : List.of("AssociatedRoles.DBClusterAssociatedRole", "AssociatedRoles.member")) {
+            // Every index the request names, in order, whichever field it carries: an entry with a
+            // FeatureName and no RoleArn reaches validation and is refused there, and a gap in the
+            // numbering does not hide the entries after it.
+            Pattern field = Pattern.compile(Pattern.quote(prefix) + "\\.(\\d+)\\.(RoleArn|FeatureName)");
+            SortedSet<Integer> indexes = new TreeSet<>();
+            for (String key : params.keySet()) {
+                Matcher matcher = field.matcher(key);
+                if (matcher.matches()) {
+                    indexes.add(Integer.parseInt(matcher.group(1)));
+                }
+            }
+            for (int i : indexes) {
+                roles.add(new DbRoleAssociation(params.getFirst(prefix + "." + i + ".RoleArn"),
+                        params.getFirst(prefix + "." + i + ".FeatureName")));
+            }
+        }
+        return roles;
+    }
+
+    private Response handleCreateDbClusterEndpoint(MultivaluedMap<String, String> params, String region) {
+        DbClusterEndpoint endpoint = service.createDbClusterEndpoint(region,
+                params.getFirst("DBClusterIdentifier"),
+                params.getFirst("DBClusterEndpointIdentifier"),
+                params.getFirst("EndpointType"),
+                memberList(params, "StaticMembers"),
+                memberList(params, "ExcludedMembers"),
+                parseTags(params));
+        return Response.ok(AwsQueryResponse.envelope("CreateDBClusterEndpoint", AwsNamespaces.RDS,
+                dbClusterEndpointInnerXml(endpoint))).build();
+    }
+
+    private Response handleModifyDbClusterEndpoint(MultivaluedMap<String, String> params, String region) {
+        // A list left out of the request keeps the endpoint's lists; one given replaces them.
+        DbClusterEndpoint endpoint = service.modifyDbClusterEndpoint(region,
+                params.getFirst("DBClusterEndpointIdentifier"),
+                params.getFirst("EndpointType"),
+                hasMemberKeys(params, "StaticMembers") ? memberList(params, "StaticMembers") : null,
+                hasMemberKeys(params, "ExcludedMembers") ? memberList(params, "ExcludedMembers") : null);
+        return Response.ok(AwsQueryResponse.envelope("ModifyDBClusterEndpoint", AwsNamespaces.RDS,
+                dbClusterEndpointInnerXml(endpoint))).build();
+    }
+
+    private Response handleDeleteDbClusterEndpoint(MultivaluedMap<String, String> params, String region) {
+        DbClusterEndpoint endpoint = service.deleteDbClusterEndpoint(region,
+                params.getFirst("DBClusterEndpointIdentifier"));
+        return Response.ok(AwsQueryResponse.envelope("DeleteDBClusterEndpoint", AwsNamespaces.RDS,
+                dbClusterEndpointInnerXml(endpoint))).build();
+    }
+
+    private Response handleDescribeDbClusterEndpoints(MultivaluedMap<String, String> params, String region) {
+        Map<String, List<String>> filters = new LinkedHashMap<>();
+        for (String name : List.of("db-cluster-endpoint-type", "db-cluster-endpoint-custom-type",
+                "db-cluster-endpoint-id", "db-cluster-endpoint-status")) {
+            List<String> values = extractRdsFilterValues(params, name);
+            if (!values.isEmpty()) {
+                filters.put(name, values);
+            }
+        }
+        RdsService.ClusterEndpointPage page = service.describeDbClusterEndpoints(region,
+                params.getFirst("DBClusterIdentifier"),
+                params.getFirst("DBClusterEndpointIdentifier"),
+                filters,
+                optionalInt(params.getFirst("MaxRecords")),
+                params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder().start("DBClusterEndpoints");
+        for (DbClusterEndpoint endpoint : page.endpoints()) {
+            xml.start("DBClusterEndpointList").raw(dbClusterEndpointInnerXml(endpoint)).end("DBClusterEndpointList");
+        }
+        xml.end("DBClusterEndpoints");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBClusterEndpoints", AwsNamespaces.RDS,
+                xml.build())).build();
+    }
+
+    /** The DBClusterEndpoint members; a built-in endpoint has no identifier, ARN, custom type or lists. */
+    private static String dbClusterEndpointInnerXml(DbClusterEndpoint e) {
+        XmlBuilder xml = new XmlBuilder();
+        if (e.getDbClusterEndpointIdentifier() != null) {
+            xml.elem("DBClusterEndpointIdentifier", e.getDbClusterEndpointIdentifier());
+        }
+        xml.elem("DBClusterIdentifier", e.getDbClusterIdentifier());
+        if (e.getDbClusterEndpointResourceIdentifier() != null) {
+            xml.elem("DBClusterEndpointResourceIdentifier", e.getDbClusterEndpointResourceIdentifier());
+        }
+        if (e.getEndpoint() != null) {
+            xml.elem("Endpoint", e.getEndpoint());
+        }
+        xml.elem("Status", e.getStatus())
+           .elem("EndpointType", e.getEndpointType());
+        if (e.getCustomEndpointType() != null) {
+            xml.elem("CustomEndpointType", e.getCustomEndpointType());
+            xml.start("StaticMembers");
+            e.getStaticMembers().forEach(member -> xml.elem("member", member));
+            xml.end("StaticMembers");
+            xml.start("ExcludedMembers");
+            e.getExcludedMembers().forEach(member -> xml.elem("member", member));
+            xml.end("ExcludedMembers");
+        }
+        if (e.getDbClusterEndpointArn() != null) {
+            xml.elem("DBClusterEndpointArn", e.getDbClusterEndpointArn());
+        }
+        return xml.build();
     }
 
     private Response handleDescribeEventSubscriptions(MultivaluedMap<String, String> params, String region) {
@@ -381,6 +643,45 @@ public class RdsQueryHandler {
         return xml.end("EventSubscription").build();
     }
 
+    private Response handleDescribeCertificates(MultivaluedMap<String, String> params, String region) {
+        RdsService.CertificatePage page = service.describeCertificates(region, params.getFirst("CertificateIdentifier"),
+                parseOptionalInt(params.getFirst("MaxRecords")), params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder()
+                .elem("DefaultCertificateForNewLaunches", page.defaultForNewLaunches())
+                .start("Certificates");
+        for (RdsService.Certificate certificate : page.certificates()) {
+            certificateXml(xml, certificate);
+        }
+        xml.end("Certificates");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeCertificates", AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    private Response handleModifyCertificates(MultivaluedMap<String, String> params, String region) {
+        RdsService.Certificate certificate = service.modifyCertificates(region,
+                params.getFirst("CertificateIdentifier"), parseOptionalBoolean(params, "RemoveCustomerOverride"));
+        XmlBuilder xml = new XmlBuilder();
+        certificateXml(xml, certificate);
+        return Response.ok(AwsQueryResponse.envelope("ModifyCertificates", AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    private static void certificateXml(XmlBuilder xml, RdsService.Certificate certificate) {
+        xml.start("Certificate")
+                .elem("CertificateIdentifier", certificate.certificateIdentifier())
+                .elem("CertificateType", "CA")
+                .elem("Thumbprint", certificate.thumbprint())
+                .elem("ValidFrom", certificate.validFrom().toString())
+                .elem("ValidTill", certificate.validTill().toString())
+                .elem("CertificateArn", certificate.certificateArn())
+                .elem("CustomerOverride", certificate.customerOverride());
+        if (certificate.customerOverrideValidTill() != null) {
+            xml.elem("CustomerOverrideValidTill", certificate.customerOverrideValidTill().toString());
+        }
+        xml.end("Certificate");
+    }
+
     private Response handleDescribeEvents(MultivaluedMap<String, String> params, String region) {
         String sourceIdentifier = params.getFirst("SourceIdentifier");
         String sourceType = params.getFirst("SourceType");
@@ -401,8 +702,8 @@ public class RdsQueryHandler {
         if (maxRecords != null && (maxRecords < 20 || maxRecords > 100)) {
             throw new AwsException("InvalidParameterValue", "MaxRecords must be between 20 and 100.", 400);
         }
-        java.time.Instant start = parseOptionalInstant(params.getFirst("StartTime"));
-        java.time.Instant end = parseOptionalInstant(params.getFirst("EndTime"));
+        Instant start = parseOptionalInstant(params.getFirst("StartTime"));
+        Instant end = parseOptionalInstant(params.getFirst("EndTime"));
         if (start != null && end != null && start.isAfter(end)) {
             throw new AwsException("InvalidParameterCombination", "StartTime must be before EndTime.", 400);
         }
@@ -414,7 +715,7 @@ public class RdsQueryHandler {
                 service.refreshDbInstanceRuntimeHealth(instance);
             }
         }
-        List<RdsEvent> all = service.describeEvents(sourceIdentifier, sourceType, start, end, duration);
+        List<RdsEvent> all = service.describeEvents(region, sourceIdentifier, sourceType, start, end, duration);
         int offset = parseMarker(params.getFirst("Marker"));
         int limit = maxRecords != null ? maxRecords : 100;
         int from = Math.min(offset, all.size());
@@ -452,13 +753,13 @@ public class RdsQueryHandler {
         }
     }
 
-    private static java.time.Instant parseOptionalInstant(String value) {
+    private static Instant parseOptionalInstant(String value) {
         if (value == null || value.isBlank()) {
             return null;
         }
         try {
-            return java.time.Instant.parse(value);
-        } catch (java.time.format.DateTimeParseException e) {
+            return Instant.parse(value);
+        } catch (DateTimeParseException e) {
             throw new AwsException("InvalidParameterValue", "Invalid timestamp.", 400);
         }
     }
@@ -484,7 +785,7 @@ public class RdsQueryHandler {
         }
         try {
             DbInstance instance = service.getDbInstance(id, region);
-            service.deleteDbInstance(id, region);
+            service.deleteDbInstance(id, region, !Boolean.FALSE.equals(parseOptionalBoolean(params, "DeleteAutomatedBackups")));
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("DeleteDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -499,16 +800,18 @@ public class RdsQueryHandler {
             return AwsQueryResponse.error("InvalidParameterValue", "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
         }
         String newPassword = params.getFirst("MasterUserPassword");
-        String iamStr = params.getFirst("EnableIAMDatabaseAuthentication");
-        Boolean iamEnabled = iamStr != null ? Boolean.parseBoolean(iamStr) : null;
+        Boolean iamEnabled;
         String dbSubnetGroupName = params.getFirst("DBSubnetGroupName");
         String optionGroupName = params.getFirst("OptionGroupName");
-        String autoMinorVersionUpgradeStr = params.getFirst("AutoMinorVersionUpgrade");
-        Boolean autoMinorVersionUpgrade = autoMinorVersionUpgradeStr != null
-                ? Boolean.parseBoolean(autoMinorVersionUpgradeStr) : null;
+        Boolean autoMinorVersionUpgrade;
         Boolean publiclyAccessible;
         Boolean deletionProtection;
         try {
+            // These request members are accepted, but their modify behavior is not yet emulated.
+            parseOptionalBoolean(params, "MultiAZ");
+            parseOptionalBoolean(params, "ManageMasterUserPassword");
+            iamEnabled = parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication");
+            autoMinorVersionUpgrade = parseOptionalBoolean(params, "AutoMinorVersionUpgrade");
             publiclyAccessible = parseOptionalBoolean(params, "PubliclyAccessible");
             deletionProtection = parseOptionalBoolean(params, "DeletionProtection");
         } catch (AwsException e) {
@@ -521,7 +824,8 @@ public class RdsQueryHandler {
             DbInstance instance = service.modifyDbInstance(
                     id, newPassword, iamEnabled, dbSubnetGroupName,
                     vpcSecurityGroupIds, optionGroupName, region, autoMinorVersionUpgrade,
-                    settings, publiclyAccessible, scaling, deletionProtection);
+                    settings, publiclyAccessible, scaling, deletionProtection,
+                    params.getFirst("DBParameterGroupName"));
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("ModifyDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -552,20 +856,23 @@ public class RdsQueryHandler {
     private static DbInstanceSettings instanceSettings(MultivaluedMap<String, String> params,
                                                        boolean includeEncryption) {
         return new DbInstanceSettings(
-                includeEncryption ? optionalBoolean(params.getFirst("StorageEncrypted")) : null,
+                includeEncryption ? parseOptionalBoolean(params, "StorageEncrypted") : null,
                 includeEncryption ? params.getFirst("KmsKeyId") : null,
                 optionalInt(params.getFirst("BackupRetentionPeriod")),
                 params.getFirst("PreferredBackupWindow"),
                 params.getFirst("PreferredMaintenanceWindow"),
-                optionalBoolean(params.getFirst("CopyTagsToSnapshot")),
+                parseOptionalBoolean(params, "CopyTagsToSnapshot"),
                 optionalInt(params.getFirst("MonitoringInterval")),
                 params.getFirst("MonitoringRoleArn"),
-                optionalBoolean(params.getFirst("EnablePerformanceInsights")),
+                parseOptionalBoolean(params, "EnablePerformanceInsights"),
                 optionalInt(params.getFirst("PerformanceInsightsRetentionPeriod")),
                 params.getFirst("EngineLifecycleSupport"),
                 includeEncryption ? cloudwatchLogsExports(params) : null,
                 includeEncryption ? null : cloudwatchLogsExportChanges(params),
-                optionalInt(params.getFirst("MaxAllocatedStorage")));
+                optionalInt(params.getFirst("MaxAllocatedStorage")),
+                params.getFirst("StorageType"),
+                params.getFirst("CACertificateIdentifier"),
+                params.getFirst("LicenseModel"));
     }
 
     /**
@@ -612,6 +919,109 @@ public class RdsQueryHandler {
         }
     }
 
+    private Response handleDescribeDbEngineVersions(MultivaluedMap<String, String> params) {
+        Map<String, List<String>> filters = new LinkedHashMap<>();
+        for (String name : List.of("db-parameter-group-family", "engine", "engine-mode", "engine-version", "status")) {
+            List<String> values = extractRdsFilterValues(params, name);
+            if (!values.isEmpty()) {
+                filters.put(name, values);
+            }
+        }
+        RdsService.EngineVersionPage page = service.describeDbEngineVersions(
+                params.getFirst("Engine"),
+                params.getFirst("EngineVersion"),
+                params.getFirst("DBParameterGroupFamily"),
+                Boolean.parseBoolean(params.getFirst("DefaultOnly")),
+                filters,
+                optionalInt(params.getFirst("MaxRecords")),
+                params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder().start("DBEngineVersions");
+        for (RdsEngineCatalog.EngineVersion v : page.versions()) {
+            xml.start("DBEngineVersion")
+               .elem("Engine", v.engine())
+               .elem("MajorEngineVersion", v.majorVersion())
+               .elem("EngineVersion", v.version())
+               .elem("DBParameterGroupFamily", v.family())
+               .elem("DBEngineDescription", v.engineDescription())
+               .elem("DBEngineVersionDescription", v.versionDescription())
+               .start("ValidUpgradeTarget");
+            for (RdsEngineCatalog.EngineVersion target : RdsEngineCatalog.upgradeTargets(v)) {
+                xml.start("UpgradeTarget")
+                   .elem("Engine", target.engine())
+                   .elem("EngineVersion", target.version())
+                   .elem("Description", target.versionDescription())
+                   .elem("AutoUpgrade", false)
+                   .elem("IsMajorVersionUpgrade", !target.majorVersion().equals(v.majorVersion()))
+                   .end("UpgradeTarget");
+            }
+            xml.end("ValidUpgradeTarget").start("ExportableLogTypes");
+            RdsEngineCatalog.exportableLogTypes(v).forEach(type -> xml.elem("member", type));
+            xml.end("ExportableLogTypes")
+               .elem("SupportsLogExportsToCloudwatchLogs", !RdsEngineCatalog.exportableLogTypes(v).isEmpty())
+               .elem("SupportsReadReplica", RdsEngineCatalog.supportsReadReplica(v))
+               .start("SupportedEngineModes");
+            v.engineModes().forEach(mode -> xml.elem("member", mode));
+            xml.end("SupportedEngineModes").start("SupportedFeatureNames");
+            RdsEngineCatalog.supportedFeatureNames(v).forEach(name -> xml.elem("member", name));
+            xml.end("SupportedFeatureNames")
+               .elem("Status", "available")
+               .elem("SupportsParallelQuery", false)
+               .elem("SupportsGlobalDatabases", RdsEngineCatalog.supportsGlobalDatabases(v))
+               .elem("SupportsBabelfish", false)
+               .end("DBEngineVersion");
+        }
+        xml.end("DBEngineVersions");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBEngineVersions", AwsNamespaces.RDS,
+                xml.build())).build();
+    }
+
+    /** Serves both engine default calls; they share the request and the EngineDefaults shape. */
+    private Response handleDescribeEngineDefaultParameters(MultivaluedMap<String, String> params, String action) {
+        String family = params.getFirst("DBParameterGroupFamily");
+        List<Map<String, String>> parameters = service.describeEngineDefaultParameters(family);
+        XmlBuilder xml = new XmlBuilder().start("EngineDefaults")
+                .elem("DBParameterGroupFamily", family)
+                .start("Parameters");
+        for (Map<String, String> parameter : parameters) {
+            xml.start("Parameter")
+               .elem("ParameterName", parameter.get("name"))
+               .elem("ParameterValue", parameter.get("value"))
+               .end("Parameter");
+        }
+        xml.end("Parameters").end("EngineDefaults");
+        return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    private Response handleDescribeValidDbInstanceModifications(MultivaluedMap<String, String> params, String region) {
+        List<RdsService.StorageModification> storage = service.describeValidDbInstanceModifications(
+                params.getFirst("DBInstanceIdentifier"), region);
+        XmlBuilder xml = new XmlBuilder().start("ValidDBInstanceModificationsMessage").start("Storage");
+        for (RdsService.StorageModification option : storage) {
+            xml.start("ValidStorageOptions")
+               .elem("StorageType", option.storageType())
+               .start("StorageSize");
+            for (RdsService.SizeRange range : option.sizes()) {
+                xml.start("Range")
+                   .elem("From", range.from())
+                   .elem("To", range.to())
+                   .elem("Step", 1)
+                   .end("Range");
+            }
+            xml.end("StorageSize")
+               .elem("SupportsStorageAutoscaling", true)
+               .end("ValidStorageOptions");
+        }
+        xml.end("Storage")
+           .start("ValidProcessorFeatures").end("ValidProcessorFeatures")
+           .elem("SupportsDedicatedLogVolume", false)
+           .end("ValidDBInstanceModificationsMessage");
+        return Response.ok(AwsQueryResponse.envelope("DescribeValidDBInstanceModifications", AwsNamespaces.RDS,
+                xml.build())).build();
+    }
+
     private Response handleDescribeOrderableDbInstanceOptions(MultivaluedMap<String, String> params) {
         Collection<Map<String, String>> options = service.describeOrderableDbInstanceOptions(
                 params.getFirst("Engine"),
@@ -639,6 +1049,9 @@ public class RdsQueryHandler {
     private static String licenseModel(String engine) {
         if (engine != null && engine.regionMatches(true, 0, "sqlserver", 0, 9)) {
             return "license-included";
+        }
+        if (engine != null && (engine.toLowerCase().contains("mysql") || engine.equalsIgnoreCase("mariadb"))) {
+            return "general-public-license";
         }
         return "postgresql-license";
     }
@@ -822,7 +1235,7 @@ public class RdsQueryHandler {
                     parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"),
                     optionalInt(params.getFirst("AllocatedStorage")),
                     params.getFirst("ReplicaMode"),
-                    parseTags(params));
+                    parseTags(params), params.getFirst("StorageType"), params.getFirst("CACertificateIdentifier"));
             DbInstance replica = service.createDbInstanceReadReplica(request, region);
             return Response.ok(AwsQueryResponse.envelope(
                     "CreateDBInstanceReadReplica", AwsNamespaces.RDS, dbInstanceXml(replica))).build();
@@ -903,6 +1316,14 @@ public class RdsQueryHandler {
         }
 
         try {
+            List<DbRoleAssociation> associatedRoles = parseAssociatedRoles(params);
+            service.validateClusterRoleAssociations(id, engine, associatedRoles);
+            boolean enableHttpEndpoint = Boolean.TRUE.equals(parseOptionalBoolean(params, "EnableHttpEndpoint"));
+            String globalCluster = params.getFirst("GlobalClusterIdentifier");
+            if (enableHttpEndpoint && (globalCluster == null || globalCluster.isBlank())) {
+                // A global cluster's members take its Aurora engine; any other create names its own.
+                RdsService.requireDataApiEngine(engine);
+            }
             Double serverlessV2Min = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MinCapacity");
             Double serverlessV2Max = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MaxCapacity");
             Integer serverlessV2SecondsUntilAutoPause = parseIntegerParam(
@@ -936,6 +1357,27 @@ public class RdsQueryHandler {
                             serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
                             manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode, storageEncrypted,
                             requestedPort);
+            }
+            Map<String, String> tags = parseTags(params);
+            String kmsKeyId = params.getFirst("KmsKeyId");
+            if (!tags.isEmpty()) {
+                service.addTagsToResource(cluster.getDbClusterArn(), tags, region);
+            }
+            if (kmsKeyId != null && !kmsKeyId.isBlank()) {
+                cluster = service.setNewDbClusterKmsKeyId(region, id, kmsKeyId);
+            } else if (!tags.isEmpty()) {
+                cluster = service.getDbCluster(id, region);
+            }
+            if (!associatedRoles.isEmpty()) {
+                try {
+                    cluster = service.addRolesToNewDbCluster(region, id, associatedRoles);
+                } catch (AwsException e) {
+                    service.deleteDbCluster(id, region);
+                    throw e;
+                }
+            }
+            if (enableHttpEndpoint) {
+                cluster = service.setHttpEndpoint(region, id, true);
             }
             String result = dbClusterXml(cluster);
             return Response.ok(AwsQueryResponse.envelope("CreateDBCluster", AwsNamespaces.RDS, result)).build();
@@ -1021,7 +1463,7 @@ public class RdsQueryHandler {
         }
         try {
             DbCluster cluster = service.getDbCluster(id, region);
-            service.deleteDbCluster(id, region);
+            service.deleteDbCluster(id, region, !Boolean.FALSE.equals(parseOptionalBoolean(params, "DeleteAutomatedBackups")));
             String result = dbClusterXml(cluster);
             return Response.ok(AwsQueryResponse.envelope("DeleteDBCluster", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -1046,9 +1488,19 @@ public class RdsQueryHandler {
             Double serverlessV2Max = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MaxCapacity");
             Integer serverlessV2SecondsUntilAutoPause = parseIntegerParam(
                     params, "ServerlessV2ScalingConfiguration.SecondsUntilAutoPause");
+            Boolean enableHttpEndpoint = parseOptionalBoolean(params, "EnableHttpEndpoint");
+            if (Boolean.TRUE.equals(enableHttpEndpoint)) {
+                RdsService.requireDataApiEngine(service.getDbCluster(id, region).getEngineIdentifier());
+            }
             DbCluster cluster = service.modifyDbCluster(id, newPassword, iamEnabled,
                     serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
-                    manageMasterUserPassword, masterUserSecretKmsKeyId, region);
+                    manageMasterUserPassword, masterUserSecretKmsKeyId,
+                    params.getFirst("DBClusterParameterGroupName"),
+                    Boolean.TRUE.equals(parseOptionalBoolean(params, "RotateMasterUserPassword")),
+                    Boolean.TRUE.equals(parseOptionalBoolean(params, "ApplyImmediately")), region);
+            if (enableHttpEndpoint != null) {
+                cluster = service.setHttpEndpoint(region, id, enableHttpEndpoint);
+            }
             String result = dbClusterXml(cluster);
             return Response.ok(AwsQueryResponse.envelope("ModifyDBCluster", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -1117,9 +1569,9 @@ public class RdsQueryHandler {
         if (name == null || name.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "DBParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
-        Map<String, String> parameters = parseParameterOverrides(params);
+        Map<String, String> parameters = parseParameterMember(params, "ParameterValue");
         try {
-            DbParameterGroup group = service.modifyDbParameterGroup(name, parameters, region);
+            DbParameterGroup group = service.modifyDbParameterGroup(name, parameters, parseApplyMethods(params), region);
             String result = new XmlBuilder()
                     .elem("DBParameterGroupName", group.getDbParameterGroupName())
                     .build();
@@ -1130,26 +1582,43 @@ public class RdsQueryHandler {
     }
 
     /**
-     * Parses the {@code Parameters} list of a modify request. The RDS model declares the list
+     * ApplyMethod of each modified parameter; omitted means the provider default. The RDS model
+     * declares the {@code ApplyMethod} enum as {@code immediate | pending-reboot}, so anything else
+     * is refused before the group is touched.
+     */
+    private static Map<String, String> parseApplyMethods(MultivaluedMap<String, String> params) {
+        Map<String, String> methods = parseParameterMember(params, "ApplyMethod");
+        for (Map.Entry<String, String> e : methods.entrySet()) {
+            if (!"immediate".equals(e.getValue()) && !"pending-reboot".equals(e.getValue())) {
+                throw new AwsException("InvalidParameterValue", "Invalid ApplyMethod '" + e.getValue()
+                        + "' for parameter " + e.getKey() + ". Valid values: immediate, pending-reboot.", 400);
+            }
+        }
+        return methods;
+    }
+
+    /**
+     * Parses {@code member} of each entry in the {@code Parameters} list of a modify request, keyed
+     * by name; entries without it are skipped. The RDS model declares the list
      * with {@code locationName: Parameter}, so every SDK and the CLI send
      * {@code Parameters.Parameter.N.*}; the {@code Parameters.member.N.*} form is the plain Query
      * encoding older or hand-built callers use, and is accepted as well.
      */
-    private static Map<String, String> parseParameterOverrides(MultivaluedMap<String, String> params) {
-        Map<String, String> parameters = new LinkedHashMap<>();
+    private static Map<String, String> parseParameterMember(MultivaluedMap<String, String> params, String member) {
+        Map<String, String> values = new LinkedHashMap<>();
         for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
             for (int n = 1; ; n++) {
                 String paramName = params.getFirst(prefix + "." + n + ".ParameterName");
                 if (paramName == null) {
                     break;
                 }
-                String paramValue = params.getFirst(prefix + "." + n + ".ParameterValue");
-                if (paramValue != null) {
-                    parameters.put(paramName, paramValue);
+                String value = params.getFirst(prefix + "." + n + "." + member);
+                if (value != null) {
+                    values.put(paramName, value);
                 }
             }
         }
-        return parameters;
+        return values;
     }
 
     private Response handleCopyDbParameterGroup(
@@ -1185,7 +1654,7 @@ public class RdsQueryHandler {
         }
         try {
             DbParameterGroup group = service.resetDbParameterGroup(name,
-                    Boolean.parseBoolean(params.getFirst("ResetAllParameters")), parameterNames(params), region);
+                    Boolean.TRUE.equals(parseOptionalBoolean(params, "ResetAllParameters")), parameterNames(params), region);
             String result = new XmlBuilder()
                     .elem("DBParameterGroupName", group.getDbParameterGroupName())
                     .build();
@@ -1210,6 +1679,32 @@ public class RdsQueryHandler {
         return names;
     }
 
+    /** Floci models no system parameters: a describe of those sources lists nothing. */
+    private static boolean requestsUnmodeledSource(String source) {
+        return "system".equals(source) || "engine-default".equals(source);
+    }
+
+    /**
+     * Writes parameter rows to the XML builder, applying the Source filter.
+     */
+    private static void writeParameterRows(XmlBuilder xml, Map<String, String> parameters,
+                                           Map<String, String> applyMethods, String sourceFilter) {
+        if (requestsUnmodeledSource(sourceFilter)) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : parameters.entrySet()) {
+            xml.start("Parameter")
+               .elem("ParameterName", entry.getKey())
+               .elem("ParameterValue", entry.getValue())
+               .elem("Source", "user")
+               .elem("IsModifiable", true)
+               .elem("ApplyMethod", applyMethods.getOrDefault(entry.getKey(), "immediate"))
+               .end("Parameter");
+        }
+    }
+
+
+
     private Response handleDescribeDbParameters(
             MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBParameterGroupName");
@@ -1219,13 +1714,7 @@ public class RdsQueryHandler {
         try {
             DbParameterGroup group = service.getDbParameterGroup(name, region);
             XmlBuilder xml = new XmlBuilder().start("Parameters");
-            for (Map.Entry<String, String> entry : group.getParameters().entrySet()) {
-                xml.start("member")
-                   .elem("ParameterName", entry.getKey())
-                   .elem("ParameterValue", entry.getValue())
-                   .elem("IsModifiable", true)
-                   .end("member");
-            }
+            writeParameterRows(xml, group.getParameters(), group.getApplyMethods(), params.getFirst("Source"));
             xml.end("Parameters").start("Marker").end("Marker");
             return Response.ok(AwsQueryResponse.envelope("DescribeDBParameters", AwsNamespaces.RDS, xml.build())).build();
         } catch (AwsException e) {
@@ -1294,10 +1783,10 @@ public class RdsQueryHandler {
         if (name == null || name.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "DBClusterParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
-        Map<String, String> parameters = parseParameterOverrides(params);
+        Map<String, String> parameters = parseParameterMember(params, "ParameterValue");
         try {
             DbClusterParameterGroup group = service.modifyDbClusterParameterGroup(
-                    name, parameters, region);
+                    name, parameters, parseApplyMethods(params), region);
             String result = new XmlBuilder()
                     .elem("DBClusterParameterGroupName", group.getDbClusterParameterGroupName())
                     .build();
@@ -1340,7 +1829,7 @@ public class RdsQueryHandler {
         }
         try {
             DbClusterParameterGroup group = service.resetDbClusterParameterGroup(name,
-                    Boolean.parseBoolean(params.getFirst("ResetAllParameters")), parameterNames(params), region);
+                    Boolean.TRUE.equals(parseOptionalBoolean(params, "ResetAllParameters")), parameterNames(params), region);
             String result = new XmlBuilder()
                     .elem("DBClusterParameterGroupName", group.getDbClusterParameterGroupName())
                     .build();
@@ -1359,13 +1848,7 @@ public class RdsQueryHandler {
         try {
             DbClusterParameterGroup group = service.getDbClusterParameterGroup(name, region);
             XmlBuilder xml = new XmlBuilder().start("Parameters");
-            for (Map.Entry<String, String> entry : group.getParameters().entrySet()) {
-                xml.start("member")
-                   .elem("ParameterName", entry.getKey())
-                   .elem("ParameterValue", entry.getValue())
-                   .elem("IsModifiable", true)
-                   .end("member");
-            }
+            writeParameterRows(xml, group.getParameters(), group.getApplyMethods(), params.getFirst("Source"));
             xml.end("Parameters").start("Marker").end("Marker");
             return Response.ok(AwsQueryResponse.envelope("DescribeDBClusterParameters", AwsNamespaces.RDS, xml.build())).build();
         } catch (AwsException e) {
@@ -1476,7 +1959,7 @@ public class RdsQueryHandler {
      */
     private static List<OptionGroupOption> parseOptionConfigurations(
             MultivaluedMap<String, String> params) {
-        List<OptionGroupOption> options = new java.util.ArrayList<>();
+        List<OptionGroupOption> options = new ArrayList<>();
         for (String prefix : List.of("OptionsToInclude.OptionConfiguration",
                 "OptionsToInclude.member")) {
             for (int n = 1; ; n++) {
@@ -1533,7 +2016,7 @@ public class RdsQueryHandler {
             return AwsQueryResponse.error("InvalidParameterValue", "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
         }
         try {
-            io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot =
+            DbSnapshot snapshot =
                     service.createDbSnapshot(snapshotId, instanceId, parseTags(params), region);
             String result = dbSnapshotXml(snapshot);
             return Response.ok(AwsQueryResponse.envelope("CreateDBSnapshot", AwsNamespaces.RDS, result)).build();
@@ -1594,8 +2077,7 @@ public class RdsQueryHandler {
         }
         String dbInstanceClass = params.getFirst("DBInstanceClass");
         String availabilityZone = params.getFirst("AvailabilityZone");
-        String multiAzStr = params.getFirst("MultiAZ");
-        boolean multiAz = multiAzStr != null && Boolean.parseBoolean(multiAzStr);
+        boolean multiAz = Boolean.TRUE.equals(parseOptionalBoolean(params, "MultiAZ"));
         String dbSubnetGroupName = params.getFirst("DBSubnetGroupName");
 
         List<String> vpcSecurityGroupIds = new ArrayList<>();
@@ -1609,13 +2091,11 @@ public class RdsQueryHandler {
 
         try {
             Integer requestedPort = parseIntegerParam(params, "Port");
-            DbInstance instance = requestedPort == null
-                    ? service.restoreDbInstanceFromDbSnapshot(instanceId, snapshotId,
-                            dbInstanceClass, availabilityZone, multiAz, dbSubnetGroupName,
-                            vpcSecurityGroupIds, tags, region)
-                    : service.restoreDbInstanceFromDbSnapshot(instanceId, snapshotId,
-                            dbInstanceClass, availabilityZone, multiAz, dbSubnetGroupName,
-                            vpcSecurityGroupIds, tags, region, requestedPort);
+            DbInstance instance = service.restoreDbInstanceFromDbSnapshot(instanceId, snapshotId,
+                    dbInstanceClass, availabilityZone, multiAz, dbSubnetGroupName,
+                    vpcSecurityGroupIds, tags, region, requestedPort,
+                    parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"), params.getFirst("StorageType"),
+                    params.getFirst("CACertificateIdentifier"));
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("RestoreDBInstanceFromDBSnapshot", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -1623,14 +2103,102 @@ public class RdsQueryHandler {
         }
     }
 
+    private Response handleStartExportTask(MultivaluedMap<String, String> params, String region) {
+        String exportTaskIdentifier = params.getFirst("ExportTaskIdentifier");
+        String sourceArn = params.getFirst("SourceArn");
+        String s3BucketName = params.getFirst("S3BucketName");
+        String iamRoleArn = params.getFirst("IamRoleArn");
+        String kmsKeyId = params.getFirst("KmsKeyId");
+        Response missing = firstMissingParam(
+                "ExportTaskIdentifier", exportTaskIdentifier,
+                "SourceArn", sourceArn,
+                "S3BucketName", s3BucketName,
+                "IamRoleArn", iamRoleArn,
+                "KmsKeyId", kmsKeyId);
+        if (missing != null) {
+            return missing;
+        }
+        ExportTask task = exportTaskService.startExportTask(exportTaskIdentifier, sourceArn, s3BucketName,
+                params.getFirst("S3Prefix"), iamRoleArn, kmsKeyId, memberList(params, "ExportOnly"), region);
+        return Response.ok(AwsQueryResponse.envelope("StartExportTask", AwsNamespaces.RDS, exportTaskXml(task)))
+                .build();
+    }
+
+    private Response handleDescribeExportTasks(MultivaluedMap<String, String> params, String region) {
+        String sourceType = params.getFirst("SourceType");
+        if (sourceType != null && !List.of("SNAPSHOT", "CLUSTER").contains(sourceType)) {
+            throw new AwsException("InvalidParameterValue", "SourceType must be SNAPSHOT or CLUSTER.", 400);
+        }
+        Integer maxRecords = parseOptionalInt(params.getFirst("MaxRecords"));
+        if (maxRecords != null && (maxRecords < 20 || maxRecords > 100)) {
+            throw new AwsException("InvalidParameterValue", "MaxRecords must be between 20 and 100.", 400);
+        }
+        Map<String, List<String>> filters = new LinkedHashMap<>();
+        for (int i = 1; params.getFirst("Filters.Filter." + i + ".Name") != null; i++) {
+            String name = params.getFirst("Filters.Filter." + i + ".Name");
+            filters.put(name, extractRdsFilterValues(params, name));
+        }
+        List<ExportTask> all = exportTaskService.describeExportTasks(params.getFirst("ExportTaskIdentifier"),
+                params.getFirst("SourceArn"), sourceType, filters, region);
+        int from = Math.min(parseMarker(params.getFirst("Marker")), all.size());
+        int to = Math.min(from + (maxRecords != null ? maxRecords : 100), all.size());
+        XmlBuilder xml = new XmlBuilder().start("ExportTasks");
+        for (ExportTask task : all.subList(from, to)) {
+            xml.start("ExportTask").raw(exportTaskXml(task)).end("ExportTask");
+        }
+        xml.end("ExportTasks");
+        if (to < all.size()) {
+            xml.elem("Marker", String.valueOf(to));
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeExportTasks", AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    private Response handleCancelExportTask(MultivaluedMap<String, String> params, String region) {
+        String exportTaskIdentifier = params.getFirst("ExportTaskIdentifier");
+        Response missing = firstMissingParam("ExportTaskIdentifier", exportTaskIdentifier);
+        if (missing != null) {
+            return missing;
+        }
+        ExportTask task = exportTaskService.cancelExportTask(exportTaskIdentifier, region);
+        return Response.ok(AwsQueryResponse.envelope("CancelExportTask", AwsNamespaces.RDS, exportTaskXml(task)))
+                .build();
+    }
+
+    static String exportTaskXml(ExportTask task) {
+        XmlBuilder xml = new XmlBuilder()
+                .elem("ExportTaskIdentifier", task.getExportTaskIdentifier())
+                .elem("SourceArn", task.getSourceArn())
+                .elem("SourceType", task.getSourceType());
+        if (!task.getExportOnly().isEmpty()) {
+            xml.start("ExportOnly");
+            for (String entry : task.getExportOnly()) {
+                xml.elem("member", entry);
+            }
+            xml.end("ExportOnly");
+        }
+        xml.elem("SnapshotTime", task.getSnapshotTime() != null ? task.getSnapshotTime().toString() : null)
+                .elem("TaskStartTime", task.getTaskStartTime() != null ? task.getTaskStartTime().toString() : null)
+                .elem("TaskEndTime", task.getTaskEndTime() != null ? task.getTaskEndTime().toString() : null)
+                .elem("S3Bucket", task.getS3Bucket())
+                .elem("S3Prefix", task.getS3Prefix())
+                .elem("IamRoleArn", task.getIamRoleArn())
+                .elem("KmsKeyId", task.getKmsKeyId())
+                .elem("Status", task.getStatus())
+                .elem("PercentProgress", task.getPercentProgress())
+                .elem("TotalExtractedDataInGB", task.getTotalExtractedDataInGb())
+                .elem("FailureCause", task.getFailureCause())
+                .elem("WarningMessage", task.getWarningMessage());
+        return xml.build();
+    }
+
     private Response handleDescribeDbSnapshots(MultivaluedMap<String, String> params, String region) {
         String snapshotId = params.getFirst("DBSnapshotIdentifier");
         String instanceId = params.getFirst("DBInstanceIdentifier");
         try {
-            Collection<io.github.hectorvent.floci.services.rds.model.DbSnapshot> result =
+            Collection<DbSnapshot> result =
                     service.describeDbSnapshots(snapshotId, instanceId, region);
             XmlBuilder xml = new XmlBuilder().start("DBSnapshots");
-            for (io.github.hectorvent.floci.services.rds.model.DbSnapshot s : result) {
+            for (DbSnapshot s : result) {
                 xml.raw(dbSnapshotXml(s));
             }
             xml.end("DBSnapshots");
@@ -1643,7 +2211,7 @@ public class RdsQueryHandler {
     private Response handleDescribeDbSnapshotAttributes(MultivaluedMap<String, String> params, String region) {
         String snapshotId = params.getFirst("DBSnapshotIdentifier");
         try {
-            io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot =
+            DbSnapshot snapshot =
                     service.describeDbSnapshotAttributes(snapshotId, region);
             String result = dbSnapshotAttributesResultXml(snapshot);
             return Response.ok(AwsQueryResponse.envelope(
@@ -1657,7 +2225,7 @@ public class RdsQueryHandler {
         String snapshotId = params.getFirst("DBSnapshotIdentifier");
         String attributeName = params.getFirst("AttributeName");
         try {
-            io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot = service.modifyDbSnapshotAttribute(
+            DbSnapshot snapshot = service.modifyDbSnapshotAttribute(
                     snapshotId, attributeName, memberList(params, "ValuesToAdd"), memberList(params, "ValuesToRemove"), region);
             String result = dbSnapshotAttributesResultXml(snapshot);
             return Response.ok(AwsQueryResponse.envelope(
@@ -1683,8 +2251,8 @@ public class RdsQueryHandler {
         validateDbProxyNetworkType(targetConnectionNetworkType, "TargetConnectionNetworkType", false, "IPV4 or IPV6");
         String name = params.getFirst("DBProxyName");
         String engineFamily = params.getFirst("EngineFamily");
-        boolean requireTls = "true".equalsIgnoreCase(params.getFirst("RequireTLS"));
-        boolean debugLogging = "true".equalsIgnoreCase(params.getFirst("DebugLogging"));
+        boolean requireTls = Boolean.TRUE.equals(parseOptionalBoolean(params, "RequireTLS"));
+        boolean debugLogging = Boolean.TRUE.equals(parseOptionalBoolean(params, "DebugLogging"));
         int idleClientTimeout = 1800;
         String idleClientTimeoutValue = params.getFirst("IdleClientTimeout");
         if (idleClientTimeoutValue != null) {
@@ -1747,6 +2315,84 @@ public class RdsQueryHandler {
         String result = new XmlBuilder().start("DBProxy").raw(dbProxyInnerXml(proxy)).end("DBProxy").build();
         service.deleteDbProxy(name, region);
         return Response.ok(AwsQueryResponse.envelope("DeleteDBProxy", AwsNamespaces.RDS, result)).build();
+    }
+
+    private Response handleCreateDbProxyEndpoint(MultivaluedMap<String, String> params, String region) {
+        DbProxyEndpoint endpoint = service.createDbProxyEndpoint(region,
+                params.getFirst("DBProxyName"),
+                params.getFirst("DBProxyEndpointName"),
+                memberList(params, "VpcSubnetIds"),
+                memberList(params, "VpcSecurityGroupIds"),
+                params.getFirst("TargetRole"),
+                params.getFirst("EndpointNetworkType"),
+                parseTags(params));
+        return Response.ok(AwsQueryResponse.envelope("CreateDBProxyEndpoint", AwsNamespaces.RDS,
+                dbProxyEndpointXml(endpoint))).build();
+    }
+
+    private Response handleDescribeDbProxyEndpoints(MultivaluedMap<String, String> params, String region) {
+        RdsService.ProxyEndpointPage page = service.describeDbProxyEndpoints(region,
+                params.getFirst("DBProxyName"),
+                params.getFirst("DBProxyEndpointName"),
+                optionalInt(params.getFirst("MaxRecords")),
+                params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder().start("DBProxyEndpoints");
+        for (DbProxyEndpoint endpoint : page.endpoints()) {
+            xml.start("member").raw(dbProxyEndpointInnerXml(endpoint)).end("member");
+        }
+        xml.end("DBProxyEndpoints");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBProxyEndpoints", AwsNamespaces.RDS,
+                xml.build())).build();
+    }
+
+    private Response handleModifyDbProxyEndpoint(MultivaluedMap<String, String> params, String region) {
+        // Security groups left out of the request are kept; a list given replaces them.
+        DbProxyEndpoint endpoint = service.modifyDbProxyEndpoint(region,
+                params.getFirst("DBProxyEndpointName"),
+                params.getFirst("NewDBProxyEndpointName"),
+                hasMemberKeys(params, "VpcSecurityGroupIds") ? memberList(params, "VpcSecurityGroupIds") : null);
+        return Response.ok(AwsQueryResponse.envelope("ModifyDBProxyEndpoint", AwsNamespaces.RDS,
+                dbProxyEndpointXml(endpoint))).build();
+    }
+
+    private Response handleDeleteDbProxyEndpoint(MultivaluedMap<String, String> params, String region) {
+        DbProxyEndpoint endpoint = service.deleteDbProxyEndpoint(region, params.getFirst("DBProxyEndpointName"));
+        return Response.ok(AwsQueryResponse.envelope("DeleteDBProxyEndpoint", AwsNamespaces.RDS,
+                dbProxyEndpointXml(endpoint))).build();
+    }
+
+    private static String dbProxyEndpointXml(DbProxyEndpoint e) {
+        return new XmlBuilder().start("DBProxyEndpoint").raw(dbProxyEndpointInnerXml(e)).end("DBProxyEndpoint").build();
+    }
+
+    /** The DBProxyEndpoint members; a proxy's default endpoint has no ARN. */
+    private static String dbProxyEndpointInnerXml(DbProxyEndpoint e) {
+        XmlBuilder xml = new XmlBuilder().elem("DBProxyEndpointName", e.getDbProxyEndpointName());
+        if (e.getDbProxyEndpointArn() != null) {
+            xml.elem("DBProxyEndpointArn", e.getDbProxyEndpointArn());
+        }
+        xml.elem("DBProxyName", e.getDbProxyName())
+           .elem("Status", e.getStatus());
+        if (e.getVpcId() != null) {
+            xml.elem("VpcId", e.getVpcId());
+        }
+        xml.start("VpcSecurityGroupIds");
+        e.getVpcSecurityGroupIds().forEach(id -> xml.elem("member", id));
+        xml.end("VpcSecurityGroupIds");
+        xml.start("VpcSubnetIds");
+        e.getVpcSubnetIds().forEach(id -> xml.elem("member", id));
+        xml.end("VpcSubnetIds");
+        xml.elem("Endpoint", e.getEndpoint());
+        if (e.getCreatedDate() != null) {
+            xml.elem("CreatedDate", e.getCreatedDate().toString());
+        }
+        xml.elem("TargetRole", e.getTargetRole())
+           .elem("IsDefault", String.valueOf(e.isDefault()))
+           .elem("EndpointNetworkType", e.getEndpointNetworkType() != null ? e.getEndpointNetworkType() : "IPV4");
+        return xml.build();
     }
 
     private Response handleRegisterDbProxyTargets(MultivaluedMap<String, String> params, String region) {
@@ -2197,10 +2843,67 @@ public class RdsQueryHandler {
         if (missing != null) {
             return missing;
         }
-        boolean copyTags = "true".equalsIgnoreCase(params.getFirst("CopyTags"));
+        boolean copyTags = Boolean.TRUE.equals(parseOptionalBoolean(params, "CopyTags"));
         DbClusterSnapshot copy = service.copyDbClusterSnapshot(sourceId, targetId, copyTags, parseTags(params), region);
         return Response.ok(AwsQueryResponse.envelope("CopyDBClusterSnapshot", AwsNamespaces.RDS,
                 dbClusterSnapshotXml(copy))).build();
+    }
+
+    private Response handleRestoreDbInstanceToPointInTime(MultivaluedMap<String, String> params, String region) {
+        try {
+            PointInTimeRestoreRequest request = new PointInTimeRestoreRequest(
+                    params.getFirst("TargetDBInstanceIdentifier"),
+                    params.getFirst("SourceDBInstanceIdentifier"),
+                    params.getFirst("SourceDbiResourceId"),
+                    params.getFirst("SourceDBInstanceAutomatedBackupsArn"),
+                    parseOptionalInstant(params.getFirst("RestoreTime")),
+                    parseOptionalBoolean(params, "UseLatestRestorableTime"),
+                    params.getFirst("DBInstanceClass"),
+                    parseIntegerParam(params, "Port"),
+                    params.getFirst("AvailabilityZone"),
+                    parseOptionalBoolean(params, "MultiAZ"),
+                    parseOptionalBoolean(params, "AutoMinorVersionUpgrade"),
+                    params.getFirst("DBName"),
+                    params.getFirst("OptionGroupName"),
+                    params.getFirst("DBParameterGroupName"),
+                    parseOptionalBoolean(params, "PubliclyAccessible"),
+                    params.getFirst("DBSubnetGroupName"),
+                    hasMemberKeys(params, "VpcSecurityGroupIds") ? vpcSecurityGroupIds(params) : null,
+                    parseOptionalBoolean(params, "CopyTagsToSnapshot"),
+                    parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"),
+                    parseIntegerParam(params, "BackupRetentionPeriod"),
+                    params.getFirst("PreferredBackupWindow"),
+                    parseOptionalBoolean(params, "DeletionProtection"),
+                    parseTags(params), params.getFirst("StorageType"), params.getFirst("CACertificateIdentifier"));
+            DbInstance instance = service.restoreDbInstanceToPointInTime(request, region);
+            return Response.ok(AwsQueryResponse.envelope(
+                    "RestoreDBInstanceToPointInTime", AwsNamespaces.RDS, dbInstanceXml(instance))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleRestoreDbClusterToPointInTime(MultivaluedMap<String, String> params, String region) {
+        String clusterId = params.getFirst("DBClusterIdentifier");
+        Response missing = firstMissingParam("DBClusterIdentifier", clusterId);
+        if (missing != null) {
+            return missing;
+        }
+        try {
+            DbCluster cluster = service.restoreDbClusterToPointInTime(clusterId,
+                    params.getFirst("SourceDBClusterIdentifier"), params.getFirst("SourceDbClusterResourceId"),
+                    params.getFirst("RestoreType"),
+                    parseOptionalInstant(params.getFirst("RestoreToTime")),
+                    parseOptionalBoolean(params, "UseLatestRestorableTime"),
+                    optionalInt(params.getFirst("Port")), params.getFirst("DBSubnetGroupName"),
+                    params.getFirst("DBClusterParameterGroupName"),
+                    parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"),
+                    params.getFirst("EngineMode"), parseTags(params), region);
+            return Response.ok(AwsQueryResponse.envelope("RestoreDBClusterToPointInTime", AwsNamespaces.RDS,
+                    dbClusterXml(cluster))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
     }
 
     private Response handleRestoreDbClusterFromSnapshot(MultivaluedMap<String, String> params, String region) {
@@ -2219,7 +2922,7 @@ public class RdsQueryHandler {
                 params.getFirst("DatabaseName"), params.getFirst("DBSubnetGroupName"),
                 params.getFirst("DBClusterParameterGroupName"),
                 params.getFirst("AvailabilityZones.member.1"),
-                optionalBoolean(params.getFirst("EnableIAMDatabaseAuthentication")),
+                parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"),
                 params.getFirst("EngineMode"), parseTags(params), region);
         return Response.ok(AwsQueryResponse.envelope("RestoreDBClusterFromSnapshot", AwsNamespaces.RDS,
                 dbClusterXml(cluster))).build();
@@ -2242,6 +2945,171 @@ public class RdsQueryHandler {
 
     // ── XML builders ──────────────────────────────────────────────────────────
 
+    // ── Automated backups ─────────────────────────────────────────────────────
+
+    private Response handleDescribeDbInstanceAutomatedBackups(MultivaluedMap<String, String> params, String region) {
+        RdsService.AutomatedBackupPage<DbInstanceAutomatedBackup> page = service.describeDbInstanceAutomatedBackups(
+                region, params.getFirst("DbiResourceId"), params.getFirst("DBInstanceIdentifier"),
+                params.getFirst("DBInstanceAutomatedBackupsArn"),
+                extractRdsFilterValues(params, "status"),
+                extractRdsFilterValues(params, "db-instance-id"),
+                extractRdsFilterValues(params, "dbi-resource-id"),
+                optionalInt(params.getFirst("MaxRecords")), params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder().start("DBInstanceAutomatedBackups");
+        for (DbInstanceAutomatedBackup backup : page.backups()) {
+            xml.raw(instanceAutomatedBackupXml(backup));
+        }
+        xml.end("DBInstanceAutomatedBackups");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBInstanceAutomatedBackups", AwsNamespaces.RDS,
+                xml.build())).build();
+    }
+
+    private Response handleDeleteDbInstanceAutomatedBackup(MultivaluedMap<String, String> params, String region) {
+        DbInstanceAutomatedBackup backup = service.deleteDbInstanceAutomatedBackup(region,
+                params.getFirst("DbiResourceId"), params.getFirst("DBInstanceAutomatedBackupsArn"));
+        return Response.ok(AwsQueryResponse.envelope("DeleteDBInstanceAutomatedBackup", AwsNamespaces.RDS,
+                instanceAutomatedBackupXml(backup))).build();
+    }
+
+    private Response handleStartDbInstanceAutomatedBackupsReplication(MultivaluedMap<String, String> params,
+                                                                      String region) {
+        DbInstanceAutomatedBackup backup = service.startDbInstanceAutomatedBackupsReplication(region,
+                params.getFirst("SourceDBInstanceArn"), parseIntegerParam(params, "BackupRetentionPeriod"),
+                params.getFirst("KmsKeyId"));
+        return Response.ok(AwsQueryResponse.envelope("StartDBInstanceAutomatedBackupsReplication", AwsNamespaces.RDS,
+                instanceAutomatedBackupXml(backup))).build();
+    }
+
+    private Response handleStopDbInstanceAutomatedBackupsReplication(MultivaluedMap<String, String> params,
+                                                                     String region) {
+        DbInstanceAutomatedBackup backup = service.stopDbInstanceAutomatedBackupsReplication(region,
+                params.getFirst("SourceDBInstanceArn"));
+        return Response.ok(AwsQueryResponse.envelope("StopDBInstanceAutomatedBackupsReplication", AwsNamespaces.RDS,
+                instanceAutomatedBackupXml(backup))).build();
+    }
+
+    private Response handleDescribeDbClusterAutomatedBackups(MultivaluedMap<String, String> params, String region) {
+        RdsService.AutomatedBackupPage<DbClusterAutomatedBackup> page = service.describeDbClusterAutomatedBackups(
+                region, params.getFirst("DbClusterResourceId"), params.getFirst("DBClusterIdentifier"),
+                extractRdsFilterValues(params, "status"),
+                extractRdsFilterValues(params, "db-cluster-id"),
+                extractRdsFilterValues(params, "db-cluster-resource-id"),
+                optionalInt(params.getFirst("MaxRecords")), params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder().start("DBClusterAutomatedBackups");
+        for (DbClusterAutomatedBackup backup : page.backups()) {
+            xml.raw(clusterAutomatedBackupXml(backup));
+        }
+        xml.end("DBClusterAutomatedBackups");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBClusterAutomatedBackups", AwsNamespaces.RDS,
+                xml.build())).build();
+    }
+
+    private Response handleDeleteDbClusterAutomatedBackup(MultivaluedMap<String, String> params, String region) {
+        DbClusterAutomatedBackup backup = service.deleteDbClusterAutomatedBackup(region,
+                params.getFirst("DbClusterResourceId"));
+        return Response.ok(AwsQueryResponse.envelope("DeleteDBClusterAutomatedBackup", AwsNamespaces.RDS,
+                clusterAutomatedBackupXml(backup))).build();
+    }
+
+    private String instanceAutomatedBackupXml(DbInstanceAutomatedBackup backup) {
+        DbInstance i = backup.getInstance();
+        String engine = instanceEngine(i);
+        XmlBuilder xml = new XmlBuilder().start("DBInstanceAutomatedBackup")
+                .elem("DBInstanceArn", i.getDbInstanceArn())
+                .elem("DbiResourceId", i.getDbiResourceId())
+                .elem("Region", backup.getRegion())
+                .elem("DBInstanceIdentifier", i.getDbInstanceIdentifier())
+                .start("RestoreWindow")
+                .elem("EarliestTime", backup.getEarliestTime().toString())
+                .elem("LatestTime", backup.getLatestTime().toString())
+                .end("RestoreWindow")
+                .elem("AllocatedStorage", i.getAllocatedStorage())
+                .elem("Status", backup.getStatus())
+                .elem("Port", i.getEndpoint() != null ? i.getEndpoint().port() : i.getProxyPort())
+                .elem("AvailabilityZone", i.getAvailabilityZone() != null
+                        ? i.getAvailabilityZone() : config.defaultAvailabilityZone());
+        if (i.getVpcId() != null) {
+            xml.elem("VpcId", i.getVpcId());
+        }
+        if (i.getCreatedAt() != null) {
+            xml.elem("InstanceCreateTime", i.getCreatedAt().toString());
+        }
+        xml.elem("MasterUsername", i.getMasterUsername())
+           .elem("Engine", engine)
+           .elem("EngineVersion", i.getEngineVersion())
+           .elem("LicenseModel", licenseModel(engine));
+        if (i.getOptionGroupName() != null) {
+            xml.elem("OptionGroupName", i.getOptionGroupName());
+        }
+        xml.elem("Encrypted", i.isStorageEncrypted())
+           .elem("StorageType", i.getStorageType());
+        if (backup.getKmsKeyId() != null) {
+            xml.elem("KmsKeyId", backup.getKmsKeyId());
+        }
+        xml.elem("IAMDatabaseAuthenticationEnabled", i.isIamDatabaseAuthenticationEnabled())
+           .elem("BackupRetentionPeriod", backup.getBackupRetentionPeriod())
+           .elem("PreferredBackupWindow", i.getPreferredBackupWindow() != null
+                   ? i.getPreferredBackupWindow() : DbInstanceSettings.DEFAULT_BACKUP_WINDOW)
+           .elem("DBInstanceAutomatedBackupsArn", backup.getDbInstanceAutomatedBackupsArn());
+        // Only the source's own backup lists where it replicates to.
+        if (DbInstanceAutomatedBackup.ACTIVE.equals(backup.getStatus())) {
+            xml.raw(automatedBackupReplicationsXml(i));
+        }
+        xml.elem("BackupTarget", "region");
+        return xml.end("DBInstanceAutomatedBackup").build();
+    }
+
+    private static String automatedBackupReplicationsXml(DbInstance i) {
+        XmlBuilder xml = new XmlBuilder().start("DBInstanceAutomatedBackupsReplications");
+        for (String arn : i.getAutomatedBackupReplicationArns()) {
+            xml.start("DBInstanceAutomatedBackupsReplication")
+               .elem("DBInstanceAutomatedBackupsArn", arn)
+               .end("DBInstanceAutomatedBackupsReplication");
+        }
+        return xml.end("DBInstanceAutomatedBackupsReplications").build();
+    }
+
+    private String clusterAutomatedBackupXml(DbClusterAutomatedBackup backup) {
+        DbCluster c = backup.getCluster();
+        String engine = clusterEngine(c);
+        XmlBuilder xml = new XmlBuilder().start("DBClusterAutomatedBackup")
+                .elem("Engine", engine);
+        if (c.getVpcId() != null) {
+            xml.elem("VpcId", c.getVpcId());
+        }
+        xml.elem("DBClusterAutomatedBackupsArn", backup.getDbClusterAutomatedBackupsArn())
+           .elem("DBClusterIdentifier", c.getDbClusterIdentifier())
+           .start("RestoreWindow")
+           .elem("EarliestTime", backup.getEarliestTime().toString())
+           .elem("LatestTime", backup.getLatestTime().toString())
+           .end("RestoreWindow")
+           .elem("MasterUsername", c.getMasterUsername())
+           .elem("DbClusterResourceId", c.getDbClusterResourceId())
+           .elem("Region", backup.getRegion())
+           .elem("LicenseModel", licenseModel(engine))
+           .elem("Status", backup.getStatus())
+           .elem("IAMDatabaseAuthenticationEnabled", c.isIamDatabaseAuthenticationEnabled());
+        if (c.getCreatedAt() != null) {
+            xml.elem("ClusterCreateTime", c.getCreatedAt().toString());
+        }
+        xml.elem("StorageEncrypted", c.isStorageEncrypted())
+           .elem("EngineVersion", c.getEngineVersion())
+           .elem("DBClusterArn", c.getDbClusterArn())
+           .elem("BackupRetentionPeriod", backup.getBackupRetentionPeriod())
+           .elem("PreferredBackupWindow", "04:00-06:00")
+           .elem("EngineMode", c.getEngineMode() != null ? c.getEngineMode() : "provisioned");
+        if (c.getEndpoint() != null) {
+            xml.elem("Port", c.getEndpoint().port());
+        }
+        return xml.end("DBClusterAutomatedBackup").build();
+    }
+
     private String dbInstanceXml(DbInstance i) {
         return new XmlBuilder().start("DBInstance").raw(dbInstanceInnerXml(i)).end("DBInstance").build();
     }
@@ -2255,6 +3123,7 @@ public class RdsQueryHandler {
                 .elem("Engine", engineStr)
                 .elem("EngineVersion", s.getEngineVersion())
                 .elem("AllocatedStorage", s.getAllocatedStorage())
+                .elem("StorageType", s.getStorageType())
                 .elem("Status", s.getStatus())
                 .elem("MasterUsername", s.getMasterUsername())
                 .elem("SnapshotType", s.getSnapshotType() != null
@@ -2329,7 +3198,7 @@ public class RdsQueryHandler {
         return xml.end("DBClusterSnapshotAttributesResult").build();
     }
 
-    private String dbSnapshotAttributesResultXml(io.github.hectorvent.floci.services.rds.model.DbSnapshot s) {
+    private String dbSnapshotAttributesResultXml(DbSnapshot s) {
         XmlBuilder xml = new XmlBuilder().start("DBSnapshotAttributesResult")
                 .elem("DBSnapshotIdentifier", s.getDbSnapshotIdentifier());
         xml.start("DBSnapshotAttributes").start("DBSnapshotAttribute")
@@ -2344,13 +3213,14 @@ public class RdsQueryHandler {
     private String dbInstanceInnerXml(DbInstance i) {
         DbEndpoint ep = i.getEndpoint();
         String engineStr = instanceEngine(i);
-        String statusStr = i.getStatus() != null ? statusLabel(i.getStatus()) : "available";
+        String statusStr = statusLabel(reportedStatus(i));
 
         XmlBuilder xml = new XmlBuilder()
                 .elem("DBInstanceIdentifier", i.getDbInstanceIdentifier())
                 .elem("DBInstanceStatus", statusStr)
                 .elem("Engine", engineStr.toLowerCase())
                 .elem("EngineVersion", i.getEngineVersion())
+                .elem("LicenseModel", i.getLicenseModel() != null ? i.getLicenseModel() : licenseModel(engineStr))
                 .elem("MasterUsername", i.getMasterUsername());
         if (i.getDbName() != null && !i.getDbName().isBlank()) {
             xml.elem("DBName", i.getDbName());
@@ -2361,12 +3231,22 @@ public class RdsQueryHandler {
             xml.start("Endpoint")
                .elem("Address", ep.address())
                .elem("Port", ep.port())
+               .elem("HostedZoneId", AwsRegionFacts.rdsHostedZoneId(
+                       AwsArnUtils.regionOrDefault(i.getDbInstanceArn(), config.defaultRegion()))
+                       .orElse(UNSOURCED_RDS_HOSTED_ZONE_ID))
                .end("Endpoint");
         }
+        RdsService.InstanceCertificate ca = service.instanceCertificate(i);
+        xml.elem("CACertificateIdentifier", ca.caIdentifier())
+           .start("CertificateDetails").elem("CAIdentifier", ca.caIdentifier());
+        if (ca.validTill() != null) {
+            xml.elem("ValidTill", ca.validTill().toString());
+        }
+        xml.end("CertificateDetails");
         xml.elem("IAMDatabaseAuthenticationEnabled", i.isIamDatabaseAuthenticationEnabled())
            .elem("MultiAZ", i.isMultiAz())
            .elem("AutoMinorVersionUpgrade", i.isAutoMinorVersionUpgrade())
-           .elem("StorageType", DbInstance.DEFAULT_STORAGE_TYPE)
+           .elem("StorageType", i.getStorageType())
            .elem("PubliclyAccessible", i.isPubliclyAccessible())
            .elem("AvailabilityZone", i.getAvailabilityZone() != null ? i.getAvailabilityZone() : config.defaultAvailabilityZone())
            .elem("PreferredMaintenanceWindow", i.getPreferredMaintenanceWindow() != null
@@ -2386,6 +3266,10 @@ public class RdsQueryHandler {
            .elem("MonitoringInterval", i.getMonitoringInterval())
            .elem("PerformanceInsightsEnabled", i.isPerformanceInsightsEnabled())
            .elem("EngineLifecycleSupport", i.getEngineLifecycleSupport());
+        if (i.getBackupRetentionPeriod() > 0) {
+            // Point in time restore copies the source's current data, so the latest restorable time is now.
+            xml.elem("LatestRestorableTime", Instant.now().toString());
+        }
         if (i.getMonitoringRoleArn() != null && !i.getMonitoringRoleArn().isBlank()) {
             xml.elem("MonitoringRoleArn", i.getMonitoringRoleArn());
         }
@@ -2416,6 +3300,7 @@ public class RdsQueryHandler {
             xml.elem("DBClusterIdentifier", i.getDbClusterIdentifier());
         }
         xml.raw(readReplicaXml(i));
+        writeAssociatedRoles(xml, i.getAssociatedRoles(), "DBInstanceRole");
         xml.start("TagList");
         writeTags(xml, i.getTags());
         xml.end("TagList");
@@ -2433,6 +3318,7 @@ public class RdsQueryHandler {
         if (i.hasReadReplicaSource()) {
             xml.elem("ReadReplicaSourceDBInstanceIdentifier", i.getReadReplicaSourceDbInstanceIdentifier());
         }
+        xml.raw(automatedBackupReplicationsXml(i));
         xml.start("ReadReplicaDBInstanceIdentifiers");
         for (String replicaId : i.getReadReplicaDbInstanceIdentifiers()) {
             xml.elem("ReadReplicaDBInstanceIdentifier", replicaId);
@@ -2540,6 +3426,25 @@ public class RdsQueryHandler {
                 .end("Tag"));
     }
 
+    /**
+     * The cluster's DB cluster parameter group, or the engine's default group when it was created
+     * without one, as AWS reports it. Null when the engine has no default group that
+     * DescribeDBClusterParameterGroups lists.
+     */
+    private String dbClusterParameterGroupName(DbCluster cluster, String engine) {
+        String name = cluster.getParameterGroupName();
+        if (name != null && !name.isBlank()) {
+            return name;
+        }
+        String defaultGroup;
+        try {
+            defaultGroup = "default." + service.expectedClusterParameterGroupFamily(engine, cluster.getEngineVersion());
+        } catch (AwsException e) {
+            return null;
+        }
+        return service.isManagedClusterParameterGroup(defaultGroup) ? defaultGroup : null;
+    }
+
     private String dbClusterXml(DbCluster c) {
         return new XmlBuilder().start("DBCluster").raw(dbClusterInnerXml(c)).end("DBCluster").build();
     }
@@ -2566,12 +3471,22 @@ public class RdsQueryHandler {
             xml.elem("Endpoint", ep.address())
                .elem("Port", ep.port());
         }
+        xml.elem("HostedZoneId", AwsRegionFacts.rdsHostedZoneId(
+                AwsArnUtils.regionOrDefault(c.getDbClusterArn(), config.defaultRegion()))
+                .orElse(UNSOURCED_RDS_HOSTED_ZONE_ID));
         if (readerEp != null) {
             xml.elem("ReaderEndpoint", readerEp.address());
         }
+        if (c.getCreatedAt() != null) {
+            // The restorable window runs from creation to now; see RestoreDBClusterToPointInTime.
+            xml.elem("EarliestRestorableTime", c.getCreatedAt().toString())
+               .elem("LatestRestorableTime", Instant.now().toString());
+        }
         xml.elem("IAMDatabaseAuthenticationEnabled", c.isIamDatabaseAuthenticationEnabled())
+           .elem("HttpEndpointEnabled", c.isHttpEndpointEnabled())
            .elem("MultiAZ", c.isMultiAz())
            .elem("StorageEncrypted", c.isStorageEncrypted())
+           .elem("KmsKeyId", c.getKmsKeyId())
            .elem("AvailabilityZone", c.getAvailabilityZone() != null ? c.getAvailabilityZone() : config.defaultAvailabilityZone())
            .elem("PreferredMaintenanceWindow", "mon:00:00-mon:03:00")
            .elem("PreferredBackupWindow", "04:00-06:00")
@@ -2581,8 +3496,12 @@ public class RdsQueryHandler {
                .elem("Status", "active")
              .end("VpcSecurityGroupMembership")
            .end("VpcSecurityGroups")
-           .elem("DBSubnetGroup", c.getDbSubnetGroupName() != null ? c.getDbSubnetGroupName() : "default")
-           .elem("DbClusterResourceId", c.getDbClusterResourceId())
+           .elem("DBSubnetGroup", c.getDbSubnetGroupName() != null ? c.getDbSubnetGroupName() : "default");
+        String clusterParameterGroup = dbClusterParameterGroupName(c, engineStr);
+        if (clusterParameterGroup != null) {
+            xml.elem("DBClusterParameterGroup", clusterParameterGroup);
+        }
+        xml.elem("DbClusterResourceId", c.getDbClusterResourceId())
            .elem("DBClusterArn", c.getDbClusterArn());
         if (c.getMasterUserSecretArn() != null && !c.getMasterUserSecretArn().isBlank()) {
             xml.start("MasterUserSecret")
@@ -2620,7 +3539,24 @@ public class RdsQueryHandler {
             }
         }
         xml.end("DBClusterMembers");
+        writeAssociatedRoles(xml, c.getAssociatedRoles(), "DBClusterRole");
+        xml.start("TagList");
+        writeTags(xml, c.getTags());
+        xml.end("TagList");
         return xml.build();
+    }
+
+    /** {@code AssociatedRoles}, each entry named as the model names it for the resource. */
+    private static void writeAssociatedRoles(XmlBuilder xml, List<DbRoleAssociation> roles, String elementName) {
+        xml.start("AssociatedRoles");
+        for (DbRoleAssociation role : roles) {
+            xml.start(elementName).elem("RoleArn", role.getRoleArn());
+            if (role.getFeatureName() != null) {
+                xml.elem("FeatureName", role.getFeatureName());
+            }
+            xml.elem("Status", role.getStatus()).end(elementName);
+        }
+        xml.end("AssociatedRoles");
     }
 
     private String paramGroupXml(DbParameterGroup g) {
@@ -2658,16 +3594,7 @@ public class RdsQueryHandler {
             return fallbackSubnetGroup(instance, "default", "default subnet group");
         }
         return service.getDbSubnetGroup(
-                groupName, regionFromRdsArn(instance.getDbInstanceArn()));
-    }
-
-    private String regionFromRdsArn(String arn) {
-        if (arn == null || arn.isBlank()) {
-            return config.defaultRegion();
-        }
-        String[] parts = arn.split(":", 6);
-        return parts.length == 6 && !parts[3].isBlank()
-                ? parts[3] : config.defaultRegion();
+                groupName, AwsArnUtils.regionOrDefault(instance.getDbInstanceArn(), config.defaultRegion()));
     }
 
     private DbSubnetGroup fallbackSubnetGroup(DbInstance instance, String name, String description) {
@@ -2690,14 +3617,12 @@ public class RdsQueryHandler {
 
     private static String subnetGroupArnForInstance(DbInstance instance, String name) {
         String arn = instance.getDbInstanceArn();
-        if (arn == null || arn.isBlank()) {
+        if (!AwsArnUtils.isArn(arn)) {
             return null;
         }
-        String[] parts = arn.split(":", 6);
-        if (parts.length < 6) {
-            return null;
-        }
-        return String.join(":", parts[0], parts[1], parts[2], parts[3], parts[4], "subgrp:" + name);
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        return new AwsArnUtils.Arn(parsed.partition(), parsed.service(), parsed.region(), parsed.accountId(),
+                "subgrp:" + name).toString();
     }
 
     private String paramGroupInnerXml(DbParameterGroup g) {
@@ -2812,6 +3737,13 @@ public class RdsQueryHandler {
                 .build();
     }
 
+    /** An available instance whose database refused its parameter group reports incompatible-parameters, as on AWS. */
+    private DbInstanceStatus reportedStatus(DbInstance instance) {
+        DbInstanceStatus status = instance.getStatus() != null ? instance.getStatus() : DbInstanceStatus.AVAILABLE;
+        return status == DbInstanceStatus.AVAILABLE && service.databaseRefusedParameterGroup(instance)
+                ? DbInstanceStatus.INCOMPATIBLE_PARAMETERS : status;
+    }
+
     private String statusLabel(DbInstanceStatus status) {
         return switch (status) {
             case CREATING -> "creating";
@@ -2823,6 +3755,7 @@ public class RdsQueryHandler {
             case STOPPING -> "stopping";
             case STOPPED -> "stopped";
             case STARTING -> "starting";
+            case INCOMPATIBLE_PARAMETERS -> "incompatible-parameters";
         };
     }
 
@@ -2841,7 +3774,7 @@ public class RdsQueryHandler {
      * answers an empty list for a known engine it holds nothing of — including ones Floci cannot
      * create.
      */
-    private static final java.util.Set<String> KNOWN_ENGINES = java.util.Set.of(
+    private static final Set<String> KNOWN_ENGINES = Set.of(
             "aurora", "aurora-mysql", "aurora-postgresql", "mysql", "mariadb", "postgres",
             "custom-oracle-ee", "custom-oracle-ee-cdb", "custom-oracle-se2", "custom-oracle-se2-cdb",
             "custom-sqlserver-dev", "custom-sqlserver-ee", "custom-sqlserver-se", "custom-sqlserver-web",
@@ -2894,7 +3827,7 @@ public class RdsQueryHandler {
                 break;
             }
             if (filterName.equals(name)) {
-                java.util.ArrayList<String> values = new java.util.ArrayList<>();
+                ArrayList<String> values = new ArrayList<>();
                 for (int valueIndex = 1; ; valueIndex++) {
                     String value = params.getFirst("Filters.Filter." + i + ".Values.Value." + valueIndex);
                     if (value == null) {
@@ -2911,53 +3844,37 @@ public class RdsQueryHandler {
     }
 
     private static List<String> memberList(MultivaluedMap<String, String> params, String baseName) {
-        return params.keySet().stream()
-                .filter(key -> key.matches(memberKeyRegex(baseName)))
-                .sorted(java.util.Comparator.comparingInt(RdsQueryHandler::numericSuffix))
-                .map(params::getFirst)
-                .filter(value -> value != null && !value.isBlank())
-                .toList();
+        return AwsQueryLists.values(params, baseName, memberName(baseName));
     }
 
     private static boolean hasMemberKeys(MultivaluedMap<String, String> params, String baseName) {
-        return params.keySet().stream().anyMatch(key -> key.matches(memberKeyRegex(baseName)));
+        Pattern keys = AwsQueryLists.memberKeys(baseName, memberName(baseName));
+        return params.keySet().stream().anyMatch(key -> keys.matcher(key).matches());
     }
 
-    private static String memberKeyRegex(String baseName) {
-        String quoted = java.util.regex.Pattern.quote(baseName);
+    /** The name the list {@code baseName}'s shape gives its members, or null for a list whose shape names none. */
+    private static String memberName(String baseName) {
         return switch (baseName) {
-            case "SubnetIds" -> quoted + "(\\.member|\\.SubnetIdentifier)?\\.\\d+";
-            case "VpcSecurityGroupIds" -> quoted + "(\\.member|\\.VpcSecurityGroupId)?\\.\\d+";
-            case "OptionsToRemove" -> quoted + "(\\.member|\\.OptionName)?\\.\\d+";
-            case "ValuesToAdd", "ValuesToRemove" -> quoted + "(\\.member|\\.AttributeValue)?\\.\\d+";
+            case "SubnetIds" -> "SubnetIdentifier";
+            case "VpcSecurityGroupIds" -> "VpcSecurityGroupId";
+            case "OptionsToRemove" -> "OptionName";
+            case "ValuesToAdd", "ValuesToRemove" -> "AttributeValue";
             default -> {
                 // Option configurations nest their membership lists under an indexed prefix,
                 // so the alternate member names have to be matched on the suffix.
                 if (baseName.endsWith("VpcSecurityGroupMemberships")) {
-                    yield quoted + "(\\.member|\\.VpcSecurityGroupId)?\\.\\d+";
+                    yield "VpcSecurityGroupId";
                 }
                 if (baseName.endsWith("DBSecurityGroupMemberships")) {
-                    yield quoted + "(\\.member|\\.DBSecurityGroupName)?\\.\\d+";
+                    yield "DBSecurityGroupName";
                 }
-                yield quoted + "(\\.member)?\\.\\d+";
+                yield null;
             }
         };
     }
 
-    private static int numericSuffix(String key) {
-        int dot = key.lastIndexOf('.');
-        if (dot < 0 || dot == key.length() - 1) {
-            return Integer.MAX_VALUE;
-        }
-        try {
-            return Integer.parseInt(key.substring(dot + 1));
-        } catch (NumberFormatException e) {
-            return Integer.MAX_VALUE;
-        }
-    }
-
     private static List<DbProxyAuth> parseProxyAuth(MultivaluedMap<String, String> params) {
-        List<DbProxyAuth> auth = new java.util.ArrayList<>();
+        List<DbProxyAuth> auth = new ArrayList<>();
         for (int index = 1; ; index++) {
             String prefix = "Auth.member." + index + ".";
             String authScheme = params.getFirst(prefix + "AuthScheme");
@@ -3041,16 +3958,9 @@ public class RdsQueryHandler {
         }
     }
 
+    /** The catalogue's default for the engine, or {@code 1.0} for an engine it does not list. */
     private static String defaultEngineVersion(String engine) {
-        if (engine == null) {
-            return "16.3";
-        }
-        return switch (engine.toLowerCase()) {
-            case "postgres", "aurora-postgresql" -> "16.3";
-            case "mysql", "aurora-mysql", "aurora" -> "8.0.36";
-            case "mariadb" -> "11.2";
-            case "sqlserver-ee", "sqlserver-se", "sqlserver-ex", "sqlserver-web" -> "15.00";
-            default -> "1.0";
-        };
+        String version = RdsEngineCatalog.defaultVersion(engine);
+        return version != null ? version : "1.0";
     }
 }

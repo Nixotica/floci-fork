@@ -1,38 +1,46 @@
 package io.github.hectorvent.floci.services.ec2;
 
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.containsString;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.hamcrest.Matchers.not;
-import static org.hamcrest.Matchers.endsWith;
-import static org.hamcrest.Matchers.emptyOrNullString;
-import static org.hamcrest.Matchers.containsInAnyOrder;
-import static org.hamcrest.Matchers.hasItems;
-import static org.hamcrest.Matchers.hasItem;
-import static org.hamcrest.Matchers.everyItem;
-import static org.hamcrest.Matchers.greaterThan;
-import static org.hamcrest.Matchers.greaterThanOrEqualTo;
-import static org.hamcrest.Matchers.notNullValue;
-import static org.hamcrest.Matchers.nullValue;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.startsWith;
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.path.xml.XmlPath;
+import io.restassured.response.ExtractableResponse;
+import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
+import org.hamcrest.MatcherAssert;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.zip.GZIPOutputStream;
-import org.junit.jupiter.api.MethodOrderer;
-import org.junit.jupiter.api.Order;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestMethodOrder;
 
-import io.quarkus.test.junit.QuarkusTest;
 import static io.restassured.RestAssured.given;
-
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.emptyOrNullString;
+import static org.hamcrest.Matchers.endsWith;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.everyItem;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.matchesRegex;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * Integration tests for EC2 via the EC2 Query Protocol (form-encoded POST, XML response).
@@ -155,12 +163,321 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .contentType("application/xml")
             .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.networkBorderGroup",
+                    everyItem(equalTo("us-east-1")))
             .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].zoneName",
                     startsWith("us-east-1"));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"eu-west-1", "us-gov-west-1", "cn-north-1"})
+    @Order(337)
+    void availabilityZoneBorderGroupUsesTheRequestedRegion(String region) {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Version", "2016-11-15")
+            .formParam("ZoneName.1", region + "b")
+            .header("Authorization", AUTH_HEADER.replace("us-east-1", region))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(1))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].networkBorderGroup",
+                    equalTo(region))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].zoneName",
+                    equalTo(region + "b"))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].zoneType",
+                    equalTo("availability-zone"));
+    }
+
+    // DescribeAvailabilityZones parameter validation and filtering
     @Test
     @Order(5)
+    void describeAvailabilityZonesWithZoneName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneName.1", "us-east-1a")
+            .formParam("ZoneName.2", "us-east-1c")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(2))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneName",
+                    hasItems("us-east-1a", "us-east-1c"));
+    }
+
+    @Test
+    @Order(6)
+    void describeAvailabilityZonesWithZoneId() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneId.1", "use1-az1")
+            .formParam("ZoneId.2", "use1-az3")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(2))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneId",
+                    hasItems("use1-az1", "use1-az3"));
+    }
+
+    @Test
+    @Order(7)
+    void describeAvailabilityZonesRejectsUnknownZoneName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneName.1", "us-east-1aa")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message", equalTo("Invalid availability zone: [us-east-1aa]"));
+    }
+
+    @Test
+    @Order(7)
+    void describeAvailabilityZonesRejectsUnknownZoneId() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneId.1", "use1-az99")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+    }
+
+    @Test
+    @Order(8)
+    void describeAvailabilityZonesWithZoneNameAndZoneIdTogether() {
+        // Terraform's aws_availability_zone data source sends ZoneIds and ZoneNames together,
+        // so the pair is narrowed to their intersection rather than refused.
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneName.1", "us-east-1a")
+            .formParam("ZoneName.2", "us-east-1b")
+            .formParam("ZoneId.1", "use1-az1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(1))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].zoneName",
+                    equalTo("us-east-1a"));
+    }
+
+    @Test
+    @Order(9)
+    void describeAvailabilityZonesFilterByZoneName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-name")
+            .formParam("Filter.1.Value.1", "us-east-1a")
+            .formParam("Filter.1.Value.2", "us-east-1b")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(2))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneName",
+                    hasItems("us-east-1a", "us-east-1b"));
+    }
+
+    @Test
+    @Order(10)
+    void describeAvailabilityZonesFilterByZoneId() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-id")
+            .formParam("Filter.1.Value.1", "use1-az2")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(1))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneId",
+                    equalTo("use1-az2"));
+    }
+
+    @Test
+    @Order(11)
+    void describeAvailabilityZonesFilterByState() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "state")
+            .formParam("Filter.1.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3));
+    }
+
+    @Test
+    @Order(12)
+    void describeAvailabilityZonesFilterByRegionName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "region-name")
+            .formParam("Filter.1.Value.1", "us-east-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3));
+    }
+
+    @Test
+    @Order(13)
+    void describeAvailabilityZonesFilterByZoneType() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-type")
+            .formParam("Filter.1.Value.1", "availability-zone")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3));
+    }
+
+    @Test
+    @Order(14)
+    void describeAvailabilityZonesFilterByMessage() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "message")
+            .formParam("Filter.1.Value.1", "any")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(15)
+    void describeAvailabilityZonesFilterByOptInStatus() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "opt-in-status")
+            .formParam("Filter.1.Value.1", "opt-in-not-required")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].optInStatus",
+                    equalTo("opt-in-not-required"));
+    }
+
+    @Test
+    @Order(16)
+    void describeAvailabilityZonesFilterByGroupName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "group-name")
+            .formParam("Filter.1.Value.1", "us-east-1-zg-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].groupName",
+                    equalTo("us-east-1-zg-1"));
+    }
+
+    @Test
+    @Order(16)
+    void describeAvailabilityZonesFilterByGroupLongName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "group-long-name")
+            .formParam("Filter.1.Value.1", "US East (N. Virginia) 1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].groupLongName",
+                    equalTo("US East (N. Virginia) 1"));
+    }
+
+    @Test
+    @Order(17)
+    void describeAvailabilityZonesRejectsInvalidFilterName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "invalid-filter")
+            .formParam("Filter.1.Value.1", "any")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message",
+                    containsString("The filter 'invalid-filter' is invalid"));
+    }
+
+    @Test
+    @Order(18)
+    void describeAvailabilityZonesMultipleFiltersAndSemantics() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-name")
+            .formParam("Filter.1.Value.1", "us-east-1a")
+            .formParam("Filter.1.Value.2", "us-east-1b")
+            .formParam("Filter.2.Name", "state")
+            .formParam("Filter.2.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(2))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneName",
+                    hasItems("us-east-1a", "us-east-1b"));
+    }
+
+    @Test
+    @Order(19)
+    void describeAvailabilityZonesMultipleSameNameFiltersAndSemantics() {
+        // Two zone-name filters - should AND them
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-name")
+            .formParam("Filter.1.Value.1", "us-east-1a")
+            .formParam("Filter.2.Name", "zone-name")
+            .formParam("Filter.2.Value.1", "us-east-1b")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(20)
     void describeRegions() {
         given()
             .formParam("Action", "DescribeRegions")
@@ -303,7 +620,7 @@ class Ec2IntegrationTest {
      * absent from the body rather than compared as a value.
      */
     private void assertSynthesizedOwnership(String ownerScope, String expectedId, String expectedAlias) {
-        var response = given()
+        ExtractableResponse<Response> response = given()
             .formParam("Action", "DescribeImages")
             .formParam("Owner.1", ownerScope)
             .formParam("Filter.1.Name", "name")
@@ -345,7 +662,7 @@ class Ec2IntegrationTest {
     void anOwnerAliasFilterAloneStillAgreesWithTheOwnerId() {
         // The mirror of the above. Filtering on the alias with no Owner.N left the id at the
         // Amazon default, so the image reported aws-marketplace beside Amazon's account.
-        var response = given()
+        ExtractableResponse<Response> response = given()
             .formParam("Action", "DescribeImages")
             .formParam("Filter.1.Name", "name")
             .formParam("Filter.1.Value.1", "unmatched-alias-filter-only-*")
@@ -503,6 +820,33 @@ class Ec2IntegrationTest {
             .body("DescribeImagesResponse.imagesSet.item.imageId",
                     containsInAnyOrder("ami-ubuntu2404-arm64", "ami-ubuntu2404-cloud-arm64"))
             .body("DescribeImagesResponse.imagesSet.item.architecture", everyItem(equalTo("arm64")));
+    }
+
+    @ParameterizedTest
+    @Order(9)
+    @CsvSource({
+        "679593333241, openSUSE-Leap-16-0-*, ami-opensuse-leap160",
+        "679593333241, suse-sles-15-sp6-byos-v*-hvm-ssd-x86_64, ami-sles15sp6-byos",
+        "013907871322, suse-sles-15-sp6-v*-hvm-ssd-x86_64, ami-sles15sp6",
+        "792107900819, Rocky-9-EC2-Base-9*, ami-rocky9",
+        "309956199498, RHEL-9.5.0_HVM-*, ami-rhel9"
+    })
+    void describeImagesFindsSuseAndRedHatFamilyImagesByOwnerAndName(String owner, String name, String imageId) {
+        given()
+            .formParam("Action", "DescribeImages")
+            .formParam("Owner.1", owner)
+            .formParam("Filter.1.Name", "name")
+            .formParam("Filter.1.Value.1", name)
+            .formParam("Filter.2.Name", "architecture")
+            .formParam("Filter.2.Value.1", "x86_64")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeImagesResponse.imagesSet.item.size()", equalTo(1))
+            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo(imageId))
+            .body("DescribeImagesResponse.imagesSet.item.imageOwnerId", equalTo(owner));
     }
 
     @Test
@@ -868,6 +1212,72 @@ class Ec2IntegrationTest {
                     everyItem(equalTo("3")))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.processorInfo.supportedArchitectures.item",
                     everyItem(equalTo("arm64")));
+    }
+
+    @Test
+    void describeEbsOnlyGravitonInstanceType() {
+        given()
+            .formParam("Action", "DescribeInstanceTypes")
+            .formParam("InstanceType.1", "m6g.large")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.size()", equalTo(1))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.vCpuInfo.defaultVCpus", equalTo("2"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.memoryInfo.sizeInMiB", equalTo("8192"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.processorInfo.supportedArchitectures.item",
+                    equalTo("arm64"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.instanceStorageSupported", equalTo("false"));
+    }
+
+    @Test
+    void describeEbsOnlyGravitonOfferingsWithLocationFilters() {
+        for (String zone : List.of("us-east-1a", "us-east-1b", "us-east-1c")) {
+            given()
+                .formParam("Action", "DescribeInstanceTypeOfferings")
+                .formParam("LocationType", "availability-zone")
+                .formParam("Filter.1.Name", "location")
+                .formParam("Filter.1.Value.1", zone)
+                .formParam("MaxResults", "1000")
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.instanceType",
+                        hasItems("m6g.large", "m5.large"))
+                .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.location", everyItem(equalTo(zone)));
+        }
+        given()
+            .formParam("Action", "DescribeInstanceTypeOfferings")
+            .formParam("LocationType", "region")
+            .formParam("Filter.1.Name", "instance-type")
+            .formParam("Filter.1.Value.1", "m6g.large")
+            .formParam("Filter.2.Name", "location")
+            .formParam("Filter.2.Value.1", "us-east-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.size()", equalTo(1))
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.instanceType", equalTo("m6g.large"))
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.location", equalTo("us-east-1"));
+        given()
+            .formParam("Action", "DescribeInstanceTypeOfferings")
+            .formParam("LocationType", "availability-zone")
+            .formParam("Filter.1.Name", "instance-type")
+            .formParam("Filter.1.Value.1", "m6g.large")
+            .formParam("Filter.2.Name", "location")
+            .formParam("Filter.2.Value.1", "other-zone")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.size()", equalTo(0));
     }
 
     @Test
@@ -1922,15 +2332,15 @@ class Ec2IntegrationTest {
             .body("DescribeAddressesResponse.addressesSet.item.size()", equalTo(1))
             .body("DescribeAddressesResponse.addressesSet.item.allocationId", equalTo(targetAllocationId));
 
-        // Negative, resource-specific field filter: floci's synthesized public IPs always
-        // start with "54." (Ec2Service.allocateAddress), so an RFC 5737 TEST-NET-3 address is
+        // Negative, resource-specific field filter: floci allocates Elastic IPs only from
+        // 203.0.113.0/24 (Ec2Service.allocateAddress), so an RFC 5737 TEST-NET-2 address is
         // guaranteed not to match anything this test (or any other) could have allocated.
         given()
             .formParam("Action", "DescribeAddresses")
             .formParam("Filter.1.Name", "tag:Suite")
             .formParam("Filter.1.Value.1", suiteTag)
             .formParam("Filter.2.Name", "public-ip")
-            .formParam("Filter.2.Value.1", "203.0.113.99")
+            .formParam("Filter.2.Value.1", "198.51.100.99")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -2186,7 +2596,7 @@ class Ec2IntegrationTest {
         given()
             .formParam("Action", "ImportKeyPair")
             .formParam("KeyName", importedKeyName)
-            .formParam("PublicKeyMaterial", "c3NoLXJzYSBBQUFBQjNOemFDMXljMkVBQUFBREFRQUJBQUFCQVFD")
+            .formParam("PublicKeyMaterial", encodedPublicKey())
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -2202,7 +2612,7 @@ class Ec2IntegrationTest {
         given()
             .formParam("Action", "ImportKeyPair")
             .formParam("KeyName", importedKeyName)
-            .formParam("PublicKeyMaterial", "c3NoLXJzYSBBQUFBQjNOemFDMXljMkVBQUFBREFRQUJBQUFCQVFD")
+            .formParam("PublicKeyMaterial", encodedPublicKey())
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -2243,6 +2653,12 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(400)
             .body("Response.Errors.Error.Code", equalTo("MissingParameter"));
+    }
+
+    /** A whole RSA public key, base64-encoded as ImportKeyPair takes it: EC2 refuses a partial one. */
+    private static String encodedPublicKey() {
+        return Base64.getEncoder().encodeToString(
+                Ec2KeyMaterial.generateRsa().openSshPublicKey().getBytes(StandardCharsets.UTF_8));
     }
 
     @Test
@@ -2795,6 +3211,7 @@ class Ec2IntegrationTest {
             .formParam("VpcId", vpcId)
             .formParam("ServiceName", "com.amazonaws.us-east-1.s3")
             .formParam("VpcEndpointType", "Gateway")
+            .formParam("IpAddressType", "ipv4")
             .formParam("RouteTableId.1", routeTableId)
             .formParam("TagSpecification.1.ResourceType", "vpc-endpoint")
             .formParam("TagSpecification.1.Tag.1.Key", "Name")
@@ -2806,6 +3223,7 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .body("CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId", startsWith("vpce-"))
             .body("CreateVpcEndpointResponse.vpcEndpoint.vpcId", equalTo(vpcId))
+            .body("CreateVpcEndpointResponse.vpcEndpoint.ipAddressType", equalTo("ipv4"))
             .body("CreateVpcEndpointResponse.vpcEndpoint.routeTableIdSet.item",
                     equalTo(routeTableId))
             .extract().path("CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId");
@@ -2825,7 +3243,9 @@ class Ec2IntegrationTest {
             .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.vpcEndpointId",
                     equalTo(vpcEndpointId))
             .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.serviceName",
-                    equalTo("com.amazonaws.us-east-1.s3"));
+                    equalTo("com.amazonaws.us-east-1.s3"))
+            .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.ipAddressType",
+                    equalTo("ipv4"));
     }
 
     @Test
@@ -3706,7 +4126,7 @@ class Ec2IntegrationTest {
             .statusCode(200)
         .extract().body().asString();
 
-        org.hamcrest.MatcherAssert.assertThat(body, not(containsString("<nextToken>")));
+        MatcherAssert.assertThat(body, not(containsString("<nextToken>")));
     }
 
     // =========================================================================
@@ -3784,14 +4204,14 @@ class Ec2IntegrationTest {
         int pageCount = 0;
         String nextToken = null;
         do {
-            io.restassured.specification.RequestSpecification req = given()
+            RequestSpecification req = given()
                     .formParam("Action", "DescribeNetworkInterfaces")
                     .formParam("MaxResults", "5")
                     .header("Authorization", AUTH_HEADER);
             if (nextToken != null) {
                 req = req.formParam("NextToken", nextToken);
             }
-            io.restassured.response.Response resp = req.when().post("/");
+            Response resp = req.when().post("/");
             resp.then().statusCode(200);
             pageCount++;
 
@@ -3803,16 +4223,16 @@ class Ec2IntegrationTest {
 
             // Every page but the last must be a full page of 5.
             if (nextToken != null && !nextToken.isEmpty()) {
-                org.hamcrest.MatcherAssert.assertThat(ids.size(), equalTo(5));
+                MatcherAssert.assertThat(ids.size(), equalTo(5));
             }
         } while (nextToken != null && !nextToken.isEmpty());
 
-        org.hamcrest.MatcherAssert.assertThat(
+        MatcherAssert.assertThat(
                 "Expected " + expectedTotal + " ENIs across " + pageCount + " page(s)",
                 collected, equalTo(expectedTotal));
         // With 5 new ENIs and MaxResults=5, at least one truncated page
         // must have occurred (i.e. more than a single page was fetched).
-        org.hamcrest.MatcherAssert.assertThat(pageCount, greaterThanOrEqualTo(2));
+        MatcherAssert.assertThat(pageCount, greaterThanOrEqualTo(2));
 
         // ── Cleanup: terminate the 5 extra instances ──
         for (String id : batchIds) {
@@ -3836,14 +4256,14 @@ class Ec2IntegrationTest {
         int total = 0;
         String nextToken = null;
         do {
-            io.restassured.specification.RequestSpecification req = given()
+            RequestSpecification req = given()
                     .formParam("Action", "DescribeNetworkInterfaces")
                     .formParam("MaxResults", "1000")
                     .header("Authorization", AUTH_HEADER);
             if (nextToken != null) {
                 req = req.formParam("NextToken", nextToken);
             }
-            io.restassured.response.Response resp = req.when().post("/");
+            Response resp = req.when().post("/");
             resp.then().statusCode(200);
 
             List<String> ids = resp.xmlPath().getList(
@@ -3928,7 +4348,11 @@ class Ec2IntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("DescribeVolumesResponse.volumeSet.item.volumeType", equalTo("gp2"));
+            // Earlier tests launch from gp2-rooted catalog AMIs, so the result holds their root
+            // volumes too: assert the filter, not a count.
+            .body("DescribeVolumesResponse.volumeSet.item.findAll { it.volumeType != 'gp2' }.size()", equalTo(0))
+            .body("DescribeVolumesResponse.volumeSet.item.findAll { it.volumeId == '" + volumeId + "' }.size()",
+                    equalTo(1));
     }
 
     @Test
@@ -4703,6 +5127,149 @@ class Ec2IntegrationTest {
             .body("Response.Errors.Error.Code", equalTo("DependencyViolation"));
     }
 
+    private String newNetworkAcl(String vpcId) {
+        return given()
+            .formParam("Action", "CreateNetworkAcl")
+            .formParam("VpcId", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200)
+            .extract().path("CreateNetworkAclResponse.networkAcl.networkAclId");
+    }
+
+    private void putNetworkAclEntry(String action, String aclId, int ruleNumber, boolean egress,
+                                    String cidrParam, String cidr) {
+        given()
+            .formParam("Action", action)
+            .formParam("NetworkAclId", aclId)
+            .formParam("RuleNumber", String.valueOf(ruleNumber))
+            .formParam("Protocol", "-1")
+            .formParam("RuleAction", "allow")
+            .formParam("Egress", String.valueOf(egress))
+            .formParam(cidrParam, cidr)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200)
+            .body(action + "Response.return", equalTo("true"));
+    }
+
+    private XmlPath describeNetworkAcl(String aclId) {
+        return new XmlPath(given()
+            .formParam("Action", "DescribeNetworkAcls")
+            .formParam("NetworkAclId.1", aclId)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200)
+            .extract().asString());
+    }
+
+    private static String naclEntryPath(int ruleNumber, boolean egress) {
+        return "DescribeNetworkAclsResponse.networkAclSet.item.entrySet.item.find { it.ruleNumber == '"
+                + ruleNumber + "' && it.egress == '" + egress + "' }";
+    }
+
+    // An entry created with only Ipv6CidrBlock reads back with that range under ipv6CidrBlock.
+    @Test
+    @Order(314)
+    void createNetworkAclEntryKeepsIpv6CidrBlock() {
+        String aclId = newNetworkAcl(newVpc("10.34.0.0/16"));
+        putNetworkAclEntry("CreateNetworkAclEntry", aclId, 100, false, "CidrBlock", "0.0.0.0/0");
+        putNetworkAclEntry("CreateNetworkAclEntry", aclId, 101, false, "Ipv6CidrBlock", "::/0");
+        putNetworkAclEntry("CreateNetworkAclEntry", aclId, 101, true, "Ipv6CidrBlock", "::/0");
+
+        XmlPath acl = describeNetworkAcl(aclId);
+
+        assertEquals("0.0.0.0/0", acl.getString(naclEntryPath(100, false) + ".cidrBlock"));
+        assertEquals(0, acl.getInt(naclEntryPath(100, false) + ".ipv6CidrBlock.size()"));
+        for (boolean egress : new boolean[] {false, true}) {
+            assertEquals("::/0", acl.getString(naclEntryPath(101, egress) + ".ipv6CidrBlock"));
+            assertEquals(0, acl.getInt(naclEntryPath(101, egress) + ".cidrBlock.size()"));
+        }
+    }
+
+    @Test
+    @Order(314)
+    void replaceNetworkAclEntrySwitchesToIpv6CidrBlock() {
+        String aclId = newNetworkAcl(newVpc("10.35.0.0/16"));
+        putNetworkAclEntry("CreateNetworkAclEntry", aclId, 120, false, "CidrBlock", "10.0.0.0/8");
+        putNetworkAclEntry("ReplaceNetworkAclEntry", aclId, 120, false, "Ipv6CidrBlock", "2001:db8::/32");
+
+        XmlPath acl = describeNetworkAcl(aclId);
+
+        assertEquals("2001:db8::/32", acl.getString(naclEntryPath(120, false) + ".ipv6CidrBlock"));
+        assertEquals(0, acl.getInt(naclEntryPath(120, false) + ".cidrBlock.size()"));
+    }
+
+    // The default ACL's IPv6 rule reads back as IPv6, and only ICMP entries carry an icmpTypeCode.
+    @Test
+    @Order(314)
+    void defaultNetworkAclIpv6RuleReadsBackWithoutIcmpTypeCode() {
+        String vpc = newVpc("10.42.0.0/16");
+        String aclId = given()
+            .formParam("Action", "DescribeNetworkAcls")
+            .formParam("Filter.1.Name", "vpc-id")
+            .formParam("Filter.1.Value.1", vpc)
+            .formParam("Filter.2.Name", "default")
+            .formParam("Filter.2.Value.1", "true")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200)
+            .extract().path("DescribeNetworkAclsResponse.networkAclSet.item.networkAclId");
+        for (boolean egress : new boolean[] {false, true}) {
+            given()
+                .formParam("Action", "CreateNetworkAclEntry")
+                .formParam("NetworkAclId", aclId)
+                .formParam("RuleNumber", "101")
+                .formParam("Protocol", "-1")
+                .formParam("RuleAction", "allow")
+                .formParam("Egress", String.valueOf(egress))
+                .formParam("Ipv6CidrBlock", "::/0")
+                .formParam("PortRange.From", "0")
+                .formParam("PortRange.To", "0")
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200);
+        }
+
+        XmlPath acl = describeNetworkAcl(aclId);
+
+        for (boolean egress : new boolean[] {false, true}) {
+            assertEquals("0.0.0.0/0", acl.getString(naclEntryPath(100, egress) + ".cidrBlock"));
+            assertEquals(0, acl.getInt(naclEntryPath(100, egress) + ".ipv6CidrBlock.size()"));
+            assertEquals("::/0", acl.getString(naclEntryPath(101, egress) + ".ipv6CidrBlock"));
+            assertEquals(0, acl.getInt(naclEntryPath(101, egress) + ".cidrBlock.size()"));
+        }
+        assertEquals(0, acl.getInt(
+                "DescribeNetworkAclsResponse.networkAclSet.item.entrySet.item.icmpTypeCode.size()"));
+    }
+
+    @Test
+    @Order(314)
+    void networkAclEntryKeepsIcmpTypeCodeOnlyForIcmp() {
+        String aclId = newNetworkAcl(newVpc("10.43.0.0/16"));
+        for (String[] rule : new String[][] {{"110", "1"}, {"120", "6"}}) {
+            given()
+                .formParam("Action", "CreateNetworkAclEntry")
+                .formParam("NetworkAclId", aclId)
+                .formParam("RuleNumber", rule[0])
+                .formParam("Protocol", rule[1])
+                .formParam("RuleAction", "allow")
+                .formParam("Egress", "false")
+                .formParam("CidrBlock", "0.0.0.0/0")
+                .formParam("Icmp.Type", "8")
+                .formParam("Icmp.Code", "-1")
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200);
+        }
+
+        XmlPath acl = describeNetworkAcl(aclId);
+
+        assertEquals("8", acl.getString(naclEntryPath(110, false) + ".icmpTypeCode.type"));
+        assertEquals("-1", acl.getString(naclEntryPath(110, false) + ".icmpTypeCode.code"));
+        assertEquals(0, acl.getInt(naclEntryPath(120, false) + ".icmpTypeCode.size()"));
+    }
+
     @Test
     @Order(315)
     void describePrefixListsReturnsManagedS3() {
@@ -5011,6 +5578,156 @@ class Ec2IntegrationTest {
             .statusCode(400)
             .body("Response.Errors.Error.Code", equalTo("InvalidIpamId.NotFound"));
     }
+
+    @Test
+    @Order(322)
+    void describeIpamScopesReturnsTheDefaultScopesOverQuery() {
+        // aws_vpc_ipam_pool reads its scope through DescribeIpamScopes before CreateIpamPool
+        XmlPath created = given()
+            .formParam("Action", "CreateIpam")
+            .formParam("Description", "scope-ipam")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath();
+        String ipamId = created.getString("CreateIpamResponse.ipam.ipamId");
+        String ipamArn = created.getString("CreateIpamResponse.ipam.ipamArn");
+        String scopeId = given()
+            .formParam("Action", "DescribeIpams")
+            .formParam("IpamId.1", ipamId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("DescribeIpamsResponse.ipamSet.item.privateDefaultScopeId");
+
+        given()
+            .formParam("Action", "DescribeIpamScopes")
+            .formParam("IpamScopeId.1", scopeId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.size()", equalTo(1))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeId", equalTo(scopeId))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamArn", equalTo(ipamArn))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeType", equalTo("private"))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.isDefault", equalTo("true"))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeArn", endsWith("ipam-scope/" + scopeId));
+
+        // aws_vpc_ipam_pool's Read splits ipamScopeArn on "/" and reads ipamScopeType off the pool
+        String poolId = given()
+            .formParam("Action", "CreateIpamPool")
+            .formParam("IpamScopeId", scopeId)
+            .formParam("AddressFamily", "ipv4")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateIpamPoolResponse.ipamPool.ipamPoolId");
+        given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("IpamPoolId.1", poolId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamScopeArn", endsWith("ipam-scope/" + scopeId))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamScopeType", equalTo("private"))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamArn", equalTo(ipamArn))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamRegion", equalTo("us-east-1"));
+
+        given()
+            .formParam("Action", "DescribeIpamScopes")
+            .formParam("IpamScopeId.1", "ipam-scope-doesnotexist")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidIpamScopeId.NotFound"));
+    }
+
+    @Test
+    @Order(3225)
+    void describeIpamPoolsAppliesFiltersOverQuery() {
+        String ipamId = given()
+            .formParam("Action", "CreateIpam")
+            .formParam("OperatingRegion.1.RegionName", "us-east-1")
+            .formParam("OperatingRegion.2.RegionName", "eu-west-1")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().path("CreateIpamResponse.ipam.ipamId");
+        String scopeId = given()
+            .formParam("Action", "DescribeIpams")
+            .formParam("IpamId.1", ipamId)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().path("DescribeIpamsResponse.ipamSet.item.privateDefaultScopeId");
+        String poolId = given()
+            .formParam("Action", "CreateIpamPool")
+            .formParam("IpamScopeId", scopeId)
+            .formParam("AddressFamily", "ipv4")
+            .formParam("Locale", "eu-west-1")
+            .formParam("Description", "filter-target-pool")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().path("CreateIpamPoolResponse.ipamPool.ipamPoolId");
+
+        // scope-id pins the query to this test's pool; the other filter is the one under test
+        assertIpamPoolFilter("locale", "eu-west-1", scopeId, poolId, true);
+        assertIpamPoolFilter("locale", "eu-west-9", scopeId, poolId, false);
+        assertIpamPoolFilter("address-family", "ipv4", scopeId, poolId, true);
+        assertIpamPoolFilter("address-family", "ipv6", scopeId, poolId, false);
+        assertIpamPoolFilter("description", "filter-target-*", scopeId, poolId, true);
+        assertIpamPoolFilter("description", "no-such-pool", scopeId, poolId, false);
+        assertIpamPoolFilter("ipam-scope-type", "private", scopeId, poolId, true);
+        assertIpamPoolFilter("ipam-scope-type", "public", scopeId, poolId, false);
+        assertIpamPoolFilter("tag:Env", "prod", scopeId, poolId, false);
+
+        // AND across two non-scope filters: locale matches, description does not
+        List<String> anded = given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("Filter.1.Name", "locale")
+            .formParam("Filter.1.Value.1", "eu-west-1")
+            .formParam("Filter.2.Name", "description")
+            .formParam("Filter.2.Value.1", "no-such-pool")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().xmlPath()
+            .getList("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamPoolId");
+        assertEquals(List.of(), anded);
+
+        given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("Filter.1.Name", "no-such-filter")
+            .formParam("Filter.1.Value.1", "x")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(400).body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+    }
+
+    private void assertIpamPoolFilter(String name, String value, String scopeId, String poolId,
+                                      boolean expectPool) {
+        List<String> ids = given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("Filter.1.Name", "ipam-scope-id")
+            .formParam("Filter.1.Value.1", scopeId)
+            .formParam("Filter.2.Name", name)
+            .formParam("Filter.2.Value.1", value)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().xmlPath()
+            .getList("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamPoolId");
+        assertEquals(expectPool ? List.of(poolId) : List.of(), ids, name + "=" + value);
+    }
+
     @Test
     @Order(323)
     void associateIpamByoasnSuccess() {
@@ -5208,5 +5925,198 @@ class Ec2IntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+    }
+
+    @Test
+    @Order(329)
+    void runInstancesRootBlockDeviceMappingOverridesAmiRootVolumeType() {
+        // ami-0abcdef1234567890 is gp2-rooted at /dev/xvda; a root mapping overrides it.
+        assertEquals("gp3", rootVolumeType(launch(Map.of(
+            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
+            "BlockDeviceMapping.1.Ebs.VolumeSize", "8",
+            "BlockDeviceMapping.1.Ebs.VolumeType", "gp3"))));
+        assertEquals("gp2", rootVolumeType(launch(Map.of())));
+    }
+
+    @Test
+    @Order(330)
+    void runInstancesLaunchTemplateRootMappingOverridesAmiAndYieldsToRequest() {
+        String templateId = given()
+            .formParam("Action", "CreateLaunchTemplate")
+            .formParam("LaunchTemplateName", "gp3-root-template")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.DeviceName", "/dev/xvda")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
+
+        assertEquals("gp3", rootVolumeType(launch(Map.of("LaunchTemplate.LaunchTemplateId", templateId))));
+        // A request mapping for the same device wins over the template's.
+        assertEquals("io1", rootVolumeType(launch(Map.of(
+            "LaunchTemplate.LaunchTemplateId", templateId,
+            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
+            "BlockDeviceMapping.1.Ebs.VolumeType", "io1"))));
+    }
+
+    @Test
+    @Order(331)
+    void runInstancesRejectsAnUnknownBlockDeviceMappingVolumeType() {
+        given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-0abcdef1234567890")
+            .formParam("InstanceType", "t2.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .formParam("BlockDeviceMapping.1.DeviceName", "/dev/xvda")
+            .formParam("BlockDeviceMapping.1.Ebs.VolumeType", "gp9")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>InvalidParameterValue</Code>"))
+            .body(containsString("Value (gp9) for parameter volumeType is invalid. Unknown volume type."));
+    }
+
+    @Test
+    @Order(332)
+    void runInstancesKeepsTemplateDevicesTheRequestDoesNotName() {
+        String templateId = given()
+            .formParam("Action", "CreateLaunchTemplate")
+            .formParam("LaunchTemplateName", "gp3-root-data-request-template")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.DeviceName", "/dev/xvda")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
+
+        // The request maps only a data device, so the template's root mapping still applies.
+        assertEquals("gp3", rootVolumeType(launch(Map.of(
+            "LaunchTemplate.LaunchTemplateId", templateId,
+            "BlockDeviceMapping.1.DeviceName", "/dev/xvdb",
+            "BlockDeviceMapping.1.Ebs.VolumeSize", "10",
+            "BlockDeviceMapping.1.Ebs.VolumeType", "io1"))));
+    }
+
+    @Test
+    @Order(334)
+    void runInstancesRequestEntryForATemplateDeviceChangesOnlyWhatItSets() {
+        String templateId = given()
+            .formParam("Action", "CreateLaunchTemplate")
+            .formParam("LaunchTemplateName", "gp3-root-size-override-template")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.DeviceName", "/dev/xvda")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
+
+        // The request resizes the root but names no type, so the template's gp3 stands.
+        assertEquals("gp3", rootVolumeType(launch(Map.of(
+            "LaunchTemplate.LaunchTemplateId", templateId,
+            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
+            "BlockDeviceMapping.1.Ebs.VolumeSize", "20"))));
+    }
+
+    @Test
+    @Order(333)
+    void launchTemplateWithAnUnknownVolumeTypeIsStoredButFailsAtLaunch() {
+        String templateId = given()
+            .formParam("Action", "CreateLaunchTemplate")
+            .formParam("LaunchTemplateName", "unknown-volume-type-template")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.DeviceName", "/dev/xvdb")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeType", "gp9")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
+
+        given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-0abcdef1234567890")
+            .formParam("InstanceType", "t2.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .formParam("LaunchTemplate.LaunchTemplateId", templateId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>InvalidParameterValue</Code>"))
+            .body(containsString("Value (gp9) for parameter volumeType is invalid. Unknown volume type."));
+    }
+
+    @Test
+    @Order(335)
+    void runInstancesNoDeviceRootMappingFallsBackToAmiRootVolumeType() {
+        String templateId = given()
+            .formParam("Action", "CreateLaunchTemplate")
+            .formParam("LaunchTemplateName", "gp3-root-nodevice-template")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.DeviceName", "/dev/xvda")
+            .formParam("LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
+
+        // NoDevice removes the template's root mapping, so the AMI's gp2 root applies.
+        assertEquals("gp2", rootVolumeType(launch(Map.of(
+            "LaunchTemplate.LaunchTemplateId", templateId,
+            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
+            "BlockDeviceMapping.1.NoDevice", ""))));
+    }
+
+    @Test
+    @Order(336)
+    void runInstancesIgnoresVolumeTypeOnANoDeviceMapping() {
+        // The device is removed regardless of the assigned value, so gp9 is never validated.
+        assertEquals("gp2", rootVolumeType(launch(Map.of(
+            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
+            "BlockDeviceMapping.1.NoDevice", "",
+            "BlockDeviceMapping.1.Ebs.VolumeType", "gp9"))));
+    }
+
+    private String launch(Map<String, String> params) {
+        return given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-0abcdef1234567890")
+            .formParam("InstanceType", "t2.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .formParams(params)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
+    }
+
+    /** The type of the instance's root volume, ami-0abcdef1234567890's /dev/xvda; data devices also get volumes. */
+    private String rootVolumeType(String instanceId) {
+        return given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("Filter.1.Name", "attachment.instance-id")
+            .formParam("Filter.1.Value.1", instanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("DescribeVolumesResponse.volumeSet.item.find { it.attachmentSet.item.device == '/dev/xvda' }"
+                    + ".volumeType");
     }
 }

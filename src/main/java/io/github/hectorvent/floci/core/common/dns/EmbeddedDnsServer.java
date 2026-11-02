@@ -1,10 +1,15 @@
 package io.github.hectorvent.floci.core.common.dns;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.LocalStackParity;
 import io.github.hectorvent.floci.config.TlsConfigSource;
+import io.github.hectorvent.floci.core.common.DomainNames;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.quarkus.runtime.Startup;
+import io.vertx.core.Future;
 import io.vertx.core.Vertx;
+import io.vertx.core.WorkerExecutor;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.datagram.DatagramSocketOptions;
@@ -16,6 +21,7 @@ import org.jboss.logging.Logger;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.InetAddress;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -27,6 +33,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.SequencedSet;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -71,10 +78,16 @@ public class EmbeddedDnsServer {
     // Per-upstream timeout. Bounded so trying every upstream stays under a typical 5s client
     // resolver timeout even in the worst case.
     private static final int FORWARD_TIMEOUT_MS = 1500;
+    // Forwards block a thread for up to FORWARD_TIMEOUT_MS per target, so they get their own
+    // bounded pool: a burst of queries to a dead resolver must not take every thread of the
+    // shared worker pool that planQuery and the rest of the emulator also run on.
+    private static final String FORWARD_POOL_NAME = "floci-dns-forward";
+    private static final int FORWARD_POOL_SIZE = 8;
     public static final String DEFAULT_SUFFIX = "localhost.floci.io";
     public static final String LOCALSTACK_SUFFIX = "localhost.localstack.cloud";
     private static final Pattern EC2_PRIVATE_DNS_NAME =
-            Pattern.compile("^ip-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.ec2\\.internal$", Pattern.CASE_INSENSITIVE);
+            Pattern.compile("^ip-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.(?:ec2|((?:[a-z0-9]+-)+\\d+)\\.compute)\\.internal$",
+                    Pattern.CASE_INSENSITIVE);
 
     // Well-known emulator wildcard DNS domains that always resolve to Floci's IP.
     // The suffix "localhost.X" covers "localhost.X" itself and "*.localhost.X"; it does
@@ -86,6 +99,7 @@ public class EmbeddedDnsServer {
     private volatile String serverIp;
     private final SequencedSet<String> suffixes = new LinkedHashSet<>();
     private volatile List<String> upstreamDnsServers = List.of();
+    private volatile WorkerExecutor forwardPool;
     // Held as the Iterable a CDI Instance already is, so iterating resolves the beans lazily on
     // the packet path rather than at startup, where a source's storage must not be touched yet.
     private final Iterable<DnsRecordSource> recordSources;
@@ -144,7 +158,7 @@ public class EmbeddedDnsServer {
 
             suffixes.addAll(BUILTIN_SUFFIXES);
             config.hostname().ifPresent(suffixes::add);
-            config.dns().extraSuffixes().ifPresent(suffixes::addAll);
+            LocalStackParity.withDnsSuffixes(config.dns().extraSuffixes()).ifPresent(suffixes::addAll);
             if (config.dns().spoofAwsEndpoints()) {
                 suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
                 if (shouldWarnSpoofInvisibleToTls(true, TlsConfigSource.tlsEnabledVisibleToTls(),
@@ -194,7 +208,7 @@ public class EmbeddedDnsServer {
             int questionOffset = buf.position(); // always 12 for a standard query
             String qname = readName(buf, data);
             short qtype = buf.getShort();
-            buf.getShort(); // qclass
+            short qclass = buf.getShort();
             int questionEnd = buf.position();
 
             vertx.<QueryPlan>executeBlocking(() -> planQuery(qname, senderHost, myIp, qtype), false)
@@ -209,7 +223,13 @@ public class EmbeddedDnsServer {
                             return;
                         }
                         DnsAnswer records = plan.answer().orElseThrow();
-                        byte[] response = !records.isEmpty()
+                        if (records.isPublicAuthorityAnswer()
+                                && (qdCount != 1 || qclass != 1 || (flags & 0x7840) != 0)) {
+                            records = DnsAnswer.refused();
+                        }
+                        byte[] response = records.isPublicAuthorityAnswer()
+                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records)
+                                : !records.isEmpty()
                                 ? buildAResponse(data, txId, questionOffset, questionEnd, records)
                                 : buildEmptyResponse(data, txId, questionOffset, questionEnd,
                                         records.nameExists() ? 0 : 3);
@@ -230,7 +250,7 @@ public class EmbeddedDnsServer {
         String lower = name.toLowerCase();
         for (String suffix : suffixes) {
             String s = suffix.toLowerCase();
-            if (lower.equals(s) || lower.endsWith("." + s)) {
+            if (DomainNames.isWithin(lower, s)) {
                 return true;
             }
         }
@@ -247,6 +267,10 @@ public class EmbeddedDnsServer {
     }
 
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
+        if (stored.isPresent()) {
+            return stored;
+        }
         Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
         return emulatorName.isPresent() ? emulatorName : resolveFromRecordSources(name, type);
     }
@@ -270,7 +294,8 @@ public class EmbeddedDnsServer {
     }
 
     /**
-     * Names the emulator itself owns come first, whatever the rules say. Route 53 Resolver does
+     * Stored public authority answers take precedence over broad emulator suffix spoofing.
+     * Other names the emulator itself owns come first, whatever the rules say. Route 53 Resolver does
      * the same for the AWS-internal domains it autodefines system rules for, so that a rule for a
      * broad domain (or for "." itself) cannot send the platform's own names off to a resolver that
      * knows nothing about them.
@@ -280,8 +305,9 @@ public class EmbeddedDnsServer {
      * hosted zone that matches the same name.
      */
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
         Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
-        if (emulatorName.isPresent()) {
+        if (emulatorName.isPresent() && stored.isEmpty()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
         // A rule steers the name whatever the query asks about it, so this is deliberately not
@@ -290,7 +316,8 @@ public class EmbeddedDnsServer {
         if (rule.isPresent() && rule.orElseThrow().forwards()) {
             return QueryPlan.forwardingTo(rule.orElseThrow().targets());
         }
-        return resolveFromRecordSources(name, type).map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
+        return stored.or(() -> resolveFromRecordSources(name, type))
+                .map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
     }
 
     private Optional<DnsAnswer> resolveEmulatorName(String name, String myIp, int type) {
@@ -371,13 +398,29 @@ public class EmbeddedDnsServer {
      * through to the upstream resolvers, which is what happened before any source existed.
      */
     private Optional<DnsAnswer> resolveFromRecordSources(String name, int type) {
+        return resolveFromRecordSources(name, type, false);
+    }
+
+    private Optional<DnsAnswer> resolveFromRecordSources(String name, int type, boolean authoritative) {
         if (recordSources == null) {
             return Optional.empty();
         }
+        // Two sources can own the same zone (a Cloud Map namespace and the Route 53 zone behind it),
+        // and bean order is unspecified. An empty answer (NXDOMAIN, or NODATA for a name holding only
+        // other types) only speaks for that source, so it must not win over another source's records;
+        // it is returned only if no source has any, an existing name preferred over NXDOMAIN.
+        Optional<DnsAnswer> empty = Optional.empty();
         for (DnsRecordSource source : recordSources) {
             try {
-                Optional<DnsAnswer> answer = source.resolve(name, type);
+                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type)
+                        : source.resolve(name, type);
                 if (answer != null && answer.isPresent()) {
+                    if (answer.get().isEmpty()) {
+                        if (empty.isEmpty() || (!empty.get().nameExists() && answer.get().nameExists())) {
+                            empty = answer;
+                        }
+                        continue;
+                    }
                     return answer;
                 }
             } catch (Exception e) {
@@ -385,7 +428,7 @@ public class EmbeddedDnsServer {
                         source.getClass().getSimpleName(), name, e.getMessage());
             }
         }
-        return Optional.empty();
+        return empty;
     }
 
     byte[] buildEmptyResponse(byte[] query, short txId, int questionOffset, int questionEnd, int responseCode) {
@@ -423,6 +466,9 @@ public class EmbeddedDnsServer {
         }
         Matcher matcher = EC2_PRIVATE_DNS_NAME.matcher(name);
         if (!matcher.matches()) {
+            return Optional.empty();
+        }
+        if (matcher.group(5) != null && !RegionResolver.isKnownRegion(matcher.group(5))) {
             return Optional.empty();
         }
 
@@ -505,7 +551,8 @@ public class EmbeddedDnsServer {
 
         // header
         resp.putShort(txId);
-        resp.putShort((short) (0x8180 | (truncated ? 0x0200 : 0))); // QR=1, RD=1, RCODE=0
+        int flags = answer.authority() == null ? 0x8180 : 0x8400 | (query[2] & 1) << 8;
+        resp.putShort((short) (flags | (truncated ? 0x0200 : 0)));
         resp.putShort((short) 1);           // qdcount
         resp.putShort((short) answerCount); // ancount
         resp.putShort((short) 0);           // nscount
@@ -525,6 +572,34 @@ public class EmbeddedDnsServer {
         }
         appendOpt(resp, payload);
         return resp.array();
+    }
+
+    byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd, DnsAnswer answer) {
+        if (!answer.isEmpty()) {
+            return buildAResponse(query, txId, questionOffset, questionEnd, answer);
+        }
+        int flags = 0x8000 | (query[2] & 0x79) << 8 | answer.responseCode();
+        DnsAnswer.Authority authority = answer.authority();
+        if (authority == null) {
+            return buildAnswerlessResponse(query, txId, questionOffset, questionEnd, (short) flags);
+        }
+        byte[] owner = DnsRecord.encodeName(authority.name());
+        byte[] soa = authority.soa().data();
+        UdpPayload payload = udpPayload(query, questionEnd);
+        int questionLength = questionEnd - questionOffset;
+        int length = 12 + questionLength + (payload.edns() ? 11 : 0);
+        boolean fits = length + owner.length + 10 + soa.length <= payload.size();
+        ByteBuffer response = ByteBuffer.allocate(length + (fits ? owner.length + 10 + soa.length : 0));
+        response.putShort(txId).putShort((short) (flags | 0x0400 | (fits ? 0 : 0x0200)));
+        response.putShort((short) 1).putShort((short) 0).putShort((short) (fits ? 1 : 0))
+                .putShort((short) (payload.edns() ? 1 : 0));
+        response.put(query, questionOffset, questionLength);
+        if (fits) {
+            response.put(owner).putShort((short) 6).putShort((short) 1).putInt(authority.ttlSeconds())
+                    .putShort((short) soa.length).put(soa);
+        }
+        appendOpt(response, payload);
+        return response.array();
     }
 
     private record UdpPayload(int size, boolean edns) {}
@@ -571,7 +646,7 @@ public class EmbeddedDnsServer {
         if (upstreams.isEmpty()) {
             return;
         }
-        vertx.executeBlocking(() -> forwardToUpstreams(query, upstreams, DNS_PORT))
+        submitForward(forwardPool(vertx), () -> forwardToUpstreams(query, upstreams, DNS_PORT))
                 .onSuccess(response ->
                         socket.send(Buffer.buffer(response), senderPort, senderHost, v -> {}))
                 .onFailure(e ->
@@ -592,7 +667,7 @@ public class EmbeddedDnsServer {
                                       String senderHost, int senderPort,
                                       List<DnsForwardingRule.Target> targets, String qname,
                                       short txId, int questionOffset, int questionEnd) {
-        vertx.executeBlocking(() -> forwardToTargets(query, shuffled(targets)))
+        submitForward(forwardPool(vertx), () -> forwardToTargets(query, shuffled(targets)))
                 .onSuccess(response ->
                         socket.send(Buffer.buffer(response), senderPort, senderHost, v -> {}))
                 .onFailure(e -> {
@@ -602,6 +677,28 @@ public class EmbeddedDnsServer {
                                     buildServerFailureResponse(query, txId, questionOffset, questionEnd)),
                             senderPort, senderHost, v -> {});
                 });
+    }
+
+    /**
+     * Runs a blocking forward on the pool without Vert.x's per-context ordering, so one
+     * unresponsive upstream or rule target does not hold up forwarding for every other query.
+     */
+    static <T> Future<T> submitForward(WorkerExecutor pool, Callable<T> task) {
+        return pool.executeBlocking(task, false);
+    }
+
+    private WorkerExecutor forwardPool(Vertx vertx) {
+        WorkerExecutor pool = forwardPool;
+        if (pool == null) {
+            synchronized (this) {
+                pool = forwardPool;
+                if (pool == null) {
+                    pool = vertx.createSharedWorkerExecutor(FORWARD_POOL_NAME, FORWARD_POOL_SIZE);
+                    forwardPool = pool;
+                }
+            }
+        }
+        return pool;
     }
 
     private static List<DnsForwardingRule.Target> shuffled(List<DnsForwardingRule.Target> targets) {
@@ -631,13 +728,25 @@ public class EmbeddedDnsServer {
         Exception last = null;
         for (DnsForwardingRule.Target target : targets) {
             try (java.net.DatagramSocket fwd = new java.net.DatagramSocket()) {
-                fwd.setSoTimeout(FORWARD_TIMEOUT_MS);
                 InetAddress addr = InetAddress.getByName(target.address());
+                fwd.connect(addr, target.port());
                 fwd.send(new DatagramPacket(query, query.length, addr, target.port()));
+                long deadline = System.nanoTime() + FORWARD_TIMEOUT_MS * 1_000_000L;
                 byte[] buf = new byte[MAX_DNS_UDP_RESPONSE];
                 DatagramPacket resp = new DatagramPacket(buf, buf.length);
-                fwd.receive(resp);
-                return Arrays.copyOf(resp.getData(), resp.getLength());
+                while (true) {
+                    long remainingNs = deadline - System.nanoTime();
+                    if (remainingNs <= 0) {
+                        throw new SocketTimeoutException("DNS forward timeout");
+                    }
+                    resp.setLength(buf.length);
+                    // setSoTimeout(0) means wait forever, so never let the rounding reach 0.
+                    fwd.setSoTimeout((int) Math.max(1, remainingNs / 1_000_000L));
+                    fwd.receive(resp);
+                    if (isValidResponse(query, resp.getData(), resp.getLength())) {
+                        return Arrays.copyOf(resp.getData(), resp.getLength());
+                    }
+                }
             } catch (Exception e) {
                 last = e;
                 LOG.debugv("DNS forward to {0} failed: {1}", target.address(), e.getMessage());
@@ -693,5 +802,51 @@ public class EmbeddedDnsServer {
             LOG.debugv("Could not read /etc/resolv.conf: {0}", e.getMessage());
         }
         return servers;
+    }
+
+    /**
+     * True when the datagram answers this query: same transaction ID, QR bit set, the same question
+     * count, and the query's question echoed back. The name is compared ignoring ASCII case, like
+     * glibc and c-ares, since a resolver may echo it case-folded. Only the question is compared:
+     * clients usually append an EDNS OPT record to the query, and the answer section takes its place
+     * in the response.
+     */
+    private static boolean isValidResponse(byte[] query, byte[] response, int length) {
+        int questionEnd = questionEnd(query);
+        // Also stops the question comparison reading stale buffer bytes past a short datagram.
+        if (questionEnd < 0 || length < questionEnd) {
+            return false;
+        }
+        if (response[0] != query[0] || response[1] != query[1]) {
+            return false;
+        }
+        if ((response[2] & 0x80) == 0) {
+            return false;
+        }
+        if (response[4] != query[4] || response[5] != query[5]) {
+            return false;
+        }
+        int nameEnd = questionEnd - 4;
+        for (int i = 12; i < nameEnd; i++) {
+            if (asciiLower(response[i]) != asciiLower(query[i])) {
+                return false;
+            }
+        }
+        return Arrays.equals(query, nameEnd, questionEnd, response, nameEnd, questionEnd);
+    }
+
+    /** Label length bytes are below 64, so lowering every byte of the name only touches letters. */
+    private static byte asciiLower(byte b) {
+        return b >= 'A' && b <= 'Z' ? (byte) (b + ('a' - 'A')) : b;
+    }
+
+    /** End offset of the query's single question (name, type, class), or -1 if it is malformed. */
+    private static int questionEnd(byte[] query) {
+        int pos = 12;
+        while (pos < query.length && query[pos] != 0) {
+            pos += 1 + (query[pos] & 0xFF);
+        }
+        int end = pos + 1 + 4;
+        return end <= query.length ? end : -1;
     }
 }

@@ -12,6 +12,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** The vendored per-region tables, pinned against the Terraform and CDK rows they came from. */
 class AwsRegionFactsTest {
 
+    @Test
+    void rdsHostedZoneIsPresentOnlyForCapturedRegions() {
+        assertEquals(Optional.of("Z2R2ITUGPM61AM"), AwsRegionFacts.rdsHostedZoneId("us-east-1"));
+        assertTrue(AwsRegionFacts.rdsHostedZoneId("eu-west-1").isEmpty());
+    }
+
     @ParameterizedTest
     @CsvSource({
             "us-east-1,      Z35SXDOTRQ7X7K,        Z26RNL4JYFTOTI,        Z3AQBSTGFYJSTF",
@@ -48,6 +54,37 @@ class AwsRegionFactsTest {
         assertEquals(Optional.of("https://signin.sc2shome.sgov.gov/saml"), AwsRegionFacts.samlSignOnUrl("aws-iso-b"));
         assertTrue(AwsRegionFacts.samlSignOnUrl("aws-eusc").isEmpty());
         assertTrue(AwsRegionFacts.samlSignOnUrl(null).isEmpty());
+    }
+
+    /** The hosts the China and GovCloud user guides state; no guide covers the ISO or EUSC partitions. */
+    @Test
+    void consoleHostIsPerPartitionWhereAGuideStatesIt() {
+        assertEquals(Optional.of("console.aws.amazon.com"), AwsRegionFacts.consoleHost("aws"));
+        assertEquals(Optional.of("console.amazonaws.cn"), AwsRegionFacts.consoleHost("aws-cn"));
+        assertEquals(Optional.of("console.amazonaws-us-gov.com"), AwsRegionFacts.consoleHost("aws-us-gov"));
+        assertTrue(AwsRegionFacts.consoleHost("aws-iso").isEmpty());
+        assertTrue(AwsRegionFacts.consoleHost("aws-eusc").isEmpty());
+        assertTrue(AwsRegionFacts.consoleHost(null).isEmpty());
+    }
+
+    /** The botocore model's example name for the commercial partition, the China guide for {@code aws-cn}. */
+    @Test
+    void cloudFrontDomainSuffixIsPerPartitionWhereCloudFrontExists() {
+        assertEquals(Optional.of("cloudfront.net"), AwsRegionFacts.cloudFrontDomainSuffix("aws"));
+        assertEquals(Optional.of("cloudfront.cn"), AwsRegionFacts.cloudFrontDomainSuffix("aws-cn"));
+        assertTrue(AwsRegionFacts.cloudFrontDomainSuffix("aws-us-gov").isEmpty());
+        assertTrue(AwsRegionFacts.cloudFrontDomainSuffix("aws-eusc").isEmpty());
+        assertTrue(AwsRegionFacts.cloudFrontDomainSuffix(null).isEmpty());
+    }
+
+    /** The GovCloud guide states the two regional endpoint zones; no source covers another region. */
+    @Test
+    void apiGatewayRegionalZoneIsPublishedForGovCloudOnly() {
+        assertEquals(Optional.of("Z1K6XKP9SAGWDV"), AwsRegionFacts.apiGatewayRegionalHostedZoneId("us-gov-west-1"));
+        assertEquals(Optional.of("Z3SE9ATJYCRCZJ"), AwsRegionFacts.apiGatewayRegionalHostedZoneId("us-gov-east-1"));
+        assertTrue(AwsRegionFacts.apiGatewayRegionalHostedZoneId("us-east-1").isEmpty());
+        assertTrue(AwsRegionFacts.apiGatewayRegionalHostedZoneId("cn-north-1").isEmpty());
+        assertTrue(AwsRegionFacts.apiGatewayRegionalHostedZoneId(null).isEmpty());
     }
 
     @ParameterizedTest

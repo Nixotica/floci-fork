@@ -454,6 +454,37 @@ public final class XmlParser {
         return null;
     }
 
+    /**
+     * Parses a whole document into its document element's tree, or returns {@code null} when the
+     * document is empty or not well-formed anywhere, after its document element included.
+     *
+     * <p>For a stored document whose every part has effect, where {@link #extractElementTree}
+     * would return a complete element followed by content that never parsed.
+     */
+    public static XmlElement parseDocumentElementTree(String xml) {
+        if (xml == null || xml.isEmpty()) {
+            return null;
+        }
+        try {
+            XMLStreamReader r = FACTORY.createXMLStreamReader(new StringReader(xml));
+            try {
+                XmlElement root = null;
+                while (r.hasNext()) {
+                    int event = r.next();
+                    if (root == null && event == XMLStreamConstants.START_ELEMENT) {
+                        root = readElementTree(r);
+                    }
+                }
+                return root;
+            } finally {
+                r.close();
+            }
+        } catch (XMLStreamException e) {
+            LOG.debugv("Ignoring malformed XML document: {0}", e.getMessage());
+            return null;
+        }
+    }
+
     private static XmlElement readElementTree(XMLStreamReader r) throws XMLStreamException {
         String name = r.getLocalName();
         StringBuilder text = new StringBuilder();
@@ -466,14 +497,19 @@ public final class XmlParser {
                     || event == XMLStreamConstants.CDATA) {
                 text.append(r.getText());
             } else if (event == XMLStreamConstants.END_ELEMENT) {
-                return new XmlElement(name, text.toString().trim(), List.copyOf(children));
+                String raw = text.toString();
+                return new XmlElement(name, raw.trim(), List.copyOf(children), raw);
             }
         }
         throw new XMLStreamException("Unexpected end of XML while reading " + name);
     }
 
-    /** A namespace-agnostic XML element used by {@link #extractElementTree(String, String)}. */
-    public record XmlElement(String name, String text, List<XmlElement> children) {
+    /**
+     * A namespace-agnostic XML element used by {@link #extractElementTree(String, String)}.
+     * {@code text} is trimmed for enum and number fields; {@code rawText} keeps a free-form
+     * value such as a name or comment exactly as the client sent it.
+     */
+    public record XmlElement(String name, String text, List<XmlElement> children, String rawText) {
         public XmlElement child(String childName) {
             return children.stream()
                     .filter(child -> childName.equals(child.name()))

@@ -86,8 +86,19 @@ class S3BlockPublicAccessIntegrationTest {
     }
 
     @Test
-    void aPublicBucketPolicyIsAcceptedWithoutBlockPublicPolicy() {
+    void aPublicBucketPolicyIsRefusedWithoutBlockPublicPolicyConfigured() {
         String bucket = createBucket();
+
+        given().body(PUBLIC_POLICY.formatted(bucket))
+                .when().put("/" + bucket + "?policy")
+                .then().statusCode(403)
+                .body(containsString("AccessDenied"));
+    }
+
+    @Test
+    void aPublicBucketPolicyIsAcceptedOnceBlockPublicPolicyIsDeleted() {
+        String bucket = createBucket();
+        deleteBucketPublicAccessBlock(bucket);
 
         given().body(PUBLIC_POLICY.formatted(bucket))
                 .when().put("/" + bucket + "?policy")
@@ -97,6 +108,7 @@ class S3BlockPublicAccessIntegrationTest {
     @Test
     void blockPublicPolicyDoesNotRemoveAPolicyStoredBeforeItWasSet() {
         String bucket = createBucket();
+        deleteBucketPublicAccessBlock(bucket);
         given().body(PUBLIC_POLICY.formatted(bucket))
                 .when().put("/" + bucket + "?policy")
                 .then().statusCode(200);
@@ -190,7 +202,15 @@ class S3BlockPublicAccessIntegrationTest {
     private static String createBucket() {
         String bucket = "bpa-" + UUID.randomUUID();
         given().when().put("/" + bucket).then().statusCode(200);
+        // These cases exercise ACL policy rather than the default ACL-disabled ownership mode.
+        given().body("<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>")
+                .when().put("/" + bucket + "?ownershipControls")
+                .then().statusCode(200);
         return bucket;
+    }
+
+    private static void deleteBucketPublicAccessBlock(String bucket) {
+        given().when().delete("/" + bucket + "?publicAccessBlock").then().statusCode(204);
     }
 
     private static void putBucketPublicAccessBlock(String bucket, boolean blockPublicAcls,

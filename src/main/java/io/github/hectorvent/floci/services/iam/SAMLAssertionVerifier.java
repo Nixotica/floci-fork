@@ -2,18 +2,21 @@ package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.iam.model.SAMLProvider;
+import org.w3c.dom.Document;
 import org.w3c.dom.Element;
+import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 import javax.xml.crypto.dsig.CanonicalizationMethod;
+import javax.xml.crypto.dsig.Reference;
 import javax.xml.crypto.dsig.Transform;
 import javax.xml.crypto.dsig.XMLSignature;
 import javax.xml.crypto.dsig.XMLSignatureFactory;
 import javax.xml.crypto.dsig.dom.DOMValidateContext;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
@@ -43,7 +46,7 @@ final class SAMLAssertionVerifier {
     static Verified verify(String encoded, SAMLProvider provider, Instant now) throws InvalidAssertionException {
         try {
             byte[] bytes = Base64.getDecoder().decode(encoded);
-            var document = SAMLXml.document(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+            Document document = SAMLXml.document(new String(bytes, StandardCharsets.UTF_8));
             Element assertion = document.getDocumentElement();
             if ("Response".equals(assertion.getLocalName())) {
                 assertion = first(assertion, SAML, "Assertion");
@@ -74,11 +77,11 @@ final class SAMLAssertionVerifier {
                 }
             }
             X509Certificate certificate = certificate(provider.getCertificate());
-            var context = new DOMValidateContext(certificate.getPublicKey(), signature);
+            DOMValidateContext context = new DOMValidateContext(certificate.getPublicKey(), signature);
             context.setProperty("org.jcp.xml.dsig.secureValidation", Boolean.TRUE);
             XMLSignature xmlSignature = XMLSignatureFactory.getInstance("DOM").unmarshalXMLSignature(context);
             if (xmlSignature.getSignedInfo().getReferences().size() != 1
-                    || !(xmlSignature.getSignedInfo().getReferences().get(0) instanceof javax.xml.crypto.dsig.Reference reference)
+                    || !(xmlSignature.getSignedInfo().getReferences().get(0) instanceof Reference reference)
                     || !("#" + assertionId).equals(reference.getURI())) {
                 throw invalid("signature reference");
             }
@@ -166,8 +169,8 @@ final class SAMLAssertionVerifier {
             if (roles.isEmpty()) {
                 throw invalid("role pair missing");
             }
-            String nameQualifier = java.util.Base64.getEncoder().encodeToString(MessageDigest.getInstance("SHA-1")
-                    .digest((issuer + provider.getArn()).getBytes(StandardCharsets.UTF_8)));
+            String nameQualifier = Base64.getEncoder().encodeToString(
+                    Digests.sha1((issuer + provider.getArn()).getBytes(StandardCharsets.UTF_8)));
             return new Verified(issuer, name, subjectType, nameQualifier, notOnOrAfter, roles);
         } catch (InvalidAssertionException e) {
             throw e;
@@ -181,19 +184,19 @@ final class SAMLAssertionVerifier {
         return (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(new ByteArrayInputStream(der));
     }
 
-    private static Element first(org.w3c.dom.Node parent, String namespace, String local) {
+    private static Element first(Node parent, String namespace, String local) {
         if (parent == null) {
             return null;
         }
         NodeList list = ((Element) parent).getElementsByTagNameNS(namespace, local);
         return list.getLength() == 0 ? null : (Element) list.item(0);
     }
-    private static String childText(org.w3c.dom.Node parent, String namespace, String local) {
+    private static String childText(Node parent, String namespace, String local) {
         Element e = first(parent, namespace, local);
         return e == null ? null : e.getTextContent().trim();
     }
 
-    private static boolean hasText(org.w3c.dom.Node parent, String namespace, String local, String expected) {
+    private static boolean hasText(Node parent, String namespace, String local, String expected) {
         NodeList list = ((Element) parent).getElementsByTagNameNS(namespace, local);
         for (int i = 0; i < list.getLength(); i++) {
             if (expected.equals(list.item(i).getTextContent().trim())) {

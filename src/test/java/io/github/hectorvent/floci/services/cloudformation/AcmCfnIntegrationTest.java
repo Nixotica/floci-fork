@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
@@ -8,6 +9,7 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -112,6 +114,34 @@ class AcmCfnIntegrationTest {
         describeCertificate(arn).then()
             .statusCode(404)
             .body("__type", equalTo("ResourceNotFoundException"));
+    }
+
+    @Test
+    void certificateStackAcceptsEmptySans() {
+        String stack = "acm-empty-sans";
+        String template = """
+                {
+                  "Resources": {"Cert": {
+                    "Type": "AWS::CertificateManager::Certificate",
+                    "Properties": {
+                      "DomainName": "empty-sans.example.com",
+                      "SubjectAlternativeNames": [],
+                      "ValidationMethod": "DNS"
+                    }
+                  }},
+                  "Outputs": {"CertArn": {"Value": {"Ref": "Cert"}}}
+                }
+                """;
+        cloudFormation(stack, "CreateStack", template, Map.of());
+        try {
+            String arn = outputValue(describeStacks(stack, "CREATE_COMPLETE"), "CertArn");
+            describeCertificate(arn).then()
+                .statusCode(200)
+                .body("Certificate.SubjectAlternativeNames", equalTo(List.of("empty-sans.example.com")));
+        } finally {
+            cloudFormation(stack, "DeleteStack", null, Map.of());
+            CfnStackWaits.awaitStackDeleted(stack);
+        }
     }
 
     @Test

@@ -1,10 +1,12 @@
 package com.floci.test;
 
 import org.junit.jupiter.api.*;
-import software.amazon.awssdk.core.waiters.WaiterOverrideConfiguration;
+import org.junit.jupiter.api.parallel.Isolated;
 import software.amazon.awssdk.core.waiters.WaiterResponse;
 import software.amazon.awssdk.services.ecs.EcsClient;
 import software.amazon.awssdk.services.ecs.model.*;
+import software.amazon.awssdk.services.ecs.model.Tag;
+import software.amazon.awssdk.services.ecs.model.TaskSet;
 
 import java.time.Duration;
 import java.util.List;
@@ -13,6 +15,7 @@ import static org.assertj.core.api.Assertions.*;
 
 @DisplayName("ECS Elastic Container Service")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@Isolated
 class EcsTests {
 
     private static EcsClient ecs;
@@ -289,8 +292,8 @@ class EcsTests {
     void tagResource() {
         ecs.tagResource(TagResourceRequest.builder()
                 .resourceArn(cluster.clusterArn())
-                .tags(software.amazon.awssdk.services.ecs.model.Tag.builder().key("env").value("test").build(),
-                      software.amazon.awssdk.services.ecs.model.Tag.builder().key("team").value("sdk").build())
+                .tags(Tag.builder().key("env").value("test").build(),
+                      Tag.builder().key("team").value("sdk").build())
                 .build());
     }
 
@@ -298,7 +301,7 @@ class EcsTests {
     @Order(16)
     @DisplayName("ListTagsForResource - verify tags")
     void listTagsForResource() {
-        List<software.amazon.awssdk.services.ecs.model.Tag> tags = ecs.listTagsForResource(ListTagsForResourceRequest.builder()
+        List<Tag> tags = ecs.listTagsForResource(ListTagsForResourceRequest.builder()
                 .resourceArn(cluster.clusterArn())
                 .build()).tags();
 
@@ -315,7 +318,7 @@ class EcsTests {
                 .tagKeys("team")
                 .build());
 
-        List<software.amazon.awssdk.services.ecs.model.Tag> tags = ecs.listTagsForResource(ListTagsForResourceRequest.builder()
+        List<Tag> tags = ecs.listTagsForResource(ListTagsForResourceRequest.builder()
                 .resourceArn(cluster.clusterArn())
                 .build()).tags();
 
@@ -853,9 +856,7 @@ class EcsTests {
                         .cluster(clusterName)
                         .services(serviceName)
                         .build(),
-                WaiterOverrideConfiguration.builder()
-                        .waitTimeout(Duration.ofSeconds(30))
-                        .build());
+                TestFixtures.waiterOverride(Duration.ofSeconds(30)));
 
         assertThat(response.matched().response()).isPresent();
         assertThat(response.matched().response().get().services().get(0).deployments()).hasSize(1);
@@ -945,7 +946,7 @@ class EcsTests {
                 .launchType(LaunchType.FARGATE)
                 .build());
 
-        software.amazon.awssdk.services.ecs.model.TaskSet ts =
+        TaskSet ts =
                 ecs.createTaskSet(CreateTaskSetRequest.builder()
                         .cluster(clusterName)
                         .service(externalService)
@@ -968,7 +969,7 @@ class EcsTests {
         String taskSetArn = ts.taskSetArn();
 
         // Describe task sets
-        List<software.amazon.awssdk.services.ecs.model.TaskSet> sets =
+        List<TaskSet> sets =
                 ecs.describeTaskSets(DescribeTaskSetsRequest.builder()
                         .cluster(clusterName)
                         .service(externalService)
@@ -989,7 +990,7 @@ class EcsTests {
                 .satisfies(failure -> assertThat(failure.reason()).isEqualTo("MISSING"));
 
         // Update task set
-        software.amazon.awssdk.services.ecs.model.TaskSet updated =
+        TaskSet updated =
                 ecs.updateTaskSet(UpdateTaskSetRequest.builder()
                         .cluster(clusterName)
                         .service(externalService)
@@ -1002,7 +1003,7 @@ class EcsTests {
         assertThat(updated.computedDesiredCount()).isEqualTo(3);
 
         // Update primary task set
-        software.amazon.awssdk.services.ecs.model.TaskSet primary =
+        TaskSet primary =
                 ecs.updateServicePrimaryTaskSet(UpdateServicePrimaryTaskSetRequest.builder()
                         .cluster(clusterName)
                         .service(externalService)
@@ -1021,7 +1022,7 @@ class EcsTests {
                 .isInstanceOf(EcsException.class)
                 .hasMessageContaining("scaled down to zero");
 
-        software.amazon.awssdk.services.ecs.model.TaskSet deleted =
+        TaskSet deleted =
                 ecs.deleteTaskSet(DeleteTaskSetRequest.builder()
                         .cluster(clusterName)
                         .service(externalService)

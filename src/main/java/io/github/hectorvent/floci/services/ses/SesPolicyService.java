@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.ses;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -172,9 +174,9 @@ public class SesPolicyService {
             throw new AwsException("InvalidParameterValue", "PolicyName is required.", 400);
         }
         if (policyName.length() > 64) {
-            throw new AwsException("ValidationError",
-                    "1 validation error detected: Value at 'policyName' failed to satisfy constraint: "
-                            + "Member must have length less than or equal to 64", 400);
+            throw SmithyValidationErrors.validationError(
+                    "Value at 'policyName' failed to satisfy constraint: "
+                            + "Member must have length less than or equal to 64");
         }
         if (!POLICY_NAME_CHARS.matcher(policyName).matches()) {
             throw new AwsException("InvalidParameterValue",
@@ -190,7 +192,7 @@ public class SesPolicyService {
         try {
             // AWS returns the policy with insignificant whitespace stripped; compact it to match.
             return objectMapper.readTree(policy).toString();
-        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+        } catch (JsonProcessingException e) {
             // Floci does not validate policy semantics; keep an unparseable document verbatim.
             LOG.debugv("Identity policy is not valid JSON, storing as-is: {0}", e.getMessage());
             return policy;

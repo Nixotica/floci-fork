@@ -132,4 +132,63 @@ class ApplicationDefaultsTest {
         assertEquals(String.valueOf(maxConnections), fallback.value(),
                 "the @WithDefault must match application.yml, which wins over it");
     }
+
+    // Catches: streaming-max-connections declared and documented but absent from the shipped
+    // application.yml, or a yml value that silently disagrees with the @WithDefault fallback.
+    @Test
+    void productionConfigDeclaresTheStreamingDockerPoolAtItsDefault() throws IOException, NoSuchMethodException {
+        JsonNode streamingMaxConnections = new YAMLMapper()
+                .readTree(Path.of("src/main/resources/application.yml").toFile())
+                .path("floci").path("docker").path("streaming-max-connections");
+
+        assertFalse(streamingMaxConnections.isMissingNode(),
+                "streaming-max-connections should be declared in application.yml");
+        assertEquals(512, streamingMaxConnections.asInt());
+
+        WithDefault fallback = EmulatorConfig.DockerConfig.class
+                .getMethod("streamingMaxConnections")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "streamingMaxConnections should declare a fallback default");
+        assertEquals("512", fallback.value(),
+                "the @WithDefault must match application.yml, which wins over it");
+    }
+
+    // Catches: connection-request-timeout-seconds missing from the shipped application.yml, or a yml
+    // value that silently disagrees with the @WithDefault fallback.
+    @Test
+    void productionConfigDeclaresTheDockerLeaseTimeoutAtItsDefault() throws IOException, NoSuchMethodException {
+        JsonNode leaseTimeout = new YAMLMapper()
+                .readTree(Path.of("src/main/resources/application.yml").toFile())
+                .path("floci").path("docker").path("connection-request-timeout-seconds");
+
+        assertFalse(leaseTimeout.isMissingNode(),
+                "connection-request-timeout-seconds should be declared in application.yml");
+        assertEquals(30, leaseTimeout.asInt());
+
+        WithDefault fallback = EmulatorConfig.DockerConfig.class
+                .getMethod("connectionRequestTimeoutSeconds")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "connectionRequestTimeoutSeconds should declare a fallback default");
+        assertEquals("30", fallback.value(),
+                "the @WithDefault must match application.yml, which wins over it");
+    }
+
+    // Catches: api-timeout-seconds missing from the shipped application.yml, or a yml value that
+    // silently disagrees with the @WithDefault fallback.
+    @Test
+    void productionConfigDeclaresTheDockerApiTimeoutAtItsDefault() throws IOException, NoSuchMethodException {
+        JsonNode apiTimeout = new YAMLMapper()
+                .readTree(Path.of("src/main/resources/application.yml").toFile())
+                .path("floci").path("docker").path("api-timeout-seconds");
+
+        assertFalse(apiTimeout.isMissingNode(), "api-timeout-seconds should be declared in application.yml");
+        assertEquals(300, apiTimeout.asInt());
+
+        WithDefault fallback = EmulatorConfig.DockerConfig.class
+                .getMethod("apiTimeoutSeconds")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "apiTimeoutSeconds should declare a fallback default");
+        assertEquals("300", fallback.value(),
+                "the @WithDefault must match application.yml, which wins over it");
+    }
 }

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.memorydb.container;
 
+import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -7,7 +8,6 @@ import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
-import com.github.dockerjava.api.DockerClient;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Optional;
 
@@ -93,7 +94,7 @@ class MemoryDbContainerManagerTest {
                 try (Socket socket = serverSocket.accept()) {
                     socket.getInputStream().read(new byte[64]);
                     OutputStream out = socket.getOutputStream();
-                    out.write("+PONG\r\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    out.write("+PONG\r\n".getBytes(StandardCharsets.UTF_8));
                     out.flush();
                 } catch (IOException e) {
                     // Test teardown races the socket close; nothing left to assert on.
@@ -125,7 +126,7 @@ class MemoryDbContainerManagerTest {
                 try (Socket socket = serverSocket.accept()) {
                     socket.getInputStream().read(new byte[64]);
                     OutputStream out = socket.getOutputStream();
-                    out.write("+PONG\r\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    out.write("+PONG\r\n".getBytes(StandardCharsets.UTF_8));
                     out.flush();
                 } catch (IOException e) {
                     LOG.debugv(e, "Acceptor socket closed during test teardown");
@@ -142,7 +143,7 @@ class MemoryDbContainerManagerTest {
             ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
             ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
             when(containerBuilder.newContainer(anyString())).thenReturn(builder);
-            when(builder.build()).thenReturn(mock(ContainerSpec.class));
+            when(builder.build()).thenReturn(new ContainerSpec("test-image"));
 
             EmulatorConfig config = mock(EmulatorConfig.class);
             EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
@@ -170,7 +171,7 @@ class MemoryDbContainerManagerTest {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
-        when(builder.build()).thenReturn(mock(ContainerSpec.class));
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
 
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
         lenient().when(logStreamer.generateLogStreamName(any())).thenReturn("log-stream");

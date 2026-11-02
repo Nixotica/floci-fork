@@ -1,11 +1,15 @@
 package io.github.hectorvent.floci.services.ssoportal;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.services.identitystore.IdentityStoreService;
 import io.github.hectorvent.floci.services.ssoadmin.SsoAdminService;
 import io.github.hectorvent.floci.services.ssooidc.SsoOidcService;
+import io.github.hectorvent.floci.services.ssooidc.model.DeviceAuthorization;
+import io.github.hectorvent.floci.services.ssooidc.model.RegisteredClient;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.Test;
 
 import java.util.UUID;
@@ -33,16 +37,16 @@ class SsoPortalIntegrationTest {
     void listAccountsIncludesDirectAndGroupAssignmentsForTokenPrincipal() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String storeId = ssoAdminService.getIdentityStoreId();
-        var userRequest = mapper.createObjectNode();
+        ObjectNode userRequest = mapper.createObjectNode();
         userRequest.put("IdentityStoreId", storeId);
         userRequest.put("UserName", "portal-" + suffix + "@example.com");
         String userId = identityStoreService.createUser(userRequest).userId();
 
-        var groupRequest = mapper.createObjectNode();
+        ObjectNode groupRequest = mapper.createObjectNode();
         groupRequest.put("IdentityStoreId", storeId);
         groupRequest.put("DisplayName", "PortalGroup" + suffix);
         String groupId = identityStoreService.createGroup(groupRequest).groupId();
-        var membershipRequest = mapper.createObjectNode();
+        ObjectNode membershipRequest = mapper.createObjectNode();
         membershipRequest.put("IdentityStoreId", storeId);
         membershipRequest.put("GroupId", groupId);
         membershipRequest.putObject("MemberId").put("UserId", userId);
@@ -67,8 +71,8 @@ class SsoPortalIntegrationTest {
                 .queryParam("account_id", "111111111111")
             .when().get("/assignment/roles")
             .then().statusCode(200)
-                .body("roleList[0].accountId", org.hamcrest.Matchers.equalTo("111111111111"))
-                .body("roleList[0].roleName", org.hamcrest.Matchers.equalTo("PortalDirect" + suffix));
+                .body("roleList[0].accountId", Matchers.equalTo("111111111111"))
+                .body("roleList[0].roleName", Matchers.equalTo("PortalDirect" + suffix));
 
         given()
                 .header("x-amz-sso_bearer_token", accessToken)
@@ -82,10 +86,10 @@ class SsoPortalIntegrationTest {
                 .queryParam("role_name", "PortalDirect" + suffix)
             .when().get("/federation/credentials")
             .then().statusCode(200)
-                .body("roleCredentials.accessKeyId", org.hamcrest.Matchers.startsWith("ASIA"))
-                .body("roleCredentials.secretAccessKey", org.hamcrest.Matchers.not(org.hamcrest.Matchers.emptyString()))
-                .body("roleCredentials.sessionToken", org.hamcrest.Matchers.not(org.hamcrest.Matchers.emptyString()))
-                .body("roleCredentials.expiration", org.hamcrest.Matchers.greaterThan(System.currentTimeMillis()));
+                .body("roleCredentials.accessKeyId", Matchers.startsWith("ASIA"))
+                .body("roleCredentials.secretAccessKey", Matchers.not(Matchers.emptyString()))
+                .body("roleCredentials.sessionToken", Matchers.not(Matchers.emptyString()))
+                .body("roleCredentials.expiration", Matchers.greaterThan(System.currentTimeMillis()));
 
         given()
                 .header("x-amz-sso_bearer_token", accessToken)
@@ -118,7 +122,7 @@ class SsoPortalIntegrationTest {
                 .header("x-amz-sso_bearer_token", accessToken)
             .when().post("/logout")
             .then().statusCode(200)
-                .body(org.hamcrest.Matchers.emptyOrNullString());
+                .body(Matchers.emptyOrNullString());
 
         given()
                 .header("x-amz-sso_bearer_token", accessToken)
@@ -134,7 +138,7 @@ class SsoPortalIntegrationTest {
     }
 
     private String createPermissionSet(String instanceArn, String name) {
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("InstanceArn", instanceArn);
         request.put("Name", name);
         return ssoAdminService.createPermissionSet(request).arn();
@@ -142,7 +146,7 @@ class SsoPortalIntegrationTest {
 
     private void createAssignment(String instanceArn, String accountId, String permissionSetArn,
                                   String principalId, String principalType) {
-        var request = mapper.createObjectNode();
+        ObjectNode request = mapper.createObjectNode();
         request.put("InstanceArn", instanceArn);
         request.put("TargetId", accountId);
         request.put("TargetType", "AWS_ACCOUNT");
@@ -153,21 +157,21 @@ class SsoPortalIntegrationTest {
     }
 
     private String accessTokenFor(String principalId, String suffix) {
-        var registration = mapper.createObjectNode();
+        ObjectNode registration = mapper.createObjectNode();
         registration.put("clientName", "Portal Integration " + suffix);
         registration.put("clientType", "public");
         registration.putArray("grantTypes").add("urn:ietf:params:oauth:grant-type:device_code");
         registration.putArray("scopes").add("sso:account:access");
-        var client = oidcService.registerClient(registration);
+        RegisteredClient client = oidcService.registerClient(registration);
 
-        var start = mapper.createObjectNode();
+        ObjectNode start = mapper.createObjectNode();
         start.put("clientId", client.clientId());
         start.put("clientSecret", client.clientSecret());
         start.put("startUrl", "https://example.awsapps.com/start");
-        var authorization = oidcService.startDeviceAuthorization(start);
+        DeviceAuthorization authorization = oidcService.startDeviceAuthorization(start);
         oidcService.authorizeDevice(authorization.userCode(), principalId);
 
-        var token = mapper.createObjectNode();
+        ObjectNode token = mapper.createObjectNode();
         token.put("clientId", client.clientId());
         token.put("clientSecret", client.clientSecret());
         token.put("grantType", "urn:ietf:params:oauth:grant-type:device_code");

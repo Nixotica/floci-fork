@@ -2,10 +2,10 @@ package io.github.hectorvent.floci.services.amazonmq;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -120,7 +120,7 @@ public class AmazonMqService implements ResourceProvider {
 
         String brokerId = "b-" + UUID.randomUUID();
         String accountId = regionResolver.getAccountId();
-        String brokerArn = AwsArnUtils.Arn.of("mq", config.defaultRegion(), accountId,
+        String brokerArn = AwsArnUtils.Arn.of("mq", regionResolver.getRegion(), accountId,
                 "broker:" + name + ":" + brokerId).toString();
         String engineVersion = (params.engineVersion() == null || params.engineVersion().isBlank())
                 ? DEFAULT_ENGINE_VERSION : params.engineVersion();
@@ -141,6 +141,14 @@ public class AmazonMqService implements ResourceProvider {
         if (params.tags() != null) {
             broker.setTags(new HashMap<>(params.tags()));
         }
+        broker.setSecurityGroups(params.securityGroups());
+        broker.setSubnetIds(params.subnetIds());
+        broker.setLogs(params.logs());
+        broker.setMaintenanceWindowStartTime(params.maintenanceWindowStartTime());
+        broker.setStorageType(params.storageType());
+        broker.setAuthenticationStrategy(params.authenticationStrategy());
+        broker.setEncryptionOptions(params.encryptionOptions());
+        broker.setConfiguration(params.configuration());
 
         if (config.services().amazonmq().mock()) {
             // No backing container: come up immediately with synthetic endpoints.

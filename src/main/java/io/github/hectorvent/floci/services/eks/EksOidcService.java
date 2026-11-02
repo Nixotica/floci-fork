@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.CompactJws;
 import io.github.hectorvent.floci.core.common.OidcIssuerKeyLookup;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -15,14 +16,12 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
-import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
@@ -179,12 +178,9 @@ public class EksOidcService implements OidcIssuerKeyLookup {
         long exp = now + lifetime;
         String subject = "system:serviceaccount:" + namespace + ":" + serviceAccount;
 
-        String header = base64Url(writeJson(buildHeader(key.getKeyId())));
-        String payload = base64Url(writeJson(
-                buildClaims(issuer, aud, subject, namespace, serviceAccount, now, exp)));
-
-        String signingInput = header + "." + payload;
-        return signingInput + "." + sign(signingInput, toPrivateKey(key.getPrivateKey()));
+        return CompactJws.sign(writeJson(buildHeader(key.getKeyId())),
+                writeJson(buildClaims(issuer, aud, subject, namespace, serviceAccount, now, exp)),
+                toPrivateKey(key.getPrivateKey()), "SHA256withRSA");
     }
 
     private int resolveLifetime(Integer requested) {
@@ -231,17 +227,6 @@ public class EksOidcService implements OidcIssuerKeyLookup {
         }
     }
 
-    private String sign(String signingInput, PrivateKey privateKey) {
-        try {
-            Signature signature = Signature.getInstance("SHA256withRSA");
-            signature.initSign(privateKey);
-            signature.update(signingInput.getBytes(StandardCharsets.UTF_8));
-            return base64Url(signature.sign());
-        } catch (GeneralSecurityException e) {
-            throw new IllegalStateException("EKS OIDC token signing failed", e);
-        }
-    }
-
     RSAPublicKey toPublicKey(String encoded) {
         try {
             X509EncodedKeySpec spec = new X509EncodedKeySpec(Base64.getDecoder().decode(encoded));
@@ -258,10 +243,6 @@ public class EksOidcService implements OidcIssuerKeyLookup {
         } catch (GeneralSecurityException | IllegalArgumentException e) {
             throw new IllegalStateException("Failed to load EKS OIDC private key", e);
         }
-    }
-
-    private static String base64Url(byte[] data) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(data);
     }
 
     /**

@@ -1,8 +1,8 @@
 package io.github.hectorvent.floci.services.apigateway;
 
 import io.github.hectorvent.floci.core.common.RequestHost;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.apigateway.model.BasePathMapping;
-import io.github.hectorvent.floci.services.apigateway.model.CustomDomain;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -33,6 +33,9 @@ import java.net.URI;
 @ApplicationScoped
 public class ApiGatewayCustomDomainFilter implements ContainerRequestFilter {
 
+    /** Set on requests this filter rewrote, so later Host filters do not claim them again. */
+    public static final String ROUTED_PROPERTY = ApiGatewayCustomDomainFilter.class.getName() + ".routed";
+
     private static final Logger LOG = Logger.getLogger(ApiGatewayCustomDomainFilter.class);
     private static final String REGIONAL_SUFFIX = ".regional.local";
 
@@ -59,7 +62,7 @@ public class ApiGatewayCustomDomainFilter implements ContainerRequestFilter {
         String hostname = stripPort(host);
 
         // Try matching by regionalDomainName first, then by bare domain name
-        CustomDomain domain = null;
+        ApiGatewayService.CustomDomainRoute domain = null;
         if (hostname.endsWith(REGIONAL_SUFFIX)) {
             domain = apiGatewayService.findDomainByRegionalHostname(hostname);
         }
@@ -77,9 +80,9 @@ public class ApiGatewayCustomDomainFilter implements ContainerRequestFilter {
         }
 
         // Resolve the base path mapping for this domain + path
-        BasePathMapping mapping = apiGatewayService.resolveBasePathMapping(domain.getDomainName(), path);
+        BasePathMapping mapping = apiGatewayService.resolveBasePathMapping(domain, path);
         if (mapping == null) {
-            LOG.debugv("No base path mapping found for domain {0} path {1}", domain.getDomainName(), path);
+            LOG.debugv("No base path mapping found for domain {0} path {1}", domain.domainName(), path);
             return;
         }
 
@@ -109,17 +112,15 @@ public class ApiGatewayCustomDomainFilter implements ContainerRequestFilter {
                 .build();
 
         LOG.debugv("Custom domain routing: {0}{1} -> {2}", host, path, newUri.getPath());
-        // AWS_IAM dispatch rebuilds the caller's canonical request, which covers the path they
-        // signed: the custom-domain path, not the /execute-api/... form this rewrite produces.
-        // Older persisted mappings have no type. Prefer REST if that API exists; otherwise
-        // retain v2 routing when a v2 API owns the id.
-        if ("REST".equals(mapping.getApiType())
-                || (mapping.getApiType() == null
-                        && (apiGatewayService.hasRestApi(restApiId)
-                                || apiGatewayV2Service.findApiOwner(restApiId).isEmpty()))) {
-            routeContext.routeToRestApi();
-        }
+        String mappedRegion = domain.region();
+        boolean restApi = "REST".equals(mapping.getApiType())
+                || (mapping.getApiType() == null && RequestScopes.callAs(
+                        domain.accountId(), domain.region(),
+                        () -> apiGatewayService.hasRestApi(mappedRegion, restApiId)
+                                || !apiGatewayV2Service.hasApi(mappedRegion, restApiId)));
+        routeContext.routeToMappedApi(domain, restApi);
         routeContext.recordSignedRequestPath(path);
+        requestContext.setProperty(ROUTED_PROPERTY, Boolean.TRUE);
         requestContext.setRequestUri(newUri);
     }
 

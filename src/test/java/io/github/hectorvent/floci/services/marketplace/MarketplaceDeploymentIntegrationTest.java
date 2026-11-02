@@ -2,8 +2,12 @@ package io.github.hectorvent.floci.services.marketplace;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
@@ -18,7 +22,7 @@ class MarketplaceDeploymentIntegrationTest {
         String body = "{\"agreementId\":\"agr-local\",\"clientToken\":\"12345678901234567890123456789012\","
                 + "\"deploymentParameter\":{\"name\":\"ApiKey\",\"secretString\":\"local-secret\"},"
                 + "\"tags\":{\"env\":\"test\"}}";
-        var response = given().contentType("application/json").header("Authorization", auth()).body(body)
+        Response response = given().contentType("application/json").header("Authorization", auth()).body(body)
                 .post("/catalogs/AWSMarketplace/products/prod-local/deployment-parameters")
                 .then().statusCode(200).body("deploymentParameterId", notNullValue())
                 .body("tags.env", equalTo("test")).extract().response();
@@ -62,7 +66,7 @@ class MarketplaceDeploymentIntegrationTest {
     }
 
     private static String encode(String value) {
-        return java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8);
+        return URLEncoder.encode(value, StandardCharsets.UTF_8);
     }
 
     private static String auth() {

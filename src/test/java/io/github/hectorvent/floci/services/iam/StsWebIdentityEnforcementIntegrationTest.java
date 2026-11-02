@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
@@ -22,11 +24,8 @@ class StsWebIdentityEnforcementIntegrationTest {
 
     @Test
     void rejectsUnknownIssuerWhenIamEnforcementIsEnabled() {
-        String header = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
-                "{\"alg\":\"none\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        String payload = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
-                "{\"iss\":\"https://untrusted.example\",\"aud\":\"sts.amazonaws.com\"}"
-                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String header = Base64Url.encode("{\"alg\":\"none\"}");
+        String payload = Base64Url.encode("{\"iss\":\"https://untrusted.example\",\"aud\":\"sts.amazonaws.com\"}");
 
         assumeRole(header + "." + payload + ".")
         .then()
@@ -34,7 +33,7 @@ class StsWebIdentityEnforcementIntegrationTest {
             .body(containsString("InvalidIdentityToken"));
     }
 
-    private static io.restassured.response.Response assumeRole(String token) {
+    private static Response assumeRole(String token) {
         return given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "AssumeRoleWithWebIdentity")

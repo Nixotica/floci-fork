@@ -8,16 +8,28 @@ package io.github.hectorvent.floci.services.rds.container;
 public interface RdsBackendGate {
 
     /** A gate for backends that never pause. */
-    RdsBackendGate OPEN = (host, port) -> Lease.NONE;
+    RdsBackendGate OPEN = runtimeId -> Lease.NONE;
 
     /**
-     * Waits until the container serving {@code host:port} can take a client, resuming it when it
+     * Waits until the container owned by {@code runtimeId} can take a client, resuming it when it
      * is auto-paused, and keeps it awake until the lease is closed. A backend with no auto-pause
      * gets {@link Lease#NONE}.
      *
      * @throws InterruptedException when interrupted while a pause or resume is under way
      */
-    Lease enter(String host, int port) throws InterruptedException;
+    Lease enterRuntime(String runtimeId) throws InterruptedException;
+
+    /**
+     * Like {@link #enterRuntime(String)}, but with {@code waitForResume=false} starts resume in the
+     * background and throws {@link ResumingException} if the runtime is not yet ready.
+     */
+    default Lease enterRuntime(String runtimeId, boolean waitForResume) throws InterruptedException {
+        return enterRuntime(runtimeId);
+    }
+
+    /** The backend is being resumed; no lease was acquired and the caller must retry. */
+    class ResumingException extends RuntimeException {
+    }
 
     /** Held for as long as a client uses the backend; closing it more than once is harmless. */
     interface Lease extends AutoCloseable {

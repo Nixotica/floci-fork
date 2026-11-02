@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.controlcatalog.model.ControlDefinitio
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -63,7 +64,8 @@ public class ControlCatalogService implements Resettable {
         ObjectNode response = objectMapper.createObjectNode();
         String responseArn = definition.globalIdentifier() == null
                 ? controlArn
-                : "arn:" + partition + ":controlcatalog:::control/" + definition.globalIdentifier();
+                : AwsArnUtils.Arn.global(partition, "controlcatalog", "", "control/" + definition.globalIdentifier())
+                        .toString();
         response.put("Arn", responseArn);
         response.set("Aliases", stringArray(definition.aliases()));
         response.put("Name", definition.name());
@@ -74,8 +76,7 @@ public class ControlCatalogService implements Resettable {
         ObjectNode regionConfiguration = response.putObject("RegionConfiguration");
         regionConfiguration.put("Scope", definition.scope());
         if ("REGIONAL".equals(definition.scope())) {
-            String region = requestRegion == null || requestRegion.isBlank() ? "us-east-1" : requestRegion; // partition-literal: fallback only when the record carries no region; no resolver in scope (follow-up)
-            regionConfiguration.set("DeployableRegions", stringArray(List.of(region)));
+            regionConfiguration.set("DeployableRegions", stringArray(List.of(requestRegion)));
         }
 
         ObjectNode implementation = response.putObject("Implementation");
@@ -130,7 +131,7 @@ public class ControlCatalogService implements Resettable {
                 .filter(definition -> identifierFilter == null || definition.aliases().contains(identifierFilter))
                 .filter(definition -> providerFilter == null || "AWS".equals(providerFilter))
                 .distinct()
-                .sorted(java.util.Comparator.comparing(ControlDefinition::globalIdentifier))
+                .sorted(Comparator.comparing(ControlDefinition::globalIdentifier))
                 .toList();
         if (offset > definitions.size()) {
             throw validation("nextToken is invalid.");

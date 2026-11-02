@@ -8,7 +8,6 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudfront.model.CacheBehavior;
 import io.github.hectorvent.floci.services.cloudfront.model.CachePolicy;
-import io.github.hectorvent.floci.services.cloudfront.model.OriginRequestPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.CloudFrontFunction;
 import io.github.hectorvent.floci.services.cloudfront.model.CloudFrontOriginAccessIdentity;
 import io.github.hectorvent.floci.services.cloudfront.model.DefaultCacheBehavior;
@@ -17,11 +16,13 @@ import io.github.hectorvent.floci.services.cloudfront.model.DistributionConfig;
 import io.github.hectorvent.floci.services.cloudfront.model.KeyGroup;
 import io.github.hectorvent.floci.services.cloudfront.model.Origin;
 import io.github.hectorvent.floci.services.cloudfront.model.OriginAccessControl;
+import io.github.hectorvent.floci.services.cloudfront.model.OriginRequestPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.PublicKey;
 import io.github.hectorvent.floci.services.cloudfront.model.ResponseHeadersPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.StreamingDistribution;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.mockito.Mockito;
 
 import java.security.KeyPairGenerator;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -127,23 +129,29 @@ class CloudFrontServiceTest {
         return serviceWithDomainSuffix(domainSuffix, "us-east-1");
     }
 
+    /** A null {@code domainSuffix} is {@code floci.services.cloudfront.domain-suffix} left unset. */
     private CloudFrontService serviceWithDomainSuffix(String domainSuffix, String region) {
+        return serviceWithDomainSuffix(domainSuffix, region, "http://localhost:4566");
+    }
+
+    private CloudFrontService serviceWithDomainSuffix(String domainSuffix, String region, String baseUrl) {
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
         when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
                 .thenAnswer(invocation -> AccountAwareStorageBackend.inMemory("000000000000"));
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
         EmulatorConfig.DnsConfig dnsConfig = Mockito.mock(EmulatorConfig.DnsConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var cloudFrontConfig = Mockito.mock(EmulatorConfig.CloudFrontServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.CloudFrontServiceConfig cloudFrontConfig = Mockito.mock(EmulatorConfig.CloudFrontServiceConfig.class);
 
         when(config.defaultAccountId()).thenReturn(ACCOUNT);
         when(config.hostname()).thenReturn(Optional.empty());
+        when(config.effectiveBaseUrl()).thenReturn(baseUrl);
         when(config.dns()).thenReturn(dnsConfig);
         when(dnsConfig.extraSuffixes()).thenReturn(Optional.empty());
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.cloudfront()).thenReturn(cloudFrontConfig);
-        when(cloudFrontConfig.domainSuffix()).thenReturn(domainSuffix);
+        when(cloudFrontConfig.domainSuffix()).thenReturn(Optional.ofNullable(domainSuffix));
 
         return new CloudFrontService(storageFactory, config, new RegionResolver(region, ACCOUNT));
     }
@@ -167,6 +175,86 @@ class CloudFrontServiceTest {
         assertEquals(development.getFunctionCode(), describedLive.getFunctionCode());
         assertEquals(development.getEtag(), describedDevelopment.getEtag());
         assertNotEquals(development.getEtag(), live.getEtag());
+    }
+
+    @Test
+    void createFunction_existingName_isRejectedAndKeepsTheFunction() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CloudFrontFunction first = new CloudFrontFunction();
+        first.setName("routing");
+        first.setFunctionCode("first");
+        service.createFunction(first);
+        CloudFrontFunction second = new CloudFrontFunction();
+        second.setName("routing");
+        second.setFunctionCode("second");
+
+        AwsException error = assertThrows(AwsException.class, () -> service.createFunction(second));
+
+        assertEquals("FunctionAlreadyExists", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals("first", service.describeFunction("routing", null).getFunctionCode());
+    }
+
+    @Test
+    void createFunction_nameOfADeletedFunction_isAccepted() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CloudFrontFunction function = new CloudFrontFunction();
+        function.setName("routing");
+        CloudFrontFunction created = service.createFunction(function);
+        service.publishFunction("routing", created.getEtag());
+        service.deleteFunction("routing", created.getEtag());
+        CloudFrontFunction again = new CloudFrontFunction();
+        again.setName("routing");
+
+        assertEquals("DEVELOPMENT", service.createFunction(again).getStage());
+    }
+
+    @Test
+    void createFunction_unknownRuntime_isRejected() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CloudFrontFunction function = new CloudFrontFunction();
+        function.setName("routing");
+        function.setRuntime("python3");
+
+        AwsException error = assertThrows(AwsException.class, () -> service.createFunction(function));
+
+        assertEquals("InvalidArgument", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertThrows(AwsException.class, () -> service.describeFunction("routing", null));
+    }
+
+    @Test
+    void createFunction_supportedRuntimes_areAccepted() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        for (String runtime : List.of("cloudfront-js-1.0", "cloudfront-js-2.0")) {
+            CloudFrontFunction function = new CloudFrontFunction();
+            function.setName("routing-" + runtime);
+            function.setRuntime(runtime);
+
+            assertEquals(runtime, service.createFunction(function).getRuntime());
+        }
+    }
+
+    @Test
+    void updateFunction_unknownRuntime_isRejectedAndKeepsTheFunction() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CloudFrontFunction function = new CloudFrontFunction();
+        function.setName("routing");
+        function.setFunctionCode("first");
+        function.setRuntime("cloudfront-js-2.0");
+        String etag = service.createFunction(function).getEtag();
+        CloudFrontFunction update = new CloudFrontFunction();
+        update.setFunctionCode("second");
+        update.setRuntime("python3");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunction("routing", etag, update));
+
+        assertEquals("InvalidArgument", error.getErrorCode());
+        CloudFrontFunction kept = service.describeFunction("routing", null);
+        assertEquals("first", kept.getFunctionCode());
+        assertEquals("cloudfront-js-2.0", kept.getRuntime());
+        assertEquals(etag, kept.getEtag());
     }
 
     @Test
@@ -242,8 +330,33 @@ class CloudFrontServiceTest {
     }
 
     @Test
+    void distributionTagsAreReadAndUpdatedByArn() {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+        Distribution dist = service.createDistribution(new Distribution(), Map.of("env", "dev"));
+
+        assertEquals(Map.of("env", "dev"), service.listTagsForResource(dist.getArn()));
+
+        service.tagResource(dist.getArn(), Map.of("team", "infra"));
+        assertEquals(Map.of("env", "dev", "team", "infra"), service.listTagsForResource(dist.getArn()));
+
+        service.untagResource(dist.getArn(), List.of("env"));
+        assertEquals(Map.of("team", "infra"), service.listTagsForResource(dist.getArn()));
+    }
+
+    @Test
+    void deletingDistributionRemovesTagsStoredUnderItsArn() {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+        Distribution dist = service.createDistribution(new Distribution(), Map.of());
+        service.tagResource(dist.getArn(), Map.of("env", "dev"));
+
+        service.deleteDistribution(dist.getId(), dist.getEtag());
+
+        assertEquals(Map.of(), service.listTagsForResource(dist.getArn()));
+    }
+
+    @Test
     void createDistributionUsesDefaultDomainSuffix() {
-        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CloudFrontService service = serviceWithDomainSuffix(null);
 
         Distribution dist = service.createDistribution(new Distribution(), Map.of());
 
@@ -279,6 +392,33 @@ class CloudFrontServiceTest {
         CloudFrontService service = serviceWithDomainSuffix("cloudfront.local");
 
         Distribution dist = service.createDistribution(new Distribution(), Map.of());
+
+        assertTrue(dist.getDomainName().endsWith(".cloudfront.local"),
+                "Expected configured suffix, got: " + dist.getDomainName());
+    }
+
+    /**
+     * China's distributions are named under {@code cloudfront.cn}; GovCloud has no CloudFront and
+     * so no suffix of its own, and keeps the commercial one.
+     */
+    @Test
+    void anUnconfiguredDomainSuffixFollowsTheRequestsPartition() {
+        CloudFrontService china = serviceWithDomainSuffix(null, "cn-north-1");
+        CloudFrontService govCloud = serviceWithDomainSuffix(null, "us-gov-west-1");
+
+        Distribution dist = china.createDistribution(new Distribution(), Map.of());
+        StreamingDistribution streaming = china.createStreamingDistribution(new StreamingDistribution());
+
+        assertEquals(dist.getId().toLowerCase(Locale.ROOT) + ".cloudfront.cn", dist.getDomainName());
+        assertEquals(streaming.getId().toLowerCase(Locale.ROOT) + ".cloudfront.cn", streaming.getDomainName());
+        assertTrue(govCloud.createDistribution(new Distribution(), Map.of()).getDomainName().endsWith(".cloudfront.net"));
+    }
+
+    @Test
+    void aConfiguredDomainSuffixWinsOverThePartitions() {
+        CloudFrontService china = serviceWithDomainSuffix("cloudfront.local", "cn-north-1");
+
+        Distribution dist = china.createDistribution(new Distribution(), Map.of());
 
         assertTrue(dist.getDomainName().endsWith(".cloudfront.local"),
                 "Expected configured suffix, got: " + dist.getDomainName());
@@ -423,23 +563,416 @@ class CloudFrontServiceTest {
 
         OriginAccessControl missingName = originAccessControl();
         missingName.setName(null);
-        assertInvalidOriginAccessControl(service, missingName);
+        assertInvalidOriginAccessControl(service, missingName, "MalformedXML", "1 validation error detected: Value null"
+                + " at 'originAccessControlConfig.name' failed to satisfy constraint: Member must not be null");
+
+        OriginAccessControl emptyName = originAccessControl();
+        emptyName.setName("");
+        assertInvalidOriginAccessControl(service, emptyName, "InvalidArgument", "The parameter Name is too small or empty.");
 
         OriginAccessControl longName = originAccessControl();
         longName.setName("x".repeat(65));
-        assertInvalidOriginAccessControl(service, longName);
+        assertInvalidOriginAccessControl(service, longName, "InvalidArgument", "The parameter Name is too big.");
 
         OriginAccessControl invalidProtocol = originAccessControl();
         invalidProtocol.setSigningProtocol("sigv2");
-        assertInvalidOriginAccessControl(service, invalidProtocol);
+        assertInvalidOriginAccessControl(service, invalidProtocol, "MalformedXML", "1 validation error detected: Value"
+                + " 'sigv2' at 'originAccessControlConfig.signingProtocol' failed to satisfy constraint: Member must"
+                + " satisfy enum value set: [sigv4, sigv4a]");
 
         OriginAccessControl invalidBehavior = originAccessControl();
         invalidBehavior.setSigningBehavior("sometimes");
-        assertInvalidOriginAccessControl(service, invalidBehavior);
+        assertInvalidOriginAccessControl(service, invalidBehavior, "MalformedXML", "1 validation error detected: Value"
+                + " 'sometimes' at 'originAccessControlConfig.signingBehavior' failed to satisfy constraint: Member"
+                + " must satisfy enum value set: [always-amz-auth, never, always, no-override]");
 
         OriginAccessControl invalidOriginType = originAccessControl();
         invalidOriginType.setOriginAccessControlOriginType("custom");
-        assertInvalidOriginAccessControl(service, invalidOriginType);
+        assertInvalidOriginAccessControl(service, invalidOriginType, "MalformedXML", "1 validation error detected:"
+                + " Value 'custom' at 'originAccessControlConfig.originAccessControlOriginType' failed to satisfy"
+                + " constraint: Member must satisfy enum value set: [s3, execute-api, lambda, mediastore,"
+                + " mediapackagev2]");
+    }
+
+    @Test
+    void originAccessControlEnumsAndNameAreReportedTogetherBeforeTheOtherRules() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        assertInvalidOriginAccessControl(service, new OriginAccessControl(), "MalformedXML", "4 validation errors"
+                + " detected: Value null at 'originAccessControlConfig.originAccessControlOriginType' failed to satisfy"
+                + " constraint: Member must not be null; Value null at 'originAccessControlConfig.signingProtocol'"
+                + " failed to satisfy constraint: Member must not be null; Value null at"
+                + " 'originAccessControlConfig.signingBehavior' failed to satisfy constraint: Member must not be null;"
+                + " Value null at 'originAccessControlConfig.name' failed to satisfy constraint: Member must not be null");
+
+        OriginAccessControl longNameAndBehavior = originAccessControl();
+        longNameAndBehavior.setName("x".repeat(65));
+        longNameAndBehavior.setSigningBehavior("always-amz-auth");
+        assertInvalidOriginAccessControl(service, longNameAndBehavior, "InvalidArgument", "The parameter Name is too big.");
+    }
+
+    @Test
+    void alwaysAmzAuthIsForLambdaAndSigV4aForS3OrLambda() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        assertInvalidOriginAccessControl(service, originAccessControl("sigv4", "always-amz-auth", "s3"),
+                "InvalidArgument", "The parameter SigningBehavior always-amz-auth is only supported with lambda origin type.");
+        assertInvalidOriginAccessControl(service, originAccessControl("sigv4a", "always-amz-auth", "mediastore"),
+                "InvalidArgument", "The parameter SigningBehavior always-amz-auth is only supported with lambda origin type.");
+        assertInvalidOriginAccessControl(service, originAccessControl("sigv4a", "always", "mediapackagev2"),
+                "InvalidArgument", "The parameter OriginType sigv4a is only supported with s3 or lambda origin types.");
+
+        assertDoesNotThrow(() -> service.createOriginAccessControl(originAccessControl("sigv4a", "always-amz-auth", "lambda")));
+        assertDoesNotThrow(() -> service.createOriginAccessControl(originAccessControl("sigv4a", "never", "lambda")));
+        assertDoesNotThrow(() -> service.createOriginAccessControl(originAccessControl("sigv4a", "always", "s3")));
+    }
+
+    @Test
+    void theExecuteApiOriginTypeIsRefused() {
+        AwsException error = assertAws("AccessDenied", () -> serviceWithDomainSuffix("cloudfront.net")
+                .createOriginAccessControl(originAccessControl("sigv4", "always", "execute-api")));
+
+        assertEquals("Access Denied.", error.getMessage());
+        assertEquals(403, error.getHttpStatus());
+    }
+
+    @Test
+    void aLambdaOriginNeedsTheOriginAccessControlItsHostnameCallsFor() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        String regional = "abcdefghijklmnopqrstuvwxyz.001.lambda-web.us-east-1.on.aws";
+        String global = "abcdefghijklmnopqrstuvwxyz.lambda-web.global.on.aws";
+        String functionUrl = "abcdefghijklmnopqrstuvwxyz0123.lambda-url.us-east-1.on.aws";
+        String differ = "The origin type and OAC origin type differ";
+
+        assertOriginAccessControlRefused(service, regional, "sigv4", "never", "lambda",
+                "Lambda-Web origins require always-amz-auth signing behavior.");
+        assertOriginAccessControlRefused(service, "abcdefghijklmnop.001.lambda-web.us-east-1.localhost:4566", "sigv4",
+                "always", "lambda", "Lambda-Web origins require always-amz-auth signing behavior.");
+        assertOriginAccessControlRefused(service, regional, "sigv4", "always", "s3", differ);
+        assertOriginAccessControlRefused(service, global, "sigv4", "always", "s3", differ);
+        assertOriginAccessControlRefused(service, "example.com", "sigv4", "always-amz-auth", "lambda", differ);
+        assertOriginAccessControlRefused(service, "bucket.s3.us-east-1.amazonaws.com", "sigv4", "always", "lambda", differ);
+        assertOriginAccessControlRefused(service, global, "sigv4", "always-amz-auth", "lambda",
+                "This origin domain requires SigV4a signing protocol.");
+        assertOriginAccessControlRefused(service, global, "sigv4", "never", "lambda",
+                "This origin domain requires SigV4a signing protocol.");
+        assertOriginAccessControlRefused(service, regional, "sigv4a", "always", "lambda",
+                "SigV4a signing protocol is not compatible with this origin domain.");
+        assertOriginAccessControlRefused(service, "abcdefghijklmnopqrstuvwxyz.001.lambda-web.us-west-2.on.aws", "sigv4a",
+                "always-amz-auth", "lambda", "SigV4a signing protocol is not compatible with this origin domain.");
+        assertOriginAccessControlRefused(service, functionUrl, "sigv4a", "always-amz-auth", "lambda",
+                "SigV4a signing protocol is not compatible with this origin domain.");
+        assertOriginAccessControlRefused(service, functionUrl, "sigv4", "always-amz-auth", "lambda",
+                "always-amz-auth signing behavior requires a Lambda-Web origin.");
+
+        assertDoesNotThrow(() -> service.createDistribution(
+                distributionWithOrigin(regional, oac(service, "sigv4", "always-amz-auth", "lambda"), null), Map.of()));
+        assertDoesNotThrow(() -> service.createDistribution(
+                distributionWithOrigin(global, oac(service, "sigv4a", "always-amz-auth", "lambda"), null), Map.of()));
+        assertDoesNotThrow(() -> service.createDistribution(
+                distributionWithOrigin(functionUrl, oac(service, "sigv4", "never", "lambda"), null), Map.of()));
+    }
+
+    @Test
+    void onlyAHostnameUnderOnAwsOrThisFlociIsALambdaOrigin() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        String differ = "The origin type and OAC origin type differ";
+
+        for (String notLambda : List.of("api.lambda-web.us-east-1.example.com",
+                "abcdefghijklmnopqrstuvwxyz.001.lambda-web.us-east-1.on.aws.example.com",
+                "abcdefghijklmnopqrstuvwxyz0123.lambda-url.us-east-1.example.com",
+                "abcdefghijklmnopqrstuvwxyz.001.lambda-web.us-east-1.amazonaws.com",
+                "abcdefghijklmnopqrstuvwxyz.001.lambda-web.us-east-1.floci.example.com",
+                "abcdefghijklmnopqrstuvwxyz.001.LAMBDA-WEB.US-EAST-1.ON.AWS",
+                "abc.lambda-web.Global.on.aws",
+                "lambda-web.us-east-1.on.aws",
+                "abc.lambda-web.foo.on.aws")) {
+            assertOriginAccessControlRefused(service, notLambda, "sigv4a", "always-amz-auth", "lambda", differ);
+        }
+        for (String webFunction : List.of("ABC.lambda-web.us-east-1.on.aws", "a.b.c.lambda-web.us-east-1.on.aws",
+                "abc.lambda-web.xx-fake-9.on.aws", "abcdefghijklmnop.001.lambda-web.us-east-1.localhost")) {
+            assertOriginAccessControlRefused(service, webFunction, "sigv4a", "always-amz-auth", "lambda",
+                    "SigV4a signing protocol is not compatible with this origin domain.");
+        }
+    }
+
+    @Test
+    void aFlociHostWithAnUnderscoreNamesLambdaOriginsToo() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net", "us-east-1", "http://floci_host:4566");
+
+        for (String webFunction : List.of("abcdefghijklmnop.001.lambda-web.us-east-1.floci_host:4566",
+                "abcdefghijklmnop.001.lambda-web.us-east-1.floci_host")) {
+            assertOriginAccessControlRefused(service, webFunction, "sigv4a", "always-amz-auth", "lambda",
+                    "SigV4a signing protocol is not compatible with this origin domain.");
+        }
+    }
+
+    @Test
+    void anUpdateChecksTheOriginAccessControlOfALambdaOrigin() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        String never = oac(service, "sigv4", "never", "lambda");
+        Distribution created = service.createDistribution(
+                distributionWithOrigin("abcdefghijklmnopqrstuvwxyz0123.lambda-url.us-east-1.on.aws", never, null), Map.of());
+
+        AwsException error = assertAws("IllegalOriginAccessConfiguration", () -> service.updateDistribution(
+                created.getId(), created.getEtag(), distributionWithOrigin(
+                        "abcdefghijklmnopqrstuvwxyz.001.lambda-web.us-east-1.on.aws", never, null)));
+
+        assertEquals("Illegal configuration: Lambda-Web origins require always-amz-auth signing behavior.",
+                error.getMessage());
+    }
+
+    @Test
+    void aDistributionNamingAnUnknownOriginAccessControlIsRefused() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        AwsException created = assertAws("InvalidOriginAccessControl", () -> service.createDistribution(
+                distributionWithOrigin("example.com", "E0000000000000", null), Map.of()));
+        assertEquals("The specified origin access control does not exist or is not valid.", created.getMessage());
+        assertEquals(400, created.getHttpStatus());
+
+        Distribution existing = service.createDistribution(distributionWithOrigin("example.com", null, null), Map.of());
+        assertAws("InvalidOriginAccessControl", () -> service.updateDistribution(existing.getId(),
+                existing.getEtag(), distributionWithOrigin("example.com", "E0000000000000", null)));
+        assertNull(service.getDistribution(existing.getId()).getConfig().getOrigins().getFirst()
+                .getOriginAccessControlId());
+    }
+
+    @Test
+    void createDistributionRejectsConnectionAttemptsOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException above = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionAttempts(4);
+                }), Map.of()));
+        assertEquals("The parameter ConnectionAttempts must be between 1 and 3.", above.getMessage());
+        assertEquals(400, above.getHttpStatus());
+
+        assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionAttempts(0);
+                }), Map.of()));
+    }
+
+    @Test
+    void createDistributionRejectsConnectionTimeoutOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException above = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionTimeout(11);
+                }), Map.of()));
+        assertEquals("The parameter ConnectionTimeout must be between 1 and 10 seconds.", above.getMessage());
+        assertEquals(400, above.getHttpStatus());
+
+        AwsException below = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionTimeout(0);
+                }), Map.of()));
+        assertEquals("The parameter ConnectionTimeout must be between 1 and 10 seconds.", below.getMessage());
+    }
+
+    @Test
+    void createDistributionRejectsOriginReadTimeoutOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException error = assertAws("InvalidOriginReadTimeout",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 121);
+                }), Map.of()));
+        assertEquals("The parameter OriginReadTimeout must be between 1 and 120 seconds.", error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+
+        assertAws("InvalidOriginReadTimeout",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 0);
+                }), Map.of()));
+    }
+
+    @Test
+    void createDistributionRejectsOriginKeepaliveTimeoutOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException below = assertAws("InvalidOriginKeepaliveTimeout",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginKeepaliveTimeout", 0);
+                }), Map.of()));
+        assertEquals("The parameter OriginKeepaliveTimeout must be between 1 and 300 seconds.", below.getMessage());
+        assertEquals(400, below.getHttpStatus());
+
+        assertAws("InvalidOriginKeepaliveTimeout",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginKeepaliveTimeout", 301);
+                }), Map.of()));
+    }
+
+    @Test
+    void createDistributionRejectsAResponseCompletionTimeoutShorterThanTheReadTimeout() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException below = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 30);
+                    origin.setResponseCompletionTimeout(29);
+                }), Map.of()));
+        assertEquals("The parameter ResponseCompletionTimeout must be greater than or equal to"
+                + " OriginReadTimeout.", below.getMessage());
+        assertEquals(400, below.getHttpStatus());
+
+        AwsException negative = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin ->
+                        origin.setResponseCompletionTimeout(-1)), Map.of()));
+        assertEquals("The parameter ResponseCompletionTimeout must be a non-negative integer.",
+                negative.getMessage());
+        assertEquals(400, negative.getHttpStatus());
+
+        // A completion timeout as long as the read timeout, and none at all, are both accepted.
+        assertDoesNotThrow(() -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+            origin.getCustomOriginConfig().put("OriginReadTimeout", 30);
+            origin.setResponseCompletionTimeout(30);
+        }), Map.of()));
+        assertDoesNotThrow(() -> service.createDistribution(distributionWithCustomOrigin(origin ->
+                origin.setResponseCompletionTimeout(0)), Map.of()));
+
+        // No OriginReadTimeout means the 30 s default, which a shorter completion timeout breaks.
+        AwsException belowDefault = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin ->
+                        origin.setResponseCompletionTimeout(10)), Map.of()));
+        assertEquals("The parameter ResponseCompletionTimeout must be greater than or equal to"
+                + " OriginReadTimeout.", belowDefault.getMessage());
+    }
+
+    @Test
+    void updateDistributionRejectsOriginSettingsOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution existing = service.createDistribution(
+                distributionWithCustomOrigin(origin -> { }), Map.of());
+
+        AwsException error = assertAws("InvalidArgument", () -> service.updateDistribution(
+                existing.getId(), existing.getEtag(),
+                distributionWithCustomOrigin(origin -> origin.setConnectionAttempts(4))));
+        assertEquals("The parameter ConnectionAttempts must be between 1 and 3.", error.getMessage());
+
+        assertAws("InvalidOriginReadTimeout", () -> service.updateDistribution(
+                existing.getId(), existing.getEtag(),
+                distributionWithCustomOrigin(origin ->
+                        origin.getCustomOriginConfig().put("OriginReadTimeout", 121))));
+    }
+
+    @Test
+    void updateDistributionRejectsAResponseCompletionTimeoutShorterThanTheReadTimeout() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution existing = service.createDistribution(
+                distributionWithCustomOrigin(origin -> { }), Map.of());
+
+        AwsException below = assertAws("InvalidArgument", () -> service.updateDistribution(
+                existing.getId(), existing.getEtag(),
+                distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 30);
+                    origin.setResponseCompletionTimeout(29);
+                })));
+        assertEquals("The parameter ResponseCompletionTimeout must be greater than or equal to"
+                + " OriginReadTimeout.", below.getMessage());
+        assertEquals(400, below.getHttpStatus());
+
+        AwsException negative = assertAws("InvalidArgument", () -> service.updateDistribution(
+                existing.getId(), existing.getEtag(),
+                distributionWithCustomOrigin(origin -> origin.setResponseCompletionTimeout(-1))));
+        assertEquals("The parameter ResponseCompletionTimeout must be a non-negative integer.",
+                negative.getMessage());
+        assertEquals(400, negative.getHttpStatus());
+
+        // The rejected updates left the distribution as it was.
+        Origin origin = service.getDistribution(existing.getId()).getConfig().getOrigins().getFirst();
+        assertNull(origin.getResponseCompletionTimeout());
+    }
+
+    @Test
+    void createDistributionAcceptsOriginSettingsWithinTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        Distribution created = assertDoesNotThrow(() -> service.createDistribution(
+                distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionAttempts(2);
+                    origin.setConnectionTimeout(5);
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 45);
+                    origin.getCustomOriginConfig().put("OriginKeepaliveTimeout", 300);
+                }), Map.of()));
+
+        Origin origin = created.getConfig().getOrigins().getFirst();
+        assertEquals(2, origin.getConnectionAttempts());
+        assertEquals(5, origin.getConnectionTimeout());
+        assertEquals(45, origin.getCustomOriginConfig().get("OriginReadTimeout"));
+        assertEquals(300, origin.getCustomOriginConfig().get("OriginKeepaliveTimeout"));
+    }
+
+    @Test
+    void anOriginAccessControlInUseKeepsHowItSigns() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        String s3 = oac(service, "sigv4", "always", "s3");
+        service.createDistribution(distributionWithOrigin("bucket.s3.us-east-1.amazonaws.com", s3, null), Map.of());
+        String functionUrl = oac(service, "sigv4", "always", "lambda");
+        service.createDistribution(distributionWithOrigin(
+                "abcdefghijklmnopqrstuvwxyz0123.lambda-url.us-east-1.on.aws", functionUrl, null), Map.of());
+
+        assertDoesNotThrow(() -> updateOriginAccessControl(service, s3, "sigv4", "never", "s3"));
+        assertDoesNotThrow(() -> updateOriginAccessControl(service, s3, "sigv4", "no-override", "s3"));
+        assertDoesNotThrow(() -> updateOriginAccessControl(service, functionUrl, "sigv4", "never", "lambda"));
+        assertIllegalUpdate(service, s3, "sigv4a", "no-override", "s3");
+        assertIllegalUpdate(service, s3, "sigv4", "no-override", "mediastore");
+        assertIllegalUpdate(service, functionUrl, "sigv4", "always-amz-auth", "lambda");
+        assertIllegalUpdate(service, functionUrl, "sigv4a", "never", "lambda");
+
+        String unused = oac(service, "sigv4", "always", "s3");
+        assertDoesNotThrow(() -> updateOriginAccessControl(service, unused, "sigv4a", "always", "lambda"));
+    }
+
+    private static void updateOriginAccessControl(CloudFrontService service, String id, String protocol,
+                                                  String behavior, String originType) {
+        service.updateOriginAccessControl(id, service.getOriginAccessControl(id).getEtag(),
+                originAccessControl(protocol, behavior, originType));
+    }
+
+    private static void assertIllegalUpdate(CloudFrontService service, String id, String protocol, String behavior,
+                                            String originType) {
+        AwsException error = assertAws("IllegalUpdate",
+                () -> updateOriginAccessControl(service, id, protocol, behavior, originType));
+        assertEquals("Cannot update origin type when associated to origins.", error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+    }
+
+    @Test
+    void lambdaEdgeOriginTriggersAreRefusedInFrontOfAnAlwaysAmzAuthOrSigV4aOrigin() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        String regional = "abcdefghijklmnopqrstuvwxyz.001.lambda-web.us-east-1.on.aws";
+        String amzAuth = oac(service, "sigv4", "always-amz-auth", "lambda");
+        String message = "Lambda@Edge origin triggers are incompatible with SigV4a and always-amz-auth origins."
+                + " Use a different origin or disassociate the function.";
+
+        for (String eventType : List.of("origin-request", "origin-response")) {
+            AwsException error = assertAws("InvalidLambdaFunctionAssociation", () -> service.createDistribution(
+                    distributionWithOrigin(regional, amzAuth, eventType), Map.of()));
+            assertEquals(message, error.getMessage());
+            assertEquals(400, error.getHttpStatus());
+        }
+        Distribution onABehavior = distributionWithOrigin(regional, amzAuth, null);
+        CacheBehavior behavior = new CacheBehavior();
+        behavior.setPathPattern("/api/*");
+        behavior.setTargetOriginId("o");
+        behavior.setLambdaFunctionAssociations(List.of(Map.<String, Object>of("LambdaFunctionARN",
+                "arn:aws:lambda:us-east-1:000000000000:function:edge:1", "EventType", "origin-request")));
+        onABehavior.getConfig().setCacheBehaviors(List.of(behavior));
+        assertEquals(message, assertAws("InvalidLambdaFunctionAssociation",
+                () -> service.createDistribution(onABehavior, Map.of())).getMessage());
+        Distribution sigv4aS3 = distributionWithOrigin(
+                "bucket.s3.us-east-1.amazonaws.com", oac(service, "sigv4a", "always", "s3"), "origin-request");
+        assertEquals(message, assertAws("InvalidLambdaFunctionAssociation",
+                () -> service.createDistribution(sigv4aS3, Map.of())).getMessage());
+
+        assertDoesNotThrow(() -> service.createDistribution(
+                distributionWithOrigin(regional, amzAuth, "viewer-request"), Map.of()));
+        assertDoesNotThrow(() -> service.createDistribution(distributionWithOrigin(
+                "bucket.s3.us-east-1.amazonaws.com", oac(service, "sigv4", "always", "s3"), "origin-request"), Map.of()));
     }
 
     @Test
@@ -454,7 +987,7 @@ class CloudFrontServiceTest {
                 () -> service.updateOriginAccessControl(
                         existing.getId(), existing.getEtag(), invalid));
 
-        assertEquals("InvalidArgument", error.getErrorCode());
+        assertEquals("MalformedXML", error.getErrorCode());
         assertEquals("test-oac", service.getOriginAccessControl(existing.getId()).getName());
     }
 
@@ -1031,6 +1564,131 @@ class CloudFrontServiceTest {
     }
 
     @Test
+    void exposesTheSevenAwsManagedCachePolicies() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        List<String> originOverrideHeaders = List.of(
+                "Host", "Origin", "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override");
+        Map<String, Object> noHeaders = Map.of("HeaderBehavior", "none");
+        Map<String, Object> noCookies = Map.of("CookieBehavior", "none");
+        Map<String, Object> allCookies = Map.of("CookieBehavior", "all");
+        Map<String, Object> noQueryStrings = Map.of("QueryStringBehavior", "none");
+        Map<String, Object> allQueryStrings = Map.of("QueryStringBehavior", "all");
+        Map<String, Object> originOverrideHeaderSelection =
+                Map.of("HeaderBehavior", "whitelist", "Headers", originOverrideHeaders);
+
+        assertManagedCachePolicy(service, "2e54312d-136d-493c-8eb9-b001f22f67d2", "Managed-Amplify",
+                "2", "2", "600", "true", "true",
+                Map.of("HeaderBehavior", "whitelist", "Headers",
+                        List.of("Authorization", "CloudFront-Viewer-Country", "Host")),
+                allCookies, allQueryStrings);
+        assertManagedCachePolicy(service, "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+                "Managed-CachingDisabled", "0", "0", "0", "false", "false",
+                noHeaders, noCookies, noQueryStrings);
+        assertManagedCachePolicy(service, "658327ea-f89d-4fab-a63d-7e88639e58f6",
+                "Managed-CachingOptimized", "1", "86400", "31536000", "true", "true",
+                noHeaders, noCookies, noQueryStrings);
+        assertManagedCachePolicy(service, "b2884449-e4de-46a7-ac36-70bc7f1ddd6d",
+                "Managed-CachingOptimizedForUncompressedObjects", "1", "86400", "31536000",
+                "false", "false", noHeaders, noCookies, noQueryStrings);
+        assertManagedCachePolicy(service, "08627262-05a9-4f76-9ded-b50ca2e3a84f",
+                "Managed-Elemental-MediaPackage", "0", "86400", "31536000", "true", "false",
+                Map.of("HeaderBehavior", "whitelist", "Headers", List.of("Origin")), noCookies,
+                Map.of("QueryStringBehavior", "whitelist", "QueryStrings",
+                        List.of("aws.manifestfilter", "start", "end", "m")));
+        assertManagedCachePolicy(service, "83da9c7e-98b4-4e11-a168-04f0df8e2c65",
+                "Managed-UseOriginCacheControlHeaders", "0", "0", "31536000", "true", "true",
+                originOverrideHeaderSelection, allCookies, noQueryStrings);
+        assertManagedCachePolicy(service, "4cc15a8a-d715-48a4-82b8-cc0b614638fe",
+                "Managed-UseOriginCacheControlHeaders-QueryStrings", "0", "0", "31536000",
+                "true", "true", originOverrideHeaderSelection, allCookies, allQueryStrings);
+
+        assertAws("NoSuchCachePolicy",
+                () -> service.getCachePolicy("4d1d2f1d-3a71-49ad-9e08-7ea5d843a556"));
+    }
+
+    @Test
+    void listsManagedAndCustomCachePoliciesByType() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CachePolicy custom = service.createCachePolicy(namedCachePolicy("custom-cache-policy"));
+
+        assertEquals(7, service.listCachePolicies(null, 100, "managed").size());
+        assertTrue(service.listCachePolicies(null, 100, "managed").stream()
+                .allMatch(policy -> CloudFrontService.isManagedCachePolicy(policy.getId())));
+        assertEquals(List.of(custom.getId()), service.listCachePolicies(null, 100, "custom")
+                .stream().map(CachePolicy::getId).toList());
+        assertEquals(8, service.listCachePolicies(null, 100, null).size());
+        assertEquals(8, service.listCachePolicies(null, 100).size());
+        assertAws("InvalidArgument", () -> service.listCachePolicies(null, 100, "MANAGED"));
+    }
+
+    @Test
+    void listCachePolicies_badType_rejectsWithCachePolicyMessage() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException error = assertAws("InvalidArgument",
+                () -> service.listCachePolicies(null, 100, "unsupported"));
+
+        assertEquals("Cache policy Type must be managed or custom.", error.getMessage());
+    }
+
+    @Test
+    void listOriginRequestPolicies_badType_rejectsWithOriginRequestPolicyMessage() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException error = assertAws("InvalidArgument",
+                () -> service.listOriginRequestPolicies(null, 100, "unsupported"));
+
+        assertEquals("Origin request policy Type must be managed or custom.", error.getMessage());
+    }
+
+    @Test
+    void listResponseHeadersPolicies_badTypeAndUnknownMarker_rejectWithOwnMessages() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException badType = assertAws("InvalidArgument",
+                () -> service.listResponseHeadersPolicies(null, 100, "unsupported"));
+        AwsException badMarker = assertAws("InvalidArgument",
+                () -> service.listResponseHeadersPolicies("missing-marker", 100, null));
+
+        assertEquals("Response headers policy Type must be managed or custom.", badType.getMessage());
+        assertEquals("The specified marker is invalid.", badMarker.getMessage());
+    }
+
+    @Test
+    void refusesToUpdateOrDeleteAManagedCachePolicy() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CachePolicy managed = service.getCachePolicy("658327ea-f89d-4fab-a63d-7e88639e58f6");
+
+        assertAws("IllegalUpdate", () -> service.updateCachePolicy(managed.getId(),
+                managed.getEtag(), namedCachePolicy("replacement")));
+        assertAws("IllegalDelete",
+                () -> service.deleteCachePolicy(managed.getId(), managed.getEtag()));
+
+        CachePolicy after = service.getCachePolicy(managed.getId());
+        assertEquals("Managed-CachingOptimized", after.getName());
+        assertEquals(managed.getEtag(), after.getEtag());
+    }
+
+    private static void assertManagedCachePolicy(
+            CloudFrontService service, String id, String name, String minTtl, String defaultTtl,
+            String maxTtl, String gzip, String brotli, Map<String, Object> headers,
+            Map<String, Object> cookies, Map<String, Object> queryStrings) {
+        CachePolicy policy = service.getCachePolicy(id);
+        assertEquals(id, policy.getId());
+        assertEquals(name, policy.getName());
+        Map<String, Object> config = policy.getConfig();
+        assertEquals(minTtl, config.get("MinTTL"), name + " MinTTL");
+        assertEquals(defaultTtl, config.get("DefaultTTL"), name + " DefaultTTL");
+        assertEquals(maxTtl, config.get("MaxTTL"), name + " MaxTTL");
+        Map<?, ?> parameters = (Map<?, ?>) config.get("ParametersInCacheKeyAndForwardedToOrigin");
+        assertEquals(gzip, parameters.get("EnableAcceptEncodingGzip"), name + " Gzip");
+        assertEquals(brotli, parameters.get("EnableAcceptEncodingBrotli"), name + " Brotli");
+        assertEquals(headers, parameters.get("HeadersConfig"), name + " headers");
+        assertEquals(cookies, parameters.get("CookiesConfig"), name + " cookies");
+        assertEquals(queryStrings, parameters.get("QueryStringsConfig"), name + " query strings");
+    }
+
+    @Test
     void deletesAnUnattachedCachePolicy() {
         CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
         CachePolicy policy = service.createCachePolicy(namedCachePolicy("free-cache-policy"));
@@ -1108,7 +1766,7 @@ class CloudFrontServiceTest {
     }
 
     private static AwsException assertAws(
-            String code, org.junit.jupiter.api.function.Executable action) {
+            String code, Executable action) {
         AwsException error = assertThrows(AwsException.class, action);
         assertEquals(code, error.getErrorCode());
         return error;
@@ -1124,12 +1782,66 @@ class CloudFrontServiceTest {
     }
 
     private static OriginAccessControl originAccessControl() {
+        return originAccessControl("sigv4", "always", "s3");
+    }
+
+    private static OriginAccessControl originAccessControl(String protocol, String behavior, String originType) {
         OriginAccessControl oac = new OriginAccessControl();
         oac.setName("test-oac");
-        oac.setSigningProtocol("sigv4");
-        oac.setSigningBehavior("always");
-        oac.setOriginAccessControlOriginType("s3");
+        oac.setSigningProtocol(protocol);
+        oac.setSigningBehavior(behavior);
+        oac.setOriginAccessControlOriginType(originType);
         return oac;
+    }
+
+    private static String oac(CloudFrontService service, String protocol, String behavior, String originType) {
+        return service.createOriginAccessControl(originAccessControl(protocol, behavior, originType)).getId();
+    }
+
+    /** A distribution whose only origin {@code o} is {@code domainName}, with an optional Lambda@Edge trigger. */
+    private static Distribution distributionWithOrigin(String domainName, String oacId, String edgeEventType) {
+        Origin origin = new Origin();
+        origin.setId("o");
+        origin.setDomainName(domainName);
+        origin.setOriginAccessControlId(oacId);
+        DefaultCacheBehavior behavior = new DefaultCacheBehavior();
+        behavior.setTargetOriginId("o");
+        if (edgeEventType != null) {
+            behavior.setLambdaFunctionAssociations(List.of(Map.<String, Object>of("LambdaFunctionARN",
+                    "arn:aws:lambda:us-east-1:000000000000:function:edge:1", "EventType", edgeEventType)));
+        }
+        Distribution distribution = distribution(false, List.of());
+        distribution.getConfig().setOrigins(List.of(origin));
+        distribution.getConfig().setDefaultCacheBehavior(behavior);
+        return distribution;
+    }
+
+    /** A distribution with one custom (HTTP/HTTPS) origin, customized through {@code originCustomizer}. */
+    private static Distribution distributionWithCustomOrigin(Consumer<Origin> originCustomizer) {
+        Origin origin = new Origin();
+        origin.setId("o");
+        origin.setDomainName("example.com");
+        Map<String, Object> customOriginConfig = new LinkedHashMap<>();
+        customOriginConfig.put("HTTPPort", "80");
+        customOriginConfig.put("HTTPSPort", "443");
+        customOriginConfig.put("OriginProtocolPolicy", "https-only");
+        origin.setCustomOriginConfig(customOriginConfig);
+        originCustomizer.accept(origin);
+        DefaultCacheBehavior behavior = new DefaultCacheBehavior();
+        behavior.setTargetOriginId("o");
+        Distribution distribution = distribution(false, List.of());
+        distribution.getConfig().setOrigins(List.of(origin));
+        distribution.getConfig().setDefaultCacheBehavior(behavior);
+        return distribution;
+    }
+
+    private static void assertOriginAccessControlRefused(CloudFrontService service, String domainName, String protocol,
+                                                         String behavior, String originType, String reason) {
+        Distribution distribution = distributionWithOrigin(domainName, oac(service, protocol, behavior, originType), null);
+        AwsException error = assertAws("IllegalOriginAccessConfiguration",
+                () -> service.createDistribution(distribution, Map.of()));
+        assertEquals("Illegal configuration: " + reason, error.getMessage(), domainName);
+        assertEquals(400, error.getHttpStatus());
     }
 
     private static PublicKey validPublicKey(String name) throws Exception {
@@ -1179,10 +1891,9 @@ class CloudFrontServiceTest {
     }
 
     private static void assertInvalidOriginAccessControl(
-            CloudFrontService service, OriginAccessControl oac) {
-        AwsException error = assertThrows(AwsException.class,
-                () -> service.createOriginAccessControl(oac));
-        assertEquals("InvalidArgument", error.getErrorCode());
+            CloudFrontService service, OriginAccessControl oac, String errorCode, String message) {
+        AwsException error = assertAws(errorCode, () -> service.createOriginAccessControl(oac));
+        assertEquals(message, error.getMessage());
         assertEquals(400, error.getHttpStatus());
     }
 

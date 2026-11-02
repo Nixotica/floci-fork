@@ -1,18 +1,19 @@
 package io.github.hectorvent.floci.services.ec2;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.containsString;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.not;
-import static org.hamcrest.xml.HasXPath.hasXPath;
-
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
-import io.quarkus.test.junit.QuarkusTest;
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.xml.HasXPath.hasXPath;
 
 /**
  * A route is addressed by one destination, and per
@@ -45,11 +46,11 @@ class Ec2Ipv6RouteTest {
 
     private static String routeTableId;
 
-    private static io.restassured.specification.RequestSpecification ec2() {
+    private static RequestSpecification ec2() {
         return given().header("Authorization", AUTH_HEADER);
     }
 
-    private static io.restassured.response.ValidatableResponse describe() {
+    private static ValidatableResponse describe() {
         return ec2()
             .formParam("Action", "DescribeRouteTables")
             .formParam("RouteTableId.1", routeTableId)

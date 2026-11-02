@@ -116,6 +116,10 @@ def test_arn_regex_dialect_does_not_match_a_plain_literal():
     ("public.ecr.aws/lambda/java", True),
     ("ec2.cn-north-1.amazonaws.com.cn", False),
     ("c2s.ic.gov", False),
+    # A host written as a Java regex, its dots escaped, is held to the same rule.
+    ("[0-9]{12}\\\\.dkr\\\\.ecr\\\\.[a-z0-9-]+\\\\.amazonaws\\\\.com", True),
+    ("[a-z]+\\\\.cloudfront\\\\.net", True),
+    ("ecr\\\\.[a-z0-9-]+\\\\.amazonaws\\\\.com\\\\.cn", False),
 ])
 def test_dns_suffix_matches_commercial_hosts_only(text, expected):
     assert ("dns-suffix" in categories_of(text)) is expected
@@ -186,6 +190,42 @@ def test_blank_region_arn_matches_a_call_split_across_lines(tmp_path):
     assert [f.line for f in findings] == [2]
 
 
+@pytest.mark.parametrize("code, expected", [
+    ('"aws".equals(arn.partition())', True),
+    ('!"aws".equalsIgnoreCase(partition)', True),
+    ('partition.equals("aws")', True),
+    ('Objects.equals(parsed.partition(), "aws")', True),
+    ('Objects.equals("aws", partition)', True),
+    ('Objects.equals(arn.partition(), "aws")', True),
+    ('foo(Objects.equals(a, b), "aws")', False),
+    ('Objects.equals(a, b) || log("aws")', False),
+    ('switch (arn.partition()) { case "aws" -> 1; default -> 2; }', True),
+    ('case "aws":', True),
+    ('case "aws-cn", "aws" ->', True),
+    ('case "aws", "aws-cn" ->', True),
+    ('case "aws-cn" ->', False),
+    ('AwsRegions.partitionFor(region).equals(arn.partition())', False),
+    ('"aws-cn".equals(partition)', False),
+    ('name.equals("awsome")', False),
+])
+def test_aws_partition_compare_matches_comparisons_with_the_literal_aws(code, expected):
+    category = p.CATEGORY_BY_NAME["aws-partition-compare"]
+    assert (category.regex.search(code) is not None) is expected
+
+
+def test_aws_partition_compare_is_counted_and_an_escape_excuses_its_line(tmp_path):
+    write_java(tmp_path, "a/A.java", (
+        'class A {\n'
+        '    boolean commercial = "aws".equals(arn.partition());\n'
+        '    boolean managed = "aws".equals(arn.accountId()); // partition-literal: the managed-policy account\n'
+        '    // "aws".equals(partition) in a comment never counts\n'
+        '}\n'
+    ))
+    findings = p.collect_findings(tmp_path, [])
+    assert p.count(findings) == Counter({("aws-partition-compare", "a/A.java"): 1})
+    assert [(f.line, f.counted) for f in findings] == [(2, True), (3, False)]
+
+
 def test_blank_region_arn_is_a_code_category_and_never_matches_literals(tmp_path):
     write_java(tmp_path, "a/A.java", (
         'class A {\n'
@@ -196,6 +236,70 @@ def test_blank_region_arn_is_a_code_category_and_never_matches_literals(tmp_path
     ))
     counted = p.count(p.collect_findings(tmp_path, []))
     assert counted == Counter({("blank-region-arn", "a/A.java"): 1})
+
+
+@pytest.mark.parametrize("code, expected", [
+    ('return "arn:" + partition + ":eks:" + region;', True),
+    ('String prefix = "arn:"+AwsRegions.partitionFor(region) + ":ses:";', True),
+    ('Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\\\d{12}:root")', False),
+    ('Pattern.compile("arn:" + PARTITION_REGEX + ":sso:::instance/.+")', False),
+    ('Pattern.compile("arn:"\n            + AwsArnUtils.PARTITION_REGEX + ":logs:")', False),
+    ('String partitionRegexName = "arn:" + PARTITION_REGEX_NAME;', True),
+    ('String s = "arn:aws:" + name;', False),
+    ('String s = prefix + "arn:";', False),
+])
+def test_arn_concat_matches_a_concatenated_arn_but_not_a_partition_regex(code, expected):
+    category = p.CATEGORY_BY_NAME["arn-concat"]
+    assert (category.regex.search(code) is not None) is expected
+
+
+@pytest.mark.parametrize("code, expected", [
+    ('if (value.startsWith("arn:")) {', True),
+    ('id != null && id . startsWith( "arn:" )', True),
+    ('value.startsWith("arn:aws:")', False),
+    ('value.startsWith("arn")', False),
+    ('AwsArnUtils.isArn(value)', False),
+])
+def test_arn_probe_matches_a_bare_arn_prefix_check(code, expected):
+    category = p.CATEGORY_BY_NAME["arn-probe"]
+    assert (category.regex.search(code) is not None) is expected
+
+
+@pytest.mark.parametrize("code, expected", [
+    ('String[] parts = arn.split(":");', True),
+    ('String[] parts = roleArn.split(":", 6);', True),
+    ('String account = role.getArn().split(":", 6)[4];', True),
+    ('String[] p = arnParts . split( ":" , -1);', True),
+    ('String[] parts = fn.getFunctionArn().split(":");', True),
+    ('String[] parts = arn.split("/");', False),
+    ('String[] parts = warning.split(":");', False),
+    ('String[] parts = learnerId.split(":");', False),
+    ('String[] parts = value.split(":");', False),
+])
+def test_arn_split_matches_a_colon_split_of_an_arn_named_value(code, expected):
+    category = p.CATEGORY_BY_NAME["arn-split"]
+    assert (category.regex.search(code) is not None) is expected
+
+
+def test_arn_shape_categories_count_code_only_and_honour_an_escape(tmp_path):
+    write_java(tmp_path, "a/A.java", (
+        'class A {\n'
+        '    String arn = "arn:" + partition + ":sqs:" + region;\n'
+        '    boolean probe = value.startsWith("arn:");\n'
+        '    String[] parts = arn.split(":", 6);\n'
+        '    // "arn:" + partition, value.startsWith("arn:"), arn.split(":") in a comment never count\n'
+        '    String doc = "arn.split(\\":\\")";\n'
+        '    String[] kept = arn.split(":", 6); // partition-literal: the one ARN parser\n'
+        '}\n'
+    ))
+    findings = p.collect_findings(tmp_path, [])
+    assert p.count(findings) == Counter({
+        ("arn-concat", "a/A.java"): 1,
+        ("arn-probe", "a/A.java"): 1,
+        ("arn-split", "a/A.java"): 1,
+    })
+    assert [(f.category, f.line, f.counted) for f in findings if f.category == "arn-split"] == [
+        ("arn-split", 4, True), ("arn-split", 7, False)]
 
 
 def test_every_category_is_gated():
@@ -372,10 +476,11 @@ def test_check_treats_an_escaped_literal_as_absent(tmp_path):
 # Audit and CLI
 # --------------------------------------------------------------------------- #
 def test_package_of_groups_by_service_and_falls_back_to_the_parent():
-    assert p.package_of("src/main/java/io/github/hectorvent/floci/services/s3/S3Service.java") == "services/s3"
-    assert p.package_of("src/main/java/io/github/hectorvent/floci/core/common/AwsArnUtils.java") == "core/common"
-    assert p.package_of("src/main/java/io/github/hectorvent/floci/config/EmulatorConfig.java") == "config"
-    assert p.package_of("src/main/java/io/github/hectorvent/floci/services/s3/model/Bucket.java") == "services/s3"
+    root = p.PACKAGE_ROOT.relative_to(p.REPO_ROOT).as_posix()
+    assert p.package_of(f"{root}/services/s3/S3Service.java") == "services/s3"
+    assert p.package_of(f"{root}/core/common/AwsArnUtils.java") == "core/common"
+    assert p.package_of(f"{root}/config/EmulatorConfig.java") == "config"
+    assert p.package_of(f"{root}/services/s3/model/Bucket.java") == "services/s3"
     assert p.package_of("elsewhere/x/Y.java") == "elsewhere/x"
 
 

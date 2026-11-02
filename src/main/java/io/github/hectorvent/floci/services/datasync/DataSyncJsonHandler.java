@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.services.datasync.model.DataSyncAgent;
 import io.github.hectorvent.floci.services.datasync.model.DataSyncLocation;
 import io.github.hectorvent.floci.services.datasync.model.DataSyncLocationType;
@@ -63,7 +64,7 @@ public class DataSyncJsonHandler {
                 yield ok(mapper.createObjectNode());
             }
             case "ListAgents" -> {
-                var page = dataSyncService.listAgents(text(request, "NextToken"),
+                DataSyncService.Page<DataSyncAgent> page = dataSyncService.listAgents(text(request, "NextToken"),
                         request.path("MaxResults").asInt(0));
                 ObjectNode response = mapper.createObjectNode();
                 ArrayNode entries = response.putArray("Agents");
@@ -99,7 +100,7 @@ public class DataSyncJsonHandler {
                 yield ok(mapper.createObjectNode());
             }
             case "ListLocations" -> {
-                var page = dataSyncService.listLocations(request.get("Filters"),
+                DataSyncService.Page<DataSyncLocation> page = dataSyncService.listLocations(request.get("Filters"),
                         text(request, "NextToken"), request.path("MaxResults").asInt(0));
                 ObjectNode response = mapper.createObjectNode();
                 ArrayNode entries = response.putArray("Locations");
@@ -130,7 +131,7 @@ public class DataSyncJsonHandler {
                 yield ok(mapper.createObjectNode());
             }
             case "ListTasks" -> {
-                var page = dataSyncService.listTasks(request.get("Filters"),
+                DataSyncService.Page<DataSyncTask> page = dataSyncService.listTasks(request.get("Filters"),
                         text(request, "NextToken"), request.path("MaxResults").asInt(0));
                 ObjectNode response = mapper.createObjectNode();
                 ArrayNode entries = response.putArray("Tasks");
@@ -252,7 +253,7 @@ public class DataSyncJsonHandler {
     }
 
     private static double epochSeconds(Instant instant) {
-        return (instant != null ? instant : Instant.EPOCH).toEpochMilli() / 1000.0;
+        return EpochSeconds.fromInstant((instant != null ? instant : Instant.EPOCH));
     }
 
     private static String text(JsonNode request, String member) {

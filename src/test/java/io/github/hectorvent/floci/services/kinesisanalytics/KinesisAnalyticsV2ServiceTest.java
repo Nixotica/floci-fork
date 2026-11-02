@@ -15,6 +15,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -88,8 +89,8 @@ class KinesisAnalyticsV2ServiceTest {
                 .create(Mockito.anyString(), Mockito.anyString(), Mockito.any());
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.KinesisAnalyticsServiceConfig kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.kinesisAnalytics()).thenReturn(kaConfig);
         when(kaConfig.mock()).thenReturn(true);
@@ -210,7 +211,7 @@ class KinesisAnalyticsV2ServiceTest {
     void deleteApplicationRejectsWrongTimestamp() {
         create("demo");
         assertThrows(AwsException.class,
-                () -> service.deleteApplication("demo", java.time.Instant.ofEpochSecond(1)));
+                () -> service.deleteApplication("demo", Instant.ofEpochSecond(1)));
     }
 
     @Test
@@ -497,7 +498,7 @@ class KinesisAnalyticsV2ServiceTest {
         createRunningWithCode("demo");
         service.createApplicationSnapshot("demo", "snap1");
         assertThrows(AwsException.class, () -> service.deleteApplicationSnapshot(
-                "demo", "snap1", java.time.Instant.ofEpochSecond(1)));
+                "demo", "snap1", Instant.ofEpochSecond(1)));
     }
 
     @Test
@@ -687,8 +688,8 @@ class KinesisAnalyticsV2ServiceTest {
                 .create(Mockito.anyString(), Mockito.anyString(), Mockito.any());
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.KinesisAnalyticsServiceConfig kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.kinesisAnalytics()).thenReturn(kaConfig);
         when(kaConfig.mock()).thenReturn(false);
@@ -759,8 +760,8 @@ class KinesisAnalyticsV2ServiceTest {
                 .create(Mockito.anyString(), Mockito.anyString(), Mockito.any());
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.KinesisAnalyticsServiceConfig kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.kinesisAnalytics()).thenReturn(kaConfig);
         when(kaConfig.mock()).thenReturn(mock);

@@ -3,12 +3,15 @@ package io.github.hectorvent.floci.services.pipes;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.*;
 
+import java.util.HashSet;
+import java.util.Set;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -383,7 +386,7 @@ class PipesPollerIntegrationTest {
     @Test
     @Order(24)
     void allBatchMessagesEventuallyForwarded() throws Exception {
-        java.util.Set<String> found = new java.util.HashSet<>();
+        Set<String> found = new HashSet<>();
         for (int i = 0; i < 20 && found.size() < 3; i++) {
             Thread.sleep(500);
             String body = given()

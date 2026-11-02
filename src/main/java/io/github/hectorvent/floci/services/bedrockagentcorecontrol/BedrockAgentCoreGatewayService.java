@@ -4,8 +4,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -99,11 +99,11 @@ public class BedrockAgentCoreGatewayService {
     }
 
     private Gateway findByArn(String region, String arn) {
-        String[] parts = arn == null ? new String[0] : arn.split(":");
-        if (parts.length < 6 || !parts[5].startsWith("gateway/")) {
+        String resource = BedrockAgentCoreArns.resource(arn);
+        if (resource == null || !resource.startsWith("gateway/")) {
             throw new AwsException("ValidationException", "Unsupported resource ARN: " + arn, 400);
         }
-        return get(parts[5].substring("gateway/".length()), region);
+        return get(resource.substring("gateway/".length()), region);
     }
 
     public Gateway get(String id, String region) {

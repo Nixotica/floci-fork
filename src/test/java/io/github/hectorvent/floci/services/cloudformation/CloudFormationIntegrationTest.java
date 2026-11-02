@@ -1,26 +1,26 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.MutableClock;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.path.xml.XmlPath;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
-
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
@@ -41,6 +42,8 @@ import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
@@ -71,8 +74,8 @@ class CloudFormationIntegrationTest {
 
     private static byte[] buildHandlerZip() {
         try {
-            var baos = new ByteArrayOutputStream();
-            try (var zos = new ZipOutputStream(baos)) {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (ZipOutputStream zos = new ZipOutputStream(baos)) {
                 zos.putNextEntry(new ZipEntry("index.js"));
                 zos.write("exports.handler=async(e)=>({statusCode:200})".getBytes(StandardCharsets.UTF_8));
                 zos.closeEntry();
@@ -871,7 +874,7 @@ class CloudFormationIntegrationTest {
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "UpdateStack")
             .formParam("StackName", stackName)
-            .formParam("TemplateBody", template)
+            .formParam("TemplateBody", CfnUpdates.forceUpdate(template))
         .when()
             .post("/")
         .then()
@@ -1557,7 +1560,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("ROLLBACK_COMPLETE"))
-            .body(containsString("FileSystemConfigs must be a list"));
+            .body(containsString("Property [FileSystemConfigs] expected type: JSONArray, found: JSONObject"));
     }
 
     private static String lambdaFileSystemTemplate(String functionName, String accessPointArn,
@@ -2766,8 +2769,10 @@ class CloudFormationIntegrationTest {
         return xml.substring(xml.lastIndexOf("<member>", idAt), xml.indexOf("</member>", idAt));
     }
 
+    // Measured against CloudFormation (eu-west-1, 2026-10-04): a change set the stack does not
+    // have, on a stack in REVIEW_IN_PROGRESS as on one in CREATE_COMPLETE, is deleted with success.
     @Test
-    void deleteChangeSet_nonExistentChangeSet_returnsError() {
+    void deleteChangeSet_nonExistentChangeSet_succeeds() {
         String template = """
             {
               "Resources": {
@@ -2794,7 +2799,6 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
-        // Attempt to delete a changeset that does not exist
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DeleteChangeSet")
@@ -2803,8 +2807,18 @@ class CloudFormationIntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(400)
-            .body(containsString("ChangeSetNotFoundException"));
+            .statusCode(200)
+            .body(containsString("<DeleteChangeSetResult/>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeChangeSet")
+            .formParam("StackName", "cs-error-stack")
+            .formParam("ChangeSetName", "existing-changeset")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
     }
 
     @Test
@@ -2850,7 +2864,7 @@ class CloudFormationIntegrationTest {
             .body(containsString("<StackId>"));
 
         // 2. Verify stack completed and the auto-generated table name follows the pattern
-        var describeResponse = given()
+        String describeResponse = given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStackResources")
             .formParam("StackName", "auto-name-stack")
@@ -2931,7 +2945,7 @@ class CloudFormationIntegrationTest {
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "UpdateStack")
             .formParam("StackName", stackName)
-            .formParam("TemplateBody", template)
+            .formParam("TemplateBody", CfnUpdates.forceUpdate(template))
         .when()
             .post("/")
         .then()
@@ -3259,7 +3273,7 @@ class CloudFormationIntegrationTest {
 
         // Verify SSM Parameter name via SSM API using DescribeStackResources physical ID
         // We extract the auto-generated name from the stack resource and verify it's accessible
-        var ssmResourceXml = given()
+        String ssmResourceXml = given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStackResources")
             .formParam("StackName", "ssm-auto-stack")
@@ -5434,7 +5448,7 @@ class CloudFormationIntegrationTest {
                     "FunctionName": { "Ref": "MyFunction" },
                     "Enabled": true,
                     "BatchSize": 100,
-                    "Topics": ["orders-topic", "events-topic"],
+                    "Topics": ["orders-topic"],
                     "SelfManagedEventSource": {
                       "Endpoints": {
                         "KAFKA_BOOTSTRAP_SERVERS": ["kafka-broker-1:9092", "kafka-broker-2:9092"]
@@ -5512,9 +5526,8 @@ class CloudFormationIntegrationTest {
 
         // Verify Topics
         JsonNode topics = esmNode.path("Topics");
-        assertTrue(topics.isArray() && topics.size() == 2);
+        assertTrue(topics.isArray() && topics.size() == 1);
         assertEquals("orders-topic", topics.get(0).asText());
-        assertEquals("events-topic", topics.get(1).asText());
 
         // Verify SelfManagedEventSource
         JsonNode smes = esmNode.path("SelfManagedEventSource");
@@ -6681,6 +6694,204 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createStack_snsTopicWithInlineSubscriptions() {
+        String topicArn = "arn:aws:sns:us-east-1:000000000000:cfn-inline-subs-topic";
+        String template = """
+            {
+              "Resources": {
+                "MyQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-inline-subs-queue"}
+                },
+                "MyTopic": {
+                  "Type": "AWS::SNS::Topic",
+                  "Properties": {
+                    "TopicName": "cfn-inline-subs-topic",
+                    "Subscription": [
+                      {"Protocol": "sqs", "Endpoint": {"Fn::GetAtt": ["MyQueue", "Arn"]}},
+                      {"Protocol": "email", "Endpoint": "alerts@example.com"}
+                    ]
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-inline-subs-stack")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String subscriptions = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListSubscriptionsByTopic")
+            .formParam("TopicArn", topicArn)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("arn:aws:sqs:us-east-1:000000000000:cfn-inline-subs-queue"))
+            .body(containsString("alerts@example.com"))
+            .extract().asString();
+        String sqsArn = new XmlPath(subscriptions)
+                .getString("**.find { it.Protocol == 'sqs' }.SubscriptionArn");
+        String emailArn = new XmlPath(subscriptions)
+                .getString("**.find { it.Protocol == 'email' }.SubscriptionArn");
+        assertTrue(sqsArn.startsWith(topicArn + ":"), sqsArn);
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetSubscriptionAttributes")
+            .formParam("SubscriptionArn", emailArn)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("**.find { it.key == 'PendingConfirmation' }.value", equalTo("true"));
+    }
+
+    @Test
+    void createStack_snsTopicResolvesConditionalInlineSubscriptions() {
+        String topicArn = "arn:aws:sns:us-east-1:000000000000:cfn-conditional-subs-topic";
+        String template = """
+            {
+              "Conditions": {"Include": {"Fn::Equals": ["yes", "yes"]}},
+              "Resources": {
+                "MyTopic": {
+                  "Type": "AWS::SNS::Topic",
+                  "Properties": {
+                    "TopicName": "cfn-conditional-subs-topic",
+                    "Subscription": {"Fn::If": ["Include", [
+                      {"Protocol": "email", "Endpoint": "selected@example.com"},
+                      {"Fn::If": ["Include", {"Ref": "AWS::NoValue"},
+                        {"Protocol": "email", "Endpoint": "omitted@example.com"}]}
+                    ], {"Ref": "AWS::NoValue"}]}
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-conditional-subs-stack")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListSubscriptionsByTopic")
+            .formParam("TopicArn", topicArn)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("selected@example.com"))
+            .body(not(containsString("omitted@example.com")));
+    }
+
+    @Test
+    void updateStack_snsTopicRemovesOnlyDroppedInlineSubscriptions() {
+        String topicArn = "arn:aws:sns:us-east-1:000000000000:cfn-update-inline-subs-topic";
+        String initialTemplate = """
+            {"Resources":{"MyTopic":{"Type":"AWS::SNS::Topic","Properties":{
+              "TopicName":"cfn-update-inline-subs-topic",
+              "Subscription":[{"Protocol":"email","Endpoint":"inline@example.com"}]}}}}
+            """;
+        String updatedTemplate = """
+            {"Resources":{"MyTopic":{"Type":"AWS::SNS::Topic","Properties":{
+              "TopicName":"cfn-update-inline-subs-topic"}}}}
+            """;
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-update-inline-subs-stack")
+            .formParam("TemplateBody", initialTemplate)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "Subscribe")
+            .formParam("TopicArn", topicArn)
+            .formParam("Protocol", "email")
+            .formParam("Endpoint", "manual@example.com")
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", "cfn-update-inline-subs-stack")
+            .formParam("TemplateBody", updatedTemplate)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListSubscriptionsByTopic")
+            .formParam("TopicArn", topicArn)
+        .when().post("/").then().statusCode(200)
+            .body(containsString("manual@example.com"))
+            .body(not(containsString("inline@example.com")));
+    }
+
+    @Test
+    void createStack_snsTopicSubscribesSameStackLambda() {
+        String functionName = "cfn-inline-subs-lambda";
+        String functionArn = "arn:aws:lambda:us-east-1:000000000000:function:" + functionName;
+        String topicArn = "arn:aws:sns:us-east-1:000000000000:cfn-lambda-inline-subs-topic";
+        String template = """
+            {
+              "Resources": {
+                "Fn": {"Type":"AWS::Lambda::Function","Properties":{
+                  "FunctionName":"%s","Runtime":"python3.12","Handler":"index.handler",
+                  "Role":"arn:aws:iam::000000000000:role/cfn-test-lambda-role",
+                  "Code":{"ZipFile":"def handler(e, c): return 'ok'"}}},
+                "Topic": {"Type":"AWS::SNS::Topic","Properties":{
+                  "TopicName":"cfn-lambda-inline-subs-topic",
+                  "Subscription":[{"Protocol":"lambda","Endpoint":{"Fn::GetAtt":["Fn","Arn"]}}]}},
+                "Perm": {"Type":"AWS::Lambda::Permission","Properties":{
+                  "FunctionName":{"Ref":"Fn"},"Action":"lambda:InvokeFunction",
+                  "Principal":"sns.amazonaws.com","SourceArn":{"Ref":"Topic"}}}
+              }
+            }
+            """.formatted(functionName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-lambda-inline-subs-stack")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-lambda-inline-subs-stack")
+        .when().post("/").then().statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+        String lambdaSubscriptionArn = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListSubscriptionsByTopic")
+            .formParam("TopicArn", topicArn)
+        .when().post("/").then().statusCode(200)
+            .body(containsString(functionArn))
+            .extract().xmlPath().getString("**.find { it.Protocol == 'lambda' }.SubscriptionArn");
+        assertTrue(lambdaSubscriptionArn.startsWith(topicArn + ":"), lambdaSubscriptionArn);
+        given()
+            .when().get("/2015-03-31/functions/" + functionName + "/policy")
+            .then().statusCode(200)
+            .body(containsString("sns.amazonaws.com"))
+            .body(containsString(topicArn));
+    }
+
+    @Test
     void createStack_snsSqsFifoWithContentBasedDeduplicationAndSubscription() {
         String stackName = "cfn-sns-sqs-fifo-stack";
         String template = """
@@ -7272,8 +7483,8 @@ class CloudFormationIntegrationTest {
      * resource's {@code Outputs.*} attributes right after the child's (synchronous, same-thread)
      * {@code executeTemplate} call returns. When the child's own resource loop fails, {@code
      * executeTemplate} never reaches its Outputs block at all: {@code rollbackFailedExecution}
-     * rewrites the child's status straight from {@code CREATE_FAILED} into {@code
-     * ROLLBACK_COMPLETE} before returning. {@code executeNestedStack} used to detect a failed
+     * settles the child in {@code ROLLBACK_COMPLETE} before returning, and the child's status is
+     * never {@code CREATE_FAILED}. {@code executeNestedStack} used to detect a failed
      * child only by checking for the literal strings {@code CREATE_FAILED}/{@code UPDATE_FAILED},
      * which a rolled-back create can never match, so the parent kept going and reported
      * {@code CREATE_COMPLETE} with its {@code Fn::GetAtt} on the child's outputs left unresolved:
@@ -7439,6 +7650,11 @@ class CloudFormationIntegrationTest {
 
     private static final String ECS_TARGET_PREFIX = "AmazonEC2ContainerServiceV20141113.";
     private static final String ECS_CONTENT_TYPE = "application/x-amz-json-1.1";
+    // The service's tasks must be able to start, since CloudFormation waits for them: an awsvpc
+    // task gets its ENI in a subnet and security group that exist, here the default VPC's.
+    private static final String ECS_SUBNET_A = Ec2Service.defaultSubnetId("us-east-1", "a");
+    private static final String ECS_SUBNET_B = Ec2Service.defaultSubnetId("us-east-1", "b");
+    private static final String ECS_SECURITY_GROUP = Ec2Service.defaultSecurityGroupId("us-east-1");
 
     private static String outputValue(String describeXml, String key) {
         return describeXml.split("<OutputKey>" + key + "</OutputKey>")[1]
@@ -7486,8 +7702,8 @@ class CloudFormationIntegrationTest {
                     "LaunchType": "FARGATE",
                     "NetworkConfiguration": {
                       "AwsvpcConfiguration": {
-                        "Subnets": ["subnet-aaa", "subnet-bbb"],
-                        "SecurityGroups": ["sg-123"],
+                        "Subnets": ["%1$s", "%2$s"],
+                        "SecurityGroups": ["%3$s"],
                         "AssignPublicIp": "ENABLED"
                       }
                     }
@@ -7503,7 +7719,7 @@ class CloudFormationIntegrationTest {
                 "ServiceArn": { "Value": { "Fn::GetAtt": ["EcsService", "ServiceArn"] } }
               }
             }
-            """;
+            """.formatted(ECS_SUBNET_A, ECS_SUBNET_B, ECS_SECURITY_GROUP);
 
         String stackName = "cfn-ecs-stack";
 
@@ -7573,8 +7789,8 @@ class CloudFormationIntegrationTest {
             .body("services[0].serviceName", equalTo("cfn-ecs-service"))
             .body("services[0].desiredCount", equalTo(2))
             .body("services[0].launchType", equalTo("FARGATE"))
-            .body("services[0].networkConfiguration.awsvpcConfiguration.subnets", hasItem("subnet-aaa"))
-            .body("services[0].networkConfiguration.awsvpcConfiguration.securityGroups", hasItem("sg-123"))
+            .body("services[0].networkConfiguration.awsvpcConfiguration.subnets", hasItem(ECS_SUBNET_A))
+            .body("services[0].networkConfiguration.awsvpcConfiguration.securityGroups", hasItem(ECS_SECURITY_GROUP))
             .body("services[0].networkConfiguration.awsvpcConfiguration.assignPublicIp", equalTo("ENABLED"));
     }
 
@@ -7891,7 +8107,7 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("clusters", org.hamcrest.Matchers.empty());
+            .body("clusters", Matchers.empty());
 
         // Task definition is deregistered (INACTIVE)
         given()
@@ -8082,12 +8298,14 @@ class CloudFormationIntegrationTest {
     @Test
     void updateStack_elbV2Listener_modifiesPort() {
         String stackName = "cfn-elbv2-update-stack";
+        String subnetA = Ec2Service.defaultSubnetId("us-east-1", "a");
+        String subnetB = Ec2Service.defaultSubnetId("us-east-1", "b");
         String template = """
             {
               "Resources": {
                 "Alb": {
                   "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
-                  "Properties": { "Name": "cfn-upd-alb", "Type": "application" }
+                  "Properties": { "Name": "cfn-upd-alb", "Type": "application", "Subnets": ["%s", "%s"] }
                 },
                 "Listener": {
                   "Type": "AWS::ElasticLoadBalancingV2::Listener",
@@ -8118,7 +8336,7 @@ class CloudFormationIntegrationTest {
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "CreateStack")
             .formParam("StackName", stackName)
-            .formParam("TemplateBody", template.formatted(80))
+            .formParam("TemplateBody", template.formatted(subnetA, subnetB, 80))
         .when()
             .post("/")
         .then()
@@ -8150,7 +8368,7 @@ class CloudFormationIntegrationTest {
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "UpdateStack")
             .formParam("StackName", stackName)
-            .formParam("TemplateBody", template.formatted(8080))
+            .formParam("TemplateBody", template.formatted(subnetA, subnetB, 8080))
         .when()
             .post("/")
         .then()
@@ -8178,7 +8396,7 @@ class CloudFormationIntegrationTest {
               "Resources": {
                 "Alb": {
                   "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
-                  "Properties": { "Name": "cfn-del-alb", "Type": "application" }
+                  "Properties": { "Name": "cfn-del-alb", "Type": "application", "Subnets": ["%s", "%s"] }
                 },
                 "Tg": {
                   "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
@@ -8203,7 +8421,7 @@ class CloudFormationIntegrationTest {
                 }
               }
             }
-            """;
+            """.formatted(Ec2Service.defaultSubnetId("us-east-1", "a"), Ec2Service.defaultSubnetId("us-east-1", "b"));
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -8394,13 +8612,14 @@ class CloudFormationIntegrationTest {
             .statusCode(200)
             .body("Items.findAll { it.ApiId == '" + apiId + "' }.Name", hasItem("cfn-apigwv2-api-v2"));
 
-        // Idempotent re-deploy with no changes is a no-op (criterion #3): counts/ids unchanged
+        // Re-deploying the same resources is a no-op for them (criterion #3): counts/ids unchanged.
+        // An identical template is refused outright, so a new output forces the update.
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "UpdateStack")
             .formParam("StackName", stackName)
-            .formParam("TemplateBody",
-                    template.formatted("cfn-apigwv2-api-v2", "https://example.com/v2", "GET /things", "true"))
+            .formParam("TemplateBody", CfnUpdates.forceUpdate(
+                    template.formatted("cfn-apigwv2-api-v2", "https://example.com/v2", "GET /things", "true")))
         .when()
             .post("/")
         .then()
@@ -8414,7 +8633,7 @@ class CloudFormationIntegrationTest {
         getStages(apiId).body("Items.size()", equalTo(1));
     }
 
-    private io.restassured.response.ValidatableResponse getRoutes(String apiId) {
+    private ValidatableResponse getRoutes(String apiId) {
         return given()
             .header("X-Amz-Target", "AmazonApiGatewayV2.GetRoutes")
             .contentType(APIGWV2_CONTENT_TYPE)
@@ -8425,7 +8644,7 @@ class CloudFormationIntegrationTest {
             .statusCode(200);
     }
 
-    private io.restassured.response.ValidatableResponse getIntegrations(String apiId) {
+    private ValidatableResponse getIntegrations(String apiId) {
         return given()
             .header("X-Amz-Target", "AmazonApiGatewayV2.GetIntegrations")
             .contentType(APIGWV2_CONTENT_TYPE)
@@ -8436,7 +8655,7 @@ class CloudFormationIntegrationTest {
             .statusCode(200);
     }
 
-    private io.restassured.response.ValidatableResponse getStages(String apiId) {
+    private ValidatableResponse getStages(String apiId) {
         return given()
             .header("X-Amz-Target", "AmazonApiGatewayV2.GetStages")
             .contentType(APIGWV2_CONTENT_TYPE)
@@ -8447,7 +8666,7 @@ class CloudFormationIntegrationTest {
             .statusCode(200);
     }
 
-    private io.restassured.response.ValidatableResponse getAuthorizers(String apiId) {
+    private ValidatableResponse getAuthorizers(String apiId) {
         return given()
             .header("X-Amz-Target", "AmazonApiGatewayV2.GetAuthorizers")
             .contentType(APIGWV2_CONTENT_TYPE)
@@ -9999,10 +10218,10 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
-    void updateStack_unsupportedResourceRollbackRemainsExplicitlyFailed() {
+    void updateStack_ssmRollbackRestoresTheValueAndTemplate() {
         String suffix = Long.toString(System.nanoTime(), 36);
-        String stackName = "unsupported-update-rollback-" + suffix;
-        String parameterName = "/cfn/unsupported-update-rollback/" + suffix;
+        String stackName = "ssm-update-rollback-" + suffix;
+        String parameterName = "/cfn/ssm-update-rollback/" + suffix;
         String template = """
             {
               "Resources": {
@@ -10028,7 +10247,7 @@ class CloudFormationIntegrationTest {
                   "Type": "AWS::SecretsManager::Secret",
                   "DependsOn": "Parameter",
                   "Properties": {
-                    "Name": "unsupported-update-rollback-secret-%s",
+                    "Name": "ssm-update-rollback-secret-%s",
                     "SecretString": "explicit",
                     "GenerateSecretString": {"PasswordLength": 32}
                   }
@@ -10063,8 +10282,7 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body(containsString("<StackStatus>UPDATE_ROLLBACK_FAILED</StackStatus>"))
-            .body(containsString("Parameter"));
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>"));
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -10075,7 +10293,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("<LogicalResourceId>Parameter</LogicalResourceId>"))
-            .body(containsString("<ResourceStatus>UPDATE_FAILED</ResourceStatus>"))
+            .body(not(containsString("<ResourceStatus>UPDATE_FAILED</ResourceStatus>")))
             .body(not(containsString("<LogicalResourceId>BadSecret</LogicalResourceId>")));
 
         given()
@@ -10086,7 +10304,7 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Parameter.Value", equalTo("updated"));
+            .body("Parameter.Value", equalTo("initial"));
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -10096,7 +10314,8 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body(containsString("updated"));
+            .body(containsString("initial"))
+            .body(not(containsString("BadSecret")));
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -10693,7 +10912,7 @@ class CloudFormationIntegrationTest {
                 .body(containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
         }
 
-        for (String stateMachineName : java.util.List.of(missingName, multipleName)) {
+        for (String stateMachineName : List.of(missingName, multipleName)) {
             given()
                 .header("X-Amz-Target", "AWSStepFunctions.DescribeStateMachine")
                 .contentType(SFN_CONTENT_TYPE)
@@ -10706,7 +10925,7 @@ class CloudFormationIntegrationTest {
                 .body(containsString("StateMachineDoesNotExist"));
         }
 
-        for (String stack : java.util.List.of(missingStack, multipleStack)) {
+        for (String stack : List.of(missingStack, multipleStack)) {
             given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DeleteStack")
@@ -10756,14 +10975,14 @@ class CloudFormationIntegrationTest {
             .statusCode(200)
             .extract().asString(), "MyStateMachine");
 
-        var stack = cloudFormationService.describeStacks(stackName, "us-east-1").getFirst();
+        Stack stack = cloudFormationService.describeStacks(stackName, "us-east-1").getFirst();
         stack.getResources().get("MyStateMachine").getAttributes().remove("FlociStepFunctionsNameMode");
 
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "UpdateStack")
             .formParam("StackName", stackName)
-            .formParam("TemplateBody", template)
+            .formParam("TemplateBody", CfnUpdates.forceUpdate(template))
         .when()
             .post("/")
         .then()

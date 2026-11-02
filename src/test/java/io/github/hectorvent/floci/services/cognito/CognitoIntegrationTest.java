@@ -3,8 +3,10 @@ package io.github.hectorvent.floci.services.cognito;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.testutil.SesMailbox;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -13,6 +15,8 @@ import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -20,36 +24,39 @@ import java.security.KeyFactory;
 import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.RSAPublicKeySpec;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.Spliterators;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
 import static io.github.hectorvent.floci.services.cognito.CognitoRestAssuredUtils.cognitoAction;
 import static io.github.hectorvent.floci.services.cognito.CognitoRestAssuredUtils.cognitoJson;
 import static io.restassured.RestAssured.given;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class CognitoIntegrationTest {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-    private static final Pattern SIX_DIGIT_CODE = Pattern.compile("\\b(\\d{6})\\b");
 
     private static String poolId;
     private static String clientId;
@@ -133,9 +140,9 @@ class CognitoIntegrationTest {
                 """.formatted(clientId, USERNAME, PASSWORD))
                 .then()
                 .statusCode(200)
-                .body("AuthenticationResult.AccessToken", org.hamcrest.Matchers.notNullValue())
-                .body("AuthenticationResult.IdToken", org.hamcrest.Matchers.notNullValue())
-                .body("AuthenticationResult.RefreshToken", org.hamcrest.Matchers.notNullValue());
+                .body("AuthenticationResult.AccessToken", Matchers.notNullValue())
+                .body("AuthenticationResult.IdToken", Matchers.notNullValue())
+                .body("AuthenticationResult.RefreshToken", Matchers.notNullValue());
     }
 
     @Test
@@ -153,7 +160,7 @@ class CognitoIntegrationTest {
                 .then()
                 .statusCode(400)
                 .body("__type", equalTo("InvalidParameterException"))
-                .body("AuthenticationResult", org.hamcrest.Matchers.nullValue());
+                .body("AuthenticationResult", Matchers.nullValue());
     }
 
     @Test
@@ -172,7 +179,7 @@ class CognitoIntegrationTest {
                 .then()
                 .statusCode(400)
                 .body("__type", equalTo("InvalidParameterException"))
-                .body("AuthenticationResult", org.hamcrest.Matchers.nullValue());
+                .body("AuthenticationResult", Matchers.nullValue());
     }
 
     @Test
@@ -206,7 +213,7 @@ class CognitoIntegrationTest {
                 """.formatted(poolId, clientId, USERNAME, PASSWORD))
                 .then()
                 .statusCode(200)
-                .body("AuthenticationResult.AccessToken", org.hamcrest.Matchers.notNullValue());
+                .body("AuthenticationResult.AccessToken", Matchers.notNullValue());
     }
 
     @Test
@@ -285,7 +292,7 @@ class CognitoIntegrationTest {
         assertTrue(schema.size() >= 20,
                 "DescribeUserPool must include all 20 Cognito standard attributes");
 
-        java.util.Set<String> names = new java.util.HashSet<>();
+        Set<String> names = new HashSet<>();
         schema.forEach(attr -> names.add(attr.path("Name").asText()));
 
         for (String expected : List.of("sub", "name", "given_name", "family_name", "middle_name",
@@ -382,8 +389,8 @@ class CognitoIntegrationTest {
                 """.formatted(forgotPasswordClientId, forgotPasswordUsername))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("CodeMismatchException"))
-                .body("message", org.hamcrest.Matchers.equalTo("Invalid verification code provided, please try again."));
+                .body("__type", Matchers.equalTo("CodeMismatchException"))
+                .body("message", Matchers.equalTo("Invalid verification code provided, please try again."));
     }
 
     @Test
@@ -467,7 +474,7 @@ class CognitoIntegrationTest {
                 """.formatted(strictClientId))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("InvalidPasswordException"));
+                .body("__type", Matchers.equalTo("InvalidPasswordException"));
 
         cognitoAction("SignUp", """
                 {
@@ -652,8 +659,8 @@ class CognitoIntegrationTest {
                 """.formatted(signUpClientId, signUpUsername))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("CodeMismatchException"))
-                .body("message", org.hamcrest.Matchers.equalTo("Invalid verification code provided, please try again."));
+                .body("__type", Matchers.equalTo("CodeMismatchException"))
+                .body("message", Matchers.equalTo("Invalid verification code provided, please try again."));
 
         JsonNode stillUnconfirmedUser = cognitoJson("AdminGetUser", """
                 {
@@ -721,6 +728,206 @@ class CognitoIntegrationTest {
     }
 
     @Test
+    void signUpCodeIsSentFromTheEmailConfigurationFrom() throws Exception {
+        verifySesEmailIdentity("noreply@repro.example");
+        String fromUsername = signUpWithEmailConfiguration("EmailConfigurationFromPool", """
+                {
+                  "EmailSendingAccount": "DEVELOPER",
+                  "SourceArn": "arn:aws:ses:us-east-1:000000000000:identity/noreply@repro.example",
+                  "From": "Repro App <noreply@repro.example>"
+                }
+                """);
+
+        // The sender name stays in Source, the From header, while the return path, which the SMTP
+        // relay uses as the envelope sender, is the bare address.
+        given()
+                .when()
+                .get("/_aws/ses")
+                .then()
+                .statusCode(200)
+                .body("messages.findAll { it.Destination?.ToAddresses?.contains('" + fromUsername + "') }",
+                        hasSize(1))
+                .body("messages.find { it.Destination?.ToAddresses?.contains('" + fromUsername + "') }.Source",
+                        equalTo("Repro App <noreply@repro.example>"))
+                .body("messages.find { it.Destination?.ToAddresses?.contains('" + fromUsername + "') }.ReturnPath",
+                        equalTo("noreply@repro.example"));
+    }
+
+    @Test
+    void signUpCodeIsSentFromTheDefaultAddressWhenSesHasNotVerifiedTheSourceArn() throws Exception {
+        String unverified = "noreply-" + UUID.randomUUID() + "@unverified.example";
+        String fromUsername = signUpWithEmailConfiguration("UnverifiedSourceArnPool", """
+                {
+                  "EmailSendingAccount": "DEVELOPER",
+                  "SourceArn": "arn:aws:ses:us-east-1:000000000000:identity/%s",
+                  "From": "Repro App <%s>"
+                }
+                """.formatted(unverified, unverified));
+
+        given()
+                .when()
+                .get("/_aws/ses")
+                .then()
+                .statusCode(200)
+                .body("messages.findAll { it.Destination?.ToAddresses?.contains('" + fromUsername + "') }",
+                        hasSize(1))
+                .body("messages.find { it.Destination?.ToAddresses?.contains('" + fromUsername + "') }.Source",
+                        equalTo("no-reply@verificationemail.com"));
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = "Inv\"ite\\123Aa!")
+    void adminCreateUserEmailsAnInvitationWithAWorkingTemporaryPassword(String temporaryPassword) throws Exception {
+        String invitePoolId = cognitoJson("CreateUserPool", """
+                { "PoolName": "InvitationPool" }
+                """).path("UserPool").path("Id").asText();
+        String inviteClientId = cognitoJson("CreateUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientName": "invitation-client",
+                  "ExplicitAuthFlows": ["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+                }
+                """.formatted(invitePoolId)).path("UserPoolClient").path("ClientId").asText();
+        String invitee = "invited+" + UUID.randomUUID() + "@example.com";
+
+        Map<String, Object> createUser = new LinkedHashMap<>();
+        createUser.put("UserPoolId", invitePoolId);
+        createUser.put("Username", invitee);
+        createUser.put("UserAttributes", List.of(Map.of("Name", "email", "Value", invitee)));
+        createUser.put("DesiredDeliveryMediums", List.of("EMAIL"));
+        if (temporaryPassword != null) {
+            createUser.put("TemporaryPassword", temporaryPassword);
+        }
+        cognitoAction("AdminCreateUser", OBJECT_MAPPER.writeValueAsString(createUser))
+                .then()
+                .statusCode(200)
+                .body("User.UserStatus", equalTo("FORCE_CHANGE_PASSWORD"));
+
+        String toInvitee = "messages.findAll { it.Destination?.ToAddresses?.contains('" + invitee + "') }";
+        String body = given()
+                .when()
+                .get("/_aws/ses")
+                .then()
+                .statusCode(200)
+                .body(toInvitee, hasSize(1))
+                .body(toInvitee + "[0].Subject", equalTo("Your temporary password"))
+                .extract()
+                .path(toInvitee + "[0].Body.text_part");
+        Matcher invitation = Pattern.compile("^Your username is (\\S+) and temporary password is (\\S+)\\.$")
+                .matcher(body);
+        assertTrue(invitation.find(), body);
+        assertEquals(invitee, invitation.group(1));
+        if (temporaryPassword != null) {
+            assertEquals(temporaryPassword, invitation.group(2));
+        }
+
+        cognitoAction("AdminInitiateAuth", OBJECT_MAPPER.writeValueAsString(Map.of(
+                "UserPoolId", invitePoolId,
+                "ClientId", inviteClientId,
+                "AuthFlow", "ADMIN_USER_PASSWORD_AUTH",
+                "AuthParameters", Map.of("USERNAME", invitee, "PASSWORD", invitation.group(2)))))
+                .then()
+                .statusCode(200)
+                .body("ChallengeName", equalTo("NEW_PASSWORD_REQUIRED"));
+    }
+
+    @Test
+    void adminCreateUserWithSuppressSendsNoInvitation() throws Exception {
+        String suppressPoolId = cognitoJson("CreateUserPool", """
+                { "PoolName": "SuppressedInvitationPool" }
+                """).path("UserPool").path("Id").asText();
+        String invitee = "suppressed+" + UUID.randomUUID() + "@example.com";
+
+        cognitoAction("AdminCreateUser", """
+                {
+                  "UserPoolId": "%s",
+                  "Username": "%s",
+                  "UserAttributes": [{ "Name": "email", "Value": "%s" }],
+                  "DesiredDeliveryMediums": ["EMAIL"],
+                  "MessageAction": "SUPPRESS"
+                }
+                """.formatted(suppressPoolId, invitee, invitee))
+                .then()
+                .statusCode(200)
+                .body("User.UserStatus", equalTo("FORCE_CHANGE_PASSWORD"));
+
+        given()
+                .when()
+                .get("/_aws/ses")
+                .then()
+                .statusCode(200)
+                .body("messages.findAll { it.Destination?.ToAddresses?.contains('" + invitee + "') }", hasSize(0));
+    }
+
+    @Test
+    void adminCreateUserRefusesAnUnknownDeliveryMedium() throws Exception {
+        String mediumPoolId = cognitoJson("CreateUserPool", """
+                { "PoolName": "UnknownMediumPool" }
+                """).path("UserPool").path("Id").asText();
+
+        cognitoAction("AdminCreateUser", """
+                {
+                  "UserPoolId": "%s",
+                  "Username": "medium-user",
+                  "UserAttributes": [{ "Name": "email", "Value": "medium@example.com" }],
+                  "DesiredDeliveryMediums": ["VOICE"]
+                }
+                """.formatted(mediumPoolId))
+                .then()
+                .statusCode(400)
+                .body("__type", equalTo("InvalidParameterException"))
+                .body("message", containsString("'desiredDeliveryMediums'"));
+    }
+
+    /** Creates a pool with {@code emailConfiguration}, signs a new user up to it and returns the username. */
+    private static String signUpWithEmailConfiguration(String poolName, String emailConfiguration) throws Exception {
+        JsonNode poolResponse = cognitoJson("CreateUserPool", """
+                {
+                  "PoolName": "%s",
+                  "AutoVerifiedAttributes": ["email"],
+                  "EmailConfiguration": %s
+                }
+                """.formatted(poolName, emailConfiguration));
+        String fromPoolId = poolResponse.path("UserPool").path("Id").asText();
+
+        JsonNode clientResponse = cognitoJson("CreateUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientName": "email-configuration-from-client"
+                }
+                """.formatted(fromPoolId));
+        String fromClientId = clientResponse.path("UserPoolClient").path("ClientId").asText();
+
+        String fromUsername = "from+" + UUID.randomUUID() + "@example.com";
+        cognitoAction("SignUp", """
+                {
+                  "ClientId": "%s",
+                  "Username": "%s",
+                  "Password": "Passw0rd!",
+                  "UserAttributes": [
+                    { "Name": "email", "Value": "%s" }
+                  ]
+                }
+                """.formatted(fromClientId, fromUsername, fromUsername))
+                .then()
+                .statusCode(200);
+        return fromUsername;
+    }
+
+    private static void verifySesEmailIdentity(String emailAddress) {
+        given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
+                .formParam("Action", "VerifyEmailIdentity")
+                .formParam("EmailAddress", emailAddress)
+                .when()
+                .post("/")
+                .then()
+                .statusCode(200);
+    }
+
+    @Test
     void resendConfirmationCodeReplacesTheSignUpCode() throws Exception {
         given().delete("/_aws/ses").then().statusCode(200);
 
@@ -783,7 +990,7 @@ class CognitoIntegrationTest {
                 """.formatted(resendClientId, resendUsername, originalCode))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("CodeMismatchException"));
+                .body("__type", Matchers.equalTo("CodeMismatchException"));
 
         cognitoAction("ConfirmSignUp", """
                 {
@@ -803,7 +1010,7 @@ class CognitoIntegrationTest {
                 """.formatted(resendClientId, resendUsername))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("NotAuthorizedException"));
+                .body("__type", Matchers.equalTo("NotAuthorizedException"));
     }
 
     @Test
@@ -846,7 +1053,7 @@ class CognitoIntegrationTest {
                 """.formatted(client, user))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("InvalidParameterException"));
+                .body("__type", Matchers.equalTo("InvalidParameterException"));
     }
 
     @Test
@@ -955,13 +1162,7 @@ class CognitoIntegrationTest {
                 .body("__type", equalTo("NotAuthorizedException"))
                 .body("message", equalTo("Contact administrator to reset password."));
 
-        given()
-                .queryParam("email", email)
-                .when()
-                .get("/_aws/ses")
-                .then()
-                .statusCode(200)
-                .body("messages", hasSize(0));
+        assertEquals(0, SesMailbox.messagesTo(email).size());
     }
 
     @Test
@@ -2024,7 +2225,7 @@ class CognitoIntegrationTest {
                 """.formatted(clientId, USERNAME, PASSWORD))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.containsString("PasswordResetRequiredException"));
+                .body("__type", Matchers.containsString("PasswordResetRequiredException"));
 
         // 3. Admin sets a new password
         String newPassword = "NewPassword123!";
@@ -2598,6 +2799,49 @@ class CognitoIntegrationTest {
                 .statusCode(400);
     }
 
+    /**
+     * AWS: access and ID tokens "Must be set to a value between 5 minutes and 1 day", refresh tokens
+     * "between 60 minutes and 3,650 days". The first two requests are the reproduction in #5147.
+     */
+    @Test
+    @Order(96)
+    void createAndUpdateUserPoolClientRejectTokenValidityOutsideAwsLimits() throws Exception {
+        String limitsPoolId = cognitoJson("CreateUserPool", """
+                {"PoolName": "TokenValidityLimitsPool"}
+                """).path("UserPool").path("Id").asText();
+
+        for (String validity : List.of(
+                """
+                "AccessTokenValidity": 1, "IdTokenValidity": 1,
+                "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes"}""",
+                """
+                "RefreshTokenValidity": 20, "TokenValidityUnits": {"RefreshToken": "minutes"}""",
+                """
+                "AccessTokenValidity": 25""")) {
+            cognitoAction("CreateUserPoolClient", """
+                    {"UserPoolId": "%s", "ClientName": "short-tokens", %s}
+                    """.formatted(limitsPoolId, validity))
+                    .then()
+                    .statusCode(400)
+                    .body("__type", equalTo("InvalidParameterException"))
+                    .body("message", equalTo("Invalid range for token validity."));
+        }
+
+        String limitsClientId = cognitoJson("CreateUserPoolClient", """
+                {"UserPoolId": "%s", "ClientName": "limit-tokens",
+                 "AccessTokenValidity": 5, "IdTokenValidity": 1440, "RefreshTokenValidity": 60,
+                 "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes", "RefreshToken": "minutes"}}
+                """.formatted(limitsPoolId)).path("UserPoolClient").path("ClientId").asText();
+        cognitoAction("UpdateUserPoolClient", """
+                {"UserPoolId": "%s", "ClientId": "%s", "AccessTokenValidity": 4,
+                 "TokenValidityUnits": {"AccessToken": "minutes"}}
+                """.formatted(limitsPoolId, limitsClientId))
+                .then()
+                .statusCode(400)
+                .body("__type", equalTo("InvalidParameterException"))
+                .body("message", equalTo("Invalid range for token validity."));
+    }
+
     @Test
     @Order(97)
     void createUserPoolClientRejectsInconsistentOAuthFlowConfiguration() throws Exception {
@@ -2810,7 +3054,7 @@ class CognitoIntegrationTest {
                 """.formatted(clientId))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("NotAuthorizedException"));
+                .body("__type", Matchers.equalTo("NotAuthorizedException"));
     }
 
     @Test
@@ -2818,7 +3062,7 @@ class CognitoIntegrationTest {
     void initiateAuthRefreshTokenAuthRejectsUnknownWellFormedRefreshToken() {
         // Well-formed shape (poolId|username|clientId|iat|nonce) but for a user that
         // does not exist in this pool — must still be rejected, not silently accepted.
-        String bogusToken = java.util.Base64.getEncoder().withoutPadding().encodeToString(
+        String bogusToken = Base64.getEncoder().withoutPadding().encodeToString(
                 (poolId + "|nonexistent-user|" + clientId + "|" + System.currentTimeMillis() + "|"
                         + UUID.randomUUID()).getBytes(StandardCharsets.UTF_8));
 
@@ -2831,7 +3075,7 @@ class CognitoIntegrationTest {
                 """.formatted(clientId, bogusToken))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("NotAuthorizedException"));
+                .body("__type", Matchers.equalTo("NotAuthorizedException"));
     }
 
     @Test
@@ -2839,7 +3083,7 @@ class CognitoIntegrationTest {
     void initiateAuthRefreshTokenAuthRejectsTokenWithNonNumericIssuedAt() {
         // Well-formed shape (5 base64 parts), but the issued-at field is not a number.
         // Must fail with NotAuthorizedException, not a 500 from an unguarded parseLong.
-        String bogusToken = java.util.Base64.getEncoder().withoutPadding().encodeToString(
+        String bogusToken = Base64.getEncoder().withoutPadding().encodeToString(
                 (poolId + "|" + USERNAME + "|" + clientId + "|not-a-number|"
                         + UUID.randomUUID()).getBytes(StandardCharsets.UTF_8));
 
@@ -2852,7 +3096,7 @@ class CognitoIntegrationTest {
                 """.formatted(clientId, bogusToken))
                 .then()
                 .statusCode(400)
-                .body("__type", org.hamcrest.Matchers.equalTo("NotAuthorizedException"));
+                .body("__type", Matchers.equalTo("NotAuthorizedException"));
     }
 
     /**
@@ -3397,19 +3641,8 @@ class CognitoIntegrationTest {
     }
 
     private static String fetchLatestSesVerificationCode(String recipient) throws Exception {
-        String response = given()
-                .queryParam("email", recipient)
-                .when()
-                .get("/_aws/ses")
-                .then()
-                .statusCode(200)
-                .extract()
-                .asString();
-        JsonNode payload = OBJECT_MAPPER.readTree(response);
-        String body = payload.path("messages").get(0).path("Body").path("text_part").asText();
-        Matcher matcher = SIX_DIGIT_CODE.matcher(body);
-        assertTrue(matcher.find(), "verification code email should contain a 6-digit code");
-        return matcher.group(1);
+        return CognitoCodes.sixDigitCode(
+                SesMailbox.messagesTo(recipient).get(0).path("Body").path("text_part").asText());
     }
 
     private static String padBase64(String value) {

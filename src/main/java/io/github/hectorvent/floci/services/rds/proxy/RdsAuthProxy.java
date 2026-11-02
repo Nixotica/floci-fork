@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
+import io.github.hectorvent.floci.core.common.ListenBacklog;
 import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import org.jboss.logging.Logger;
@@ -8,6 +9,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.time.Duration;
 import java.util.concurrent.Semaphore;
 
 /**
@@ -21,8 +23,15 @@ public class RdsAuthProxy {
 
     private final int backendPort;
     private volatile boolean iamEnabled;
+    private final EndpointKind endpointKind;
+
+    /** Native database IAM and standard client-to-proxy IAM have different role requirements. */
+    public enum EndpointKind { DATABASE, STANDARD_DB_PROXY }
+
     private final String instanceId;
     private final String backendHost;
+    private final BackendEndpointResolver backendEndpointResolver;
+    private final String backendRuntimeId;
     private final String masterUsername;
     private volatile String masterPassword;
     private final String dbName;
@@ -39,34 +48,39 @@ public class RdsAuthProxy {
 
     private volatile boolean running;
     private ServerSocket serverSocket;
+    private Thread acceptThread;
+    Duration acceptRetirementTimeout = Duration.ofSeconds(5);
 
     public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
+                        String backendRuntimeId,
                         DatabaseEngine engine, boolean iamEnabled,
                         String masterUsername, String masterPassword, String dbName,
                         RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
                         MasterPasswordCheck passwordValidator,
                         int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
                         int maxConnections) {
-        this(instanceId, backendHost, backendPort, engine, iamEnabled, masterUsername, masterPassword,
-                dbName, sigV4, tlsCertificates, passwordValidator, handshakeTimeoutMillis,
-                backendConnectTimeoutMillis, maxConnections, null, username -> false,
-                RdsBackendGate.OPEN);
+        this(instanceId, backendHost, backendPort, backendRuntimeId, engine, iamEnabled,
+                masterUsername, masterPassword, dbName, sigV4, tlsCertificates, passwordValidator,
+                handshakeTimeoutMillis, backendConnectTimeoutMillis, maxConnections, null,
+                username -> false, RdsBackendGate.OPEN);
     }
 
     public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
+                        String backendRuntimeId,
                         DatabaseEngine engine, boolean iamEnabled,
                         String masterUsername, String masterPassword, String dbName,
                         RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
                         MasterPasswordCheck passwordValidator,
                         int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
                         int maxConnections, RdsProxyBinding binding, RdsBackendGate backendGate) {
-        this(instanceId, backendHost, backendPort, engine, iamEnabled, masterUsername, masterPassword,
-                dbName, sigV4, tlsCertificates, passwordValidator, handshakeTimeoutMillis,
-                backendConnectTimeoutMillis, maxConnections, binding,
+        this(instanceId, backendHost, backendPort, backendRuntimeId, engine, iamEnabled,
+                masterUsername, masterPassword, dbName, sigV4, tlsCertificates, passwordValidator,
+                handshakeTimeoutMillis, backendConnectTimeoutMillis, maxConnections, binding,
                 username -> binding != null, backendGate);
     }
 
     public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
+                        String backendRuntimeId,
                         DatabaseEngine engine, boolean iamEnabled,
                         String masterUsername, String masterPassword, String dbName,
                         RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
@@ -75,11 +89,51 @@ public class RdsAuthProxy {
                         int maxConnections, RdsProxyBinding binding,
                         MySqlProtocolHandler.IamUserChecker iamUserChecker,
                         RdsBackendGate backendGate) {
+        this(instanceId, backendHost, backendPort, backendRuntimeId, engine, iamEnabled,
+                masterUsername, masterPassword, dbName, sigV4, tlsCertificates, passwordValidator,
+                handshakeTimeoutMillis, backendConnectTimeoutMillis, maxConnections, binding,
+                iamUserChecker, backendGate, EndpointKind.DATABASE);
+    }
+
+    public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
+                        String backendRuntimeId,
+                        DatabaseEngine engine, boolean iamEnabled,
+                        String masterUsername, String masterPassword, String dbName,
+                        RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
+                        MasterPasswordCheck passwordValidator,
+                        int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
+                        int maxConnections, RdsProxyBinding binding,
+                        MySqlProtocolHandler.IamUserChecker iamUserChecker,
+                        RdsBackendGate backendGate, EndpointKind endpointKind) {
+        this(instanceId, backendHost, backendPort,
+                () -> new BackendEndpoint(backendHost, backendPort), backendRuntimeId,
+                engine, iamEnabled, masterUsername, masterPassword, dbName, sigV4,
+                tlsCertificates, passwordValidator, handshakeTimeoutMillis,
+                backendConnectTimeoutMillis, maxConnections, binding, iamUserChecker,
+                backendGate, endpointKind);
+    }
+
+    public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
+                        BackendEndpointResolver backendEndpointResolver, String backendRuntimeId,
+                        DatabaseEngine engine, boolean iamEnabled,
+                        String masterUsername, String masterPassword, String dbName,
+                        RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
+                        MasterPasswordCheck passwordValidator,
+                        int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
+                        int maxConnections, RdsProxyBinding binding,
+                        MySqlProtocolHandler.IamUserChecker iamUserChecker,
+                        RdsBackendGate backendGate, EndpointKind endpointKind) {
+        if (backendRuntimeId == null || backendRuntimeId.isBlank()) {
+            throw new IllegalArgumentException("RDS backend runtime ID is required");
+        }
         this.instanceId = instanceId;
         this.backendHost = backendHost;
         this.backendPort = backendPort;
+        this.backendEndpointResolver = backendEndpointResolver;
+        this.backendRuntimeId = backendRuntimeId;
         this.engine = engine;
         this.iamEnabled = iamEnabled;
+        this.endpointKind = endpointKind;
         this.masterUsername = masterUsername;
         this.masterPassword = masterPassword;
         this.dbName = dbName;
@@ -95,13 +149,20 @@ public class RdsAuthProxy {
     }
 
     public void start(int proxyPort) throws IOException {
-        serverSocket = new ServerSocket();
-        serverSocket.setReuseAddress(true);
-        serverSocket.bind(new InetSocketAddress(proxyPort));
+        serverSocket = listenSocket(proxyPort, ListenBacklog.ACCEPT);
         running = true;
-        Thread.ofVirtual().name("rds-proxy-accept-" + instanceId).start(this::acceptLoop);
+        acceptThread = Thread.ofVirtual().name("rds-proxy-accept-" + instanceId).unstarted(this::acceptLoop);
+        acceptThread.start();
         LOG.infov("RDS proxy started for instance {0} on port {1} → {2}:{3}",
                 instanceId, String.valueOf(proxyPort), backendHost, String.valueOf(backendPort));
+    }
+
+    /**
+     * Binds the listening socket. A seam so a test can pin the accept backlog: a bound
+     * {@code ServerSocket} does not report the backlog it was created with.
+     */
+    ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
+        return ListenBacklog.acceptSocket(proxyPort, backlog);
     }
 
     /** Swap the master-password snapshot after a rotation; new connections authenticate against it. */
@@ -125,12 +186,29 @@ public class RdsAuthProxy {
             throw new RuntimeException(
                     "Failed to stop RDS proxy for instance " + instanceId, e);
         }
+        // A socket closed during accept can retain its native descriptor until accept exits.
+        // Retire that loop before a reboot binds its replacement to the same port.
+        Thread accepting = acceptThread;
+        if (accepting != null && accepting != Thread.currentThread() && accepting.isAlive()) {
+            try {
+                if (!accepting.join(acceptRetirementTimeout)) {
+                    throw new IllegalStateException("RDS proxy accept loop did not stop for instance " + instanceId);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while stopping RDS proxy for instance " + instanceId, e);
+            }
+        }
     }
 
     private void acceptLoop() {
         while (running) {
             try {
                 Socket client = serverSocket.accept();
+                if (!running) {
+                    closeQuietly(client);
+                    break;
+                }
                 if (!connectionPermits.tryAcquire()) {
                     LOG.warnv("Refusing RDS connection for instance {0}: connection limit reached",
                             instanceId);
@@ -160,7 +238,7 @@ public class RdsAuthProxy {
         try {
             // An auto-paused Aurora backend resumes before the client is served: the client is
             // held, not refused, and the backend stays awake for as long as the connection lasts.
-            lease = backendGate.enter(backendHost, backendPort);
+            lease = backendGate.enterRuntime(backendRuntimeId);
             client.setTcpNoDelay(true);
 
             // RDS only proxy-validates the master user; a non-master user passes through so the
@@ -175,8 +253,9 @@ public class RdsAuthProxy {
             };
 
             PostgresProtocolHandler.BackendConnector connector = () -> {
+                BackendEndpoint endpoint = backendEndpointResolver.resolve();
                 Socket backendSocket = new Socket();
-                backendSocket.connect(new InetSocketAddress(backendHost, backendPort),
+                backendSocket.connect(new InetSocketAddress(endpoint.host(), endpoint.port()),
                         backendConnectTimeoutMillis);
                 backendSocket.setTcpNoDelay(true);
                 return backendSocket;
@@ -184,10 +263,12 @@ public class RdsAuthProxy {
 
             switch (engine) {
                 case POSTGRES -> {
+                    // forwardStartupParameters = true: an RDS for PostgreSQL endpoint is the
+                    // server itself, so the client's options and run-time parameters apply.
                     session = PostgresProtocolHandler.authenticate(
                                     client, connector, masterUsername, masterPassword, dbName,
                                     iamEnabled, sigV4, binding, tlsCertificates, authAdapter,
-                                    handshakeTimeoutMillis);
+                                    handshakeTimeoutMillis, true, endpointKind == EndpointKind.DATABASE);
                     if (session != null) {
                         PostgresProtocolHandler.bridge(session);
                     }
@@ -236,6 +317,15 @@ public class RdsAuthProxy {
         } catch (IOException e) {
             LOG.debugv(e, "Error closing RDS proxy client socket");
         }
+    }
+
+    /** Backend address resolved immediately before each outbound connection attempt. */
+    public record BackendEndpoint(String host, int port) {}
+
+    /** Resolves the current backend address for a new outbound connection. */
+    @FunctionalInterface
+    public interface BackendEndpointResolver {
+        BackendEndpoint resolve() throws IOException;
     }
 
     /**

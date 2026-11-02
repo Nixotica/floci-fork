@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
 import java.util.logging.LogRecord;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -45,7 +46,7 @@ class PersistentPathValidatorTest {
     private static ServiceDescriptor descriptor(String key, boolean enabled, String storageKey, String mode) {
         return new ServiceDescriptor(key, key, enabled, true, storageKey, mode, 0L,
                 null, ServiceProtocol.REST_XML, Set.of(ServiceProtocol.REST_XML),
-                Set.of(), Set.of(), Set.of(), Set.of());
+                Set.of(), Set.of(), Set.of(), Set.of(), Set.of());
     }
 
     @Test
@@ -67,7 +68,7 @@ class PersistentPathValidatorTest {
         validator().validateAtBoot();
 
         assertTrue(Files.isDirectory(root));
-        try (var entries = Files.list(root)) {
+        try (Stream<Path> entries = Files.list(root)) {
             assertEquals(0, entries.count(), "write probe must not be left behind");
         }
     }

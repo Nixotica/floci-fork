@@ -5,16 +5,31 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
-import io.github.hectorvent.floci.services.ssoadmin.model.Assignment;
-import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentOperation;
+import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAccessScope;
 import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAssignment;
+import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationAuthenticationMethod;
+import io.github.hectorvent.floci.services.ssoadmin.model.ApplicationGrant;
+import io.github.hectorvent.floci.services.ssoadmin.model.Assignment;
+import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentDeletionOperation;
+import io.github.hectorvent.floci.services.ssoadmin.model.AssignmentOperation;
+import io.github.hectorvent.floci.services.ssoadmin.model.CustomerManagedPolicyReference;
+import io.github.hectorvent.floci.services.ssoadmin.model.InstanceAccessControlAttributeConfiguration;
+import io.github.hectorvent.floci.services.ssoadmin.model.InstanceUpdateState;
+import io.github.hectorvent.floci.services.ssoadmin.model.OidcJwtIssuerConfiguration;
 import io.github.hectorvent.floci.services.ssoadmin.model.PermissionSet;
 import io.github.hectorvent.floci.services.ssoadmin.model.PermissionSetProvisioningOperation;
+import io.github.hectorvent.floci.services.ssoadmin.model.PermissionsBoundary;
+import io.github.hectorvent.floci.services.ssoadmin.model.RegionMetadata;
 import io.github.hectorvent.floci.services.ssoadmin.model.SsoApplication;
+import io.github.hectorvent.floci.services.ssoadmin.model.SsoInstance;
+import io.github.hectorvent.floci.services.ssoadmin.model.TrustedTokenIssuer;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
+
+import java.util.Map;
 
 @ApplicationScoped
 public class SsoAdminJsonHandler {
@@ -119,12 +134,12 @@ public class SsoAdminJsonHandler {
             ObjectNode node = instances.addObject();
             node.put("InstanceArn", instance.instanceArn());
             node.put("IdentityStoreId", instance.identityStoreId());
-            var updateState = service.instanceUpdateState(instance);
+            InstanceUpdateState updateState = service.instanceUpdateState(instance);
             if (updateState.name() != null) {
                 node.put("Name", updateState.name());
             }
             node.put("OwnerAccountId", instance.ownerAccountId());
-            node.put("CreatedDate", instance.createdDateEpochMillis() / 1000.0d);
+            node.put("CreatedDate", EpochSeconds.fromMillis(instance.createdDateEpochMillis()));
             node.put("PrimaryRegion", instance.primaryRegion());
             ArrayNode regionNodes = node.putArray("Regions");
             service.listRegionsForInstance(instance).forEach(region -> {
@@ -143,7 +158,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response createInstance(JsonNode request, String callerAccountId, String region) {
-        var instance = service.createInstance(request, callerAccountId, region);
+        SsoInstance instance = service.createInstance(request, callerAccountId, region);
         return Response.ok(mapper.createObjectNode().put("InstanceArn", instance.instanceArn())).build();
     }
 
@@ -153,10 +168,10 @@ public class SsoAdminJsonHandler {
     }
 
     private Response describeInstance(JsonNode request) {
-        var instance = service.describeInstance(request);
-        var updateState = service.instanceUpdateState(instance);
+        SsoInstance instance = service.describeInstance(request);
+        InstanceUpdateState updateState = service.instanceUpdateState(instance);
         ObjectNode response = mapper.createObjectNode();
-        response.put("CreatedDate", instance.createdDateEpochMillis() / 1000.0d);
+        response.put("CreatedDate", EpochSeconds.fromMillis(instance.createdDateEpochMillis()));
         response.put("IdentityStoreId", instance.identityStoreId());
         response.put("InstanceArn", instance.instanceArn());
         if (updateState.name() != null) {
@@ -191,7 +206,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response describeInstanceAccessControlAttributeConfiguration(JsonNode request) {
-        var configuration = service.describeInstanceAccessControlAttributeConfiguration(request);
+        InstanceAccessControlAttributeConfiguration configuration = service.describeInstanceAccessControlAttributeConfiguration(request);
         ObjectNode response = mapper.createObjectNode();
         ObjectNode configurationNode = response.putObject("InstanceAccessControlAttributeConfiguration");
         ArrayNode attributes = configurationNode.putArray("AccessControlAttributes");
@@ -218,7 +233,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response createTrustedTokenIssuer(JsonNode request, String callerAccountId) {
-        var issuer = service.createTrustedTokenIssuer(request, callerAccountId);
+        TrustedTokenIssuer issuer = service.createTrustedTokenIssuer(request, callerAccountId);
         return Response.ok(mapper.createObjectNode()
                 .put("TrustedTokenIssuerArn", issuer.trustedTokenIssuerArn())).build();
     }
@@ -229,10 +244,10 @@ public class SsoAdminJsonHandler {
     }
 
     private Response describeTrustedTokenIssuer(JsonNode request) {
-        var issuer = service.describeTrustedTokenIssuer(request);
+        TrustedTokenIssuer issuer = service.describeTrustedTokenIssuer(request);
         ObjectNode response = trustedTokenIssuerMetadataNode(issuer);
         ObjectNode configuration = response.putObject("TrustedTokenIssuerConfiguration");
-        var oidc = issuer.oidcJwtConfiguration();
+        OidcJwtIssuerConfiguration oidc = issuer.oidcJwtConfiguration();
         ObjectNode oidcNode = configuration.putObject("OidcJwtConfiguration");
         oidcNode.put("ClaimAttributePath", oidc.claimAttributePath());
         oidcNode.put("IdentityStoreAttributePath", oidc.identityStoreAttributePath());
@@ -242,7 +257,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listTrustedTokenIssuers(JsonNode request) {
-        var page = service.listTrustedTokenIssuers(request);
+        PaginatedResult<TrustedTokenIssuer> page = service.listTrustedTokenIssuers(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode issuers = response.putArray("TrustedTokenIssuers");
         page.items().forEach(issuer -> issuers.add(trustedTokenIssuerMetadataNode(issuer)));
@@ -252,7 +267,7 @@ public class SsoAdminJsonHandler {
         return Response.ok(response).build();
     }
 
-    private ObjectNode trustedTokenIssuerMetadataNode(io.github.hectorvent.floci.services.ssoadmin.model.TrustedTokenIssuer issuer) {
+    private ObjectNode trustedTokenIssuerMetadataNode(TrustedTokenIssuer issuer) {
         ObjectNode response = mapper.createObjectNode();
         response.put("Name", issuer.name());
         response.put("TrustedTokenIssuerArn", issuer.trustedTokenIssuerArn());
@@ -266,12 +281,12 @@ public class SsoAdminJsonHandler {
     }
 
     private Response addRegion(JsonNode request) {
-        var region = service.addRegion(request);
+        RegionMetadata region = service.addRegion(request);
         return Response.ok(mapper.createObjectNode().put("Status", region.status())).build();
     }
 
     private Response removeRegion(JsonNode request, String requestRegion) {
-        var region = service.removeRegion(request, requestRegion);
+        RegionMetadata region = service.removeRegion(request, requestRegion);
         return Response.ok(mapper.createObjectNode().put("Status", region.status())).build();
     }
 
@@ -280,7 +295,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listRegions(JsonNode request) {
-        var page = service.listRegions(request);
+        PaginatedResult<RegionMetadata> page = service.listRegions(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode regions = response.putArray("Regions");
         page.items().forEach(region -> regions.add(regionNode(region)));
@@ -290,7 +305,7 @@ public class SsoAdminJsonHandler {
         return Response.ok(response).build();
     }
 
-    private ObjectNode regionNode(io.github.hectorvent.floci.services.ssoadmin.model.RegionMetadata region) {
+    private ObjectNode regionNode(RegionMetadata region) {
         ObjectNode response = mapper.createObjectNode();
         response.put("AddedDate", service.regionAddedDateEpochSeconds(region));
         response.put("IsPrimaryRegion", region.primaryRegion());
@@ -300,7 +315,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listTagsForResource(JsonNode request) {
-        var page = service.listTagsForResource(request);
+        PaginatedResult<Map.Entry<String, String>> page = service.listTagsForResource(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode tags = response.putArray("Tags");
         page.items().forEach(tag -> tags.addObject()
@@ -343,7 +358,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response getApplicationAccessScope(JsonNode request) {
-        var accessScope = service.getApplicationAccessScope(request);
+        ApplicationAccessScope accessScope = service.getApplicationAccessScope(request);
         ObjectNode response = mapper.createObjectNode();
         response.put("Scope", accessScope.scope());
         ArrayNode targets = response.putArray("AuthorizedTargets");
@@ -352,7 +367,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listApplicationAccessScopes(JsonNode request) {
-        var page = service.listApplicationAccessScopes(request);
+        PaginatedResult<ApplicationAccessScope> page = service.listApplicationAccessScopes(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode scopes = response.putArray("Scopes");
         page.items().forEach(accessScope -> {
@@ -391,7 +406,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listApplicationProviders(JsonNode request, String region) {
-        var page = service.listApplicationProviders(request, region);
+        PaginatedResult<String> page = service.listApplicationProviders(request, region);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode providers = response.putArray("ApplicationProviders");
         page.items().forEach(provider -> providers.add(applicationProviderNode(provider)));
@@ -409,12 +424,12 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listApplicationAssignments(JsonNode request) {
-        var page = service.listApplicationAssignments(request);
+        PaginatedResult<ApplicationAssignment> page = service.listApplicationAssignments(request);
         return applicationAssignmentsResponse(page);
     }
 
     private Response listApplicationAssignmentsForPrincipal(JsonNode request, String callerAccountId) {
-        var page = service.listApplicationAssignmentsForPrincipal(request, callerAccountId);
+        PaginatedResult<ApplicationAssignment> page = service.listApplicationAssignmentsForPrincipal(request, callerAccountId);
         return applicationAssignmentsResponse(page);
     }
 
@@ -439,14 +454,14 @@ public class SsoAdminJsonHandler {
     }
 
     private Response getApplicationAuthenticationMethod(JsonNode request) {
-        var method = service.getApplicationAuthenticationMethod(request);
+        ApplicationAuthenticationMethod method = service.getApplicationAuthenticationMethod(request);
         ObjectNode response = mapper.createObjectNode();
         response.set("AuthenticationMethod", method.authenticationMethod());
         return Response.ok(response).build();
     }
 
     private Response listApplicationAuthenticationMethods(JsonNode request) {
-        var page = service.listApplicationAuthenticationMethods(request);
+        PaginatedResult<ApplicationAuthenticationMethod> page = service.listApplicationAuthenticationMethods(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode methods = response.putArray("AuthenticationMethods");
         page.items().forEach(method -> {
@@ -471,12 +486,12 @@ public class SsoAdminJsonHandler {
     }
 
     private Response getApplicationGrant(JsonNode request) {
-        var grant = service.getApplicationGrant(request);
+        ApplicationGrant grant = service.getApplicationGrant(request);
         return Response.ok(mapper.createObjectNode().set("Grant", grant.grant())).build();
     }
 
     private Response listApplicationGrants(JsonNode request) {
-        var page = service.listApplicationGrants(request);
+        PaginatedResult<ApplicationGrant> page = service.listApplicationGrants(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode grants = response.putArray("Grants");
         page.items().forEach(grant -> {
@@ -529,7 +544,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listApplications(JsonNode request, String callerAccountId) {
-        var page = service.listApplications(request, callerAccountId);
+        PaginatedResult<SsoApplication> page = service.listApplications(request, callerAccountId);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode applications = response.putArray("Applications");
         page.items().forEach(application -> applications.add(applicationNode(application)));
@@ -544,7 +559,7 @@ public class SsoAdminJsonHandler {
         response.put("ApplicationAccount", application.applicationAccount());
         response.put("ApplicationArn", application.applicationArn());
         response.put("ApplicationProviderArn", application.applicationProviderArn());
-        response.put("CreatedDate", application.createdDateEpochMillis() / 1000.0d);
+        response.put("CreatedDate", EpochSeconds.fromMillis(application.createdDateEpochMillis()));
         response.put("CreatedFrom", application.createdFrom());
         if (application.description() != null) {
             response.put("Description", application.description());
@@ -570,7 +585,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listPermissionSets(JsonNode request) {
-        var page = service.listPermissionSets(request);
+        PaginatedResult<PermissionSet> page = service.listPermissionSets(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode arns = response.putArray("PermissionSets");
         page.items().forEach(p -> arns.add(p.arn()));
@@ -608,7 +623,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listManagedPolicies(JsonNode request) {
-        var page = service.listManagedPolicies(request);
+        PaginatedResult<Map.Entry<String, String>> page = service.listManagedPolicies(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode policies = response.putArray("AttachedManagedPolicies");
         page.items().forEach(policy -> policies.addObject()
@@ -636,7 +651,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listCustomerManagedPolicyReferences(JsonNode request) {
-        var page = service.listCustomerManagedPolicyReferences(request);
+        PaginatedResult<CustomerManagedPolicyReference> page = service.listCustomerManagedPolicyReferences(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode references = response.putArray("CustomerManagedPolicyReferences");
         page.items().forEach(reference -> references.addObject()
@@ -676,7 +691,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response getPermissionsBoundary(JsonNode request) {
-        var boundary = service.getPermissionsBoundary(
+        PermissionsBoundary boundary = service.getPermissionsBoundary(
                 SsoAdminService.required(request, "InstanceArn"),
                 SsoAdminService.required(request, "PermissionSetArn"));
         ObjectNode response = mapper.createObjectNode();
@@ -703,7 +718,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listAccountAssignments(JsonNode request) {
-        var page = service.listAssignments(request);
+        PaginatedResult<Assignment> page = service.listAssignments(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode array = response.putArray("AccountAssignments");
         for (Assignment a : page.items()) {
@@ -717,7 +732,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listAccountAssignmentsForPrincipal(JsonNode request, String callerAccountId) {
-        var page = service.listAssignmentsForPrincipal(request, callerAccountId);
+        PaginatedResult<Assignment> page = service.listAssignmentsForPrincipal(request, callerAccountId);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode array = response.putArray("AccountAssignments");
         for (Assignment assignment : page.items()) {
@@ -739,7 +754,7 @@ public class SsoAdminJsonHandler {
         ObjectNode status = response.putObject("PermissionSetProvisioningStatus");
         status.put("RequestId", operation.requestId());
         status.put("Status", operation.status());
-        status.put("CreatedDate", operation.createdDateEpochMillis() / 1000.0d);
+        status.put("CreatedDate", EpochSeconds.fromMillis(operation.createdDateEpochMillis()));
         if (operation.accountId() != null) {
             status.put("AccountId", operation.accountId());
         }
@@ -758,7 +773,7 @@ public class SsoAdminJsonHandler {
         ObjectNode status = response.putObject("PermissionSetProvisioningStatus");
         status.put("RequestId", operation.requestId());
         status.put("Status", operation.status());
-        status.put("CreatedDate", operation.createdDateEpochMillis() / 1000.0d);
+        status.put("CreatedDate", EpochSeconds.fromMillis(operation.createdDateEpochMillis()));
         if (operation.accountId() != null) {
             status.put("AccountId", operation.accountId());
         }
@@ -772,14 +787,14 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listPermissionSetProvisioningStatus(JsonNode request) {
-        var page = service.listPermissionSetProvisioningStatus(request);
+        PaginatedResult<PermissionSetProvisioningOperation> page = service.listPermissionSetProvisioningStatus(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode statuses = response.putArray("PermissionSetsProvisioningStatus");
         for (PermissionSetProvisioningOperation operation : page.items()) {
             ObjectNode status = statuses.addObject();
             status.put("RequestId", operation.requestId());
             status.put("Status", operation.status());
-            status.put("CreatedDate", operation.createdDateEpochMillis() / 1000.0d);
+            status.put("CreatedDate", EpochSeconds.fromMillis(operation.createdDateEpochMillis()));
         }
         if (page.nextToken() != null) {
             response.put("NextToken", page.nextToken());
@@ -788,7 +803,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listPermissionSetsProvisionedToAccount(JsonNode request) {
-        var page = service.listPermissionSetsProvisionedToAccount(request);
+        PaginatedResult<String> page = service.listPermissionSetsProvisionedToAccount(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode permissionSets = response.putArray("PermissionSets");
         page.items().forEach(permissionSets::add);
@@ -799,7 +814,7 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listAccountsForProvisionedPermissionSet(JsonNode request) {
-        var page = service.listAccountsForProvisionedPermissionSet(request);
+        PaginatedResult<String> page = service.listAccountsForProvisionedPermissionSet(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode accountIds = response.putArray("AccountIds");
         page.items().forEach(accountIds::add);
@@ -817,12 +832,12 @@ public class SsoAdminJsonHandler {
     }
 
     private Response deleteAccountAssignment(JsonNode request) {
-        var operation = service.deleteAssignment(request);
+        AssignmentDeletionOperation operation = service.deleteAssignment(request);
         ObjectNode response = mapper.createObjectNode();
         ObjectNode status = response.putObject("AccountAssignmentDeletionStatus");
         status.put("RequestId", operation.requestId());
         status.put("Status", operation.status());
-        status.put("CreatedDate", operation.createdDateEpochMillis() / 1000.0d);
+        status.put("CreatedDate", EpochSeconds.fromMillis(operation.createdDateEpochMillis()));
         status.put("TargetId", operation.accountId());
         status.put("TargetType", "AWS_ACCOUNT");
         status.put("PermissionSetArn", operation.permissionSetArn());
@@ -844,14 +859,14 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listAccountAssignmentCreationStatus(JsonNode request) {
-        var page = service.listAccountAssignmentCreationStatus(request);
+        PaginatedResult<AssignmentOperation> page = service.listAccountAssignmentCreationStatus(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode statuses = response.putArray("AccountAssignmentsCreationStatus");
         for (AssignmentOperation operation : page.items()) {
             ObjectNode status = statuses.addObject();
             status.put("RequestId", operation.requestId());
             status.put("Status", operation.status());
-            status.put("CreatedDate", operation.createdDateEpochMillis() / 1000.0d);
+            status.put("CreatedDate", EpochSeconds.fromMillis(operation.createdDateEpochMillis()));
         }
         if (page.nextToken() != null) {
             response.put("NextToken", page.nextToken());
@@ -860,14 +875,14 @@ public class SsoAdminJsonHandler {
     }
 
     private Response describeAssignmentDeletion(JsonNode request) {
-        var operation = service.getAssignmentDeletionOperation(
+        AssignmentDeletionOperation operation = service.getAssignmentDeletionOperation(
                 SsoAdminService.required(request, "InstanceArn"),
                 SsoAdminService.required(request, "AccountAssignmentDeletionRequestId"));
         ObjectNode response = mapper.createObjectNode();
         ObjectNode status = response.putObject("AccountAssignmentDeletionStatus");
         status.put("RequestId", operation.requestId());
         status.put("Status", operation.status());
-        status.put("CreatedDate", operation.createdDateEpochMillis() / 1000.0d);
+        status.put("CreatedDate", EpochSeconds.fromMillis(operation.createdDateEpochMillis()));
         status.put("TargetId", operation.accountId());
         status.put("TargetType", "AWS_ACCOUNT");
         status.put("PermissionSetArn", operation.permissionSetArn());
@@ -880,14 +895,14 @@ public class SsoAdminJsonHandler {
     }
 
     private Response listAccountAssignmentDeletionStatus(JsonNode request) {
-        var page = service.listAccountAssignmentDeletionStatus(request);
+        PaginatedResult<AssignmentDeletionOperation> page = service.listAccountAssignmentDeletionStatus(request);
         ObjectNode response = mapper.createObjectNode();
         ArrayNode statuses = response.putArray("AccountAssignmentsDeletionStatus");
         page.items().forEach(operation -> {
             ObjectNode status = statuses.addObject();
             status.put("RequestId", operation.requestId());
             status.put("Status", operation.status());
-            status.put("CreatedDate", operation.createdDateEpochMillis() / 1000.0d);
+            status.put("CreatedDate", EpochSeconds.fromMillis(operation.createdDateEpochMillis()));
         });
         if (page.nextToken() != null) {
             response.put("NextToken", page.nextToken());
@@ -909,7 +924,7 @@ public class SsoAdminJsonHandler {
     private ObjectNode assignmentOperationNode(AssignmentOperation op) {
         ObjectNode node = mapper.createObjectNode();
         node.put("RequestId", op.requestId()); node.put("Status", op.status());
-        node.put("CreatedDate", op.createdDateEpochMillis() / 1000.0d);
+        node.put("CreatedDate", EpochSeconds.fromMillis(op.createdDateEpochMillis()));
         node.put("TargetId", op.accountId()); node.put("TargetType", "AWS_ACCOUNT");
         node.put("PermissionSetArn", op.permissionSetArn()); node.put("PrincipalId", op.principalId());
         node.put("PrincipalType", op.principalType());

@@ -2,17 +2,21 @@ package io.github.hectorvent.floci.services.verifiedpermissions;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.services.verifiedpermissions.model.EntityIdentifier;
 import io.github.hectorvent.floci.services.verifiedpermissions.model.IdentitySource;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 
 @ApplicationScoped
 public class VerifiedPermissionsTokenService {
@@ -150,7 +154,7 @@ public class VerifiedPermissionsTokenService {
     }
 
     private List<EntityIdentifier> mergeParents(TokenInfo identity, TokenInfo access) {
-        java.util.LinkedHashSet<EntityIdentifier> parents = new java.util.LinkedHashSet<>();
+        LinkedHashSet<EntityIdentifier> parents = new LinkedHashSet<>();
         if (identity != null) {
             parents.addAll(identity.parents());
         }
@@ -176,7 +180,7 @@ public class VerifiedPermissionsTokenService {
             } else {
                 throw VerifiedPermissionsService.validation("context must contain cedarJson or contextMap.");
             }
-        } catch (java.io.IOException e) {
+        } catch (IOException e) {
             throw VerifiedPermissionsService.validation("context.cedarJson isn't valid JSON.");
         }
         ObjectNode token = root.putObject("token");
@@ -200,11 +204,11 @@ public class VerifiedPermissionsTokenService {
         if (!union.isObject() || union.size() != 1) {
             throw VerifiedPermissionsService.validation("Context attributes must contain one union member.");
         }
-        var entry = union.fields().next();
+        Map.Entry<String, JsonNode> entry = union.fields().next();
         return switch (entry.getKey()) {
             case "boolean", "long", "string" -> entry.getValue().deepCopy();
             case "set" -> {
-                var array = objectMapper.createArrayNode();
+                ArrayNode array = objectMapper.createArrayNode();
                 entry.getValue().forEach(v -> array.add(rawAttribute(v)));
                 yield array;
             }
@@ -225,7 +229,7 @@ public class VerifiedPermissionsTokenService {
                 throw VerifiedPermissionsService.validation("Token claims aren't a JSON object.");
             }
             return claims;
-        } catch (IllegalArgumentException | java.io.IOException e) {
+        } catch (IllegalArgumentException | IOException e) {
             throw VerifiedPermissionsService.validation("Token payload isn't valid base64url JSON.");
         }
     }

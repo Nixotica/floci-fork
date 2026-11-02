@@ -30,10 +30,12 @@ public class MskController {
     private static final String PROVISIONED_CLUSTER_TYPE = "PROVISIONED";
 
     private final MskService mskService;
+    private final MskScramSecretsService mskScramSecretsService;
 
     @Inject
-    public MskController(MskService mskService) {
+    public MskController(MskService mskService, MskScramSecretsService mskScramSecretsService) {
         this.mskService = mskService;
+        this.mskScramSecretsService = mskScramSecretsService;
     }
 
     @POST
@@ -57,14 +59,14 @@ public class MskController {
     @GET
     @Path("/v1/clusters")
     public Response listClusters() {
-        var clusters = mskService.listProvisionedClusters().stream().map(this::toClusterViewV1).toList();
+        List<Map<String, Object>> clusters = mskService.listProvisionedClusters().stream().map(this::toClusterViewV1).toList();
         return Response.ok(Map.of("clusterInfoList", clusters)).build();
     }
 
     @GET
     @Path("/api/v2/clusters")
     public Response listClustersV2() {
-        var clusters = mskService.listClusters().stream().map(this::toClusterViewV2).toList();
+        List<Map<String, Object>> clusters = mskService.listClusters().stream().map(this::toClusterViewV2).toList();
         return Response.ok(Map.of("clusterInfoList", clusters)).build();
     }
 
@@ -96,6 +98,43 @@ public class MskController {
         return Response.ok(Map.of("bootstrapBrokerString", bootstrapBrokers)).build();
     }
 
+    @POST
+    @Path("/v1/clusters/{clusterArn}/scram-secrets")
+    public Response batchAssociateScramSecret(@PathParam("clusterArn") String clusterArn,
+                                              Map<String, Object> request) {
+        List<String> secretArns = request == null ? null
+                : asStringList(request.get("secretArnList"), "secretArnList");
+        List<Map<String, String>> unprocessedScramSecrets =
+                mskScramSecretsService.batchAssociateScramSecret(clusterArn, secretArns);
+        return Response.ok(Map.of("clusterArn", clusterArn, "unprocessedScramSecrets", unprocessedScramSecrets)).build();
+    }
+
+    @GET
+    @Path("/v1/clusters/{clusterArn}/scram-secrets")
+    public Response listScramSecrets(@PathParam("clusterArn") String clusterArn,
+                                     @QueryParam("maxResults") String maxResults,
+                                     @QueryParam("nextToken") String nextToken) {
+        PaginatedResult<String> result = mskScramSecretsService.listScramSecrets(clusterArn,
+                Pagination.parseMaxResults(maxResults, "BadRequestException"), nextToken);
+        Map<String, Object> response = new HashMap<>();
+        response.put("secretArnList", result.items());
+        if (result.nextToken() != null) {
+            response.put("nextToken", result.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    @PATCH
+    @Path("/v1/clusters/{clusterArn}/scram-secrets")
+    public Response batchDisassociateScramSecret(@PathParam("clusterArn") String clusterArn,
+                                                 Map<String, Object> request) {
+        List<String> secretArns = request == null ? null
+                : asStringList(request.get("secretArnList"), "secretArnList");
+        List<Map<String, String>> unprocessedScramSecrets =
+                mskScramSecretsService.batchDisassociateScramSecret(clusterArn, secretArns);
+        return Response.ok(Map.of("clusterArn", clusterArn, "unprocessedScramSecrets", unprocessedScramSecrets)).build();
+    }
+
     // ── Configurations ───────────────────────────────────────────────────────
 
     @POST
@@ -121,7 +160,7 @@ public class MskController {
                                         @QueryParam("nextToken") String nextToken) {
         PaginatedResult<MskConfiguration> result = mskService.listConfigurations(
                 Pagination.parseMaxResults(maxResultsParam, "BadRequestException"), nextToken);
-        var configurations = result.items().stream()
+        List<Map<String, Object>> configurations = result.items().stream()
                 .map(this::toConfigurationView)
                 .toList();
 

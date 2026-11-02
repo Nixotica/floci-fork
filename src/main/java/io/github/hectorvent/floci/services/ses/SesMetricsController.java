@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.ses.model.SentEmail;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -30,9 +32,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
-import static io.github.hectorvent.floci.services.ses.SesV2Json.epochSeconds;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.readOptionBody;
-import static io.github.hectorvent.floci.services.ses.SesV2Json.stringMemberOrAbsent;
 
 /**
  * SES V2 metric data ({@code POST /v2/email/metrics/batch}), the aggregate view of the same stored
@@ -85,6 +85,7 @@ public class SesMetricsController {
         accountService.requireVdmEnabled(region);
 
         JsonNode request = readOptionBody(objectMapper, body);
+        SesV2RequestShapes.check("BatchGetMetricData", request);
         List<JsonNode> queryNodes = requireQueries(request);
         requireUniqueIds(queryNodes);
         requireKnownDimensionNames(queryNodes);
@@ -152,7 +153,7 @@ public class SesMetricsController {
         node.put("Id", query.id());
         ArrayNode timestamps = node.putArray("Timestamps");
         for (Instant timestamp : series.timestamps()) {
-            timestamps.add(epochSeconds(timestamp));
+            timestamps.add(EpochSeconds.fromInstant(timestamp));
         }
         ArrayNode values = node.putArray("Values");
         for (Long value : series.values()) {
@@ -163,11 +164,6 @@ public class SesMetricsController {
 
     private static List<JsonNode> requireQueries(JsonNode request) {
         JsonNode queries = request.path("Queries");
-        // Absent and null fail the list constraint, but a present value of the wrong shape is a
-        // deserialization failure, the same treatment the Dimensions map gets below.
-        if (!queries.isMissingNode() && !queries.isNull() && !queries.isArray()) {
-            throw SesV2Json.unexpectedStartError(queries);
-        }
         if (!queries.isArray() || queries.isEmpty()) {
             throw listConstraint("Member must have length greater than or equal to 1");
         }
@@ -187,7 +183,7 @@ public class SesMetricsController {
     private static void requireUniqueIds(List<JsonNode> queries) {
         Set<String> seen = new LinkedHashSet<>();
         for (JsonNode query : queries) {
-            String id = stringMemberOrAbsent(query, "Id");
+            String id = query.path("Id").textValue();
             if (id != null && !seen.add(id)) {
                 throw new AwsException("BadRequestException",
                         "All queries must have a unique identifier.", 400);
@@ -204,11 +200,6 @@ public class SesMetricsController {
             JsonNode dimensions = query.path("Dimensions");
             if (dimensions.isMissingNode() || dimensions.isNull()) {
                 continue;
-            }
-            // A map member has to be a JSON object: an array or a scalar is a deserialization
-            // failure, not an absent Dimensions that silently drops the filter.
-            if (!dimensions.isObject()) {
-                throw SesV2Json.unexpectedStartError(dimensions);
             }
             Iterator<String> names = dimensions.fieldNames();
             while (names.hasNext()) {
@@ -230,17 +221,17 @@ public class SesMetricsController {
         for (int i = 0; i < queries.size(); i++) {
             JsonNode query = queries.get(i);
             int position = i + 1;
-            String metric = stringMemberOrAbsent(query, "Metric");
+            String metric = query.path("Metric").textValue();
             if (metric == null || !SesMetricData.METRICS.contains(metric)) {
                 violations.add(memberConstraint(position, "metric",
                         "Member must satisfy enum value set: " + METRIC_ENUM));
             }
-            String namespace = stringMemberOrAbsent(query, "Namespace");
+            String namespace = query.path("Namespace").textValue();
             if (namespace == null || !"VDM".equals(namespace)) {
                 violations.add(memberConstraint(position, "namespace",
                         "Member must satisfy enum value set: " + NAMESPACE_ENUM));
             }
-            String id = stringMemberOrAbsent(query, "Id");
+            String id = query.path("Id").textValue();
             if (id == null || id.isEmpty()) {
                 violations.add(memberConstraint(position, "id",
                         "Member must have length greater than or equal to 1"));
@@ -294,8 +285,8 @@ public class SesMetricsController {
                     "Invalid interval, can request at most 60 days. Please partition your "
                             + "requested interval.", 400);
         }
-        return new SesMetricData.Query(stringMemberOrAbsent(query, "Id"),
-                stringMemberOrAbsent(query, "Metric"), dimensions, startDate, endDate);
+        return new SesMetricData.Query(query.path("Id").textValue(),
+                query.path("Metric").textValue(), dimensions, startDate, endDate);
     }
 
     /**
@@ -350,7 +341,8 @@ public class SesMetricsController {
     private static Instant requireTimestamp(JsonNode query, String field, String member, int position) {
         JsonNode node = query.path(field);
         if (node.isMissingNode() || node.isNull()) {
-            throw aggregated(List.of(memberConstraint(position, member, "Member must not be null")));
+            throw aggregated(List.of(
+                    SmithyValidationErrors.notNullWithoutValue("queries." + position + ".member." + member)));
         }
         if (node.isNumber()) {
             try {
@@ -380,10 +372,6 @@ public class SesMetricsController {
     }
 
     private static AwsException aggregated(List<String> violations) {
-        String header = violations.size() == 1
-                ? "1 validation error detected: "
-                : violations.size() + " validation errors detected: ";
-        return new AwsException("BadRequestException",
-                header + String.join("; ", violations), 400);
+        return SmithyValidationErrors.badRequest(violations);
     }
 }

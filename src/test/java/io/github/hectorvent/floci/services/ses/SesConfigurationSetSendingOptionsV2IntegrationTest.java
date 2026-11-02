@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ses;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -26,7 +27,23 @@ class SesConfigurationSetSendingOptionsV2IntegrationTest {
     private static final String SES_AUTH =
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/ses/aws4_request";
     private static final String CS = "cs-sending-options";
-    private static final String SENDER = "sender@example.com";
+    // A sender of its own, verified below: the identity outlives this class, and other SES classes
+    // that share the application create sender@example.com themselves.
+    private static final String SENDER = "cs-sending-options-sender@floci.test";
+
+    @Test
+    @Order(0)
+    void verifySender() {
+        given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", SES_AUTH)
+                .formParam("Action", "VerifyEmailIdentity")
+                .formParam("EmailAddress", SENDER)
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200);
+    }
 
     @Test
     @Order(1)
@@ -193,7 +210,7 @@ class SesConfigurationSetSendingOptionsV2IntegrationTest {
     @Test
     @Order(13)
     void putSendingOptions_stringSendingEnabled_coercesToTrue() {
-        // Real AWS coerces any string to true (200), matching CreateConfigurationSet. Verify the
+        // Real AWS coerces "yes" to true (200), matching CreateConfigurationSet. Verify the
         // persisted value, not just the status — CS was disabled by @Order(12).
         given()
                 .contentType("application/json")
@@ -264,7 +281,7 @@ class SesConfigurationSetSendingOptionsV2IntegrationTest {
                 .body(containsString("boolean must follow xsd1.1 definition"));
     }
 
-    private static io.restassured.response.Response sendEmail(String configSet) {
+    private static Response sendEmail(String configSet) {
         return given()
                 .contentType("application/json")
                 .header("Authorization", SES_AUTH)

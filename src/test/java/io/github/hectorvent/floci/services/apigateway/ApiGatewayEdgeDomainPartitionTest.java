@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -41,7 +42,7 @@ class ApiGatewayEdgeDomainPartitionTest {
                 stores.computeIfAbsent(invocation.getArgument(1, String.class),
                         ignored -> AccountAwareStorageBackend.inMemory("000000000000")));
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(config.services().cloudfront().domainSuffix()).thenReturn("cloudfront.net");
+        when(config.services().cloudfront().domainSuffix()).thenReturn(Optional.empty());
         service = new ApiGatewayService(storageFactory, config, mock(TlsCertificateManager.class),
                 new RegionResolver(GOV_REGION, "000000000000"));
     }
@@ -89,5 +90,14 @@ class ApiGatewayEdgeDomainPartitionTest {
                         "endpointConfiguration", Map.of("types", List.of("EDGE")))));
 
         assertEquals("BadRequestException", error.getErrorCode());
+    }
+
+    /** Without a type the domain is edge-optimized only where the partition has edge. */
+    @Test
+    void aDomainWithoutATypeStaysRegionalWhereThePartitionHasNoCloudFront() {
+        CustomDomain domain = service.createDomainName(GOV_REGION, Map.of("domainName", "default.example.com",
+                "certificateArn", "arn:aws-us-gov:acm:us-gov-west-1:000000000000:certificate/d"));
+
+        assertEquals("REGIONAL", domain.getEndpointConfigurationType());
     }
 }

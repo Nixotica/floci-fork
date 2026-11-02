@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.codeartifact;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
@@ -11,20 +12,25 @@ import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.Publ
 import io.github.hectorvent.floci.services.codeartifact.model.CodeArtifactDomain;
 import io.github.hectorvent.floci.services.codeartifact.model.CodeArtifactPackageVersion;
 import io.github.hectorvent.floci.services.codeartifact.model.CodeArtifactRepository;
+import io.github.hectorvent.floci.services.codeartifact.model.PackageOriginConfig;
 import io.github.hectorvent.floci.testutil.LogCapture;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.logging.LogRecord;
 import java.util.stream.Stream;
 
@@ -57,7 +63,7 @@ class CodeArtifactAssetPersistenceTest {
 
         byte[] content = "hello world, this is the asset payload".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         String json = Files.readString(dir.resolve("codeartifact-package-versions.json"));
         String base64Content = Base64.getEncoder().encodeToString(content);
@@ -72,7 +78,7 @@ class CodeArtifactAssetPersistenceTest {
         first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         PublishPackageVersionResult published = first.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
 
         CodeArtifactService restarted = newService(dir);
         PackageVersionAssetResult result = restarted.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
@@ -80,6 +86,52 @@ class CodeArtifactAssetPersistenceTest {
 
         assertEquals("hello world", new String(result.asset().getContent(), StandardCharsets.UTF_8));
         assertEquals(published.packageVersion().getRevision(), result.packageVersionRevision());
+    }
+
+    /**
+     * The fix for a real finding (hectorvent, PR #5484): {@code containerBackedAssetBytes} used
+     * to be wired through {@code StorageFactory} like every other durable store here, but the
+     * Maven/npm/pypi content it counts lives only in the sidecar containers themselves, which do
+     * not survive a Floci restart either (no volume attached, removed on shutdown; see this
+     * service's own Known limitations doc). A persisted count surviving a restart the content
+     * itself does not would leave a stale total with nothing to ever clean it up.
+     */
+    @Test
+    void containerBackedAssetBytesDoesNotSurviveRestart(@TempDir Path dir) {
+        CodeArtifactService first = newService(dir);
+        first.createDomain(REGION, "dom", null, Map.of());
+        first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        long fence = first.currentContainerBackedPackageFence(REGION, "dom", null, "repo", "maven", "com.example",
+                "my-pkg");
+        first.recordContainerBackedAssetBytes(REGION, "dom", null, "repo", "maven", "com.example", "my-pkg", 4096L,
+                fence);
+        assertEquals(4096L, first.describeDomain(REGION, "dom", null).assetSizeBytes());
+
+        CodeArtifactService restarted = newService(dir);
+
+        assertEquals(0L, restarted.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * {@code packageOriginConfigs} is wired through {@code StorageFactory} the same way
+     * {@code domains}/{@code repositories}/{@code packageVersions} are, but that similarity had
+     * never actually been exercised: this confirms a stored origin configuration, including one
+     * set on a package with no versions at all, actually round-trips through disk rather than only
+     * ever having been read back from the same in-memory instance that wrote it.
+     */
+    @Test
+    void packageOriginConfigurationSurvivesRestart(@TempDir Path dir) {
+        CodeArtifactService first = newService(dir);
+        first.createDomain(REGION, "dom", null, Map.of());
+        first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        first.putPackageOriginConfiguration(REGION, "dom", null, "repo", "generic", "ns", "never-published", "BLOCK",
+                "ALLOW");
+
+        CodeArtifactService restarted = newService(dir);
+        CodeArtifactService.PackageDescription described = restarted.describePackage(REGION, "dom", null, "repo",
+                "generic", "ns", "never-published");
+        assertEquals("BLOCK", described.publishRestriction());
+        assertEquals("ALLOW", described.upstreamRestriction());
     }
 
     /**
@@ -96,11 +148,11 @@ class CodeArtifactAssetPersistenceTest {
         first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         first.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         CodeArtifactService restarted = newService(dir);
         PublishPackageVersionResult result = restarted.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
 
         assertEquals("Unfinished", result.packageVersion().getStatus());
         assertEquals(1, result.packageVersion().getAssets().size());
@@ -113,12 +165,12 @@ class CodeArtifactAssetPersistenceTest {
         first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         first.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         CodeArtifactService restarted = newService(dir);
         byte[] different = "different bytes".getBytes(StandardCharsets.UTF_8);
         AwsException e = assertThrows(AwsException.class, () -> restarted.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", sha256Hex(different), "true", different));
+                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(different), "true", different));
         assertEquals("ConflictException", e.getErrorCode());
         assertEquals("a.txt", e.getExtendedData().get("resourceId"));
     }
@@ -137,7 +189,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Path assetRoot = dir.resolve("codeartifact-assets");
         try (Stream<Path> paths = Files.walk(assetRoot)) {
@@ -147,7 +199,7 @@ class CodeArtifactAssetPersistenceTest {
         }
 
         PublishPackageVersionResult result = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
 
         assertEquals("Unfinished", result.packageVersion().getStatus());
         PackageVersionAssetResult fetched = service.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
@@ -168,7 +220,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         Path assetRoot = dir.resolve("codeartifact-assets");
         try (Stream<Path> paths = Files.walk(assetRoot)) {
@@ -178,7 +230,7 @@ class CodeArtifactAssetPersistenceTest {
         }
 
         PublishPackageVersionResult result = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
 
         assertEquals("Published", result.packageVersion().getStatus());
         PackageVersionAssetResult fetched = service.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
@@ -200,7 +252,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Path assetRoot = dir.resolve("codeartifact-assets");
         try (Stream<Path> paths = Files.walk(assetRoot)) {
@@ -210,7 +262,7 @@ class CodeArtifactAssetPersistenceTest {
         }
 
         PublishPackageVersionResult result = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
 
         assertEquals("Unfinished", result.packageVersion().getStatus());
         PackageVersionAssetResult fetched = service.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
@@ -237,7 +289,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Path assetFile;
         try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
@@ -251,7 +303,7 @@ class CodeArtifactAssetPersistenceTest {
         try {
             List<LogRecord> records = LogCapture.capture(CodeArtifactService.class, () ->
                     service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0",
-                            "a.txt", sha256Hex(content), "true", content));
+                            "a.txt", Digests.sha256Hex(content), "true", content));
 
             assertTrue(records.stream().anyMatch(r -> r.getMessage() != null
                             && r.getMessage().contains("Could not verify")
@@ -288,7 +340,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
         Path assetFile;
         try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
             assetFile = paths.filter(Files::isRegularFile).findFirst().orElseThrow();
@@ -297,7 +349,7 @@ class CodeArtifactAssetPersistenceTest {
         assertNotNull(fileKeyBefore, "test filesystem must support file keys for this identity check to be meaningful");
 
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Object fileKeyAfter = Files.readAttributes(assetFile, BasicFileAttributes.class).fileKey();
         assertEquals(fileKeyBefore, fileKeyAfter, "an intact retry must not replace the backing file");
@@ -310,7 +362,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
         Path assetFile;
         try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
             assetFile = paths.filter(Files::isRegularFile).findFirst().orElseThrow();
@@ -319,7 +371,7 @@ class CodeArtifactAssetPersistenceTest {
         assertNotNull(fileKeyBefore, "test filesystem must support file keys for this identity check to be meaningful");
 
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         Object fileKeyAfter = Files.readAttributes(assetFile, BasicFileAttributes.class).fileKey();
         assertEquals(fileKeyBefore, fileKeyAfter, "an intact retry must not replace the backing file");
@@ -339,7 +391,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Path assetRoot = dir.resolve("codeartifact-assets");
         try (Stream<Path> paths = Files.walk(assetRoot)) {
@@ -350,9 +402,204 @@ class CodeArtifactAssetPersistenceTest {
 
         byte[] different = "different content".getBytes(StandardCharsets.UTF_8);
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", sha256Hex(different), "true", different));
+                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(different), "true", different));
         assertEquals("ConflictException", e.getErrorCode());
         assertEquals("a.txt", e.getExtendedData().get("resourceId"));
+    }
+
+    /**
+     * {@code deletePackage} removes a version's metadata record before it attempts to clean up
+     * that version's asset bytes, specifically so a cleanup failure on one asset never leaves the
+     * record in place pointing at bytes that may now be missing. A {@link DirectoryNotEmptyException}
+     * forced on one asset's path stands in for the failure here, since it is deterministic and
+     * platform-independent (unlike a permission trick, which a root-run CI container would ignore).
+     * The other asset in the same version must still get cleaned up, and the failure must be logged
+     * rather than silently swallowed, the same way {@code republishingWithMatchingContentRepairsAnUnreadableBackingFileAndLogsAWarning}
+     * above asserts on the real log record rather than trusting that the behavior exists.
+     */
+    @Test
+    void deletingAnAssetsBytesFailingStillRemovesTheVersionRecordAndCleansUpTheOtherAsset(@TempDir Path dir)
+            throws IOException {
+        CodeArtifactService service = newService(dir);
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        byte[] contentA = "content of a".getBytes(StandardCharsets.UTF_8);
+        byte[] contentB = "content of b".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(contentA), "true", contentA);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "b.txt",
+                Digests.sha256Hex(contentB), "true", contentB);
+
+        Path assetFileA;
+        Path assetFileB;
+        try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
+            List<Path> files = paths.filter(Files::isRegularFile).toList();
+            assetFileA = files.stream().filter(p -> matchesContent(p, contentA)).findFirst().orElseThrow();
+            assetFileB = files.stream().filter(p -> matchesContent(p, contentB)).findFirst().orElseThrow();
+        }
+        Files.delete(assetFileB);
+        Files.createDirectory(assetFileB);
+        Files.createFile(assetFileB.resolve("not-empty"));
+
+        List<LogRecord> records = LogCapture.capture(CodeArtifactService.class, () ->
+                service.deletePackage(REGION, "dom", null, "repo", "generic", "ns", "my-pkg"));
+
+        assertTrue(records.stream().anyMatch(r -> r.getMessage() != null
+                        && r.getMessage().contains("Could not delete CodeArtifact asset file")
+                        && r.getThrown() instanceof UncheckedIOException
+                        && r.getThrown().getCause() instanceof DirectoryNotEmptyException),
+                "expected a warning logging the failed asset cleanup, got: " + records);
+        assertFalse(Files.exists(assetFileA), "the other asset's bytes must still be cleaned up");
+
+        AwsException gone = assertThrows(AwsException.class, () -> service.getPackageVersionAsset(REGION, "dom",
+                null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt", null));
+        assertEquals("ResourceNotFoundException", gone.getErrorCode());
+    }
+
+    /**
+     * Qodo review finding on the PR that added {@code DisposePackageVersions}: unlike {@code
+     * deletePackage} (whose version record is already gone by the time its own best-effort asset
+     * cleanup runs, so a failure there can never be reached again), a disposed version's record
+     * is kept around: {@code DescribePackageVersion} must keep answering for it. The dispose path
+     * used to catch and log a failed delete the same way {@code deletePackage} does, then still
+     * mark the version Disposed and clear its asset map regardless, permanently orphaning bytes
+     * that record could no longer point back to. The same {@link DirectoryNotEmptyException} trick
+     * as {@link #deletingAnAssetsBytesFailingStillRemovesTheVersionRecordAndCleansUpTheOtherAsset}
+     * forces a real delete failure.
+     *
+     * <p>Raised again by Greptile's review: this now also proves the status write itself runs
+     * <em>before</em> the delete, not after (see {@code applyGenericStatusChange}'s own javadoc).
+     * The version reads {@code Disposed} (blocking downloads immediately) rather than staying
+     * {@code Published} with a broken asset still reachable, even though this one real asset's
+     * own delete never actually succeeded.
+     */
+    @Test
+    void disposePackageVersionsPropagatesAFailedAssetDeletionInsteadOfReportingSuccess(@TempDir Path dir)
+            throws IOException {
+        CodeArtifactService service = newService(dir);
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        byte[] content = "v1".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(content), "false", content);
+
+        Path assetFile;
+        try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
+            assetFile = paths.filter(Files::isRegularFile).filter(p -> matchesContent(p, content))
+                    .findFirst().orElseThrow();
+        }
+        Files.delete(assetFile);
+        Files.createDirectory(assetFile);
+        Files.createFile(assetFile.resolve("not-empty"));
+
+        UncheckedIOException e = assertThrows(UncheckedIOException.class, () -> service.disposePackageVersions(
+                REGION, "dom", null, "repo", "generic", "ns", "pkg", List.of("1.0.0"), null, null));
+        assertTrue(e.getCause() instanceof DirectoryNotEmptyException, "expected the real delete failure to "
+                + "propagate rather than being swallowed, got cause: " + e.getCause());
+
+        CodeArtifactPackageVersion pv = service.describePackageVersion(REGION, "dom", null, "repo", "generic", "ns",
+                "pkg", "1.0.0");
+        assertEquals("Disposed", pv.getStatus(), "the status write runs before the delete, so a failed delete "
+                + "must still leave the version blocked rather than reading as the untouched Published it no "
+                + "longer really is");
+        assertEquals(1, pv.getAssets().size(), "the one asset whose own delete failed is never removed from the "
+                + "record (only a successfully deleted asset is), but is still unreachable through downloads "
+                + "now that the version itself reads Disposed");
+        AwsException blocked = assertThrows(AwsException.class, () -> service.getPackageVersionAsset(REGION, "dom",
+                null, "repo", "generic", "ns", "pkg", "1.0.0", "a.txt", null));
+        assertEquals("ResourceNotFoundException", blocked.getErrorCode());
+    }
+
+    /**
+     * Raised by Greptile's review: proves the per-asset bookkeeping, not just the upfront status
+     * write above. With two assets, one whose delete succeeds and one whose delete then fails,
+     * the record must name only the one that genuinely never got deleted, not the one already
+     * gone, so a retry (now let through for an already-{@code Disposed} version, see {@code
+     * checkStatusTransitionAllowed}'s own javadoc) picks up exactly where this attempt stopped.
+     */
+    @Test
+    void disposePackageVersionsRemovesEachAssetFromTheRecordRightAfterItsOwnSuccessfulDelete(@TempDir Path dir)
+            throws IOException {
+        CodeArtifactService service = newService(dir);
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        byte[] contentA = "content of a".getBytes(StandardCharsets.UTF_8);
+        byte[] contentB = "content of b".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(contentA), "true", contentA);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "b.txt",
+                Digests.sha256Hex(contentB), "true", contentB);
+
+        Path assetFileA;
+        Path assetFileB;
+        try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
+            List<Path> files = paths.filter(Files::isRegularFile).toList();
+            assetFileA = files.stream().filter(p -> matchesContent(p, contentA)).findFirst().orElseThrow();
+            assetFileB = files.stream().filter(p -> matchesContent(p, contentB)).findFirst().orElseThrow();
+        }
+        Files.delete(assetFileB);
+        Files.createDirectory(assetFileB);
+        Files.createFile(assetFileB.resolve("not-empty"));
+
+        assertThrows(UncheckedIOException.class, () -> service.disposePackageVersions(REGION, "dom", null, "repo",
+                "generic", "ns", "my-pkg", List.of("1.0.0"), null, null));
+
+        assertFalse(Files.exists(assetFileA), "the asset whose own delete succeeded must still be gone");
+        CodeArtifactPackageVersion pv = service.describePackageVersion(REGION, "dom", null, "repo", "generic", "ns",
+                "my-pkg", "1.0.0");
+        assertEquals("Disposed", pv.getStatus());
+        assertEquals(Set.of("b.txt"), pv.getAssets().keySet(), "only the asset whose delete never actually "
+                + "succeeded should still be named in the record");
+    }
+
+    private static boolean matchesContent(Path file, byte[] expected) {
+        try {
+            return Arrays.equals(Files.readAllBytes(file), expected);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Found by Qodo review: {@code copyPackageVersions} used to read and write each version's
+     * assets inline inside its own commit loop, so a later version's corrupted source bytes
+     * would be discovered only after an earlier, otherwise-valid version in the same batch was
+     * already committed to the destination, the per-call all-or-nothing contract AWS documents
+     * for the caller-visible failure codes, silently broken for this emulator-internal one.
+     * Every pending version's source assets are now verified against their persisted hashes
+     * before any version in the batch has anything written to the destination at all.
+     */
+    @Test
+    void copyPackageVersionsVerifiesEveryPendingVersionBeforeCommittingAnyOfThem(@TempDir Path dir)
+            throws IOException {
+        CodeArtifactService service = newService(dir);
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        byte[] contentGood = "version one, intact".getBytes(StandardCharsets.UTF_8);
+        byte[] contentBad = "version two, about to be corrupted".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "src", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(contentGood), "false", contentGood);
+        service.publishPackageVersion(REGION, "dom", null, "src", "generic", "ns", "my-pkg", "2.0.0", "a.txt",
+                Digests.sha256Hex(contentBad), "false", contentBad);
+
+        Path corruptedFile;
+        try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
+            corruptedFile = paths.filter(Files::isRegularFile)
+                    .filter(p -> matchesContent(p, contentBad))
+                    .findFirst().orElseThrow();
+        }
+        Files.write(corruptedFile, "corrupted on disk".getBytes(StandardCharsets.UTF_8));
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0", "2.0.0"), null, false, false));
+        assertEquals("InternalServerException", e.getErrorCode());
+
+        AwsException notCopied = assertThrows(AwsException.class, () -> service.describePackageVersion(REGION,
+                "dom", null, "dst", "generic", "ns", "my-pkg", "1.0.0"));
+        assertEquals("ResourceNotFoundException", notCopied.getErrorCode(),
+                "version 1.0.0 was valid on its own, but must not have been committed ahead of the batch "
+                        + "discovering version 2.0.0's corrupted bytes");
     }
 
     @Test
@@ -365,7 +612,7 @@ class CodeArtifactAssetPersistenceTest {
         for (String name : names) {
             byte[] content = ("content of " + name).getBytes(StandardCharsets.UTF_8);
             service.publishPackageVersion(REGION, "dom", null, "repo", "generic", longToken, longToken, longToken,
-                    name, sha256Hex(content), "true", content);
+                    name, Digests.sha256Hex(content), "true", content);
         }
 
         CodeArtifactService restarted = newService(dir);
@@ -383,6 +630,8 @@ class CodeArtifactAssetPersistenceTest {
                 "codeartifact-repositories.json", new TypeReference<Map<String, CodeArtifactRepository>>() {});
         AccountAwareStorageBackend<CodeArtifactPackageVersion> packageVersionStore = accountAware(dir,
                 "codeartifact-package-versions.json", new TypeReference<Map<String, CodeArtifactPackageVersion>>() {});
+        AccountAwareStorageBackend<PackageOriginConfig> packageOriginConfigStore = accountAware(dir,
+                "codeartifact-package-origin-configs.json", new TypeReference<Map<String, PackageOriginConfig>>() {});
 
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn(ACCOUNT_ID);
@@ -393,21 +642,14 @@ class CodeArtifactAssetPersistenceTest {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
 
-        return new CodeArtifactService(domainStore, repoStore, packageVersionStore, regionResolver, config,
-                false, dir.resolve("codeartifact-assets"), new CodeArtifactSidecarRegistry(List.of()));
+        return new CodeArtifactService(domainStore, repoStore, packageVersionStore, packageOriginConfigStore,
+                regionResolver, config, false, dir.resolve("codeartifact-assets"),
+                new CodeArtifactSidecarRegistry(List.of()));
     }
 
     private <V> AccountAwareStorageBackend<V> accountAware(Path dir, String fileName, TypeReference<Map<String, V>> type) {
         PersistentStorage<String, V> backend = new PersistentStorage<>(dir.resolve(fileName), type);
         backend.load();
         return new AccountAwareStorageBackend<>(backend, null, ACCOUNT_ID);
-    }
-
-    private static String sha256Hex(byte[] content) {
-        try {
-            return io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator.sha256Hex(content);
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
     }
 }

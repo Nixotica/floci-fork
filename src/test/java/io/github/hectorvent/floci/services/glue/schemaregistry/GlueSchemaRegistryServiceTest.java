@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.glue.schemaregistry;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.glue.schemaregistry.model.MetadataInfo;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.Registry;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.RegistryId;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.Schema;
@@ -13,6 +14,7 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -172,8 +174,8 @@ class GlueSchemaRegistryServiceTest {
         service.createRegistry("b", null, null, REGION);
         service.createRegistry("c", null, null, REGION);
 
-        var first = service.listRegistries(2, null);
-        var second = service.listRegistries(2, first.nextToken());
+        GlueSchemaRegistryService.Page<Registry> first = service.listRegistries(2, null);
+        GlueSchemaRegistryService.Page<Registry> second = service.listRegistries(2, first.nextToken());
 
         assertEquals(2, first.items().size());
         assertEquals("2", first.nextToken());
@@ -190,7 +192,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void updateRegistryChangesDescriptionAndUpdatedTime() throws InterruptedException {
         service.createRegistry("r1", "old", null, REGION);
-        java.time.Instant beforeTime = service.getRegistry(new RegistryId("r1", null), REGION).getUpdatedTime();
+        Instant beforeTime = service.getRegistry(new RegistryId("r1", null), REGION).getUpdatedTime();
         Thread.sleep(10);
 
         Registry updated = service.updateRegistry(new RegistryId("r1", null), "new", REGION);
@@ -214,7 +216,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void deleteRegistryCascadesToSchemasVersionsAndMetadata() {
         service.createRegistry("r1", null, null, REGION);
-        var first = service.createSchema(new RegistryId("r1", null),
+        SchemaVersion first = service.createSchema(new RegistryId("r1", null),
                 "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).firstVersion();
         service.putSchemaVersionMetadata(first.getSchemaVersionId(), "team", "platform");
 
@@ -270,7 +272,7 @@ class GlueSchemaRegistryServiceTest {
     void createSchemaCreatesV1AndReturnsAvailable() {
         preCreateRegistry();
 
-        var result = service.createSchema(new RegistryId("reg", null),
+        GlueSchemaRegistryService.SchemaWithFirstVersion result = service.createSchema(new RegistryId("reg", null),
                 "users", "AVRO", "BACKWARD", "desc", AVRO_V1, null, REGION);
 
         Schema schema = result.schema();
@@ -290,7 +292,7 @@ class GlueSchemaRegistryServiceTest {
 
     @Test
     void createSchemaWithoutRegistryAutoCreatesDefaultRegistry() {
-        var result = service.createSchema(null, "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION);
+        GlueSchemaRegistryService.SchemaWithFirstVersion result = service.createSchema(null, "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION);
 
         assertEquals("default-registry", result.schema().getRegistryName());
     }
@@ -298,7 +300,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void createSchemaDefaultsToBackwardWhenCompatibilityOmitted() {
         preCreateRegistry();
-        var result = service.createSchema(new RegistryId("reg", null),
+        GlueSchemaRegistryService.SchemaWithFirstVersion result = service.createSchema(new RegistryId("reg", null),
                 "s1", "AVRO", null, null, AVRO_V1, null, REGION);
 
         assertEquals("BACKWARD", result.schema().getCompatibility());
@@ -381,7 +383,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void registerSchemaVersionDuplicateDefinitionReturnsExistingId() {
         preCreateRegistry();
-        var v1 = service.createSchema(new RegistryId("reg", null),
+        SchemaVersion v1 = service.createSchema(new RegistryId("reg", null),
                 "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).firstVersion();
 
         SchemaVersion same = service.registerSchemaVersion(
@@ -721,7 +723,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void getSchemaVersionByLatest() {
         preCreateRegistry();
-        var first = service.createSchema(new RegistryId("reg", null),
+        SchemaVersion first = service.createSchema(new RegistryId("reg", null),
                 "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).firstVersion();
         SchemaVersion v2 = service.registerSchemaVersion(
                 new SchemaId("reg", "users", null), AVRO_V2_BACKWARD_OK, REGION);
@@ -751,7 +753,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void getSchemaVersionByVersionId() {
         preCreateRegistry();
-        var first = service.createSchema(new RegistryId("reg", null),
+        SchemaVersion first = service.createSchema(new RegistryId("reg", null),
                 "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).firstVersion();
 
         SchemaVersion fetched = service.getSchemaVersion(
@@ -774,7 +776,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void getSchemaByDefinitionFindsExisting() {
         preCreateRegistry();
-        var first = service.createSchema(new RegistryId("reg", null),
+        SchemaVersion first = service.createSchema(new RegistryId("reg", null),
                 "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).firstVersion();
 
         SchemaVersion found = service.getSchemaByDefinition(
@@ -786,7 +788,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void getSchemaByDefinitionMatchesDespiteWhitespace() {
         preCreateRegistry();
-        var first = service.createSchema(new RegistryId("reg", null),
+        SchemaVersion first = service.createSchema(new RegistryId("reg", null),
                 "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).firstVersion();
 
         // Same Avro schema but with extra whitespace
@@ -812,7 +814,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void getSchemaByArnRoundTrips() {
         preCreateRegistry();
-        var result = service.createSchema(new RegistryId("reg", null),
+        GlueSchemaRegistryService.SchemaWithFirstVersion result = service.createSchema(new RegistryId("reg", null),
                 "users", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION);
 
         Schema fetched = service.getSchema(
@@ -860,8 +862,8 @@ class GlueSchemaRegistryServiceTest {
         service.createSchema(new RegistryId("reg", null), "b", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION);
         service.createSchema(new RegistryId("reg", null), "c", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION);
 
-        var first = service.listSchemas(new RegistryId("reg", null), REGION, 2, null);
-        var second = service.listSchemas(new RegistryId("reg", null), REGION, 2, first.nextToken());
+        GlueSchemaRegistryService.Page<Schema> first = service.listSchemas(new RegistryId("reg", null), REGION, 2, null);
+        GlueSchemaRegistryService.Page<Schema> second = service.listSchemas(new RegistryId("reg", null), REGION, 2, first.nextToken());
 
         assertEquals(2, first.items().size());
         assertEquals("2", first.nextToken());
@@ -929,8 +931,8 @@ class GlueSchemaRegistryServiceTest {
         service.registerSchemaVersion(new SchemaId("reg", "a", null),
                 AVRO_V2_BACKWARD_OK.replace("email", "phone"), REGION);
 
-        var first = service.listSchemaVersions(new SchemaId("reg", "a", null), REGION, 2, null);
-        var second = service.listSchemaVersions(new SchemaId("reg", "a", null), REGION, 2, first.nextToken());
+        GlueSchemaRegistryService.Page<SchemaVersion> first = service.listSchemaVersions(new SchemaId("reg", "a", null), REGION, 2, null);
+        GlueSchemaRegistryService.Page<SchemaVersion> second = service.listSchemaVersions(new SchemaId("reg", "a", null), REGION, 2, first.nextToken());
 
         assertEquals(2, first.items().size());
         assertEquals("2", first.nextToken());
@@ -941,7 +943,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void deleteSchemaCascadesToVersions() {
         preCreateRegistry();
-        var first = service.createSchema(new RegistryId("reg", null),
+        SchemaVersion first = service.createSchema(new RegistryId("reg", null),
                 "a", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).firstVersion();
 
         service.deleteSchema(new SchemaId("reg", "a", null), REGION);
@@ -961,7 +963,7 @@ class GlueSchemaRegistryServiceTest {
         service.registerSchemaVersion(new SchemaId("reg", "a", null), AVRO_V2_BACKWARD_OK, REGION);
         service.updateSchema(new SchemaId("reg", "a", null), null, null, 2L, REGION);
 
-        var results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1", REGION);
+        List<GlueSchemaRegistryService.VersionDeletionResult> results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1", REGION);
         assertEquals(1, results.size());
         assertNull(results.get(0).errorCode());
 
@@ -979,7 +981,7 @@ class GlueSchemaRegistryServiceTest {
                 AVRO_V2_BACKWARD_OK.replace("email", "phone"), REGION);
         service.updateSchema(new SchemaId("reg", "a", null), null, null, 3L, REGION);
 
-        var results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1-2", REGION);
+        List<GlueSchemaRegistryService.VersionDeletionResult> results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1-2", REGION);
         assertEquals(2, results.size());
         assertEquals(1, service.listSchemaVersions(new SchemaId("reg", "a", null), REGION).size());
     }
@@ -990,7 +992,7 @@ class GlueSchemaRegistryServiceTest {
         service.createSchema(new RegistryId("reg", null), "a", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION);
         service.registerSchemaVersion(new SchemaId("reg", "a", null), AVRO_V2_BACKWARD_OK, REGION);
 
-        var results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1", REGION);
+        List<GlueSchemaRegistryService.VersionDeletionResult> results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1", REGION);
 
         assertEquals(1, results.size());
         assertEquals(1L, results.get(0).versionNumber());
@@ -1025,7 +1027,7 @@ class GlueSchemaRegistryServiceTest {
         preCreateRegistry();
         service.createSchema(new RegistryId("reg", null), "a", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION);
 
-        var results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1-25", REGION);
+        List<GlueSchemaRegistryService.VersionDeletionResult> results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1-25", REGION);
 
         assertEquals(25, results.size());
     }
@@ -1035,7 +1037,7 @@ class GlueSchemaRegistryServiceTest {
         preCreateRegistry();
         service.createSchema(new RegistryId("reg", null), "a", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION);
 
-        var results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1,99", REGION);
+        List<GlueSchemaRegistryService.VersionDeletionResult> results = service.deleteSchemaVersions(new SchemaId("reg", "a", null), "1,99", REGION);
         assertEquals(2, results.size());
         // Version 1 is the latest and only — cannot delete (latest constraint).
         assertEquals(99L, results.get(1).versionNumber());
@@ -1064,14 +1066,14 @@ class GlueSchemaRegistryServiceTest {
 
     @Test
     void checkSchemaVersionValidityForValidAvro() {
-        var r = service.checkSchemaVersionValidity("AVRO", AVRO_V1);
+        GlueSchemaRegistryService.CheckValidityResult r = service.checkSchemaVersionValidity("AVRO", AVRO_V1);
         assertTrue(r.valid());
         assertNull(r.error());
     }
 
     @Test
     void checkSchemaVersionValidityForInvalidAvro() {
-        var r = service.checkSchemaVersionValidity("AVRO", "{not-valid-avro");
+        GlueSchemaRegistryService.CheckValidityResult r = service.checkSchemaVersionValidity("AVRO", "{not-valid-avro");
         assertFalse(r.valid());
         assertNotNull(r.error());
     }
@@ -1095,11 +1097,11 @@ class GlueSchemaRegistryServiceTest {
     void putSchemaVersionMetadataStoresKeyValue() {
         String svId = firstVersionId();
 
-        var r = service.putSchemaVersionMetadata(svId, "team", "platform");
+        GlueSchemaRegistryService.MetadataPutResult r = service.putSchemaVersionMetadata(svId, "team", "platform");
 
         assertEquals("team", r.metadataKey());
         assertEquals("platform", r.metadataValue());
-        var map = service.querySchemaVersionMetadata(svId, null);
+        Map<String, MetadataInfo> map = service.querySchemaVersionMetadata(svId, null);
         assertEquals("platform", map.get("team").getMetadataValue());
     }
 
@@ -1120,7 +1122,7 @@ class GlueSchemaRegistryServiceTest {
 
         service.putSchemaVersionMetadata(svId, "team", "data");
 
-        var map = service.querySchemaVersionMetadata(svId, null);
+        Map<String, MetadataInfo> map = service.querySchemaVersionMetadata(svId, null);
         assertEquals("data", map.get("team").getMetadataValue());
         assertEquals(1, map.get("team").getOtherMetadataValueList().size());
         assertEquals("platform", map.get("team").getOtherMetadataValueList().get(0).getMetadataValue());
@@ -1141,7 +1143,7 @@ class GlueSchemaRegistryServiceTest {
 
         service.removeSchemaVersionMetadata(svId, "team", "data");
 
-        var map = service.querySchemaVersionMetadata(svId, null);
+        Map<String, MetadataInfo> map = service.querySchemaVersionMetadata(svId, null);
         assertEquals("platform", map.get("team").getMetadataValue());
         assertNull(map.get("team").getOtherMetadataValueList());
     }
@@ -1170,7 +1172,7 @@ class GlueSchemaRegistryServiceTest {
         service.putSchemaVersionMetadata(svId, "team", "platform");
         service.putSchemaVersionMetadata(svId, "owner", "alice");
 
-        var filtered = service.querySchemaVersionMetadata(svId,
+        Map<String, MetadataInfo> filtered = service.querySchemaVersionMetadata(svId,
                 List.of(new GlueSchemaRegistryService.MetadataKeyValueFilter("team", null)));
 
         assertEquals(1, filtered.size());
@@ -1180,7 +1182,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void deletingSchemaVersionRemovesMetadata() {
         preCreateRegistry();
-        var first = service.createSchema(new RegistryId("reg", null),
+        SchemaVersion first = service.createSchema(new RegistryId("reg", null),
                 "a", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).firstVersion();
         service.registerSchemaVersion(new SchemaId("reg", "a", null), AVRO_V2_BACKWARD_OK, REGION);
         service.updateSchema(new SchemaId("reg", "a", null), null, null, 2L, REGION);
@@ -1207,7 +1209,7 @@ class GlueSchemaRegistryServiceTest {
     @Test
     void tagAndGetTagsForSchema() {
         preCreateRegistry();
-        var schema = service.createSchema(new RegistryId("reg", null),
+        Schema schema = service.createSchema(new RegistryId("reg", null),
                 "a", "AVRO", "BACKWARD", null, AVRO_V1, null, REGION).schema();
 
         service.tagResource(schema.getSchemaArn(), Map.of("owner", "alice"));

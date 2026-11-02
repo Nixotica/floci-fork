@@ -33,6 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -590,15 +591,15 @@ public class VerifiedPermissionsService implements Resettable {
             }
             ObjectNode cognito = source.deepCopy();
             String arn = requiredText(cognito, "userPoolArn");
-            String[] arnParts = arn.split(":", 6);
-            if (arnParts.length != 6 || !"cognito-idp".equals(arnParts[2]) || !arnParts[5].startsWith("userpool/")) {
+            if (!AwsArnUtils.isArnFor(arn, "cognito-idp") || !AwsArnUtils.parse(arn).resource().startsWith("userpool/")) {
                 throw validation("userPoolArn must be a Cognito user pool ARN.");
             }
-            if (!region.equals(arnParts[3])) {
+            AwsArnUtils.Arn poolArn = AwsArnUtils.parse(arn);
+            if (!region.equals(poolArn.region())) {
                 throw validation("The Cognito user pool must be in the same Region as the policy store.");
             }
-            String poolId = arnParts[5].substring("userpool/".length());
-            cognito.put("issuer", "https://" + AwsEndpoints.host("cognito-idp", arnParts[3]) + "/" + poolId);
+            String poolId = poolArn.resource().substring("userpool/".length());
+            cognito.put("issuer", "https://" + AwsEndpoints.host("cognito-idp", poolArn.region()) + "/" + poolId);
             validateStringArray(cognito.get("clientIds"), "clientIds", 0, 1000);
             JsonNode group = cognito.get("groupConfiguration");
             if (group != null && !group.isNull()) {
@@ -740,7 +741,7 @@ public class VerifiedPermissionsService implements Resettable {
     private String requestFingerprint(JsonNode request) {
         JsonNode copy = request.deepCopy();
         if (copy.isObject()) {
-            ((com.fasterxml.jackson.databind.node.ObjectNode) copy).remove("clientToken");
+            ((ObjectNode) copy).remove("clientToken");
         }
         try {
             return canonical(copy);
@@ -751,11 +752,11 @@ public class VerifiedPermissionsService implements Resettable {
 
     private String canonical(JsonNode node) throws JsonProcessingException {
         if (node.isObject()) {
-            java.util.TreeMap<String, JsonNode> sorted = new java.util.TreeMap<>();
+            TreeMap<String, JsonNode> sorted = new TreeMap<>();
             node.fields().forEachRemaining(e -> sorted.put(e.getKey(), e.getValue()));
             StringBuilder b = new StringBuilder("{");
             boolean first = true;
-            for (var e : sorted.entrySet()) {
+            for (Map.Entry<String, JsonNode> e : sorted.entrySet()) {
                 if (!first) {
                     b.append(',');
                 }
@@ -1060,8 +1061,14 @@ public class VerifiedPermissionsService implements Resettable {
                 .forEach(a -> aliases.delete(aliasKey(region, a.aliasName())));
     }
 
+    /**
+     * A policy store's ARN carries no Region, as AWS gives it
+     * ({@code arn:aws:verifiedpermissions::123456789012:policy-store/PSEXAMPLEabcdefg111111}), in the partition of the
+     * Region the store is in.
+     */
     private String storeArn(String region, String id) {
-        return AwsArnUtils.Arn.of("verifiedpermissions", region, regionResolver.getAccountId(), "policy-store/" + id).toString();
+        return AwsArnUtils.Arn.global(regionResolver.partitionForRegion(region), "verifiedpermissions",
+                regionResolver.getAccountId(), "policy-store/" + id).toString();
     }
 
     private String aliasArn(String region, String aliasName) {
@@ -1077,7 +1084,7 @@ public class VerifiedPermissionsService implements Resettable {
             if (node == null || !node.isObject()) {
                 throw validation("The Cedar schema must be a JSON object.");
             }
-        } catch (io.github.hectorvent.floci.core.common.AwsException e) {
+        } catch (AwsException e) {
             throw e;
         } catch (Exception e) {
             throw validation("The Cedar schema is invalid: " + safeMessage(e));
@@ -1106,7 +1113,7 @@ public class VerifiedPermissionsService implements Resettable {
         if (tags.size() > MAX_TAGS) {
             throw validation("A resource can have at most 200 tags.");
         }
-        for (var tag : tags.entrySet()) {
+        for (Map.Entry<String, String> tag : tags.entrySet()) {
             if (tag.getKey() == null || tag.getKey().isEmpty() || tag.getKey().length() > 128 || tag.getValue().length() > 256) {
                 throw validation("A tag doesn't satisfy the required length constraints.");
             }

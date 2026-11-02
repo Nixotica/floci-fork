@@ -6,6 +6,7 @@ import software.amazon.awssdk.services.cloudformation.model.*;
 import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.lambda.model.GetEventSourceMappingResponse;
 import software.amazon.awssdk.services.lambda.model.ListEventSourceMappingsResponse;
+import software.amazon.awssdk.services.lambda.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.sqs.SqsClient;
 
 import java.util.List;
@@ -25,9 +26,8 @@ class CloudFormationEventSourceMappingTest {
     private static final String STACK_NAME = "compat-cfn-esm-stack";
     private static final String FUNC_NAME  = "compat-cfn-esm-func";
     private static final String QUEUE_NAME = "compat-cfn-esm-queue";
-    private static final String ROLE       = "arn:aws:iam::000000000000:role/cfn-lambda-role";
+    private static final String ROLE       = TestFixtures.globalArn("iam", "000000000000", "role/cfn-lambda-role");
     private static final String ACCOUNT    = "000000000000";
-    private static final String REGION     = "us-east-1";
 
     private static final String DDB_STACK_NAME = "compat-cfn-esm-ddb-stack";
     private static final String DDB_FUNC_NAME  = "compat-cfn-esm-ddb-func";
@@ -186,7 +186,7 @@ class CloudFormationEventSourceMappingTest {
         assertThat(esm.bisectBatchOnFunctionError()).isTrue();
         assertThat(esm.destinationConfig()).isNotNull();
         assertThat(esm.destinationConfig().onFailure().destination())
-                .isEqualTo("arn:aws:sqs:" + REGION + ":" + ACCOUNT + ":" + DLQ_NAME);
+                .isEqualTo(TestFixtures.arn("sqs", ACCOUNT, DLQ_NAME));
     }
 
     @Test
@@ -221,7 +221,7 @@ class CloudFormationEventSourceMappingTest {
         waitForDeleted(STACK_NAME, 30);
 
         assertThatThrownBy(() -> lambda.getEventSourceMapping(r -> r.uuid(esmUuid)))
-                .isInstanceOf(software.amazon.awssdk.services.lambda.model.ResourceNotFoundException.class);
+                .isInstanceOf(ResourceNotFoundException.class);
     }
 
     private static String sqsStackTemplate(String esmOptions) {

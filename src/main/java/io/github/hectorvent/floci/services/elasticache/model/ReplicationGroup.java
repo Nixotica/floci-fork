@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.elasticache.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -21,7 +23,15 @@ public class ReplicationGroup {
     private Instant createdAt;
     private int proxyPort;
     private String authToken; // stored plain-text for PASSWORD auth validation in the proxy
+    /**
+     * Set once the auth mode stops telling: a group whose last user group was removed has no
+     * access control but is still encrypted in transit. Null otherwise, see {@link #isEncryptedInTransit}.
+     */
+    private Boolean transitEncryptionEnabled;
+    private String transitEncryptionMode;
+    /** Users associated directly by user id, which Floci accepted before it modelled user groups. */
     private Set<String> associatedUserIds = new HashSet<>();
+    private Set<String> userGroupIds = new LinkedHashSet<>();
     private String arn;
     private String region;
     private boolean atRestEncryptionEnabled;
@@ -38,6 +48,7 @@ public class ReplicationGroup {
     private String cacheNodeType;
     private String cacheParameterGroupName;
     private String cacheSubnetGroupName;
+    private List<String> securityGroupIds = new ArrayList<>();
     private boolean automaticFailoverEnabled;
     private boolean multiAzEnabled;
     private List<ClusterNode> clusterNodes = new ArrayList<>();
@@ -85,9 +96,36 @@ public class ReplicationGroup {
     public String getAuthToken() { return authToken; }
     public void setAuthToken(String authToken) { this.authToken = authToken; }
 
+    public String getTransitEncryptionMode() { return transitEncryptionMode; }
+    public void setTransitEncryptionMode(String transitEncryptionMode) { this.transitEncryptionMode = transitEncryptionMode; }
+
+    public Boolean getTransitEncryptionEnabled() { return transitEncryptionEnabled; }
+    public void setTransitEncryptionEnabled(Boolean transitEncryptionEnabled) {
+        this.transitEncryptionEnabled = transitEncryptionEnabled;
+    }
+
+    /** An auth token or IAM authentication implies encryption in transit, which Floci records as the auth mode. */
+    @JsonIgnore
+    public boolean isEncryptedInTransit() {
+        return transitEncryptionEnabled != null ? transitEncryptionEnabled : authMode != AuthMode.NO_AUTH;
+    }
+
+    /** An encrypted group takes TLS only unless its mode is preferred, the mode clients migrate to TLS under. */
+    public TransitEncryption transitEncryption() {
+        if (!isEncryptedInTransit()) {
+            return TransitEncryption.NONE;
+        }
+        return "preferred".equals(transitEncryptionMode) ? TransitEncryption.PREFERRED : TransitEncryption.REQUIRED;
+    }
+
     public Set<String> getAssociatedUserIds() { return associatedUserIds; }
     public void setAssociatedUserIds(Set<String> associatedUserIds) {
         this.associatedUserIds = associatedUserIds != null ? associatedUserIds : new HashSet<>();
+    }
+
+    public Set<String> getUserGroupIds() { return userGroupIds; }
+    public void setUserGroupIds(Set<String> userGroupIds) {
+        this.userGroupIds = userGroupIds != null ? userGroupIds : new LinkedHashSet<>();
     }
 
     public String getContainerId() { return containerId; }
@@ -156,5 +194,10 @@ public class ReplicationGroup {
     public List<ClusterNode> getClusterNodes() { return clusterNodes; }
     public void setClusterNodes(List<ClusterNode> clusterNodes) {
         this.clusterNodes = clusterNodes != null ? clusterNodes : new ArrayList<>();
+    }
+
+    public List<String> getSecurityGroupIds() { return securityGroupIds; }
+    public void setSecurityGroupIds(List<String> securityGroupIds) {
+        this.securityGroupIds = securityGroupIds == null ? new ArrayList<>() : new ArrayList<>(securityGroupIds);
     }
 }

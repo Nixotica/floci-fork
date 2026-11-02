@@ -14,8 +14,8 @@ import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import io.github.hectorvent.floci.services.ec2.model.VolumeModification;
+import io.github.hectorvent.floci.testing.IndependentServiceSettingsProfile;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -33,24 +33,23 @@ import java.util.Optional;
 import java.util.UUID;
 
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * EBS volumes backed by real storage: attaching one gives a running instance container a block
+ * device of the right size, and detaching, resizing, restoring and deleting it act on that device
+ * and its backing file.
+ *
+ * <p>Real instances and volume block devices come from {@link IndependentServiceSettingsProfile},
+ * which this class shares with other classes that each call a different service.
+ */
 @QuarkusTest
-@TestProfile(Ec2VolumeBlockDeviceDockerIntegrationTest.Profile.class)
+@TestProfile(IndependentServiceSettingsProfile.class)
 class Ec2VolumeBlockDeviceDockerIntegrationTest {
-
-    public static class Profile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of(
-                    "floci.services.ec2.mock", "false",
-                    "floci.services.ec2.volume-block-devices", "true"
-            );
-        }
-    }
 
     @Inject
     Ec2Service ec2Service;
@@ -87,7 +86,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
     void cleanup() {
         for (String volId : volumesToClean) {
             try {
-                Volume vol = ec2Service.describeVolumes("us-east-1", List.of(volId), null).getFirst();
+                Volume vol = ec2Service.describeVolumes("us-east-1", List.of(volId), Map.of()).getFirst();
                 if (vol != null && vol.getAttachments() != null) {
                     for (VolumeAttachment att : vol.getAttachments()) {
                         try {
@@ -126,6 +125,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
         }
         instancesToClean.clear();
 
+        // After the volumes: detaching one from a cluster node finds the node through the provider.
         ec2Service.setClusterNodeInstanceProvider(null);
 
         for (String cid : containersToClean) {
@@ -160,7 +160,9 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
         ContainerSpec spec = containerBuilder.newContainer("alpine:3.21")
                 .withName(containerName)
                 .withPrivileged(true)
-                .withEntrypoint(List.of("sleep", "3600"))
+                // PID 1 gets no default SIGTERM handler, so a bare "sleep 3600" sits out the whole
+                // grace period of every stop: 30 seconds when stopInstances stops it, 2 in cleanup.
+                .withEntrypoint(List.of("sh", "-c", "trap 'exit 0' TERM; sleep 3600 & wait"))
                 .build();
 
         String containerId = lifecycleManager.createAndStart(spec).containerId();
@@ -336,7 +338,8 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
         ContainerSpec spec = containerBuilder.newContainer("alpine:3.21")
                 .withName(containerName)
                 .withPrivileged(true)
-                .withEntrypoint(List.of("sleep", "3600"))
+                // As in createRunningTestInstance: lets cleanup's stop return at once.
+                .withEntrypoint(List.of("sh", "-c", "trap 'exit 0' TERM; sleep 3600 & wait"))
                 .build();
 
         String containerId = lifecycleManager.createAndStart(spec).containerId();
@@ -376,8 +379,6 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
 
         ContainerExec.Result checkDev = execIn(containerId, "test -b /dev/xvdf || test -L /dev/xvdf");
         assertEquals(0, checkDev.exitCode(), "Block device should exist inside cluster node container: " + checkDev.summary());
-
-        ec2Service.setClusterNodeInstanceProvider(null);
     }
 
     @Test
@@ -392,6 +393,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
         instance.setPlacement(placement);
         instance.setState(InstanceState.running());
         ec2Service.putInstanceForTest(instance);
+        instancesToClean.add(instance.getInstanceId());
 
         Volume volume = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125, null, null);
         volumesToClean.add(volume.getVolumeId());
@@ -479,6 +481,45 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
     }
 
     @Test
+    void stopManagedContainersRemovesHelperAndKeepsBackingFile() {
+        Volume volume = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125, null, null);
+        volumesToClean.add(volume.getVolumeId());
+
+        String helperName = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
+        assertTrue(lifecycleManager.findByName(helperName).isPresent());
+
+        volumeBlockDeviceManager.stopManagedContainers();
+
+        assertTrue(lifecycleManager.findByName(helperName).isEmpty(),
+                "Helper container should be removed, not just stopped");
+        assertDoesNotThrow(() -> volumeBlockDeviceManager.stopManagedContainers());
+
+        // The next volume operation recreates the helper against the surviving backing file.
+        assertTrue(volumeBlockDeviceManager.resizeVolume(volume.getVolumeId(), 2));
+        ContainerExec.Result checkSize = execIn(helperName, "stat -c %s /volumes/" + volume.getVolumeId() + ".raw");
+        assertEquals(0, checkSize.exitCode());
+        assertEquals("2147483648", checkSize.stdout().trim());
+    }
+
+    @Test
+    void clearDeletesBackingFilesAndLeavesNoHelper() {
+        Volume volume = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125, null, null);
+        volumesToClean.add(volume.getVolumeId());
+        String helperName = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
+
+        volumeBlockDeviceManager.stopManagedContainers();
+        volumeBlockDeviceManager.clear();
+
+        assertTrue(lifecycleManager.findByName(helperName).isEmpty(),
+                "A reset should end without a helper container");
+        // The next volume operation recreates the helper, which shows the old file is gone.
+        Volume next = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125, null, null);
+        volumesToClean.add(next.getVolumeId());
+        ContainerExec.Result wiped = execIn(helperName, "test -e /volumes/" + volume.getVolumeId() + ".raw");
+        assertEquals(1, wiped.exitCode(), "The reset should have deleted the backing file");
+    }
+
+    @Test
     void modifyVolumeUnattachedGrowsBackingFile() {
         Volume volume = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125, null, null);
         volumesToClean.add(volume.getVolumeId());
@@ -540,7 +581,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
 
         ec2Service.stopInstances("us-east-1", List.of(instance.getInstanceId()));
         await().atMost(Duration.ofSeconds(35)).until(() ->
-                "stopped".equals(ec2Service.describeInstances("us-east-1", List.of(instance.getInstanceId()), null)
+                "stopped".equals(ec2Service.describeInstances("us-east-1", List.of(instance.getInstanceId()), Map.of())
                         .getFirst().getInstances().getFirst().getState().getName()));
         ec2Service.detachVolume("us-east-1", rootVolId, instance.getInstanceId(), instance.getRootDeviceName(), true);
 

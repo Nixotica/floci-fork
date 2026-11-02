@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import io.github.hectorvent.floci.core.common.AvailabilityZoneIds;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.ec2.model.FlowLog;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
@@ -18,8 +19,10 @@ import java.util.zip.GZIPInputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
@@ -40,7 +43,7 @@ class FlowLogServiceTest {
     private FlowLogService serviceCallingAs(String accountId) {
         Ec2Service ec2Service = mock(Ec2Service.class);
         when(ec2Service.callerAccountId()).thenReturn(accountId);
-        when(ec2Service.describeInstances(any(), any(), any())).thenReturn(List.of());
+        when(ec2Service.describeInstances(any(), any(), anyMap())).thenReturn(List.of());
         when(ec2Service.endpointNetworkInterfaces(any())).thenReturn(List.of());
         return new FlowLogService(ec2Service, mock(S3Service.class), new InMemoryStorage<>());
     }
@@ -181,6 +184,23 @@ class FlowLogServiceTest {
         }
     }
 
+    /**
+     * A record's az-id is the zone id subnets and DescribeAvailabilityZones publish for the same
+     * zone. FlowLogService once derived its own, with a different rule ({@code cnnorth1-az1} for
+     * China), so the two did not agree.
+     */
+    @Test
+    void azIdMatchesTheZoneIdEc2PublishesForTheZone() throws Exception {
+        for (String region : List.of("us-east-1", "cn-north-1", "us-gov-west-1")) {
+            List<String> lines = deliver(region, "${az-id}");
+
+            assertEquals("az-id", lines.get(0));
+            for (String row : records(lines)) {
+                assertEquals(AvailabilityZoneIds.forZoneName(region, region + "a"), row, "in " + region);
+            }
+        }
+    }
+
     /** The record lines of a delivered file, which must not be empty. */
     private static List<String> records(List<String> lines) {
         assertFalse(lines.size() < 2, "delivery carried a header and no records");
@@ -189,16 +209,21 @@ class FlowLogServiceTest {
 
     /** Deliver one file for a flow log with this LogFormat and return its lines. */
     private List<String> deliver(String logFormat) throws Exception {
+        return deliver("us-east-1", logFormat);
+    }
+
+    /** Deliver one file for a flow log in {@code region} with this LogFormat and return its lines. */
+    private List<String> deliver(String region, String logFormat) throws Exception {
         Ec2Service ec2Service = mock(Ec2Service.class);
         when(ec2Service.callerAccountId()).thenReturn("000000000000");
-        when(ec2Service.describeInstances(any(), any(), any()))
-                .thenReturn(List.of(reservation()));
+        when(ec2Service.describeInstances(any(), any(), anyMap()))
+                .thenReturn(List.of(reservation(region)));
         when(ec2Service.endpointNetworkInterfaces(any())).thenReturn(List.of());
         S3Service s3Service = mock(S3Service.class);
         FlowLogService service =
                 new FlowLogService(ec2Service, s3Service, new InMemoryStorage<>());
 
-        FlowLog fl = service.createFlowLog("us-east-1", "vpc-123", "VPC", "ALL", "s3",
+        FlowLog fl = service.createFlowLog(region, "vpc-123", "VPC", "ALL", "s3",
                 "arn:aws:s3:::flow-bucket", null, logFormat, 600);
         service.generateAndDeliver(fl);
 
@@ -209,20 +234,20 @@ class FlowLogServiceTest {
         return List.of(gunzip(body.getValue()).split("\n"));
     }
 
-    private static Reservation reservation() {
+    private static Reservation reservation(String region) {
         Reservation reservation = new Reservation();
-        reservation.setInstances(List.of(instance("i-aaa", "10.0.0.4"), instance("i-bbb", "10.0.0.5")));
+        reservation.setInstances(List.of(instance("i-aaa", "10.0.0.4", region), instance("i-bbb", "10.0.0.5", region)));
         return reservation;
     }
 
-    private static Instance instance(String instanceId, String privateIp) {
+    private static Instance instance(String instanceId, String privateIp, String region) {
         Instance instance = new Instance();
         instance.setInstanceId(instanceId);
         instance.setPrivateIpAddress(privateIp);
         instance.setVpcId("vpc-123");
         instance.setSubnetId("subnet-123");
         Placement placement = new Placement();
-        placement.setAvailabilityZone("us-east-1a");
+        placement.setAvailabilityZone(region + "a");
         instance.setPlacement(placement);
         return instance;
     }
@@ -231,5 +256,47 @@ class FlowLogServiceTest {
         try (GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(gz))) {
             return new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
         }
+    }
+
+    @Test
+    void anS3PrefixContainingLogGroupStaysS3AndDelivers() {
+        // Only a logs ARN names a log group; an S3 prefix may contain ":log-group:" too.
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        when(ec2Service.callerAccountId()).thenReturn("000000000000");
+        when(ec2Service.describeInstances(any(), any(), anyMap()))
+                .thenReturn(List.of(reservation("us-east-1")));
+        when(ec2Service.endpointNetworkInterfaces(any())).thenReturn(List.of());
+        S3Service s3Service = mock(S3Service.class);
+        FlowLogService service = new FlowLogService(ec2Service, s3Service, new InMemoryStorage<>());
+
+        FlowLog fl = service.createFlowLog("us-east-1", "vpc-123", "VPC", "ALL", null,
+                "arn:aws:s3:::bkt/archive:log-group:daily/", null, null, 600);
+
+        FlowLog stored = service.describeFlowLogs("us-east-1", List.of(fl.getFlowLogId())).get(0);
+        assertEquals("s3", stored.getLogDestinationType());
+        assertNull(stored.getLogGroupName());
+        verify(s3Service).putObject(eq("bkt"), anyString(), any(byte[].class), anyString(), any(Map.class));
+    }
+
+    @Test
+    void aLogsArnNamesItsLogGroup() {
+        assertEquals("/aws/flows", FlowLogService.logGroupFromArn("arn:aws:logs:us-east-1:000000000000:log-group:/aws/flows:*"));
+        assertEquals("flows", FlowLogService.logGroupFromArn("arn:aws-cn:logs:cn-north-1:000000000000:log-group:flows"));
+        assertNull(FlowLogService.logGroupFromArn("arn:aws:s3:::bkt/archive:log-group:daily/"));
+    }
+
+    @Test
+    void aLogsArnWithNoGroupNameIsNotACloudWatchDestination() {
+        assertNull(FlowLogService.logGroupFromArn("arn:aws:logs:us-east-1:000000000000:log-group:"));
+        assertNull(FlowLogService.logGroupFromArn("arn:aws:logs:us-east-1:000000000000:log-group::*"));
+        assertEquals("s3", FlowLogService.effectiveLogDestinationType(null,
+                "arn:aws:logs:us-east-1:000000000000:log-group:", null));
+    }
+
+    @Test
+    void bucketComesFromTheS3ArnEvenWhenThePrefixHasAColon() {
+        assertEquals("bkt", FlowLogService.bucketFromArn("arn:aws:s3:::bkt/logs:2024/"));
+        assertEquals("bkt", FlowLogService.bucketFromArn("arn:aws-cn:s3:::bkt"));
+        assertEquals("bkt", FlowLogService.bucketFromArn("bkt/prefix"));
     }
 }

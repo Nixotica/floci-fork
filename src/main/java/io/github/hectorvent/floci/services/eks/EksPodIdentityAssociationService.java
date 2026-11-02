@@ -1,7 +1,11 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
@@ -15,16 +19,15 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Instant;
-import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.UnaryOperator;
 
 /**
  * Manages EKS Pod Identity association metadata.
@@ -37,17 +40,20 @@ public class EksPodIdentityAssociationService {
 
     private final StorageBackend<String, StoredAssociation> associations;
     private final IamService iam;
+    private final RegionResolver regionResolver;
     private final SecureRandom random = new SecureRandom();
 
     @Inject
-    public EksPodIdentityAssociationService(StorageFactory factory, IamService iam) {
+    public EksPodIdentityAssociationService(StorageFactory factory, IamService iam, RegionResolver regionResolver) {
         this(factory.create("eks", "eks-pod-identity-associations.json",
-                new TypeReference<Map<String, StoredAssociation>>() {}), iam);
+                new TypeReference<Map<String, StoredAssociation>>() {}), iam, regionResolver);
     }
 
-    EksPodIdentityAssociationService(StorageBackend<String, StoredAssociation> associations, IamService iam) {
+    EksPodIdentityAssociationService(StorageBackend<String, StoredAssociation> associations, IamService iam,
+                                     RegionResolver regionResolver) {
         this.associations = associations;
         this.iam = iam;
+        this.regionResolver = regionResolver;
     }
 
     @RegisterForReflection
@@ -79,10 +85,10 @@ public class EksPodIdentityAssociationService {
         if (roleArn == null || roleArn.isBlank()) {
             throw invalid("roleArn is required");
         }
-        validateRoleArn(cluster, roleArn, "roleArn");
+        validateRoleArn(roleArn, "roleArn");
 
         if (request.targetRoleArn() != null && !request.targetRoleArn().isBlank()) {
-            validateTargetRoleArn(cluster, request.targetRoleArn());
+            validateTargetRoleArn(request.targetRoleArn());
         }
 
         Map<String, String> tags = request.tags() == null ? Map.of() : request.tags();
@@ -118,20 +124,13 @@ public class EksPodIdentityAssociationService {
         }
 
         String associationId = generateAssociationId();
-        String partition = "aws";
-        String region = "us-east-1"; // partition-literal: fallback only when the record carries no region; no resolver in scope (follow-up)
-        String accountId = cluster.getAccountId() != null ? cluster.getAccountId() : "000000000000";
-        if (cluster.getArn() != null) {
-            String[] clusterArn = cluster.getArn().split(":", 6);
-            if (clusterArn.length == 6) {
-                partition = clusterArn[1];
-                region = clusterArn[3];
-                accountId = clusterArn[4];
-            }
-        }
-        String associationArn = "arn:" + partition + ":eks:" + region + ":"
-                + accountId + ":podidentityassociation/" + cluster.getName() + "/" + associationId;
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        // The association lives in the cluster's region and account, which its ARN names.
+        String region = AwsArnUtils.regionOrDefault(cluster.getArn(), regionResolver.getDefaultRegion());
+        String accountId = AwsArnUtils.accountOrDefault(cluster.getArn(),
+                cluster.getAccountId() != null ? cluster.getAccountId() : regionResolver.getDefaultAccountId());
+        String associationArn = AwsArnUtils.Arn.of("eks", region, accountId,
+                "podidentityassociation/" + cluster.getName() + "/" + associationId).toString();
+        double now = EpochSeconds.fromInstant(Instant.now());
         String externalId = UUID.randomUUID().toString();
 
         PodIdentityAssociation association = new PodIdentityAssociation(
@@ -196,19 +195,19 @@ public class EksPodIdentityAssociationService {
 
         String newRoleArn = current.roleArn();
         if (request.roleArn() != null) {
-            validateRoleArn(cluster, request.roleArn(), "roleArn");
+            validateRoleArn(request.roleArn(), "roleArn");
             newRoleArn = request.roleArn();
         }
         String newTargetRoleArn = current.targetRoleArn();
         if (request.targetRoleArn() != null) {
-            validateTargetRoleArn(cluster, request.targetRoleArn());
+            validateTargetRoleArn(request.targetRoleArn());
             newTargetRoleArn = request.targetRoleArn();
         }
         Boolean newDisableSessionTags = request.disableSessionTags() != null
                 ? request.disableSessionTags() : current.disableSessionTags();
         String newPolicy = request.policy() != null ? request.policy() : current.policy();
 
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        double now = EpochSeconds.fromInstant(Instant.now());
         PodIdentityAssociation updated = new PodIdentityAssociation(
                 current.clusterName(),
                 current.namespace(),
@@ -247,7 +246,7 @@ public class EksPodIdentityAssociationService {
         String after = "";
         if (nextToken != null && !nextToken.isBlank()) {
             try {
-                String decoded = new String(Base64.getUrlDecoder().decode(nextToken), StandardCharsets.UTF_8);
+                String decoded = Base64Url.decode(nextToken);
                 if (!decoded.startsWith(prefix + "\n")) {
                     throw invalid("nextToken does not belong to this cluster");
                 }
@@ -274,8 +273,7 @@ public class EksPodIdentityAssociationService {
                 .toList();
 
         String token = remaining.size() > limit
-                ? Base64.getUrlEncoder().withoutPadding().encodeToString(
-                        (prefix + "\n" + page.getLast().associationId()).getBytes(StandardCharsets.UTF_8))
+                ? Base64Url.encode(prefix + "\n" + page.getLast().associationId())
                 : null;
 
         return new Page(page, token);
@@ -301,6 +299,31 @@ public class EksPodIdentityAssociationService {
                 .findFirst();
     }
 
+    /**
+     * Applies {@code change} to the tags of the association {@code associationArn} names on
+     * {@code cluster} and returns them, or empty when the cluster has no association with that ARN.
+     * This is how TagResource, UntagResource and ListTagsForResource reach an association.
+     */
+    public synchronized Optional<Map<String, String>> retag(Cluster cluster, String associationId, String associationArn,
+                                                            UnaryOperator<Map<String, String>> change) {
+        String key = prefix(cluster) + associationId;
+        Optional<StoredAssociation> found = associations.get(key)
+                .filter(stored -> associationArn.equals(stored.association().associationArn()));
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        PodIdentityAssociation current = found.get().association();
+        Map<String, String> tags = Map.copyOf(change.apply(current.tags() == null ? Map.of() : current.tags()));
+        if (!tags.equals(current.tags())) {
+            PodIdentityAssociation retagged = new PodIdentityAssociation(current.clusterName(), current.namespace(),
+                    current.serviceAccount(), current.roleArn(), current.associationArn(), current.associationId(),
+                    tags, current.createdAt(), current.modifiedAt(), current.ownerArn(), current.targetRoleArn(),
+                    current.disableSessionTags(), current.externalId(), current.policy());
+            associations.put(key, new StoredAssociation(retagged, found.get().clientRequestToken()));
+        }
+        return Optional.of(tags);
+    }
+
     private static String prefix(Cluster cluster) {
         String base = cluster.getArn() != null ? cluster.getArn() : cluster.getName();
         return base + "/" + Objects.toString(cluster.getCreatedAt()) + "/";
@@ -315,39 +338,30 @@ public class EksPodIdentityAssociationService {
         }
     }
 
-    private void validateRoleArn(Cluster cluster, String roleArn, String fieldName) {
-        String[] arn = roleArn.split(":", 6);
-        String expectedPartition = "aws";
-        if (cluster != null && cluster.getArn() != null) {
-            String[] clusterArn = cluster.getArn().split(":", 6);
-            if (clusterArn.length > 1) {
-                expectedPartition = clusterArn[1];
-            }
-        }
-        if (arn.length != 6 || !"arn".equals(arn[0]) || !arn[1].equals(expectedPartition)
-                || !"iam".equals(arn[2]) || !arn[3].isEmpty() || !arn[4].matches("[0-9]{12}")
-                || !arn[5].startsWith("role/") || arn[5].startsWith("role/aws-service-role/")
+    /**
+     * The role must exist in the account the ARN names. Its partition only has to be well formed:
+     * an account keeps one IAM namespace whichever partition a request is for, and STS AssumeRole
+     * accepts the same role ARNs through {@link IamService#roleArnMatches}.
+     */
+    private void validateRoleArn(String roleArn, String fieldName) {
+        AwsArnUtils.Arn arn = AwsArnUtils.isArn(roleArn) ? AwsArnUtils.parse(roleArn) : null;
+        if (arn == null || !arn.partition().matches(AwsArnUtils.PARTITION_REGEX)
+                || !"iam".equals(arn.service()) || !arn.region().isEmpty() || !arn.accountId().matches("[0-9]{12}")
+                || !arn.resource().startsWith("role/") || arn.resource().startsWith("role/aws-service-role/")
                 || roleArn.endsWith("/")) {
             throw invalid(fieldName + " must identify an IAM role");
         }
         String roleName = roleArn.substring(roleArn.lastIndexOf('/') + 1);
-        iam.findRole(arn[4], roleName)
-                .filter(role -> roleArn.equals(role.getArn()))
+        iam.findRole(arn.accountId(), roleName)
+                .filter(role -> IamService.roleArnMatches(roleArn, role))
                 .orElseThrow(() -> invalid("IAM role does not exist"));
     }
 
-    private static void validateTargetRoleArn(Cluster cluster, String targetRoleArn) {
-        String[] arn = targetRoleArn.split(":", 6);
-        String expectedPartition = "aws";
-        if (cluster != null && cluster.getArn() != null) {
-            String[] clusterArn = cluster.getArn().split(":", 6);
-            if (clusterArn.length > 1) {
-                expectedPartition = clusterArn[1];
-            }
-        }
-        if (arn.length != 6 || !"arn".equals(arn[0]) || !arn[1].equals(expectedPartition)
-                || !"iam".equals(arn[2]) || !arn[3].isEmpty() || !arn[4].matches("[0-9]{12}")
-                || !arn[5].startsWith("role/") || targetRoleArn.endsWith("/")) {
+    private static void validateTargetRoleArn(String targetRoleArn) {
+        AwsArnUtils.Arn arn = AwsArnUtils.isArn(targetRoleArn) ? AwsArnUtils.parse(targetRoleArn) : null;
+        if (arn == null || !arn.partition().matches(AwsArnUtils.PARTITION_REGEX)
+                || !"iam".equals(arn.service()) || !arn.region().isEmpty() || !arn.accountId().matches("[0-9]{12}")
+                || !arn.resource().startsWith("role/") || targetRoleArn.endsWith("/")) {
             throw invalid("targetRoleArn must identify an IAM role");
         }
     }

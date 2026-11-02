@@ -10,6 +10,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -291,14 +292,14 @@ public class WebSocketProxyEventBuilder {
         return AwsEndpoints.executeApiHost(apiId, region);
     }
 
-    private String buildMethodArn(String region, String apiId, String stageName) {
+    String buildMethodArn(String region, String apiId, String stageName) {
         return AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
                 apiId + "/" + stageName + "/$connect").toString();
     }
 
     private String formatRequestTime(long epochMillis) {
         ZonedDateTime time = ZonedDateTime.ofInstant(
-                java.time.Instant.ofEpochMilli(epochMillis), ZoneOffset.UTC);
+                Instant.ofEpochMilli(epochMillis), ZoneOffset.UTC);
         return REQUEST_TIME_FORMATTER.format(time);
     }
 }

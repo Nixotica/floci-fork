@@ -1,5 +1,9 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -9,10 +13,6 @@ import io.github.hectorvent.floci.services.dynamodb.model.DynamoDbStreamRecord;
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.StreamDescription;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -46,7 +46,8 @@ public class DynamoDbStreamService {
     private final ConcurrentHashMap<String, ConcurrentLinkedDeque<DynamoDbStreamRecord>> records =
             new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicLong> streamRecordCounts = new ConcurrentHashMap<>();
-    private final AtomicLong sequenceCounter = new AtomicLong(0);
+    /** Per stream (the stream ARN embeds account + region + table) so accounts never share a counter. */
+    private final ConcurrentHashMap<String, AtomicLong> sequenceCounters = new ConcurrentHashMap<>();
 
     private final ObjectMapper objectMapper;
 
@@ -142,6 +143,7 @@ public class DynamoDbStreamService {
         if (sd != null) {
             records.remove(sd.getStreamArn());
             streamRecordCounts.remove(sd.getStreamArn());
+            sequenceCounters.remove(sd.getStreamArn());
             LOG.infov("Deleted stream for table {0}", tableArn);
         }
     }
@@ -155,12 +157,18 @@ public class DynamoDbStreamService {
 
     public void captureEvent(String eventName, JsonNode oldItem, JsonNode newItem,
                              TableDefinition table, String region) {
+        captureEvent(eventName, oldItem, newItem, table, region, false);
+    }
+
+    /** {@code ttlDeletion} marks a removal made by the time to live sweep rather than by a caller. */
+    public void captureEvent(String eventName, JsonNode oldItem, JsonNode newItem,
+                             TableDefinition table, String region, boolean ttlDeletion) {
         StreamDescription sd = streams.get(table.getTableArn());
         if (sd == null || !"ENABLED".equals(sd.getStreamStatus())) {
             return;
         }
 
-        long seq = sequenceCounter.incrementAndGet();
+        long seq = sequenceCounters.computeIfAbsent(sd.getStreamArn(), k -> new AtomicLong()).incrementAndGet();
         String sequenceNumber = String.format("%021d", seq);
 
         JsonNode sourceItem = newItem != null ? newItem : oldItem;
@@ -182,6 +190,7 @@ public class DynamoDbStreamService {
         record.setNewImage(newImage);
         record.setOldImage(oldImage);
         record.setStreamViewType(viewType);
+        record.setTtlDeletion(ttlDeletion);
 
         ConcurrentLinkedDeque<DynamoDbStreamRecord> deque = records.get(sd.getStreamArn());
         if (deque != null) {

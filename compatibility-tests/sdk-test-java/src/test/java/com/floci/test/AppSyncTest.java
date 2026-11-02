@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -55,7 +56,7 @@ class AppSyncTest {
         assertThat(apiId).isNotBlank();
         assertThat(resp.graphqlApi().name()).isEqualTo("sdk-test-api");
         assertThat(resp.graphqlApi().authenticationType()).isEqualTo(AuthenticationType.API_KEY);
-        assertThat(resp.graphqlApi().arn()).contains("arn:aws:appsync:");
+        assertThat(resp.graphqlApi().arn()).startsWith("arn:" + TestFixtures.partition() + ":appsync:");
     }
 
     @Test
@@ -621,7 +622,7 @@ class AppSyncTest {
                 .build());
 
         assertThat(resp.dataSource().dataSourceArn()).isNotNull();
-        assertThat(resp.dataSource().dataSourceArn()).contains("arn:aws:appsync:");
+        assertThat(resp.dataSource().dataSourceArn()).startsWith("arn:" + TestFixtures.partition() + ":appsync:");
         assertThat(resp.dataSource().dataSourceArn()).contains("/datasources/arn-check-ds");
 
         client.deleteDataSource(r -> r.apiId(apiId).name("arn-check-ds"));
@@ -638,7 +639,7 @@ class AppSyncTest {
                 .build());
 
         assertThat(resp.resolver().resolverArn()).isNotNull();
-        assertThat(resp.resolver().resolverArn()).contains("arn:aws:appsync:");
+        assertThat(resp.resolver().resolverArn()).startsWith("arn:" + TestFixtures.partition() + ":appsync:");
         assertThat(resp.resolver().resolverArn()).contains("/types/Query/resolvers/resolverArnCheck");
 
         client.deleteResolver(r -> r.apiId(apiId).typeName("Query").fieldName("resolverArnCheck"));
@@ -654,7 +655,8 @@ class AppSyncTest {
                 .build());
 
         assertThat(resp.functionConfiguration().functionArn()).isNotNull();
-        assertThat(resp.functionConfiguration().functionArn()).contains("arn:aws:appsync:");
+        assertThat(resp.functionConfiguration().functionArn())
+                .startsWith("arn:" + TestFixtures.partition() + ":appsync:");
 
         client.deleteFunction(r -> r.apiId(apiId).functionId(resp.functionConfiguration().functionId()));
     }
@@ -778,7 +780,7 @@ class AppSyncTest {
     @Order(100)
     void createDomainName() {
         // Use unique domain name to avoid conflicts
-        String domainSuffix = java.util.UUID.randomUUID().toString().substring(0, 8);
+        String domainSuffix = UUID.randomUUID().toString().substring(0, 8);
         CreateDomainNameResponse resp = client.createDomainName(
                 CreateDomainNameRequest.builder()
                         .domainName("sdk-" + domainSuffix + ".example.com")
@@ -1039,7 +1041,7 @@ class AppSyncTest {
     void listDomainNames() {
         CreateDomainNameResponse created = client.createDomainName(
                 CreateDomainNameRequest.builder()
-                        .domainName("list-test-" + java.util.UUID.randomUUID().toString().substring(0, 8) + ".example.com")
+                        .domainName("list-test-" + UUID.randomUUID().toString().substring(0, 8) + ".example.com")
                         .certificateArn("arn:aws:acm:us-east-1:000000000000:certificate/test")
                         .build());
 
@@ -1169,7 +1171,7 @@ class AppSyncTest {
     void listGraphqlApisWithMaxResults() {
         for (int i = 0; i < 2; i++) {
             client.createGraphqlApi(CreateGraphqlApiRequest.builder()
-                    .name("pg-sdk-api-" + i + "-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+                    .name("pg-sdk-api-" + i + "-" + UUID.randomUUID().toString().substring(0, 8))
                     .authenticationType("API_KEY")
                     .build());
         }
@@ -1194,7 +1196,7 @@ class AppSyncTest {
         for (int i = 0; i < 2; i++) {
             client.createDataSource(CreateDataSourceRequest.builder()
                     .apiId(apiId)
-                    .name("pg-sdk-ds-" + i + "-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+                    .name("pg-sdk-ds-" + i + "-" + UUID.randomUUID().toString().substring(0, 8))
                     .type("NONE")
                     .build());
         }
@@ -1221,7 +1223,7 @@ class AppSyncTest {
     @Test
     @Order(130)
     void createDataSourceDuplicateThrowsBadRequestException() {
-        String dsName = "sdk-conflict-ds-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        String dsName = "sdk-conflict-ds-" + UUID.randomUUID().toString().substring(0, 8);
         client.createDataSource(CreateDataSourceRequest.builder()
                 .apiId(apiId)
                 .name(dsName)
@@ -1243,7 +1245,7 @@ class AppSyncTest {
     @Order(131)
     void createApiKeyExceedsLimitThrowsApiKeyLimitExceededException() {
         CreateGraphqlApiResponse tempApi = client.createGraphqlApi(CreateGraphqlApiRequest.builder()
-                .name("sdk-limit-test-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+                .name("sdk-limit-test-" + UUID.randomUUID().toString().substring(0, 8))
                 .authenticationType("API_KEY")
                 .build());
         String tempApiId = tempApi.graphqlApi().apiId();
@@ -1324,7 +1326,7 @@ class AppSyncTest {
     @Order(137)
     void createSourceApiAssociationDuplicateThrowsConcurrentModificationException() {
         String sourceApiId = client.createGraphqlApi(CreateGraphqlApiRequest.builder()
-                .name("sdk-dup-source-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+                .name("sdk-dup-source-" + UUID.randomUUID().toString().substring(0, 8))
                 .authenticationType("API_KEY")
                 .build()).graphqlApi().apiId();
 

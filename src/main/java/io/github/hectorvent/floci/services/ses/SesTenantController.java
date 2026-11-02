@@ -1,6 +1,5 @@
 package io.github.hectorvent.floci.services.ses;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -23,21 +22,24 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.util.List;
+import java.util.Map;
 
+import static io.github.hectorvent.floci.services.ses.SesV2Json.filterValues;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.intMemberOrAbsent;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.parseTagsArray;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.putTimestamp;
+import static io.github.hectorvent.floci.services.ses.SesV2Json.readOptionBody;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.remapV1Exception;
-import static io.github.hectorvent.floci.services.ses.SesV2Json.requireJsonObject;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.stringArrayOrAbsent;
+import static io.github.hectorvent.floci.services.ses.SesV2Json.stringMapMemberOrAbsent;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.stringMemberOrAbsent;
 
 /**
  * SES V2 tenant endpoints ({@code /v2/email/tenants}, {@code /v2/email/tenant} and
- * {@code /v2/email/resources/tenants}). Tenant create, get, list and suppression attributes
- * call {@link SesTenantService} directly; the resource
- * associations and tenant delete go through the {@link SesService} facade, which checks the
- * associated identity, configuration set or template exists and cascades the tenant's
+ * {@code /v2/email/resources/tenants}). Tenant create, get, list, suppression attributes and the
+ * tenant's resource list call {@link SesTenantService} directly; association create and delete,
+ * the resource's tenant list and tenant delete go through the {@link SesService} facade, which
+ * checks the associated identity, configuration set or template exists and cascades the tenant's
  * suppression entries, work that spans several domains.
  */
 @Path("/v2/email")
@@ -46,6 +48,9 @@ import static io.github.hectorvent.floci.services.ses.SesV2Json.stringMemberOrAb
 public class SesTenantController {
 
     private static final Logger LOG = Logger.getLogger(SesTenantController.class);
+
+    /** In the order SES prints them when it refuses a key. */
+    private static final List<String> TENANT_FILTER_KEYS = List.of("SENDING_STATUS", "TENANT_NAME_CONTAINS");
 
     private final SesTenantService tenantService;
     private final SesService sesService;
@@ -66,10 +71,7 @@ public class SesTenantController {
     public Response createTenant(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             String tenantName = stringMemberOrAbsent(request, "TenantName");
             List<Tag> tags = parseTagsArray(request.path("Tags"));
             List<String> suppressedReasons = null;
@@ -88,8 +90,6 @@ public class SesTenantController {
             return Response.ok(tenantJson(tenant)).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 
@@ -98,10 +98,7 @@ public class SesTenantController {
     public Response getTenant(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             String tenantName = stringMemberOrAbsent(request, "TenantName");
             Tenant tenant = tenantService.getTenant(tenantName, region);
             ObjectNode result = objectMapper.createObjectNode();
@@ -109,8 +106,6 @@ public class SesTenantController {
             return Response.ok(result).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 
@@ -119,14 +114,12 @@ public class SesTenantController {
     public Response listTenants(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
+            Map<String, String> filter = stringMapMemberOrAbsent(request, "Filter");
             Integer pageSize = intMemberOrAbsent(request, "PageSize");
             String nextToken = stringMemberOrAbsent(request, "NextToken");
-            PaginatedResult<Tenant> page = tenantService.listTenants(region, SesListPaging.V2_LIST_TENANTS,
-                    pageSize, nextToken);
+            Map<String, String> present = filterValues(filter, TENANT_FILTER_KEYS);
+            PaginatedResult<Tenant> page = tenantService.listTenants(region, present, pageSize, nextToken);
             ObjectNode result = objectMapper.createObjectNode();
             ArrayNode tenants = result.putArray("Tenants");
             for (Tenant t : page.items()) {
@@ -141,8 +134,6 @@ public class SesTenantController {
             return Response.ok(result).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 
@@ -151,17 +142,12 @@ public class SesTenantController {
     public Response deleteTenant(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             String tenantName = stringMemberOrAbsent(request, "TenantName");
             sesService.deleteTenant(tenantName, region);
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 
@@ -173,10 +159,7 @@ public class SesTenantController {
     public Response createTenantResourceAssociation(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             String tenantName = stringMemberOrAbsent(request, "TenantName");
             String resourceArn = stringMemberOrAbsent(request, "ResourceArn");
             sesService.createTenantResourceAssociation(tenantName, resourceArn,
@@ -184,8 +167,6 @@ public class SesTenantController {
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 
@@ -194,10 +175,7 @@ public class SesTenantController {
     public Response deleteTenantResourceAssociation(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             String tenantName = stringMemberOrAbsent(request, "TenantName");
             String resourceArn = stringMemberOrAbsent(request, "ResourceArn");
             sesService.deleteTenantResourceAssociation(tenantName, resourceArn,
@@ -205,8 +183,6 @@ public class SesTenantController {
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 
@@ -215,24 +191,15 @@ public class SesTenantController {
     public Response listTenantResources(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             String tenantName = stringMemberOrAbsent(request, "TenantName");
-            String resourceTypeFilter = null;
-            JsonNode filter = request.path("Filter");
-            if (!filter.isMissingNode() && !filter.isNull()) {
-                if (!filter.isObject()) {
-                    throw new AwsException("SerializationException", null, 400);
-                }
-                resourceTypeFilter = stringMemberOrAbsent(filter, "RESOURCE_TYPE");
-            }
+            Map<String, String> filter = stringMapMemberOrAbsent(request, "Filter");
+            String resourceTypeFilter = filter == null ? null : filter.get("RESOURCE_TYPE");
             Integer pageSize = intMemberOrAbsent(request, "PageSize");
             String nextToken = stringMemberOrAbsent(request, "NextToken");
-            PaginatedResult<TenantResourceAssociation> page = sesService.listTenantResources(
-                    tenantName, resourceTypeFilter, SesListPaging.V2_LIST_TENANT_RESOURCES, pageSize, nextToken,
-                    region);
+            PaginatedResult<TenantResourceAssociation> page = tenantService.listTenantResources(
+                    tenantName, resourceTypeFilter, region, SesListPaging.V2_LIST_TENANT_RESOURCES, pageSize,
+                    nextToken);
             ObjectNode result = objectMapper.createObjectNode();
             result.put("NextToken", page.nextToken());
             ArrayNode resources = result.putArray("TenantResources");
@@ -244,8 +211,6 @@ public class SesTenantController {
             return Response.ok(result).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 
@@ -254,10 +219,7 @@ public class SesTenantController {
     public Response listResourceTenants(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             String resourceArn = stringMemberOrAbsent(request, "ResourceArn");
             Integer pageSize = intMemberOrAbsent(request, "PageSize");
             String nextToken = stringMemberOrAbsent(request, "NextToken");
@@ -278,8 +240,6 @@ public class SesTenantController {
             return Response.ok(result).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 
@@ -290,10 +250,7 @@ public class SesTenantController {
     public Response putTenantSuppressionAttributes(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode()
-                    : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             String tenantName = stringMemberOrAbsent(request, "TenantName");
             List<String> suppressedReasons = stringArrayOrAbsent(request, "SuppressedReasons");
             String suppressionScope = stringMemberOrAbsent(request, "SuppressionScope");
@@ -302,8 +259,6 @@ public class SesTenantController {
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 

@@ -5,16 +5,20 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
-import io.github.hectorvent.floci.core.common.ContainerTeardown;
-import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.core.common.FileTrees;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.services.codebuild.BuildspecParser.ParsedArtifacts;
 import io.github.hectorvent.floci.services.codebuild.BuildspecParser.ParsedBuildspec;
 import io.github.hectorvent.floci.services.codebuild.model.Build;
@@ -38,11 +42,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.PathMatcher;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,6 +57,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -71,6 +78,7 @@ public class CodeBuildRunner implements ContainerTeardown {
     private final EmulatorConfig config;
     private final ContainerDetector containerDetector;
     private final RegionResolver regionResolver;
+    private final ContainerReachableEndpoint containerEndpoint;
 
     private final ConcurrentHashMap<String, String> runningContainers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicBoolean> stopFlags = new ConcurrentHashMap<>();
@@ -85,7 +93,8 @@ public class CodeBuildRunner implements ContainerTeardown {
                            SecretsManagerService secretsManagerService,
                            EmulatorConfig config,
                            ContainerDetector containerDetector,
-                           RegionResolver regionResolver) {
+                           RegionResolver regionResolver,
+                           ContainerReachableEndpoint containerEndpoint) {
         this.dockerClient = dockerClient;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -96,6 +105,7 @@ public class CodeBuildRunner implements ContainerTeardown {
         this.config = config;
         this.containerDetector = containerDetector;
         this.regionResolver = regionResolver;
+        this.containerEndpoint = containerEndpoint;
     }
 
     /**
@@ -205,7 +215,7 @@ public class CodeBuildRunner implements ContainerTeardown {
                     || (build.getEnvironment() != null
                     && Boolean.TRUE.equals(build.getEnvironment().getPrivilegedMode()));
 
-            Map<String, Object> logsMap = new java.util.HashMap<>();
+            Map<String, Object> logsMap = new HashMap<>();
             logsMap.put("groupName", logGroup);
             logsMap.put("streamName", logStream);
             logsMap.put("cloudWatchLogsArn", AwsArnUtils.Arn.of("logs", region, regionResolver.getAccountId(), "log-group:" + logGroup + ":log-stream:" + logStream).toString());
@@ -251,7 +261,13 @@ public class CodeBuildRunner implements ContainerTeardown {
             }
 
             // Copy downloaded source files into the container (no-op for NO_SOURCE builds)
-            copySourceToContainer(containerId, workspace, containerSrcDir);
+            try {
+                copySourceToContainer(containerId, workspace, containerSrcDir);
+            } catch (RuntimeException e) {
+                if (stopFlag.get()) { finishStopped(build); return; }
+                completePhaseWithError(build, "DOWNLOAD_SOURCE", "FAILED", e.getMessage());
+                throw e;
+            }
 
             // INSTALL
             if (stopFlag.get()) { finishStopped(build); return; }
@@ -342,13 +358,13 @@ public class CodeBuildRunner implements ContainerTeardown {
             build.setCurrentPhase("COMPLETED");
             completePhase(build, "COMPLETED", buildFailed ? "FAILED" : "SUCCEEDED");
 
-            build.setEndTime(System.currentTimeMillis() / 1000.0);
+            build.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
             build.setBuildComplete(true);
             build.setBuildStatus(buildFailed ? "FAILED" : "SUCCEEDED");
 
         } catch (Exception e) {
             LOG.error("Unexpected error in build " + build.getId(), e);
-            build.setEndTime(System.currentTimeMillis() / 1000.0);
+            build.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
             build.setBuildComplete(true);
             build.setBuildStatus("FAULT");
             build.setCurrentPhase("COMPLETED");
@@ -361,8 +377,8 @@ public class CodeBuildRunner implements ContainerTeardown {
                 BuildPhase completedPhase = new BuildPhase();
                 completedPhase.setPhaseType("COMPLETED");
                 completedPhase.setPhaseStatus("FAILED");
-                completedPhase.setStartTime(System.currentTimeMillis() / 1000.0);
-                completedPhase.setEndTime(System.currentTimeMillis() / 1000.0);
+                completedPhase.setStartTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
+                completedPhase.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
                 completedPhase.setDurationInSeconds(0L);
                 if (e.getMessage() != null) {
                     completedPhase.setContexts(List.of(Map.of(
@@ -483,35 +499,32 @@ public class CodeBuildRunner implements ContainerTeardown {
         return result;
     }
 
-    private String resolveEndpointUrl() {
+    String resolveEndpointUrl() {
         if (containerDetector.isRunningInContainer()) {
             String suffix = config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
-            return "http://" + suffix + ":" + config.port();
+            return "http://" + suffix + ":" + containerEndpoint.port();
         } else {
-            return "http://host.docker.internal:" + config.port();
+            return "http://host.docker.internal:" + containerEndpoint.port();
         }
     }
 
     // Copies files from the local workspace into the container's working directory.
     // Skips silently when the workspace is empty (e.g. NO_SOURCE builds).
-    private void copySourceToContainer(String containerId, Path sourceDir, String remotePath) {
-        try {
-            if (!Files.exists(sourceDir)) return;
-            boolean hasFiles;
-            try (var ls = Files.list(sourceDir)) {
-                hasFiles = ls.findAny().isPresent();
-            }
-            if (!hasFiles) return;
+    void copySourceToContainer(String containerId, Path sourceDir, String remotePath) {
+        copySourceToContainer(containerId, sourceDir, remotePath, RetryingTarCopier.DEFAULT_BACKOFF_MS);
+    }
 
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            createTarFromDir(sourceDir, bos);
-            dockerClient.copyArchiveToContainerCmd(containerId)
-                    .withRemotePath(remotePath)
-                    .withTarInputStream(new ByteArrayInputStream(bos.toByteArray()))
-                    .exec();
-        } catch (Exception e) {
-            LOG.warnv("Could not copy source to container {0}: {1}", containerId, e.getMessage());
+    void copySourceToContainer(String containerId, Path sourceDir, String remotePath, long backoffMillis) {
+        if (!Files.exists(sourceDir)) return;
+        try (Stream<Path> ls = Files.list(sourceDir)) {
+            if (ls.findAny().isEmpty()) return;
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not inspect CodeBuild source directory " + sourceDir, e);
         }
+
+        RetryingTarCopier.copyStreamed(dockerClient, containerId, remotePath,
+                "codebuild-source", out -> createTarFromDir(sourceDir, out),
+                RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, backoffMillis);
     }
 
     // Pulls the container's working directory back into the local workspace so
@@ -558,9 +571,9 @@ public class CodeBuildRunner implements ContainerTeardown {
         }
     }
 
-    private void createTarFromDir(Path dir, ByteArrayOutputStream out) throws IOException {
+    private void createTarFromDir(Path dir, OutputStream out) throws IOException {
         try (TarArchiveOutputStream tar = newTarStream(out);
-             var stream = Files.walk(dir)) {
+             Stream<Path> stream = Files.walk(dir)) {
             for (Path path : (Iterable<Path>) stream::iterator) {
                 if (path.equals(dir)) continue;
                 String entryName = dir.relativize(path).toString();
@@ -573,7 +586,7 @@ public class CodeBuildRunner implements ContainerTeardown {
                     entry.setSize(Files.size(path));
                     entry.setMode(0644);
                     tar.putArchiveEntry(entry);
-                    try (var fis = Files.newInputStream(path)) {
+                    try (InputStream fis = Files.newInputStream(path)) {
                         fis.transferTo(tar);
                     }
                     tar.closeArchiveEntry();
@@ -582,7 +595,7 @@ public class CodeBuildRunner implements ContainerTeardown {
         }
     }
 
-    private static TarArchiveOutputStream newTarStream(ByteArrayOutputStream out) {
+    private static TarArchiveOutputStream newTarStream(OutputStream out) {
         TarArchiveOutputStream tar = new TarArchiveOutputStream(out);
         tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU);
         tar.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_STAR);
@@ -730,7 +743,7 @@ public class CodeBuildRunner implements ContainerTeardown {
         }
         for (String pattern : patterns) {
             if ("**/*".equals(pattern) || "**".equals(pattern)) {
-                try (var stream = Files.walk(baseDir)) {
+                try (Stream<Path> stream = Files.walk(baseDir)) {
                     stream.filter(Files::isRegularFile).forEach(result::add);
                 }
             } else if (!pattern.contains("*") && !pattern.contains("?")
@@ -743,8 +756,8 @@ public class CodeBuildRunner implements ContainerTeardown {
                     LOG.warnv("Artifact file not found: {0}", direct);
                 }
             } else {
-                var matcher = baseDir.getFileSystem().getPathMatcher("glob:" + pattern);
-                try (var stream = Files.walk(baseDir)) {
+                PathMatcher matcher = baseDir.getFileSystem().getPathMatcher("glob:" + pattern);
+                try (Stream<Path> stream = Files.walk(baseDir)) {
                     stream.filter(Files::isRegularFile)
                             .filter(p -> matcher.matches(baseDir.relativize(p)))
                             .forEach(result::add);
@@ -791,14 +804,14 @@ public class CodeBuildRunner implements ContainerTeardown {
         BuildPhase phase = new BuildPhase();
         phase.setPhaseType(phaseType);
         phase.setPhaseStatus("IN_PROGRESS");
-        phase.setStartTime(System.currentTimeMillis() / 1000.0);
+        phase.setStartTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
         build.getPhases().add(phase);
         build.setCurrentPhase(phaseType);
     }
 
     private void completePhase(Build build, String phaseType, String status) {
         findPhase(build, phaseType).ifPresent(p -> {
-            double end = System.currentTimeMillis() / 1000.0;
+            double end = EpochSeconds.fromMillis(System.currentTimeMillis());
             p.setPhaseStatus(status);
             p.setEndTime(end);
             p.setDurationInSeconds(Math.round(end - p.getStartTime()));
@@ -807,7 +820,7 @@ public class CodeBuildRunner implements ContainerTeardown {
 
     private void completePhaseWithError(Build build, String phaseType, String status, String message) {
         findPhase(build, phaseType).ifPresent(p -> {
-            double end = System.currentTimeMillis() / 1000.0;
+            double end = EpochSeconds.fromMillis(System.currentTimeMillis());
             p.setPhaseStatus(status);
             p.setEndTime(end);
             p.setDurationInSeconds(Math.round(end - p.getStartTime()));
@@ -822,7 +835,7 @@ public class CodeBuildRunner implements ContainerTeardown {
         BuildPhase phase = new BuildPhase();
         phase.setPhaseType(phaseType);
         phase.setPhaseStatus("SUCCEEDED");
-        double now = System.currentTimeMillis() / 1000.0;
+        double now = EpochSeconds.fromMillis(System.currentTimeMillis());
         phase.setStartTime(now);
         phase.setEndTime(now);
         phase.setDurationInSeconds(0L);
@@ -830,14 +843,14 @@ public class CodeBuildRunner implements ContainerTeardown {
     }
 
     private void finishStopped(Build build) {
-        build.setEndTime(System.currentTimeMillis() / 1000.0);
+        build.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
         build.setBuildComplete(true);
         build.setBuildStatus("STOPPED");
         build.setCurrentPhase("COMPLETED");
     }
 
     private void finishFailed(Build build) {
-        build.setEndTime(System.currentTimeMillis() / 1000.0);
+        build.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
         build.setBuildComplete(true);
         build.setBuildStatus("FAILED");
         build.setCurrentPhase("COMPLETED");
@@ -851,11 +864,8 @@ public class CodeBuildRunner implements ContainerTeardown {
 
     private void deleteDirectory(Path path) {
         try {
-            if (!Files.exists(path)) { return; }
-            Files.walk(path).sorted(Comparator.reverseOrder()).forEach(p -> {
-                try { Files.delete(p); } catch (Exception ignored) {}
-            });
-        } catch (Exception e) {
+            FileTrees.delete(path);
+        } catch (IOException e) {
             LOG.debugv("Could not delete workspace {0}: {1}", path, e.getMessage());
         }
     }
