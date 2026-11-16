@@ -1,12 +1,14 @@
 package com.floci.test;
 
-import org.junit.jupiter.api.*;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+import org.junit.jupiter.api.*;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
 import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.iam.model.CreateRoleRequest;
 import software.amazon.awssdk.services.iam.model.CreateSamlProviderRequest;
@@ -15,8 +17,6 @@ import software.amazon.awssdk.services.iam.model.DeleteRoleRequest;
 import software.amazon.awssdk.services.iam.model.NoSuchEntityException;
 import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.model.*;
-import org.w3c.dom.Document;
-import org.w3c.dom.Element;
 
 import javax.xml.crypto.dsig.CanonicalizationMethod;
 import javax.xml.crypto.dsig.DigestMethod;
@@ -26,15 +26,16 @@ import javax.xml.crypto.dsig.SignedInfo;
 import javax.xml.crypto.dsig.Transform;
 import javax.xml.crypto.dsig.XMLSignatureFactory;
 import javax.xml.crypto.dsig.dom.DOMSignContext;
+import javax.xml.crypto.dsig.spec.C14NMethodParameterSpec;
 import javax.xml.crypto.dsig.spec.TransformParameterSpec;
 import javax.xml.crypto.dsig.spec.XPathFilter2ParameterSpec;
 import javax.xml.crypto.dsig.spec.XPathFilterParameterSpec;
 import javax.xml.crypto.dsig.spec.XPathType;
 import javax.xml.transform.OutputKeys;
+import javax.xml.transform.Transformer;
 import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
-
 import java.io.StringWriter;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -46,6 +47,7 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Function;
 
@@ -61,6 +63,14 @@ class StsTest {
     private static String allowedRoleArn;
     private static String allowedRoleName;
 
+    // The console sign-on URL a bearer assertion names, per partition (the CDK region facts). A
+    // partition the CDK lists none for keeps the commercial URL, as Floci does.
+    private static final Map<String, String> SAML_SIGN_ON_URLS = Map.of(
+            "aws", "https://signin.aws.amazon.com/saml",
+            "aws-cn", "https://signin.amazonaws.cn/saml",
+            "aws-us-gov", "https://signin.amazonaws-us-gov.com/saml",
+            "aws-iso", "https://signin.c2shome.ic.gov/saml",
+            "aws-iso-b", "https://signin.sc2shome.sgov.gov/saml");
     private static final String OPEN_TRUST_POLICY = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},\"Action\":\"sts:AssumeRole\"}]}";
 
     @BeforeAll
@@ -340,11 +350,16 @@ class StsTest {
 
     @Test
     void getSessionTokenDefaultDuration() {
+        Instant beforeRequest = Instant.now();
         GetSessionTokenResponse response = sts.getSessionToken(
                 GetSessionTokenRequest.builder().build());
+        Instant afterResponse = Instant.now();
 
         assertThat(response.credentials()).isNotNull();
-        assertThat(response.credentials().expiration()).isAfter(Instant.now().plusSeconds(3600));
+        // Root credentials default to one hour; wire timestamps have millisecond precision.
+        assertThat(response.credentials().expiration()).isBetween(
+                beforeRequest.plusSeconds(3600).minusMillis(1),
+                afterResponse.plusSeconds(3600).plusMillis(1));
     }
 
     @Test
@@ -433,7 +448,8 @@ class StsTest {
         String xml = "<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"" + id
                 + "\" Version=\"2.0\" IssueInstant=\"" + Instant.now() + "\"><saml:Issuer>" + issuer
                 + "</saml:Issuer><saml:Subject><saml:NameID Format=\"persistent\">sdk-test-subject</saml:NameID>"
-                + "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\"><saml:SubjectConfirmationData Recipient=\"https://signin.aws.amazon.com/saml\" NotOnOrAfter=\""
+                + "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">"
+                + "<saml:SubjectConfirmationData Recipient=\"" + samlSignOnUrl() + "\" NotOnOrAfter=\""
                 + expiry + "\"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore=\""
                 + Instant.now().minusSeconds(30) + "\" NotOnOrAfter=\"" + expiry
                 + "\"><saml:AudienceRestriction><saml:Audience>urn:amazon:webservices</saml:Audience></saml:AudienceRestriction></saml:Conditions>"
@@ -449,11 +465,11 @@ class StsTest {
                     transforms.apply(factory), null, null);
             SignedInfo signedInfo = factory.newSignedInfo(
                     factory.newCanonicalizationMethod("http://www.w3.org/2001/10/xml-exc-c14n#",
-                                                (javax.xml.crypto.dsig.spec.C14NMethodParameterSpec) null),
+                                                (C14NMethodParameterSpec) null),
                     factory.newSignatureMethod(SignatureMethod.RSA_SHA256, null), List.of(reference));
             factory.newXMLSignature(signedInfo, null)
                     .sign(new DOMSignContext(signingKeys.getPrivate(), assertion));
-            var transformer = TransformerFactory.newInstance().newTransformer();
+            Transformer transformer = TransformerFactory.newInstance().newTransformer();
             transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
             StringWriter output = new StringWriter();
             transformer.transform(new DOMSource(document), new StreamResult(output));
@@ -461,5 +477,9 @@ class StsTest {
         } catch (Exception e) {
             throw new IllegalStateException("Could not create SAML assertion", e);
         }
+    }
+
+    private static String samlSignOnUrl() {
+        return SAML_SIGN_ON_URLS.getOrDefault(TestFixtures.partition(), SAML_SIGN_ON_URLS.get("aws"));
     }
 }

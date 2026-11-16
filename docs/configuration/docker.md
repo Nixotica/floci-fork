@@ -48,11 +48,13 @@ services:
 
 Use this only when the socket's permissions require root. Without the option, Floci retains its unprivileged default. The setting applies to the container entrypoint, not to `floci.docker` configuration.
 
+The entrypoint needs to start as root to read the socket's group and to honour this option. A container started as a non-root user, with `--user 1001` or a Kubernetes `runAsUser`, skips both, so give it the socket's group yourself: `--group-add "$(stat -c '%g' /var/run/docker.sock)"`.
+
 ## Connection Pool
 
-Every Docker call Floci makes goes through one shared client with a bounded connection pool. Some of those connections stay open for as long as a container runs: each Lambda container holds two (its followed log stream and the watcher that notices its runtime exiting) plus one per Lambda extension, and other container-backed services hold one for their log stream. When those long-lived connections fill the pool, every other Docker call (create, start, stop, remove) waits for one to free up, and Floci stops making progress.
+Floci's short Docker calls (create, start, stop, remove and the like) go through one client with a bounded connection pool. A few streams also hold a connection from it for as long as they run: CodeBuild phase commands, EKS audit log followers and ECS Exec sessions. When long-lived connections fill the pool, every other Docker call waits for one to free up, and Floci stops making progress.
 
-The default of 1024 connections covers the 500 concurrent Lambda containers the default [Runtime API port range](../services/lambda.md#configuration) allows. Raise it if you widen that range or run many other containers at the same time:
+The default is 1024 connections. Raise it if you run many CodeBuild builds or ECS Exec sessions at the same time:
 
 ```yaml
 floci:
@@ -61,6 +63,46 @@ floci:
 ```
 
 Environment variable: `FLOCI_DOCKER_MAX_CONNECTIONS`
+
+Streams that stay open for as long as a container runs use a second, separate pool, so they can never starve create, start, stop and remove calls. Each Lambda container holds two of these (its log stream and the watcher that notices its runtime exiting) plus one per Lambda extension, and other containers' log streams use it too. The default of 2048 covers the 500 concurrent Lambda containers the default [Runtime API port range](../services/lambda.md#configuration) allows, with two extensions each. Raise it if you widen that range or run many other containers at the same time. It follows the same rule (at least 1):
+
+```yaml
+floci:
+  docker:
+    streaming-max-connections: 2048
+```
+
+Environment variable: `FLOCI_DOCKER_STREAMING_MAX_CONNECTIONS`
+
+When a pool is full, a Docker call waits for a free connection, then fails. The wait defaults to 30 seconds for both pools and must be at least 1 (httpclient5 reads 0 as no limit, so a call would wait forever); a failed wait is not retried, because a full pool means Floci is saturated:
+
+```yaml
+floci:
+  docker:
+    connection-request-timeout-seconds: 30
+```
+
+Environment variable: `FLOCI_DOCKER_CONNECTION_REQUEST_TIMEOUT_SECONDS`
+
+A Docker call that gets no response within `api-timeout-seconds` fails, on Unix-socket and TCP hosts alike, so a hung daemon cannot block a request indefinitely. The limit applies to each attempt: a control-plane request that is safe to repeat is tried up to six times, so against a silent daemon it can take about six times the limit, plus backoff, to fail. It defaults to 300 seconds (5 minutes) for both pools and must be at least 1, since httpclient5 reads 0 as no limit. Requests that follow a container for as long as it runs (container waits, exec and attach output, followed logs, streamed stats, daemon events, image pulls and builds) have no such limit, since they can stay silent while healthy:
+
+```yaml
+floci:
+  docker:
+    api-timeout-seconds: 300
+```
+
+Environment variable: `FLOCI_DOCKER_API_TIMEOUT_SECONDS`
+
+An image pull has a limit of its own: each attempt may take up to `image-pull-timeout-seconds`, 300 seconds (5 minutes) by default. A pull still downloading when the limit passes fails that attempt with "Could not pull image: Downloading" and is tried again, three attempts in all, so a launch that needs an image Docker does not have yet can wait up to about three times the limit before it fails; a pull that has reported no progress at all within the limit fails at once with "Timed out pulling image". A large image, such as an EMR Serverless runtime of 3.5 to 4.3 GB, can need longer on a slow connection: raise the limit, or pull the image with `docker pull` before the first launch. It must be at least 1:
+
+```yaml
+floci:
+  docker:
+    image-pull-timeout-seconds: 300
+```
+
+Environment variable: `FLOCI_DOCKER_IMAGE_PULL_TIMEOUT_SECONDS`
 
 ## Private Registry Authentication
 
@@ -247,7 +289,8 @@ podman network create floci-net
 podman run -d --name floci \
   --network floci-net \
   -p 4566:4566 \
-  -v /run/user/$(id -u)/podman/podman.sock:/var/run/docker.sock:z \
+  -v /run/user/$(id -u)/podman/podman.sock:/var/run/docker.sock \
+  --security-opt label=disable \
   -e FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK=floci-net \
   -e FLOCI_HOSTNAME=floci \
   floci/floci
@@ -262,14 +305,14 @@ What each setting does and why it is needed:
   Lambda containers it spawns to that same named network.
 - **`FLOCI_HOSTNAME=floci`** — gives Floci a stable name that Lambda containers
   resolve when calling back to the Runtime API.
-- **`:z` on the socket mount** — relabels the Podman socket for SELinux. Without
-  it, Floci fails to talk to the Podman socket: Lambda/ECR container creation
-  errors with `java.io.IOException: Broken pipe`, and the **Floci UI** sidecar
-  fails to launch with `java.net.BindException: Permission denied`. Use the
-  lowercase `:z` (shared relabel) rather than `:Z` — the Podman API socket is
-  shared with the Podman service, and `:Z` applies a container-private SELinux
-  label that can break access. If `:z` is still not enough on your host, fall
-  back to `--security-opt label=disable`.
+- **`--security-opt label=disable`**: turns off SELinux labeling for the Floci
+  container. With SELinux enforcing, the container's label keeps Floci from
+  talking to the Podman socket: Lambda/ECR container creation fails with
+  `java.net.BindException: Permission denied` (or
+  `java.io.IOException: Broken pipe`), and so does the **Floci UI** sidecar.
+  Relabeling the mount with `:z` or `:Z` is not a substitute: it fixes access to
+  the socket file, but SELinux also denies `connectto` on the Podman service at
+  the other end of the socket.
 
 !!! tip "When the Runtime API address is still unreachable"
     On some Podman network topologies the auto-detected Runtime API address
@@ -286,13 +329,28 @@ What each setting does and why it is needed:
     auto-detection entirely. See the [Lambda docs](../services/lambda.md#configuration)
     for details.
 
+## Transient I/O retry
+
+All of Floci's short-lived docker calls (create/start/inspect/remove container, volume management, image operations) travel one shared daemon socket, and under fan-out load the daemon occasionally drops a connection mid-call with `java.io.IOException: Broken pipe`. Floci retries these transient failures centrally, at the docker transport layer, up to 6 attempts with a capped exponential backoff (500ms base, 8s cap); so every call site is covered without per-call configuration, and a genuine daemon rejection (a 4xx, a name conflict) still surfaces immediately.
+
+A request is only replayed when doing so cannot change semantics: requests carrying a one-shot upload stream (e.g. copying an archive into a container), bidirectional attach streams, and `exec` requests (which would re-run the command) are never retried. Log-follow connections use a separate transport that does not retry at all. Bodyless actions whose replay changes the outcome (unnamed container create, network create, container restart, network connect and disconnect) are not retried either. A tar-writer failure on the Floci host (for example an unreadable source file) is reported at once instead of retried.
+
+Archive uploads that use the shared tar-copy helper retry above the transport layer, rebuilding
+the upload stream for each attempt with the same six-attempt backoff. This includes user-data
+scripts, the container CA bundle, Verdaccio's configuration, SageMaker model data and training
+inputs, Flink log configuration and application properties, and EKS audit policies, IRSA
+signing keys, the containerd certificate-directory link and the Pod Identity manifest. Only the
+upload is retried, not script execution. Daemon rejections still stop immediately, and each
+caller keeps its existing failure handling after retries are exhausted.
+
 ## Full Reference
 
 | Environment variable | Default | Description |
 |---|---|---|
 | `FLOCI_DOCKER_DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker daemon socket |
 | `FLOCI_DOCKER_DOCKER_CONFIG_PATH` | _(unset)_ | Path to directory containing Docker's `config.json` |
-| `FLOCI_DOCKER_MAX_CONNECTIONS` | `1024` | Connection pool size for Floci's Docker client. Each live Lambda container holds two connections, so about half this many can run at once |
+| `FLOCI_DOCKER_MAX_CONNECTIONS` | `1024` | Connection pool size for Floci's short Docker calls, plus CodeBuild phase commands, EKS audit log followers and ECS Exec sessions |
+| `FLOCI_DOCKER_STREAMING_MAX_CONNECTIONS` | `2048` | Connection pool size for streams that last a container's lifetime. Each live Lambda container holds two (log stream and exit watcher) plus one per extension |
 | `FLOCI_DOCKER_REGISTRY_CREDENTIALS_0__SERVER` | _(unset)_ | Registry hostname for credential entry 0 |
 | `FLOCI_DOCKER_REGISTRY_CREDENTIALS_0__USERNAME` | _(unset)_ | Username for credential entry 0 |
 | `FLOCI_DOCKER_REGISTRY_CREDENTIALS_0__PASSWORD` | _(unset)_ | Password for credential entry 0 |

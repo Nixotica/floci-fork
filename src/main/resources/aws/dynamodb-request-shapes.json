@@ -1,7 +1,7 @@
 {
   "_source": {
     "generator": "tools/aws/regen_dynamodb_shapes.py",
-    "botocore": "botocore 1.43.98 (installed package)"
+    "botocore": "botocore 1.43.118 (installed package)"
   },
   "operations": {
     "BatchExecuteStatement": "BatchExecuteStatementInput",
@@ -72,6 +72,10 @@
     },
     "AttributeDefinition": {
       "type": "structure",
+      "required": [
+        "AttributeName",
+        "AttributeType"
+      ],
       "members": {
         "AttributeName": "KeySchemaAttributeName",
         "AttributeType": "ScalarAttributeType"
@@ -123,6 +127,9 @@
     },
     "AutoScalingPolicyUpdate": {
       "type": "structure",
+      "required": [
+        "TargetTrackingScalingPolicyConfiguration"
+      ],
       "members": {
         "PolicyName": "AutoScalingPolicyName",
         "TargetTrackingScalingPolicyConfiguration": "AutoScalingTargetTrackingScalingPolicyConfigurationUpdate"
@@ -143,6 +150,9 @@
     },
     "AutoScalingTargetTrackingScalingPolicyConfigurationUpdate": {
       "type": "structure",
+      "required": [
+        "TargetValue"
+      ],
       "members": {
         "DisableScaleIn": "BooleanObject",
         "ScaleInCooldown": "IntegerObject",
@@ -164,6 +174,9 @@
     },
     "BatchExecuteStatementInput": {
       "type": "structure",
+      "required": [
+        "Statements"
+      ],
       "members": {
         "Statements": "PartiQLBatchRequest",
         "ReturnConsumedCapacity": "ReturnConsumedCapacity"
@@ -171,6 +184,9 @@
     },
     "BatchGetItemInput": {
       "type": "structure",
+      "required": [
+        "RequestItems"
+      ],
       "members": {
         "RequestItems": "BatchGetRequestMap",
         "ReturnConsumedCapacity": "ReturnConsumedCapacity"
@@ -182,6 +198,9 @@
     },
     "BatchStatementRequest": {
       "type": "structure",
+      "required": [
+        "Statement"
+      ],
       "members": {
         "Statement": "PartiQLStatement",
         "Parameters": "PreparedStatementParameters",
@@ -191,6 +210,9 @@
     },
     "BatchWriteItemInput": {
       "type": "structure",
+      "required": [
+        "RequestItems"
+      ],
       "members": {
         "RequestItems": "BatchWriteItemRequestMap",
         "ReturnConsumedCapacity": "ReturnConsumedCapacity",
@@ -228,6 +250,9 @@
     },
     "Condition": {
       "type": "structure",
+      "required": [
+        "ComparisonOperator"
+      ],
       "members": {
         "AttributeValueList": "AttributeValueList",
         "ComparisonOperator": "ComparisonOperator"
@@ -235,6 +260,11 @@
     },
     "ConditionCheck": {
       "type": "structure",
+      "required": [
+        "Key",
+        "TableName",
+        "ConditionExpression"
+      ],
       "members": {
         "Key": "Key",
         "TableName": "TableArn",
@@ -264,6 +294,10 @@
     },
     "CreateBackupInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "BackupName"
+      ],
       "members": {
         "TableName": "TableArn",
         "BackupName": "BackupName"
@@ -271,6 +305,11 @@
     },
     "CreateGlobalSecondaryIndexAction": {
       "type": "structure",
+      "required": [
+        "IndexName",
+        "KeySchema",
+        "Projection"
+      ],
       "members": {
         "IndexName": "IndexName",
         "KeySchema": "KeySchema",
@@ -282,6 +321,10 @@
     },
     "CreateGlobalTableInput": {
       "type": "structure",
+      "required": [
+        "GlobalTableName",
+        "ReplicationGroup"
+      ],
       "members": {
         "GlobalTableName": "TableName",
         "ReplicationGroup": "ReplicaList"
@@ -289,18 +332,27 @@
     },
     "CreateGlobalTableWitnessGroupMemberAction": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName"
       }
     },
     "CreateReplicaAction": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName"
       }
     },
     "CreateReplicationGroupMemberAction": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName",
         "KMSMasterKeyId": "KMSMasterKeyId",
@@ -312,6 +364,9 @@
     },
     "CreateTableInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "AttributeDefinitions": "AttributeDefinitions",
         "TableName": "TableArn",
@@ -335,6 +390,13 @@
     },
     "CreateVectorIndexAction": {
       "type": "structure",
+      "required": [
+        "IndexName",
+        "VectorAttribute",
+        "Projection",
+        "Dimensions",
+        "DistanceFunction"
+      ],
       "members": {
         "IndexName": "IndexName",
         "VectorAttribute": "VectorAttributeDefinition",
@@ -366,6 +428,10 @@
     },
     "Delete": {
       "type": "structure",
+      "required": [
+        "Key",
+        "TableName"
+      ],
       "members": {
         "Key": "Key",
         "TableName": "TableArn",
@@ -377,24 +443,37 @@
     },
     "DeleteBackupInput": {
       "type": "structure",
+      "required": [
+        "BackupArn"
+      ],
       "members": {
         "BackupArn": "BackupArn"
       }
     },
     "DeleteGlobalSecondaryIndexAction": {
       "type": "structure",
+      "required": [
+        "IndexName"
+      ],
       "members": {
         "IndexName": "IndexName"
       }
     },
     "DeleteGlobalTableWitnessGroupMemberAction": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName"
       }
     },
     "DeleteItemInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "Key"
+      ],
       "members": {
         "TableName": "TableArn",
         "Key": "Key",
@@ -411,24 +490,36 @@
     },
     "DeleteReplicaAction": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName"
       }
     },
     "DeleteReplicationGroupMemberAction": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName"
       }
     },
     "DeleteRequest": {
       "type": "structure",
+      "required": [
+        "Key"
+      ],
       "members": {
         "Key": "Key"
       }
     },
     "DeleteResourcePolicyInput": {
       "type": "structure",
+      "required": [
+        "ResourceArn"
+      ],
       "members": {
         "ResourceArn": "ResourceArnString",
         "ExpectedRevisionId": "PolicyRevisionId"
@@ -436,12 +527,18 @@
     },
     "DeleteTableInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn"
       }
     },
     "DeleteVectorIndexAction": {
       "type": "structure",
+      "required": [
+        "IndexName"
+      ],
       "members": {
         "IndexName": "IndexName"
       }
@@ -451,18 +548,27 @@
     },
     "DescribeBackupInput": {
       "type": "structure",
+      "required": [
+        "BackupArn"
+      ],
       "members": {
         "BackupArn": "BackupArn"
       }
     },
     "DescribeContinuousBackupsInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn"
       }
     },
     "DescribeContributorInsightsInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn",
         "IndexName": "IndexName"
@@ -474,30 +580,45 @@
     },
     "DescribeExportInput": {
       "type": "structure",
+      "required": [
+        "ExportArn"
+      ],
       "members": {
         "ExportArn": "ExportArn"
       }
     },
     "DescribeGlobalTableInput": {
       "type": "structure",
+      "required": [
+        "GlobalTableName"
+      ],
       "members": {
         "GlobalTableName": "TableName"
       }
     },
     "DescribeGlobalTableSettingsInput": {
       "type": "structure",
+      "required": [
+        "GlobalTableName"
+      ],
       "members": {
         "GlobalTableName": "TableName"
       }
     },
     "DescribeImportInput": {
       "type": "structure",
+      "required": [
+        "ImportArn"
+      ],
       "members": {
         "ImportArn": "ImportArn"
       }
     },
     "DescribeKinesisStreamingDestinationInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn"
       }
@@ -508,21 +629,47 @@
     },
     "DescribeTableInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn"
       }
     },
     "DescribeTableReplicaAutoScalingInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn"
       }
     },
     "DescribeTimeToLiveInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn"
       }
+    },
+    "DisassociateReplicationGroupMemberAction": {
+      "type": "structure",
+      "required": [
+        "RegionName",
+        "DisassociationMode"
+      ],
+      "members": {
+        "RegionName": "RegionName",
+        "DisassociationMode": "DisassociationMode"
+      }
+    },
+    "DisassociationMode": {
+      "type": "string"
+    },
+    "DisassociationProtectionEnabled": {
+      "type": "boolean"
     },
     "DoubleObject": {
       "type": "double"
@@ -535,6 +682,9 @@
     },
     "ExecuteStatementInput": {
       "type": "structure",
+      "required": [
+        "Statement"
+      ],
       "members": {
         "Statement": "PartiQLStatement",
         "Parameters": "PreparedStatementParameters",
@@ -547,6 +697,9 @@
     },
     "ExecuteTransactionInput": {
       "type": "structure",
+      "required": [
+        "TransactStatements"
+      ],
       "members": {
         "TransactStatements": "ParameterizedStatements",
         "ClientRequestToken": "ClientRequestToken",
@@ -580,6 +733,10 @@
     },
     "ExportTableToPointInTimeInput": {
       "type": "structure",
+      "required": [
+        "TableArn",
+        "S3Bucket"
+      ],
       "members": {
         "TableArn": "TableArn",
         "ExportTime": "ExportTime",
@@ -591,7 +748,8 @@
         "S3SseKmsKeyId": "S3SseKmsKeyId",
         "ExportFormat": "ExportFormat",
         "ExportType": "ExportType",
-        "IncrementalExportSpecification": "IncrementalExportSpecification"
+        "IncrementalExportSpecification": "IncrementalExportSpecification",
+        "FilterSpecification": "FilterSpecification"
       }
     },
     "ExportTime": {
@@ -618,8 +776,22 @@
       "type": "map",
       "value": "Condition"
     },
+    "FilterSpecification": {
+      "type": "structure",
+      "members": {
+        "FilterExpression": "ConditionExpression",
+        "ProjectionExpression": "ProjectionExpression",
+        "KeyConditionExpression": "KeyExpression",
+        "ExpressionAttributeNames": "ExpressionAttributeNameMap",
+        "ExpressionAttributeValues": "ExpressionAttributeValueMap"
+      }
+    },
     "Get": {
       "type": "structure",
+      "required": [
+        "Key",
+        "TableName"
+      ],
       "members": {
         "Key": "Key",
         "TableName": "TableArn",
@@ -629,6 +801,10 @@
     },
     "GetItemInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "Key"
+      ],
       "members": {
         "TableName": "TableArn",
         "Key": "Key",
@@ -641,12 +817,20 @@
     },
     "GetResourcePolicyInput": {
       "type": "structure",
+      "required": [
+        "ResourceArn"
+      ],
       "members": {
         "ResourceArn": "ResourceArnString"
       }
     },
     "GlobalSecondaryIndex": {
       "type": "structure",
+      "required": [
+        "IndexName",
+        "KeySchema",
+        "Projection"
+      ],
       "members": {
         "IndexName": "IndexName",
         "KeySchema": "KeySchema",
@@ -685,6 +869,9 @@
     },
     "GlobalTableGlobalSecondaryIndexSettingsUpdate": {
       "type": "structure",
+      "required": [
+        "IndexName"
+      ],
       "members": {
         "IndexName": "IndexName",
         "ProvisionedWriteCapacityUnits": "PositiveLongObject",
@@ -717,6 +904,11 @@
     },
     "ImportTableInput": {
       "type": "structure",
+      "required": [
+        "S3BucketSource",
+        "InputFormat",
+        "TableCreationParameters"
+      ],
       "members": {
         "ClientToken": "ClientToken",
         "S3BucketSource": "S3BucketSource",
@@ -779,6 +971,10 @@
     },
     "KeySchemaElement": {
       "type": "structure",
+      "required": [
+        "AttributeName",
+        "KeyType"
+      ],
       "members": {
         "AttributeName": "KeySchemaAttributeName",
         "KeyType": "KeyType"
@@ -789,6 +985,9 @@
     },
     "KeysAndAttributes": {
       "type": "structure",
+      "required": [
+        "Keys"
+      ],
       "members": {
         "Keys": "KeyList",
         "AttributesToGet": "AttributeNameList",
@@ -799,6 +998,10 @@
     },
     "KinesisStreamingDestinationInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "StreamArn"
+      ],
       "members": {
         "TableName": "TableArn",
         "StreamArn": "StreamArn",
@@ -873,6 +1076,9 @@
     },
     "ListTagsOfResourceInput": {
       "type": "structure",
+      "required": [
+        "ResourceArn"
+      ],
       "members": {
         "ResourceArn": "ResourceArnString",
         "NextToken": "NextTokenString"
@@ -880,6 +1086,11 @@
     },
     "LocalSecondaryIndex": {
       "type": "structure",
+      "required": [
+        "IndexName",
+        "KeySchema",
+        "Projection"
+      ],
       "members": {
         "IndexName": "IndexName",
         "KeySchema": "KeySchema",
@@ -935,6 +1146,9 @@
     },
     "ParameterizedStatement": {
       "type": "structure",
+      "required": [
+        "Statement"
+      ],
       "members": {
         "Statement": "PartiQLStatement",
         "Parameters": "PreparedStatementParameters",
@@ -957,6 +1171,9 @@
     },
     "PointInTimeRecoverySpecification": {
       "type": "structure",
+      "required": [
+        "PointInTimeRecoveryEnabled"
+      ],
       "members": {
         "PointInTimeRecoveryEnabled": "BooleanObject",
         "RecoveryPeriodInDays": "RecoveryPeriodInDays"
@@ -990,6 +1207,10 @@
     },
     "ProvisionedThroughput": {
       "type": "structure",
+      "required": [
+        "ReadCapacityUnits",
+        "WriteCapacityUnits"
+      ],
       "members": {
         "ReadCapacityUnits": "PositiveLongObject",
         "WriteCapacityUnits": "PositiveLongObject"
@@ -1003,6 +1224,10 @@
     },
     "Put": {
       "type": "structure",
+      "required": [
+        "Item",
+        "TableName"
+      ],
       "members": {
         "Item": "PutItemInputAttributeMap",
         "TableName": "TableArn",
@@ -1014,6 +1239,10 @@
     },
     "PutItemInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "Item"
+      ],
       "members": {
         "TableName": "TableArn",
         "Item": "PutItemInputAttributeMap",
@@ -1034,12 +1263,19 @@
     },
     "PutRequest": {
       "type": "structure",
+      "required": [
+        "Item"
+      ],
       "members": {
         "Item": "PutItemInputAttributeMap"
       }
     },
     "PutResourcePolicyInput": {
       "type": "structure",
+      "required": [
+        "ResourceArn",
+        "Policy"
+      ],
       "members": {
         "ResourceArn": "ResourceArnString",
         "Policy": "ResourcePolicy",
@@ -1049,6 +1285,9 @@
     },
     "QueryInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn",
         "IndexName": "IndexName",
@@ -1083,6 +1322,9 @@
     },
     "ReplicaAutoScalingUpdate": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName",
         "ReplicaGlobalSecondaryIndexUpdates": "ReplicaGlobalSecondaryIndexAutoScalingUpdateList",
@@ -1095,6 +1337,9 @@
     },
     "ReplicaGlobalSecondaryIndex": {
       "type": "structure",
+      "required": [
+        "IndexName"
+      ],
       "members": {
         "IndexName": "IndexName",
         "ProvisionedThroughputOverride": "ProvisionedThroughputOverride",
@@ -1118,6 +1363,9 @@
     },
     "ReplicaGlobalSecondaryIndexSettingsUpdate": {
       "type": "structure",
+      "required": [
+        "IndexName"
+      ],
       "members": {
         "IndexName": "IndexName",
         "ProvisionedReadCapacityUnits": "PositiveLongObject",
@@ -1134,6 +1382,9 @@
     },
     "ReplicaSettingsUpdate": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName",
         "ReplicaProvisionedReadCapacityUnits": "PositiveLongObject",
@@ -1162,7 +1413,8 @@
       "members": {
         "Create": "CreateReplicationGroupMemberAction",
         "Update": "UpdateReplicationGroupMemberAction",
-        "Delete": "DeleteReplicationGroupMemberAction"
+        "Delete": "DeleteReplicationGroupMemberAction",
+        "Disassociate": "DisassociateReplicationGroupMemberAction"
       }
     },
     "ReplicationGroupUpdateList": {
@@ -1177,6 +1429,10 @@
     },
     "RestoreTableFromBackupInput": {
       "type": "structure",
+      "required": [
+        "TargetTableName",
+        "BackupArn"
+      ],
       "members": {
         "TargetTableName": "TableName",
         "BackupArn": "BackupArn",
@@ -1191,6 +1447,9 @@
     },
     "RestoreTableToPointInTimeInput": {
       "type": "structure",
+      "required": [
+        "TargetTableName"
+      ],
       "members": {
         "SourceTableArn": "TableArn",
         "SourceTableName": "TableName",
@@ -1226,6 +1485,9 @@
     },
     "S3BucketSource": {
       "type": "structure",
+      "required": [
+        "S3Bucket"
+      ],
       "members": {
         "S3BucketOwner": "S3BucketOwner",
         "S3Bucket": "S3Bucket",
@@ -1260,6 +1522,9 @@
     },
     "ScanInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "TableName": "TableArn",
         "IndexName": "IndexName",
@@ -1291,6 +1556,10 @@
     },
     "SearchSchemaElement": {
       "type": "structure",
+      "required": [
+        "AttributeName",
+        "SearchSchemaElementType"
+      ],
       "members": {
         "AttributeName": "AttributeName",
         "SearchSchemaElementType": "SearchSchemaElementType"
@@ -1305,6 +1574,12 @@
     },
     "SearchVectorsInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "IndexName",
+        "SearchVector",
+        "TopK"
+      ],
       "members": {
         "TableName": "TableArn",
         "IndexName": "IndexName",
@@ -1328,6 +1603,9 @@
     },
     "StreamSpecification": {
       "type": "structure",
+      "required": [
+        "StreamEnabled"
+      ],
       "members": {
         "StreamEnabled": "StreamEnabled",
         "StreamViewType": "StreamViewType"
@@ -1354,6 +1632,11 @@
     },
     "TableCreationParameters": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "AttributeDefinitions",
+        "KeySchema"
+      ],
       "members": {
         "TableName": "TableName",
         "AttributeDefinitions": "AttributeDefinitions",
@@ -1371,6 +1654,10 @@
     },
     "Tag": {
       "type": "structure",
+      "required": [
+        "Key",
+        "Value"
+      ],
       "members": {
         "Key": "TagKeyString",
         "Value": "TagValueString"
@@ -1389,6 +1676,10 @@
     },
     "TagResourceInput": {
       "type": "structure",
+      "required": [
+        "ResourceArn",
+        "Tags"
+      ],
       "members": {
         "ResourceArn": "ResourceArnString",
         "Tags": "TagList"
@@ -1411,6 +1702,10 @@
     },
     "TimeToLiveSpecification": {
       "type": "structure",
+      "required": [
+        "Enabled",
+        "AttributeName"
+      ],
       "members": {
         "Enabled": "TimeToLiveEnabled",
         "AttributeName": "TimeToLiveAttributeName"
@@ -1421,6 +1716,9 @@
     },
     "TransactGetItem": {
       "type": "structure",
+      "required": [
+        "Get"
+      ],
       "members": {
         "Get": "Get"
       }
@@ -1431,6 +1729,9 @@
     },
     "TransactGetItemsInput": {
       "type": "structure",
+      "required": [
+        "TransactItems"
+      ],
       "members": {
         "TransactItems": "TransactGetItemList",
         "ReturnConsumedCapacity": "ReturnConsumedCapacity"
@@ -1451,6 +1752,9 @@
     },
     "TransactWriteItemsInput": {
       "type": "structure",
+      "required": [
+        "TransactItems"
+      ],
       "members": {
         "TransactItems": "TransactWriteItemList",
         "ReturnConsumedCapacity": "ReturnConsumedCapacity",
@@ -1460,6 +1764,10 @@
     },
     "UntagResourceInput": {
       "type": "structure",
+      "required": [
+        "ResourceArn",
+        "TagKeys"
+      ],
       "members": {
         "ResourceArn": "ResourceArnString",
         "TagKeys": "TagKeyList"
@@ -1467,6 +1775,11 @@
     },
     "Update": {
       "type": "structure",
+      "required": [
+        "Key",
+        "UpdateExpression",
+        "TableName"
+      ],
       "members": {
         "Key": "Key",
         "UpdateExpression": "UpdateExpression",
@@ -1479,6 +1792,10 @@
     },
     "UpdateContinuousBackupsInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "PointInTimeRecoverySpecification"
+      ],
       "members": {
         "TableName": "TableArn",
         "PointInTimeRecoverySpecification": "PointInTimeRecoverySpecification"
@@ -1486,6 +1803,10 @@
     },
     "UpdateContributorInsightsInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "ContributorInsightsAction"
+      ],
       "members": {
         "TableName": "TableArn",
         "IndexName": "IndexName",
@@ -1498,6 +1819,9 @@
     },
     "UpdateGlobalSecondaryIndexAction": {
       "type": "structure",
+      "required": [
+        "IndexName"
+      ],
       "members": {
         "IndexName": "IndexName",
         "ProvisionedThroughput": "ProvisionedThroughput",
@@ -1507,6 +1831,10 @@
     },
     "UpdateGlobalTableInput": {
       "type": "structure",
+      "required": [
+        "GlobalTableName",
+        "ReplicaUpdates"
+      ],
       "members": {
         "GlobalTableName": "TableName",
         "ReplicaUpdates": "ReplicaUpdateList"
@@ -1514,6 +1842,9 @@
     },
     "UpdateGlobalTableSettingsInput": {
       "type": "structure",
+      "required": [
+        "GlobalTableName"
+      ],
       "members": {
         "GlobalTableName": "TableName",
         "GlobalTableBillingMode": "BillingMode",
@@ -1525,6 +1856,10 @@
     },
     "UpdateItemInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "Key"
+      ],
       "members": {
         "TableName": "TableArn",
         "Key": "Key",
@@ -1549,6 +1884,10 @@
     },
     "UpdateKinesisStreamingDestinationInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "StreamArn"
+      ],
       "members": {
         "TableName": "TableArn",
         "StreamArn": "StreamArn",
@@ -1557,6 +1896,9 @@
     },
     "UpdateReplicationGroupMemberAction": {
       "type": "structure",
+      "required": [
+        "RegionName"
+      ],
       "members": {
         "RegionName": "RegionName",
         "KMSMasterKeyId": "KMSMasterKeyId",
@@ -1568,6 +1910,9 @@
     },
     "UpdateTableInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "AttributeDefinitions": "AttributeDefinitions",
         "TableName": "TableArn",
@@ -1584,11 +1929,15 @@
         "OnDemandThroughput": "OnDemandThroughput",
         "WarmThroughput": "WarmThroughput",
         "GlobalTableSettingsReplicationMode": "GlobalTableSettingsReplicationMode",
+        "DisassociationProtectionEnabled": "DisassociationProtectionEnabled",
         "VectorIndexUpdates": "VectorIndexUpdateList"
       }
     },
     "UpdateTableReplicaAutoScalingInput": {
       "type": "structure",
+      "required": [
+        "TableName"
+      ],
       "members": {
         "GlobalSecondaryIndexUpdates": "GlobalSecondaryIndexAutoScalingUpdateList",
         "TableName": "TableArn",
@@ -1598,6 +1947,10 @@
     },
     "UpdateTimeToLiveInput": {
       "type": "structure",
+      "required": [
+        "TableName",
+        "TimeToLiveSpecification"
+      ],
       "members": {
         "TableName": "TableArn",
         "TimeToLiveSpecification": "TimeToLiveSpecification"
@@ -1605,6 +1958,9 @@
     },
     "VectorAttributeDefinition": {
       "type": "structure",
+      "required": [
+        "AttributeName"
+      ],
       "members": {
         "AttributeName": "VectorAttributeName"
       }
@@ -1617,6 +1973,13 @@
     },
     "VectorIndex": {
       "type": "structure",
+      "required": [
+        "IndexName",
+        "VectorAttribute",
+        "Projection",
+        "Dimensions",
+        "DistanceFunction"
+      ],
       "members": {
         "IndexName": "IndexName",
         "VectorAttribute": "VectorAttributeDefinition",

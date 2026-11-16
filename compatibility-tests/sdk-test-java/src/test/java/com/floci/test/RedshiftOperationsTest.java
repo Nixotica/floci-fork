@@ -28,19 +28,29 @@ import software.amazon.awssdk.services.redshift.model.DeleteSnapshotCopyGrantReq
 import software.amazon.awssdk.services.redshift.model.DeleteTagsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterParameterGroupsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterParameterGroupsResponse;
+import software.amazon.awssdk.services.redshift.model.DescribeClusterParametersRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterSnapshotsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterSnapshotsResponse;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterSubnetGroupsRequest;
+import software.amazon.awssdk.services.redshift.model.DescribeClusterSubnetGroupsResponse;
 import software.amazon.awssdk.services.redshift.model.DescribeClustersRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClustersResponse;
+import software.amazon.awssdk.services.redshift.model.DescribeOrderableClusterOptionsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeSnapshotCopyGrantsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeSnapshotCopyGrantsResponse;
-import software.amazon.awssdk.services.redshift.model.DescribeOrderableClusterOptionsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeTagsRequest;
+import software.amazon.awssdk.services.redshift.model.DescribeTagsResponse;
 import software.amazon.awssdk.services.redshift.model.ModifyClusterIamRolesRequest;
 import software.amazon.awssdk.services.redshift.model.ModifyClusterIamRolesResponse;
+import software.amazon.awssdk.services.redshift.model.ModifyClusterParameterGroupRequest;
 import software.amazon.awssdk.services.redshift.model.ModifyClusterRequest;
+import software.amazon.awssdk.services.redshift.model.ModifyClusterResponse;
+import software.amazon.awssdk.services.redshift.model.Parameter;
 import software.amazon.awssdk.services.redshift.model.RebootClusterRequest;
+import software.amazon.awssdk.services.redshift.model.RebootClusterResponse;
+import software.amazon.awssdk.services.redshift.model.RedshiftException;
+import software.amazon.awssdk.services.redshift.model.ResetClusterParameterGroupRequest;
+import software.amazon.awssdk.services.redshift.model.ResetClusterParameterGroupResponse;
 import software.amazon.awssdk.services.redshift.model.RestoreFromClusterSnapshotRequest;
 import software.amazon.awssdk.services.redshift.model.RestoreFromClusterSnapshotResponse;
 import software.amazon.awssdk.services.redshift.model.Snapshot;
@@ -50,15 +60,10 @@ import software.amazon.awssdk.services.redshift.model.SnapshotCopyGrantNotFoundE
 import software.amazon.awssdk.services.redshift.model.Tag;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.sql.Statement;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Properties;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -94,6 +99,7 @@ class RedshiftOperationsTest {
                 try {
                     client.deleteCluster(DeleteClusterRequest.builder()
                             .clusterIdentifier(clusterId)
+                            .skipFinalClusterSnapshot(true)
                             .build());
                 } catch (Exception e) {
                     LOG.log(Level.WARNING, "Failed to clean up Redshift cluster " + clusterId, e);
@@ -141,15 +147,17 @@ class RedshiftOperationsTest {
 
     @Test
     @Order(1)
-    @DisplayName("Create cluster, insert data, snapshot, restore to new cluster, verify data")
+    @DisplayName("Create cluster, insert data, take final snapshot on deletion, restore and verify data")
     void testSnapshotAndRestoreLifecycle() throws Exception {
         String sourceClusterId = TestFixtures.uniqueName("rs-source");
         String restoredClusterId = TestFixtures.uniqueName("rs-restored");
         String snapshotId = TestFixtures.uniqueName("rs-snap");
+        String finalSnapshotId = TestFixtures.uniqueName("rs-final");
 
         clustersToCleanup.add(sourceClusterId);
         clustersToCleanup.add(restoredClusterId);
         snapshotsToCleanup.add(snapshotId);
+        snapshotsToCleanup.add(finalSnapshotId);
 
         // 1. Create source cluster
         CreateClusterResponse createRes = client.createCluster(CreateClusterRequest.builder()
@@ -171,7 +179,7 @@ class RedshiftOperationsTest {
         int sourcePort = sourceCluster.endpoint().port();
 
         // 2. Use JDBC to create a table and insert a row
-        try (Connection conn = awaitPostgresConnection(sourceHost, sourcePort, USERNAME, PASSWORD);
+        try (Connection conn = TestFixtures.awaitRedshiftConnection(sourceHost, sourcePort, USERNAME, PASSWORD);
              Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE test_data (id INT PRIMARY KEY, name VARCHAR(100));");
             stmt.execute("INSERT INTO test_data (id, name) VALUES (1, 'floci-redshift-snapshot-val');");
@@ -195,17 +203,23 @@ class RedshiftOperationsTest {
         assertThat(descSnapRes.snapshots()).isNotEmpty();
         assertThat(descSnapRes.snapshots().get(0).snapshotIdentifier()).isEqualTo(snapshotId);
 
-        // 4. Delete source cluster
+        // 4. Delete source cluster with a separate final snapshot.
         client.deleteCluster(DeleteClusterRequest.builder()
                 .clusterIdentifier(sourceClusterId)
+                .finalClusterSnapshotIdentifier(finalSnapshotId)
+                .finalClusterSnapshotRetentionPeriod(7)
                 .build());
         clustersToCleanup.remove(sourceClusterId);
+        Snapshot finalSnapshot = client.describeClusterSnapshots(request -> request.snapshotIdentifier(finalSnapshotId))
+                .snapshots().get(0);
+        assertThat(finalSnapshot.manualSnapshotRetentionPeriod()).isEqualTo(7);
+        assertThat(finalSnapshot.clusterIdentifier()).isEqualTo(sourceClusterId);
 
         // 5. Restore from snapshot to a new cluster identifier
         RestoreFromClusterSnapshotResponse restoreRes = client.restoreFromClusterSnapshot(
                 RestoreFromClusterSnapshotRequest.builder()
                         .clusterIdentifier(restoredClusterId)
-                        .snapshotIdentifier(snapshotId)
+                        .snapshotIdentifier(finalSnapshotId)
                         .nodeType("dc2.large")
                         .build());
 
@@ -218,7 +232,7 @@ class RedshiftOperationsTest {
         int restoredPort = restoredCluster.endpoint().port();
 
         // 6. Use JDBC to query restored cluster and verify row exists
-        try (Connection conn = awaitPostgresConnection(restoredHost, restoredPort, USERNAME, PASSWORD);
+        try (Connection conn = TestFixtures.awaitRedshiftConnection(restoredHost, restoredPort, USERNAME, PASSWORD);
              Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT name FROM test_data WHERE id = 1;")) {
             assertThat(rs.next()).isTrue();
@@ -228,6 +242,7 @@ class RedshiftOperationsTest {
         // Cleanup restored cluster and snapshot
         client.deleteCluster(DeleteClusterRequest.builder()
                 .clusterIdentifier(restoredClusterId)
+                .skipFinalClusterSnapshot(true)
                 .build());
         clustersToCleanup.remove(restoredClusterId);
 
@@ -273,6 +288,43 @@ class RedshiftOperationsTest {
         assertThat(foundPg.parameterGroupFamily()).isEqualTo("redshift-1.0");
         assertThat(foundPg.description()).isEqualTo("Test parameter group for Redshift");
 
+        DescribeClusterParametersRequest describeParameters = DescribeClusterParametersRequest.builder()
+                .parameterGroupName(pgName).build();
+        List<Parameter> defaults = client.describeClusterParameters(describeParameters).parameters();
+        String cursorDefault = defaults.stream()
+                .filter(parameter -> "max_cursor_result_set_size".equals(parameter.parameterName()))
+                .findFirst().orElseThrow().parameterValue();
+        client.modifyClusterParameterGroup(ModifyClusterParameterGroupRequest.builder()
+                .parameterGroupName(pgName)
+                .parameters(Parameter.builder().parameterName("max_cursor_result_set_size").parameterValue("1000").build(),
+                        Parameter.builder().parameterName("wlm_json_configuration").parameterValue("[{\"query_concurrency\":3}]").build())
+                .build());
+
+        assertThatThrownBy(() -> client.resetClusterParameterGroup(ResetClusterParameterGroupRequest.builder()
+                .parameterGroupName(pgName).parameters(Parameter.builder().parameterValue("1000").build()).build()))
+                .isInstanceOf(RedshiftException.class).hasMessageContaining("ParameterName");
+
+        ResetClusterParameterGroupResponse reset = client.resetClusterParameterGroup(ResetClusterParameterGroupRequest.builder()
+                .parameterGroupName(pgName).resetAllParameters(false)
+                .parameters(Parameter.builder().parameterName("max_cursor_result_set_size").build()).build());
+
+        assertThat(reset.parameterGroupName()).isEqualTo(pgName);
+        assertThat(reset.parameterGroupStatus()).isNotBlank();
+        List<Parameter> afterPartialReset = client.describeClusterParameters(describeParameters).parameters();
+        assertThat(afterPartialReset).anySatisfy(parameter -> {
+            assertThat(parameter.parameterName()).isEqualTo("max_cursor_result_set_size");
+            assertThat(parameter.parameterValue()).isEqualTo(cursorDefault);
+            assertThat(parameter.source()).isEqualTo("engine-default");
+        });
+        assertThat(client.describeClusterParameters(describeParameters.toBuilder().source("user").build()).parameters())
+                .extracting(Parameter::parameterName).containsExactly("wlm_json_configuration");
+
+        client.resetClusterParameterGroup(ResetClusterParameterGroupRequest.builder()
+                .parameterGroupName(pgName).resetAllParameters(true).build());
+        assertThat(client.describeClusterParameters(describeParameters).parameters())
+                .allSatisfy(parameter -> assertThat(parameter.source()).isEqualTo("engine-default"));
+        assertThat(client.describeClusterParameters(describeParameters.toBuilder().source("user").build()).parameters()).isEmpty();
+
         // 3. Delete cluster parameter group
         client.deleteClusterParameterGroup(DeleteClusterParameterGroupRequest.builder()
                 .parameterGroupName(pgName)
@@ -292,7 +344,7 @@ class RedshiftOperationsTest {
                 .build());
         subnetGroupsToCleanup.add(subnetGroupName);
 
-        var describedGroups = client.describeClusterSubnetGroups(
+        DescribeClusterSubnetGroupsResponse describedGroups = client.describeClusterSubnetGroups(
                 DescribeClusterSubnetGroupsRequest.builder()
                         .clusterSubnetGroupName(subnetGroupName)
                         .build());
@@ -308,14 +360,14 @@ class RedshiftOperationsTest {
                 .masterUserPassword(PASSWORD)
                 .build());
         clustersToCleanup.add(clusterId);
-        String arn = "arn:aws:redshift:us-east-1:000000000000:cluster:" + clusterId;
+        String arn = TestFixtures.arn("redshift", "000000000000", "cluster:" + clusterId);
 
         client.createTags(CreateTagsRequest.builder()
                 .resourceName(arn)
                 .tags(Tag.builder().key("env").value("test").build())
                 .build());
 
-        var described = client.describeTags(DescribeTagsRequest.builder()
+        DescribeTagsResponse described = client.describeTags(DescribeTagsRequest.builder()
                 .resourceName(arn)
                 .build());
         assertThat(described.taggedResources()).anyMatch(t -> "env".equals(t.tag().key()) && "test".equals(t.tag().value()));
@@ -325,13 +377,13 @@ class RedshiftOperationsTest {
                 .tagKeys("env")
                 .build());
 
-        var modified = client.modifyCluster(ModifyClusterRequest.builder()
+        ModifyClusterResponse modified = client.modifyCluster(ModifyClusterRequest.builder()
                 .clusterIdentifier(clusterId)
                 .nodeType("ra3.xlplus")
                 .build());
         assertThat(modified.cluster().nodeType()).isEqualTo("ra3.xlplus");
 
-        String roleArn = "arn:aws:iam::000000000000:role/rs-copy-role";
+        String roleArn = TestFixtures.globalArn("iam", "000000000000", "role/rs-copy-role");
         ModifyClusterIamRolesResponse withRole = client.modifyClusterIamRoles(ModifyClusterIamRolesRequest.builder()
                 .clusterIdentifier(clusterId)
                 .addIamRoles(roleArn)
@@ -352,7 +404,7 @@ class RedshiftOperationsTest {
                 .isNotEmpty()
                 .allMatch(o -> "ra3.xlplus".equals(o.nodeType()));
 
-        var rebooted = client.rebootCluster(RebootClusterRequest.builder()
+        RebootClusterResponse rebooted = client.rebootCluster(RebootClusterRequest.builder()
                 .clusterIdentifier(clusterId)
                 .build());
         assertThat(rebooted.cluster().clusterStatus()).isEqualTo("available");
@@ -454,24 +506,5 @@ class RedshiftOperationsTest {
         assertThat(paged).hasSize(total);
         assertThat(paged).doesNotHaveDuplicates();
         assertThat(paged).isSorted();
-    }
-
-    private static Connection awaitPostgresConnection(String host, int port, String username, String password) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(60));
-        SQLException last = null;
-        while (Instant.now().isBefore(deadline)) {
-            try {
-                Properties properties = new Properties();
-                properties.setProperty("user", username);
-                properties.setProperty("password", password);
-                properties.setProperty("sslmode", "disable");
-                properties.setProperty("connectTimeout", "5");
-                return DriverManager.getConnection("jdbc:postgresql://" + host + ":" + port + "/" + DATABASE, properties);
-            } catch (SQLException e) {
-                last = e;
-                Thread.sleep(1000);
-            }
-        }
-        throw last != null ? last : new SQLException("Timed out waiting for PostgreSQL connection at " + host + ":" + port);
     }
 }

@@ -207,7 +207,7 @@ The following **AppSync directives** are pre-defined and recognized in schemas:
 |-----------|-----------|---------|
 | `@aws_api_key` | OBJECT, FIELD_DEFINITION | Require API key auth |
 | `@aws_iam` | OBJECT, FIELD_DEFINITION | Require IAM auth |
-| `@aws_cognito_user_pools(cognito_groups: [String!]!)` | OBJECT, FIELD_DEFINITION | Require Cognito user pool auth |
+| `@aws_cognito_user_pools(cognito_groups: [String!])` | OBJECT, FIELD_DEFINITION | Require Cognito user pool auth |
 | `@aws_oidc` | OBJECT, FIELD_DEFINITION | Require OIDC auth |
 | `@aws_lambda` | OBJECT, FIELD_DEFINITION | Require Lambda auth |
 | `@aws_subscribe(mutations: [String!]!)` | FIELD_DEFINITION | Link subscription to mutation |
@@ -237,7 +237,10 @@ Responses are `application/json` with AWS AppSync wire shapes (`data` / `errors[
 | Unknown `apiId` | 404 | `NotFoundException` |
 | API exists but no executable schema (incl. PROCESSING) | **502** | `GraphQLSchemaException` — `No schema definition exists.` + `x-amzn-errortype` |
 | Unexpected failure | 500 | `InternalFailure` |
-| Missing/invalid/expired credentials, unconfigured mode, Lambda deny | **401** | `UnauthorizedException` — GraphQL does not run; `x-amzn-errortype` is set. Missing headers use message `Missing authorization header`. |
+| Missing/invalid/expired credentials, unconfigured mode, Lambda deny | **401** | `UnauthorizedException` — GraphQL does not run; `x-amzn-errortype` is set. Missing headers use message `Missing authorization header`. An `AWS_IAM` caller whose policies deny `appsync:GraphQL` gets `Permission denied`. |
+| `AWS_IAM` with a `SigV4` header that misses a part or a date, a date not in the ISO-8601 basic format, a credential without 5 parts, or a signed header the request lacks | **403** | `IncompleteSignatureException` with AWS's message. A missing part names a Base64 SHA-256 hash of the `Authorization` header. |
+| `AWS_IAM` signed outside 5 minutes, without `host` in `SignedHeaders`, scoped to another service, terminator or date, or with a signature that does not match | **400** | `BadRequestException` with AWS's message. A mismatch names the canonical request and the string to sign that Floci computed. |
+| `AWS_IAM` with an unknown access key, or a session token that does not fit the key | **403** | `UnrecognizedClientException`: `The security token included in the request is invalid`, ending with a period only when no token or an empty one came |
 | Field directive mismatch, Cognito group miss, Lambda `deniedFields`, IAM field DENY | **200** | Field is `null` and `errors[]` contains `Unauthorized` — `Not Authorized to access {field} on type {type}` (no `x-amzn-errortype`) |
 
 **Evidence for data-plane statuses** (empty/`[]`/`{}` → 400; missing schema → 502): AppSync team sample in [graphql/graphql-over-http#81](https://github.com/graphql/graphql-over-http/issues/81) (@robzhu). The management API Reference lists `GraphQLSchemaException` as HTTP 400 for “schema not valid” on management operations — a different surface than the GraphQL execute data plane.
@@ -248,21 +251,21 @@ Request auth runs after Content-Type and body parse and after API lookup (unknow
 
 Headers are classified by **shape** (not primary-then-fallback). If both `x-api-key` and SigV4 `Authorization` are present, **SigV4 wins**. AppSync does not fall back to the API key when IAM validation fails.
 
-Missing required auth headers return HTTP **401** `UnauthorizedException` with message `Missing authorization header`. Invalid or expired credentials that are present still return 401 with `You are not authorized to make this call.`
+Missing required auth headers return HTTP **401** `UnauthorizedException` with message `Missing authorization header`. Invalid or expired credentials that are present still return 401 with `You are not authorized to make this call.`, except the `AWS_IAM` cases in the table above.
 
 | Header shape | Mode |
 |---|---|
 | `Authorization` starts with `AWS4-HMAC-SHA256` | `AWS_IAM` (wins over `x-api-key` if both are present) |
 | `x-api-key` present | `API_KEY` |
 | `Authorization: Bearer <jwt>` | Cognito and/or OIDC (matched by `iss` / `aud` or `azp`) |
-| Other `Authorization` | `AWS_LAMBDA` |
+| Other `Authorization` | `AWS_LAMBDA`, except that a bare JWT (three dot-separated segments, no `Bearer ` prefix) is handled like `Bearer <jwt>` when Cognito or OIDC is configured: a token they reject returns 401 and is not sent to `AWS_LAMBDA` |
 
 Configured modes are the API default `authenticationType` plus `additionalAuthenticationProviders`. A classified mode that is not configured returns 401.
 
 | Mode | Emulator notes |
 |---|---|
 | API_KEY | Lookup by `ApiKey.id`, which is the key value (`da2-…`). Identity is absent (not `{}`). Default key expiry is 7 days when `expires` is omitted; stored `expires` is rounded down to the nearest hour. Create/UpdateApiKey require `expires` between 1 and 365 days from now (`ApiKeyValidityOutOfBoundsException`, 400). `deletes` is `expires` plus 60 days. |
-| AWS_IAM | Verifies a real header-signed SigV4 request (`appsync` service, fixed `/v1/apis/{apiId}/graphql` canonical path, 5-minute clock skew): the `Credential=` access key must resolve to a secret via `IamService`, and the signature must match. The legacy `test`/`test` pair is still emulator ALLOW, but it must be signed with secret `test` like any other key, and it is not a bypass. A temporary (`ASIA...`) credential must also present the `X-Amz-Security-Token` header matching the one issued for it. An unknown or unsigned key is always 401 and never becomes the account-root identity. Known keys additionally evaluate `appsync:GraphQL`. |
+| AWS_IAM | Verifies a real header-signed SigV4 request (`appsync` service, fixed `/v1/apis/{apiId}/graphql` canonical path, 5-minute clock skew): the `Credential=` access key must resolve to a secret via `IamService`, and the signature must match. The legacy `test`/`test` pair is still emulator ALLOW, but it must be signed with secret `test` like any other key, and it is not a bypass. A temporary (`ASIA...`) credential must also present the `X-Amz-Security-Token` header issued with it, and a long-term key must present none, as on AWS. The `test` key takes any token. An unknown key is 403 and an unsigned one 401, and neither becomes the account-root identity. The checks run in AppSync's order. The scope's region is not checked, because Floci takes the request's region from it. Known keys additionally evaluate `appsync:GraphQL`. |
 | Cognito / OIDC | JWT signature is verified, not just decoded. Cognito checks the token against the issuing user pool's own RS256 signing key (`alg`, `kid`, issuer, audience/`clientId`, expiry); OIDC checks it against the configured issuer's published JWKS (via OIDC discovery), the same way the HTTP API JWT authorizer does. Both fail closed: an unreachable issuer, unsupported algorithm (including `none`), unmatched `kid`, or bad signature is 401. OIDC as the sole mode still skips the token's own `iss` claim check, but the signature is always verified against the configured issuer's keys. OIDC identity is `{sub, issuer, claims}` (no `sourceIp`). |
 | Lambda | AppSync `isAuthorized` contract via `LambdaService.invoke` (not an API Gateway policy document). |
 
@@ -286,8 +289,7 @@ and RDS resolvers are not blocked by local IAM role checks. When it is on, Floci
 configured `serviceRoleArn` before invoking a backing resource. A valid same-account role ARN
 not present in Floci's IAM store remains permissive, as with STS AssumeRole. A known role must
 belong to the data source's account and partition, trust
-the partition's AppSync service principal (for example, `appsync.amazonaws.com` in commercial
-Regions), and have identity-policy permission for the requested operation and
+the AppSync service principal (`appsync.amazonaws.com`, the same in every partition), and have identity-policy permission for the requested operation and
 resource. An indexed DynamoDB Query or Scan checks the index ARN. RDS execution checks both
 `rds-data:ExecuteStatement` on the cluster and `secretsmanager:GetSecretValue` on the secret.
 Missing roles, missing trust, and insufficient permissions fail the field instead of calling
@@ -398,7 +400,7 @@ after template. `$util.error` fails the field with its selected type and details
 `$util.appendError` reports an error beside the returned data.
 
 The existing VTL loop, output-size, timeout, and reflection-sandbox limits apply. The
-`2017-02-28` template version and VTL-backed HTTP, EventBridge, OpenSearch, and Bedrock data sources
+`2017-02-28` template version and VTL-backed EventBridge, OpenSearch, and Bedrock data sources
 are not included.
 
 | Setting | Env | Default |
@@ -452,13 +454,72 @@ environment variables). `ctx.request.headers` is empty: the GraphQL context does
 | Type | Behaviour |
 |---|---|
 | `NONE` | The request is the result; a `payload` member is unwrapped, as on AWS. Supports APPSYNC_JS plus `2018-05-29` VTL UNIT resolvers and pipeline functions. |
-| `AWS_LAMBDA` | `Invoke` and `BatchInvoke` for APPSYNC_JS, and `Invoke` for `2018-05-29` VTL UNIT resolvers and pipeline functions. Both runtimes send only the resolved `payload` to the function; `BatchInvoke` sends the payload list. A function error fails the field rather than resolving to the error object. |
+| `AWS_LAMBDA` | `Invoke` and `BatchInvoke` for APPSYNC_JS, and `Invoke` for `2018-05-29` VTL UNIT resolvers and pipeline functions. Both runtimes send only the resolved `payload` to the function; `BatchInvoke` sends the payload list. A function error fails the field rather than resolving to the error object: `ctx.error.type` is `Lambda:` and the invoke's `FunctionError` (`Lambda:Unhandled` for a thrown error), and `ctx.error.message` is the function's `errorMessage`, or the raw error payload when it has none. |
 | `RELATIONAL_DATABASE` | Statements run over the RDS Data API against `rdsHttpEndpointConfig`. Accepts `{statements, variableMap}`, the `{statement, parameters}` the `/rds` helpers build, a list of either, or a bare SQL string. `variableTypeHintMap` is honoured, without it a bound date binds as text and PostgreSQL refuses the comparison (`operator does not exist: timestamp with time zone >= character varying`), so a resolver's date filters need it. The result is wrapped as `{sqlStatementResults: […]}`, which is what `toJsonObject()` reads. Supports APPSYNC_JS plus `2018-05-29` VTL UNIT resolvers and pipeline functions. |
 | `AMAZON_DYNAMODB` | `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`, through the native DynamoDB path so expressions, conditions and indexes all apply. Items come back as **plain JSON**, not attribute values, as AppSync returns them. `nextToken` is an opaque encoding of `LastEvaluatedKey`. `BatchGetItem`, `TransactWriteItems` and `Sync` are not implemented and say so. Supports APPSYNC_JS plus `2018-05-29` VTL UNIT resolvers and pipeline functions. |
-| `HTTP`, `AMAZON_EVENTBRIDGE`, `AMAZON_OPENSEARCH_SERVICE`, `AMAZON_BEDROCK_RUNTIME` | Not implemented; a resolver using one fails its field naming the type. |
+| `HTTP` | HTTP requests from APPSYNC_JS and `2018-05-29` VTL UNIT resolvers and pipeline functions. Returns `{statusCode, headers, body}`, including non-success responses. See [HTTP requests](#http-requests) for endpoint and signing limits. |
+| `AMAZON_EVENTBRIDGE`, `AMAZON_OPENSEARCH_SERVICE`, `AMAZON_BEDROCK_RUNTIME` | Not implemented; a resolver using one fails its field naming the type. |
 
 A field with no resolver falls back to reading its value off the parent object, which is how the
 fields of an object a resolver returned are populated.
+
+### HTTP requests
+
+An HTTP data source uses `httpConfig.endpoint`. Its resolver returns `method`, `resourcePath`,
+and optional `params.headers`, `params.query`, and `params.body`. Methods are `GET`, `POST`,
+`PUT`, `PATCH`, and `DELETE`. Header and query values must be strings; query values are URL-encoded.
+A string body is sent as text and an object body is JSON-encoded. The resource path is appended
+to the configured endpoint's base path and cannot select another host.
+
+For example, a VTL request template can return:
+
+```json
+{"version":"2018-05-29","method":"GET","resourcePath":"/items","params":{"query":{"limit":"10"}}}
+```
+
+The response handler receives `ctx.result.statusCode`, `ctx.result.headers`, and the text
+`ctx.result.body`. A 4xx or 5xx response is still a result for the handler to inspect. Transport
+failures use `HttpException`; invalid request mappings use `MappingTemplate`. Requests and responses
+are limited to 5 MiB, and transport work has a 30-second deadline. Redirects and automatic retries
+are disabled. Supported response charsets are respected; a missing, blank, or unrecognized charset
+falls back to UTF-8. HTTPS keeps certificate and hostname verification enabled.
+HTTP resolver callbacks use separate batches so independent query fields can run concurrently;
+root mutation fields retain their selection order.
+
+Unsigned requests support public HTTP(S) endpoints and local development services on localhost
+or private container networks. Floci rejects IPv4 and IPv6 link-local addresses
+(`169.254.0.0/16` and `fe80::/10`) and the AWS IPv6 metadata address (`fd00:ec2::254`),
+including IPv4-mapped equivalents and hostnames with any such DNS answer. It connects using
+the validated DNS snapshot. This shared policy does not block Alibaba metadata at
+`100.100.100.200`; that address remains reachable if the host can route to it.
+Unsigned HTTP data sources do not require a service role. Transport capacity is bounded to
+four active requests and sixteen queued requests. The caller deadline also covers DNS lookup,
+but system DNS can ignore cancellation: a stuck lookup retains its worker until it returns.
+If all four workers are stuck in DNS, other endpoints also lose transport capacity; excess
+requests fail with `HttpException`.
+
+For the following local AWS operations, set `httpConfig.authorizationConfig.authorizationType`
+to `AWS_IAM` and supply `awsIamConfig.signingRegion`, `awsIamConfig.signingServiceName`, and the
+data source's `serviceRoleArn`:
+
+| Signing service | Supported requests |
+|---|---|
+| `scheduler` | `POST`, `GET`, and `DELETE` on `/schedules/<name>` for CreateSchedule, GetSchedule, and DeleteSchedule. Query parameters are limited to `groupName` and `clientToken`. |
+| `states` | `POST /` with `X-Amz-Target: AWSStepFunctions.SendTaskSuccess` or `AWSStepFunctions.SendTaskFailure`, using `application/json` or `application/x-amz-json-1.0`. |
+
+The endpoint must be the service's standard regional HTTPS hostname, for example
+`https://scheduler.us-west-2.amazonaws.com`. The signing region must be a canonical published region
+in the API's partition. The target region may differ from the API's region. The role ARN must belong
+to the API's account and partition, and the target service must be enabled. Requests go to Floci's
+own listener with temporary role credentials that are removed on completion or failure. With
+`floci.services.iam.enforcement-enabled=true`, the role must exist and trust `appsync.amazonaws.com`,
+including any source conditions, and the native service applies its IAM policies. With enforcement
+off (the default), role existence, trust and permission checks are permissive, as for other local
+data sources. Removing temporary credentials does not make permissive IAM mode enforce revocation
+against a delayed or replayed request. Enable IAM enforcement when that check is required.
+The native service's response is preserved in either mode. Step Functions tokens remain bound to
+their owning account and region. Other signing services, operations, endpoint forms, and authorization
+types are unsupported and fail before credentials or a request are sent.
 
 ## Pagination
 
@@ -499,12 +560,66 @@ Deleting a GraphQL API (`DeleteGraphqlApi`) automatically deletes all child reso
 
 This matches AWS behavior where deleting an API removes its entire configuration.
 
+## CloudFormation
+
+Floci provisions these AppSync resource types:
+
+| Type | `Ref` returns | `Fn::GetAtt` attributes Floci serves |
+|---|---|---|
+| `AWS::AppSync::GraphQLApi` | the API id (AWS: the API ARN) | `ApiId`, `Arn`, `GraphQLEndpointArn`, `GraphQLUrl`, `GraphQLDns`, `RealtimeUrl`, `RealtimeDns` |
+| `AWS::AppSync::GraphQLSchema` | `<ApiId>GraphQLSchema` | `Id` (AWS rejects it, see below) |
+| `AWS::AppSync::DataSource` | the data source ARN | `DataSourceArn`, `Name` |
+| `AWS::AppSync::FunctionConfiguration` | the function ARN | `FunctionArn`, `FunctionId`, `Name`, `DataSourceName` |
+| `AWS::AppSync::Resolver` | the resolver ARN | `ResolverArn`, `TypeName`, `FieldName` |
+| `AWS::AppSync::ApiKey` | the key id, `da2-...` (AWS: the key ARN) | `ApiKey`, `ApiKeyId`, `Arn` |
+
+`GraphQLEndpointArn` returns
+`arn:<partition>:appsync:<region>:<account>:endpoints/graphql-api/<apiId>`. Use it to
+configure an [EventBridge AppSync target](eventbridge.md#appsync-targets); the API's `Arn`
+continues to identify `apis/<apiId>` for IAM permissions.
+
+One template with all six types (an API with `API_KEY` plus `AWS_IAM` auth, `LogConfig`,
+`XrayEnabled`, an inline schema, an `AWS_LAMBDA` data source, a direct Lambda resolver, an
+`APPSYNC_JS` resolver, a function and an API key) was deployed to AWS and to Floci, and so was a
+`GraphQLApi` with `AMAZON_COGNITO_USER_POOLS` default auth and a `UserPoolConfig`. Every resource
+reached `CREATE_COMPLETE` on both, and the auth, `LogConfig` and `XrayEnabled` settings
+`GetGraphqlApi` returns afterwards are the same. `Ref` and `Fn::GetAtt` agree except for these
+differences:
+
+- `Ref` on a `GraphQLApi` returns the API id. AWS returns the API ARN, the value of
+  `Fn::GetAtt Arn`. Use `Fn::GetAtt ApiId` or `Fn::GetAtt Arn` to get the same value on both.
+- `Ref` on an `ApiKey` returns the key id. AWS returns the key ARN,
+  `arn:<partition>:appsync:<region>:<account>:apis/<apiId>/apikeys/<keyId>`, the value of
+  `Fn::GetAtt Arn`. `ApiKey` and `ApiKeyId` are the same `da2-` string on both.
+- `GraphQLUrl` and `RealtimeUrl` point at Floci: `<base-url>/v1/apis/<apiId>/graphql` and the
+  matching WebSocket URL ending in `/graphql/realtime`. `GraphQLDns` and `RealtimeDns` are the
+  host of `base-url`. AWS returns `https://<id>.appsync-api.<region>.amazonaws.com/graphql` and
+  `wss://<id>.appsync-realtime-api.<region>.amazonaws.com/graphql`, where `<id>` is not the API id.
+  Floci does not serve the realtime endpoint.
+- `Fn::GetAtt` on a `GraphQLSchema`'s `Id` resolves to the same value as `Ref`. AWS refuses the
+  template with `Resource type AWS::AppSync::GraphQLSchema does not support attribute {Id}`.
+- Generated ids differ in format: a function id is 7 characters on Floci and 26 on AWS.
+
+An `UpdateStack` that changes the API `Name` and one resolver's `Code` updates both in place on
+AWS and on Floci: every id and ARN stays the same and no other resource is touched. Deleting the
+stack removes every resource.
+
+A `GraphQLSchema` with `DefinitionS3Location` and no inline `Definition`, and `CodeS3Location` on
+a `Resolver` or `FunctionConfiguration`, fail the resource with `ValidationError`. Give the schema
+inline in `Definition` and the code inline in `Code`.
+
+`AWS::AppSync::Api`, `ApiCache`, `ChannelNamespace`, `DomainName`, `DomainNameApiAssociation`,
+`SourceApiAssociation` and `Type` are not provisioned. By default such a resource is stubbed: it
+reaches `CREATE_COMPLETE` and nothing is created for it. Set
+`allow-stub-unsupported-resource-types` to `false` to fail it instead, see
+[CloudFormation](cloudformation.md#supported-resource-types).
+
 ## Not Implemented
 
 These AWS AppSync capabilities are not yet implemented and are tracked in future phases:
 
 - **VTL resolver expansion**: the `2017-02-28` version and the remaining data sources
-- **Data source adapters**: HTTP, EventBridge, OpenSearch, and Bedrock connectors
+- **Data source adapters**: EventBridge, OpenSearch, and Bedrock connectors
 - **Guardrails** (Phase 10): query depth / complexity limits and related errors
 - **Realtime subscriptions** (Phase 11+): WebSocket real-time subscriptions
 - **Caching**: API-level and per-resolver caching

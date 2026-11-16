@@ -2,7 +2,7 @@
 
 Compatibility tests for [Floci](https://github.com/hectorvent/floci) using the **AWS SDK for Java v2 (2.31.8)**.
 
-Runs 352 tests across 17 test classes against a live Floci instance — no mocks.
+Runs 2981 tests across 436 test classes against a live Floci instance — no mocks.
 
 ## Services Covered
 
@@ -26,6 +26,8 @@ Runs 352 tests across 17 test classes against a live Floci instance — no mocks
 | `Ec2Tests`                       | EC2 instances, VPCs, security groups, subnets            |
 | `AppSyncTest`                    | GraphQL API CRUDL, data sources, resolvers, functions, types, API keys, tags, schema validation |
 | `EcsTests`                       | ECS clusters, task definitions, services                 |
+| `PaymentCryptographyDataPlaneTest` | Payment Cryptography data plane: encrypt, decrypt, MAC |
+| `PaymentCryptographyPinTest`     | Payment Cryptography PIN operations: generate, verify, translate |
 
 ## Adding a New Test
 
@@ -61,6 +63,20 @@ with `FLOCI_DEFAULT_REGION=cn-north-1`) runs the suite in the China partition; t
 Partition Compatibility workflow does exactly that, and tolerates only the failures listed in
 `.github/ci/compat-partition-allowlist-cn-north-1.txt`. Tests that build their own client with an
 explicit region keep that region.
+
+## STS presigned identity checks
+
+`StsPresignedIdentityTest` checks user and role identity over HTTP/1.1 and HTTP/2.
+Valid identity requests run in both modes. Forged signatures and changed bodies are
+sent only when signature checking is enabled. To check signature refusal, start Floci
+with `FLOCI_AUTH_VALIDATE_SIGNATURES=true` and pass the same setting to this test:
+
+```bash
+FLOCI_AUTH_VALIDATE_SIGNATURES=true mvn test -Dtest=StsPresignedIdentityTest
+```
+
+The test setting must match the server setting; it does not configure the server.
+The enabled mode also checks missing and incorrect temporary-session tokens.
 
 ## Metric filter publishing checks
 

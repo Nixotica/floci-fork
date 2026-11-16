@@ -10,6 +10,11 @@ not others. Each one is a silent bug in a non-commercial deployment, and each on
 trivial to add by accident, because the literal is exactly what an `aws` deployment
 prints.
 
+It also counts ARNs handled by hand, which name no partition but bypass the helpers that
+get every partition right: an ARN concatenated from `"arn:"` (`arn-concat`), a
+`startsWith("arn:")` probe (`arn-probe`) and a `split(":")` of an ARN-named value
+(`arn-split`). Those categories started with existing sites in the baseline, which only shrink.
+
 This script inventories those literals in `src/main/java` by category and gates them
 against a checked-in per-file baseline (`baseline.tsv`):
 
@@ -40,9 +45,12 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from java_sources import PACKAGE_DIR, SOURCE_ROOT as SOURCE_DIR  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SOURCE_ROOT = REPO_ROOT / "src/main/java"
-PACKAGE_ROOT = SOURCE_ROOT / "io/github/hectorvent/floci"
+SOURCE_ROOT = REPO_ROOT / SOURCE_DIR
+PACKAGE_ROOT = REPO_ROOT / PACKAGE_DIR
 TOOL_DIR = Path(__file__).resolve().parent
 ALLOWLIST = TOOL_DIR / "allowlist.yaml"
 BASELINE = TOOL_DIR / "baseline.tsv"
@@ -81,7 +89,9 @@ CATEGORIES: tuple[Category, ...] = (
     ),
     Category(
         "dns-suffix",
-        re.compile(r"amazonaws\.com(?!\.cn)|cloudfront\.net|signin\.aws|public\.ecr\.aws"),
+        # A dot may be escaped (amazonaws\\.com in a Java regex), so a hand-written host pattern
+        # is held to the same rule as a host.
+        re.compile(r"amazonaws\\*\.com(?!\\*\.cn)|cloudfront\\*\.net|signin\\*\.aws|public\\*\.ecr\\*\.aws"),
         True,
         "a commercial DNS suffix or host; derive from the partition's dnsSuffix",
     ),
@@ -105,6 +115,50 @@ CATEGORIES: tuple[Category, ...] = (
         True,
         "an ARN minted by Arn.of with a blank region, which silently means the commercial partition; "
         "use Arn.global with the resource's or the request's partition",
+        "code",
+    ),
+    Category(
+        "aws-partition-compare",
+        re.compile(
+            r'"aws"\s*\.\s*equals(?:IgnoreCase)?\s*\('
+            r'|\.\s*equals(?:IgnoreCase)?\s*\(\s*"aws"\s*\)'
+            # Objects.equals with "aws" as either argument; the other argument may hold one level of
+            # nested calls, and the match ends at this call's own closing parenthesis.
+            r'|Objects\.equals\(\s*"aws"\s*,'
+            r'|Objects\.equals\(\s*(?:[^(),;"]|"[^"]*"|\([^()]*\))*,\s*"aws"\s*\)'
+            # A switch label naming "aws", alone or in a list (case "aws" ->, case "x", "aws":).
+            r'|\bcase\s+(?:"[^"]*"\s*,\s*)*"aws"\s*(?:->|:|,)'
+        ),
+        True,
+        "a value compared with, or switched on, the literal \"aws\", which as a partition check holds only "
+        "in the commercial partition; compare with AwsRegions.partitionFor(region) or the stored ARN's own "
+        "partition, or escape a non-partition use (an account, a command name)",
+        "code",
+    ),
+    Category(
+        "arn-concat",
+        # An ARN assembled by concatenation. A regex built from PARTITION_REGEX is the sanctioned
+        # way to recognise one, so that form does not count.
+        re.compile(r'"arn:"\s*\+(?!\s*(?:AwsArnUtils\s*\.\s*)?PARTITION_REGEX\b)'),
+        True,
+        "an ARN or ARN prefix built by concatenating \"arn:\"; mint through AwsArnUtils.Arn.of / Arn.global "
+        "or RegionResolver.buildArn, and recognise one with AwsArnUtils.PARTITION_REGEX",
+        "code",
+    ),
+    Category(
+        "arn-probe",
+        re.compile(r'\.\s*startsWith\(\s*"arn:"\s*\)'),
+        True,
+        "a hand-rolled ARN check; use AwsArnUtils.isArn, isArnFor or parse",
+        "code",
+    ),
+    Category(
+        "arn-split",
+        # A split on ":" of a value whose name says it is an ARN (arn, roleArn, getArn(), arnParts...).
+        re.compile(r'\b(?:arn|\w*Arn)\w*(?:\(\s*\))?\s*\.\s*split\(\s*":"'),
+        True,
+        "an ARN cut into fields by hand; use AwsArnUtils.parse and its partition(), region(), accountId() "
+        "and resource()",
         "code",
     ),
 )
@@ -378,22 +432,23 @@ def format_audit(findings: list[Finding], baseline: Counter) -> str:
             per_package[package_of(finding.path)][finding.category] += 1
             totals[finding.category] += 1
     width = max([len("package"), len("total")] + [len(p) for p in per_package]) + 2
-    header = f"{'package':<{width}}" + "".join(f"{name:>19}" for name in names) + f"{'total':>8}"
+    column = max(19, max(len(name) for name in names) + 2)
+    header = f"{'package':<{width}}" + "".join(f"{name:>{column}}" for name in names) + f"{'total':>8}"
     out = [header, "-" * len(header)]
     for package, counter in sorted(per_package.items(), key=lambda item: (-sum(item[1].values()), item[0])):
         out.append(
             f"{package:<{width}}"
-            + "".join(f"{counter.get(name, 0):>19}" for name in names)
+            + "".join(f"{counter.get(name, 0):>{column}}" for name in names)
             + f"{sum(counter.values()):>8}"
         )
     out.append("-" * len(header))
     out.append(
         f"{'total':<{width}}"
-        + "".join(f"{totals.get(name, 0):>19}" for name in names)
+        + "".join(f"{totals.get(name, 0):>{column}}" for name in names)
         + f"{sum(totals.values()):>8}"
     )
     gate = "".join(
-        f"{'gated' if category.gated else 'report-only':>19}" for category in CATEGORIES
+        f"{'gated' if category.gated else 'report-only':>{column}}" for category in CATEGORIES
     )
     out.append(f"{'':<{width}}{gate}")
     if baseline:

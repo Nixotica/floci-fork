@@ -1,0 +1,111 @@
+package io.floci.aws.services.kinesis.model;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+@RegisterForReflection
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class KinesisStream {
+    private String streamName;
+    private String streamArn;
+    private String accountId;
+    @JsonProperty("streamStatus")
+    private String streamStatus;
+    private Instant statusTransitionDeadline;
+    private volatile List<KinesisShard> shards = new CopyOnWriteArrayList<>();
+    private int retentionPeriodHours = 24;
+    private Instant streamCreationTimestamp;
+    private Map<String, String> tags = new HashMap<>();
+    private String encryptionType = "NONE";
+    private String keyId;
+    private String streamMode = "PROVISIONED";
+    private Set<String> enhancedMonitoringMetrics = new HashSet<>();
+    // AWS's default; streams persisted before this field existed read as the default too.
+    private int maxRecordSizeInKiB = 1024;
+    /**
+     * UpdateShardCount call timestamps, kept to enforce the rolling 24-hour scaling-operation
+     * limit. Streams persisted before this field existed read back as an empty history.
+     */
+    private List<Instant> shardCountUpdateTimestamps = new ArrayList<>();
+
+    public KinesisStream() {}
+
+    public KinesisStream(String streamName, String streamArn) {
+        this.streamName = streamName;
+        this.streamArn = streamArn;
+        this.streamStatus = "ACTIVE";
+        this.streamCreationTimestamp = Instant.now();
+    }
+
+    public String getStreamName() { return streamName; }
+    public void setStreamName(String streamName) { this.streamName = streamName; }
+
+    public String getStreamArn() { return streamArn; }
+    public void setStreamArn(String streamArn) { this.streamArn = streamArn; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
+
+    @JsonIgnore
+    public String getStreamStatus() { return getStreamStatus(Instant.now()); }
+    public synchronized String getStreamStatus(Instant now) {
+        return statusTransitionDeadline != null && !now.isBefore(statusTransitionDeadline)
+                ? "ACTIVE" : streamStatus;
+    }
+    public synchronized void setStreamStatus(String streamStatus) { this.streamStatus = streamStatus; }
+
+    public synchronized Instant getStatusTransitionDeadline() { return statusTransitionDeadline; }
+    public synchronized void setStatusTransitionDeadline(Instant statusTransitionDeadline) {
+        this.statusTransitionDeadline = statusTransitionDeadline;
+    }
+
+    public synchronized void setStatusWindow(String status, Instant deadline) {
+        this.streamStatus = status;
+        this.statusTransitionDeadline = deadline;
+    }
+
+    public List<KinesisShard> getShards() { return shards; }
+    public void setShards(List<KinesisShard> shards) {
+        this.shards = shards == null ? new CopyOnWriteArrayList<>() : new CopyOnWriteArrayList<>(shards);
+    }
+
+    public int getRetentionPeriodHours() { return retentionPeriodHours; }
+    public void setRetentionPeriodHours(int retentionPeriodHours) { this.retentionPeriodHours = retentionPeriodHours; }
+
+    public Instant getStreamCreationTimestamp() { return streamCreationTimestamp; }
+    public void setStreamCreationTimestamp(Instant timestamp) { this.streamCreationTimestamp = timestamp; }
+
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) { this.tags = tags; }
+
+    public String getEncryptionType() { return encryptionType; }
+    public void setEncryptionType(String encryptionType) { this.encryptionType = encryptionType; }
+
+    public String getKeyId() { return keyId; }
+    public void setKeyId(String keyId) { this.keyId = keyId; }
+
+    public String getStreamMode() { return streamMode; }
+    public void setStreamMode(String streamMode) { this.streamMode = streamMode; }
+
+    public int getMaxRecordSizeInKiB() { return maxRecordSizeInKiB; }
+    public void setMaxRecordSizeInKiB(int maxRecordSizeInKiB) { this.maxRecordSizeInKiB = maxRecordSizeInKiB; }
+
+    public Set<String> getEnhancedMonitoringMetrics() { return enhancedMonitoringMetrics; }
+    public void setEnhancedMonitoringMetrics(Set<String> enhancedMonitoringMetrics) { this.enhancedMonitoringMetrics = enhancedMonitoringMetrics; }
+
+    public List<Instant> getShardCountUpdateTimestamps() { return shardCountUpdateTimestamps; }
+    public void setShardCountUpdateTimestamps(List<Instant> shardCountUpdateTimestamps) {
+        this.shardCountUpdateTimestamps = shardCountUpdateTimestamps == null ? new ArrayList<>() : shardCountUpdateTimestamps;
+    }
+}

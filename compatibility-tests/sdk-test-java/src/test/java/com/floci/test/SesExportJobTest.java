@@ -7,7 +7,7 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
-
+import org.junit.jupiter.api.parallel.ResourceLock;
 import software.amazon.awssdk.services.sesv2.SesV2Client;
 import software.amazon.awssdk.services.sesv2.model.BadRequestException;
 import software.amazon.awssdk.services.sesv2.model.Body;
@@ -30,6 +30,7 @@ import software.amazon.awssdk.services.sesv2.model.ListExportJobsRequest;
 import software.amazon.awssdk.services.sesv2.model.ListExportJobsResponse;
 import software.amazon.awssdk.services.sesv2.model.Message;
 import software.amazon.awssdk.services.sesv2.model.MessageInsightsDataSource;
+import software.amazon.awssdk.services.sesv2.model.NotFoundException;
 import software.amazon.awssdk.services.sesv2.model.PutAccountVdmAttributesRequest;
 import software.amazon.awssdk.services.sesv2.model.SendEmailRequest;
 import software.amazon.awssdk.services.sesv2.model.VdmAttributes;
@@ -49,6 +50,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @DisplayName("SES v2 Export Jobs")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@ResourceLock("ses-account")
 class SesExportJobTest {
 
     private static final String SENDER = "compat-export@example.com";
@@ -148,8 +150,13 @@ class SesExportJobTest {
 
     @Test
     @Order(6)
-    @DisplayName("an unknown job id is a BadRequest rather than a NotFound")
-    void unknownJobIsABadRequest() {
+    @DisplayName("an unknown job id is a NotFound when shaped like an id, a BadRequest otherwise")
+    void unknownJobIsNotFoundOrBadRequest() {
+        String unknown = "7b9563a7-12fc-4129-ab8c-bd4783006c08";
+        assertThatThrownBy(() -> sesV2.getExportJob(
+                GetExportJobRequest.builder().jobId(unknown).build()))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Job ID: <" + unknown + "> not found");
         assertThatThrownBy(() -> sesV2.getExportJob(
                 GetExportJobRequest.builder().jobId("no-such-job").build()))
                 .isInstanceOf(BadRequestException.class)

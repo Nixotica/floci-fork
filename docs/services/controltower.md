@@ -21,6 +21,14 @@ Landing-zone versions must match the AWS version shape `digit.digit`, with one o
 
 Enabled-baseline operations are recorded with AWS operation names such as `ENABLE_BASELINE`, `RESET_ENABLED_BASELINE`, and `UPDATE_ENABLED_BASELINE`. `GetBaselineOperation` returns `ResourceNotFoundException` for an unknown operation identifier.
 
+## Tags
+
+`TagResource`, `UntagResource` and `ListTagsForResource` serve landing zones and enabled controls in the caller's account and Region; an ARN naming another account or Region returns `ResourceNotFoundException`. A landing zone keeps the tags passed to `CreateLandingZone`, and an enabled control those passed to `EnableControl`. Enabled baselines don't store tags yet, so a tag request for one returns `ResourceNotFoundException`, where AWS would answer.
+
+## IAM authorization
+
+With IAM enforcement enabled, Control Tower uses generated SDK routes and request-resource definitions. Landing-zone reads and mutations authorize the ARN or ID supplied by the request. Enabled-baseline and enabled-control identifiers name their full ARNs; enabling a control authorizes the new enabled-control resource with its generated ID left open. List and other resource-less actions require wildcard resource grants. Tag requests authorize the resource ARN on the shared tag route before changing tags. This does not add unsupported operations or enabled-baseline tag storage.
+
 ## Supported operations
 
 | Operation | Method and path | Behavior |
@@ -46,6 +54,9 @@ Enabled-baseline operations are recorded with AWS operation names such as `ENABL
 | `UpdateEnabledControl` | `POST /update-enabled-control` | Updates parameters when they differ from the current configuration |
 | `ResetEnabledControl` | `POST /reset-enabled-control` | Repairs non-SCP enabled controls and records a reset operation |
 | `GetControlOperation` | `POST /get-control-operation` | Reads a previously issued control operation |
+| `TagResource` | `POST /tags/{resourceArn}` | Adds tags to a landing zone or enabled control |
+| `UntagResource` | `DELETE /tags/{resourceArn}` | Removes tags from a landing zone or enabled control |
+| `ListTagsForResource` | `GET /tags/{resourceArn}` | Lists the tags of a landing zone or enabled control |
 
 ## Operation behavior
 

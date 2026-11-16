@@ -3,6 +3,7 @@ package com.floci.test;
 import org.junit.jupiter.api.*;
 import software.amazon.awssdk.services.scheduler.SchedulerClient;
 import software.amazon.awssdk.services.scheduler.model.*;
+import software.amazon.awssdk.services.scheduler.model.RetryPolicy;
 import software.amazon.awssdk.services.scheduler.model.Tag;
 
 import java.time.Instant;
@@ -189,7 +190,8 @@ class SchedulerTest {
                 .name(SCHEDULE_NAME)
                 .scheduleExpression("rate(1 hour)")
                 .flexibleTimeWindow(FlexibleTimeWindow.builder().mode(FlexibleTimeWindowMode.OFF).build())
-                .target(Target.builder().arn("arn:t").roleArn("arn:r").build())
+                .target(Target.builder().arn("arn:t")
+                        .roleArn("arn:aws:iam::000000000000:role/r").build())
                 .build()))
                 .isInstanceOf(ConflictException.class);
     }
@@ -310,7 +312,7 @@ class SchedulerTest {
                 .target(Target.builder()
                         .arn("arn:aws:lambda:us-east-1:000000000000:function:rp-func")
                         .roleArn("arn:aws:iam::000000000000:role/r")
-                        .retryPolicy(software.amazon.awssdk.services.scheduler.model.RetryPolicy.builder()
+                        .retryPolicy(RetryPolicy.builder()
                                 .maximumEventAgeInSeconds(3600)
                                 .maximumRetryAttempts(5)
                                 .build())
@@ -482,7 +484,8 @@ class SchedulerTest {
                 .name("does-not-exist-schedule")
                 .scheduleExpression("rate(1 hour)")
                 .flexibleTimeWindow(FlexibleTimeWindow.builder().mode(FlexibleTimeWindowMode.OFF).build())
-                .target(Target.builder().arn("arn:t").roleArn("arn:r").build())
+                .target(Target.builder().arn("arn:t")
+                        .roleArn("arn:aws:iam::000000000000:role/r").build())
                 .build()))
                 .isInstanceOf(ResourceNotFoundException.class);
     }
@@ -590,6 +593,69 @@ class SchedulerTest {
                 scheduler.deleteScheduleGroup(DeleteScheduleGroupRequest.builder()
                         .name(tagGroup).build());
             } catch (Exception ignored) {}
+        }
+    }
+
+    @Test
+    @Order(31)
+    @DisplayName("ListScheduleGroups / ListSchedules - paginators follow NextToken")
+    void listOperationsPaginate() {
+        String prefix = "sdk-paging-" + System.currentTimeMillis();
+        String groupA = prefix + "-a";
+        String groupB = prefix + "-b";
+        try {
+            for (String group : new String[]{groupA, groupB}) {
+                scheduler.createScheduleGroup(CreateScheduleGroupRequest.builder().name(group).build());
+            }
+            for (String name : new String[]{"s-1", "s-2"}) {
+                scheduler.createSchedule(CreateScheduleRequest.builder()
+                        .name(name)
+                        .groupName(groupA)
+                        .scheduleExpression("rate(1 hour)")
+                        .flexibleTimeWindow(FlexibleTimeWindow.builder().mode(FlexibleTimeWindowMode.OFF).build())
+                        .target(Target.builder()
+                                .arn("arn:aws:sqs:us-east-1:000000000000:queue")
+                                .roleArn("arn:aws:iam::000000000000:role/scheduler-role")
+                                .build())
+                        .build());
+            }
+
+            ListScheduleGroupsResponse firstGroups = scheduler.listScheduleGroups(
+                    ListScheduleGroupsRequest.builder().namePrefix(prefix).maxResults(1).build());
+            assertThat(firstGroups.scheduleGroups()).extracting(ScheduleGroupSummary::name).containsExactly(groupA);
+            assertThat(firstGroups.nextToken()).isNotNull();
+
+            assertThat(scheduler.listScheduleGroupsPaginator(
+                    ListScheduleGroupsRequest.builder().namePrefix(prefix).maxResults(1).build())
+                    .scheduleGroups())
+                    .extracting(ScheduleGroupSummary::name)
+                    .containsExactly(groupA, groupB);
+
+            assertThat(scheduler.listSchedulesPaginator(
+                    ListSchedulesRequest.builder().groupName(groupA).maxResults(1).build())
+                    .schedules())
+                    .extracting(ScheduleSummary::name)
+                    .containsExactly("s-1", "s-2");
+
+            assertThatThrownBy(() -> scheduler.listSchedules(
+                    ListSchedulesRequest.builder().nextToken("bogus-token").build()))
+                    .isInstanceOf(ValidationException.class);
+        } finally {
+            for (String name : new String[]{"s-1", "s-2"}) {
+                try {
+                    scheduler.deleteSchedule(DeleteScheduleRequest.builder().name(name).groupName(groupA).build());
+                } catch (Exception ignored) {
+                    // Best-effort cleanup: the schedule is absent when the test failed before creating it,
+                    // and a cleanup error must not mask that original failure.
+                }
+            }
+            for (String group : new String[]{groupA, groupB}) {
+                try {
+                    scheduler.deleteScheduleGroup(DeleteScheduleGroupRequest.builder().name(group).build());
+                } catch (Exception ignored) {
+                    // Best-effort cleanup, as above: the group may never have been created.
+                }
+            }
         }
     }
 }

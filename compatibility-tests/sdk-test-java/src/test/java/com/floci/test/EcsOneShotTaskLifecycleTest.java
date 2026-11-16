@@ -1,7 +1,6 @@
 package com.floci.test;
 
 import org.junit.jupiter.api.*;
-import software.amazon.awssdk.core.waiters.WaiterOverrideConfiguration;
 import software.amazon.awssdk.core.waiters.WaiterResponse;
 import software.amazon.awssdk.services.ecs.EcsClient;
 import software.amazon.awssdk.services.ecs.model.*;
@@ -105,7 +104,7 @@ class EcsOneShotTaskLifecycleTest {
 
     @Test
     @Order(1)
-    @DisplayName("RunTask - task starts RUNNING")
+    @DisplayName("RunTask - task starts PROVISIONING or PENDING")
     void runTask() {
         List<Task> launched = ecs.runTask(RunTaskRequest.builder()
                 .cluster(clusterName)
@@ -116,26 +115,24 @@ class EcsOneShotTaskLifecycleTest {
 
         assertThat(launched).hasSize(1);
         taskArn = launched.get(0).taskArn();
-        assertThat(launched.get(0).lastStatus()).isEqualTo("RUNNING");
+        // RunTask answers before the images are pulled, as AWS does. The task runs for ~2 s, so the
+        // TasksStopped waiter below, not TasksRunning (which fails on STOPPED), follows it from here.
+        assertThat(launched.get(0).lastStatus()).isIn("PROVISIONING", "PENDING");
     }
 
     @Test
     @Order(2)
     @DisplayName("WaitTasksStopped - transitions to STOPPED within 60 s")
     void waitForTaskStopped() {
-        // The container runs for ~2 s; the reconciler fires every 5 s; the waiter
-        // polls every 6 s. Allow 60 s total to be CI-safe.
-        WaiterOverrideConfiguration overrides = WaiterOverrideConfiguration.builder()
-                .waitTimeout(Duration.ofSeconds(60))
-                .build();
-
+        // The container runs for ~2 s and the reconciler fires every 5 s. Allow 60 s total to be
+        // CI-safe.
         try (EcsWaiter waiter = EcsWaiter.builder().client(ecs).build()) {
             WaiterResponse<DescribeTasksResponse> response = waiter.waitUntilTasksStopped(
                     DescribeTasksRequest.builder()
                             .cluster(clusterName)
                             .tasks(taskArn)
                             .build(),
-                    overrides);
+                    TestFixtures.waiterOverride(Duration.ofSeconds(60)));
 
             assertThat(response.matched().response()).isPresent();
             Task task = response.matched().response().get().tasks().get(0);
@@ -207,7 +204,9 @@ class EcsOneShotTaskLifecycleTest {
                 .containerDefinitions(ContainerDefinition.builder()
                         .name("main")
                         .image("busybox:latest")
-                        .command("sh", "-c", "sleep 300")
+                        // PID 1 gets no default SIGTERM handler, so a bare "sleep 300" sits out the
+                        // whole stopTimeout grace period when the test stops it.
+                        .command("sh", "-c", "trap 'exit 0' TERM; sleep 300 & wait")
                         .essential(true)
                         .cpu(256)
                         .memory(64)
@@ -229,6 +228,16 @@ class EcsOneShotTaskLifecycleTest {
 
         assertThat(stopping.desiredStatus()).isEqualTo("STOPPED");
         assertThat(stopping.stoppedReason()).isEqualTo("test-explicit-stop");
+
+        // A stop that reaches the task while it is still launching lands asynchronously.
+        WaiterResponse<DescribeTasksResponse> stopped = ecs.waiter().waitUntilTasksStopped(
+                DescribeTasksRequest.builder()
+                        .cluster(clusterName)
+                        .tasks(explicitTaskArn)
+                        .build(),
+                TestFixtures.waiterOverride(Duration.ofSeconds(60)));
+        assertThat(stopped.matched().response()).isPresent();
+        assertThat(stopped.matched().response().get().tasks().get(0).lastStatus()).isEqualTo("STOPPED");
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

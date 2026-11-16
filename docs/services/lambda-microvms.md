@@ -39,10 +39,11 @@ Two AWS service models, not one. `Lambda Microvms` (apiVersion 2025-09-09) carri
 | Action | Description |
 | --- | --- |
 | `CreateNetworkConnector` | Create a VPC egress connector |
-| `GetNetworkConnector` | Connector detail |
+| `GetNetworkConnector` | Connector detail, or one version with `:<version>` |
 | `ListNetworkConnectors` | List connectors — a six-member summary per item |
-| `UpdateNetworkConnector` | Replace the connector configuration |
-| `DeleteNetworkConnector` | Asynchronous delete, answers `DELETING` |
+| `ListNetworkConnectorVersions` | The versions of a connector, oldest first |
+| `UpdateNetworkConnector` | Replace the connector configuration. A change makes the next version |
+| `DeleteNetworkConnector` | Asynchronous delete, answers `DELETING`. With `:<version>`, deletes only that version |
 
 ## Emulation Behavior
 
@@ -50,12 +51,16 @@ Two AWS service models, not one. `Lambda Microvms` (apiVersion 2025-09-09) carri
 - **Per-operation projections:** an image is returned in four different shapes and a connector in four. Create and Update carry full detail, Get is a smaller summary, and only the list summaries carry `Type`. Absent members are absent rather than null — a connector that has never been updated has no `LastUpdateStatus` at all.
 - **Members the model marks optional but the service enforces:** a connector requires `ClientToken`, `OperatorRole`, `NetworkProtocol` and `AssociatedComputeResourceTypes`. A client written from the Smithy model alone receives four validation errors in turn.
 - **ARN or bare identifier:** images, MicroVMs and connectors resolve by either in URI paths.
+- **Passing a connector:** when IAM enforcement is on, `CreateMicrovmImage`, `UpdateMicrovmImage` and `RunMicrovm` need `lambda:PassNetworkConnector` on each connector the request names, and on the Lambda-managed `INTERNET_EGRESS` connector, or `HTTP_INGRESS` for ingress, when it names none, as on AWS (see [IAM](iam.md)).
+- **Image configuration:** Create and Update retain the requested base image version, egress connectors, logging, environment variables, OS capabilities and CPU architectures. Create retains its tags. A full-replace Update resets omitted configuration to defaults, including base image version `1.0`. Version responses retain the runtime configuration from their build; omitting egress connectors or supplying an empty list uses the managed `INTERNET_EGRESS` connector.
+- **Run configuration:** RunMicrovm retains the requested image version, execution role, ingress and egress connectors, maximum duration and idle policy in both its response and GetMicrovm. An omitted image version uses the latest active version; a requested version must exist. Empty or omitted connector lists keep the managed defaults. The maximum duration defaults to 28,800 seconds and must be between 1 and 28,800; idle policies require all three fields, a maximum idle duration of at least 60 seconds and a nonnegative suspended duration. These fields describe the emulated run; they do not start an execution environment or schedule idle timers.
+- **Connector versions:** a connector starts at version 1. As on AWS, an update that changes the subnets, the security groups, the network protocol or the operator role makes the next version, and one that only lists the subnets in another order changes nothing. A connector also resolves by its name, and `:<version>` after an id, a name or an ARN names one version. The latest version cannot be deleted on its own, and `AssociatedComputeResourceTypes` cannot change. Errors use the AWS wording.
 - **Builds per generation:** each version is built once per Graviton generation the service targets, so a version has more than one build.
 - **Not emulated:** auth tokens, the per-VM endpoint, idle and suspend timers, and suspend/resume. Those belong to a full-fidelity MicroVMs emulator rather than to CloudFormation provisioning; see [m80](https://github.com/INTENTIUS/m80).
 
 ## CloudFormation
 
-`AWS::Lambda::MicrovmImage` and `AWS::Lambda::NetworkConnector` provision and delete through the resource registry, so a template declaring either is handled rather than skipped.
+`AWS::Lambda::MicrovmImage` and `AWS::Lambda::NetworkConnector` provision and delete through the resource registry, so a template declaring either is handled rather than skipped. A connector returns `LatestVersion` and `LatestVersionArn` through `Fn::GetAtt`.
 
 ## Verification
 

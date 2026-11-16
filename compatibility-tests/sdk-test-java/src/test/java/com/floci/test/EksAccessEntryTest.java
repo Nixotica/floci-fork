@@ -14,6 +14,15 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.*;
 
 class EksAccessEntryTest {
+
+    /**
+     * A role is assumable by something, so its trust policy carries a statement: an empty object
+     * declares none, which IAM refuses rather than stores.
+     */
+    private static final String TRUST_POLICY = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}""";
+
     @Test
     void sdkRoundTripPaginationAndClusterCleanup() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
@@ -22,9 +31,9 @@ class EksAccessEntryTest {
         String secondRole = "access-b-" + suffix;
         try (EksClient eks = TestFixtures.eksClient(); IamClient iam = TestFixtures.iamClient()) {
             String first = iam.createRole(builder -> builder.roleName(firstRole).path("/nodes/")
-                    .assumeRolePolicyDocument("{}")).role().arn();
+                    .assumeRolePolicyDocument(TRUST_POLICY)).role().arn();
             String second = iam.createRole(builder -> builder.roleName(secondRole)
-                    .assumeRolePolicyDocument("{}")).role().arn();
+                    .assumeRolePolicyDocument(TRUST_POLICY)).role().arn();
             try {
                 createCluster(eks, cluster, first);
                 CreateAccessEntryRequest request = CreateAccessEntryRequest.builder().clusterName(cluster)
@@ -39,6 +48,27 @@ class EksAccessEntryTest {
                 assertThat(eks.describeAccessEntry(builder -> builder.clusterName(cluster).principalArn(first))
                         .accessEntry().principalArn()).isEqualTo(first);
                 eks.createAccessEntry(builder -> builder.clusterName(cluster).principalArn(second));
+                String admin = TestFixtures.globalArn("eks", "aws", "cluster-access-policy/AmazonEKSClusterAdminPolicy");
+                AssociateAccessPolicyResponse associated = eks.associateAccessPolicy(builder -> builder
+                        .clusterName(cluster).principalArn(second).policyArn(admin)
+                        .accessScope(scope -> scope.type(AccessScopeType.NAMESPACE).namespaces("dev-*", "payments")));
+                assertThat(associated.principalArn()).isEqualTo(second);
+                assertThat(associated.associatedAccessPolicy().associatedAt()).isNotNull();
+                ListAssociatedAccessPoliciesResponse policies = eks.listAssociatedAccessPolicies(builder -> builder
+                        .clusterName(cluster).principalArn(second));
+                assertThat(policies.associatedAccessPolicies()).singleElement().satisfies(policy -> {
+                    assertThat(policy.policyArn()).isEqualTo(admin);
+                    assertThat(policy.accessScope().type()).isEqualTo(AccessScopeType.NAMESPACE);
+                    assertThat(policy.accessScope().namespaces()).containsExactly("dev-*", "payments");
+                });
+                assertThatThrownBy(() -> eks.associateAccessPolicy(builder -> builder.clusterName(cluster)
+                        .principalArn(first).policyArn(admin).accessScope(scope -> scope.type(AccessScopeType.CLUSTER))))
+                        .isInstanceOf(InvalidRequestException.class);
+                eks.disassociateAccessPolicy(builder -> builder.clusterName(cluster).principalArn(second).policyArn(admin));
+                assertThat(eks.listAssociatedAccessPolicies(builder -> builder.clusterName(cluster).principalArn(second))
+                        .associatedAccessPolicies()).isEmpty();
+                // Removing a policy the entry no longer holds succeeds, like the first removal.
+                eks.disassociateAccessPolicy(builder -> builder.clusterName(cluster).principalArn(second).policyArn(admin));
                 ListAccessEntriesResponse page = eks.listAccessEntries(builder -> builder.clusterName(cluster).maxResults(1));
                 assertThat(page.accessEntries()).hasSize(1);
                 assertThat(page.nextToken()).isNotBlank();
@@ -67,8 +97,8 @@ class EksAccessEntryTest {
                         .bootstrapClusterCreatorAdminPermissions(false).build()));
         try (EksWaiter waiter = eks.waiter()) {
             WaiterResponse<DescribeClusterResponse> result = waiter.waitUntilClusterActive(
-                    request -> request.name(name),
-                    configuration -> configuration.waitTimeout(Duration.ofMinutes(3)));
+                    DescribeClusterRequest.builder().name(name).build(),
+                    TestFixtures.waiterOverride(Duration.ofMinutes(3)));
             assertThat(result.matched().response())
                     .withFailMessage("Cluster %s did not become ACTIVE: %s", name, result.matched().exception())
                     .isPresent();

@@ -21,7 +21,7 @@ Floci implements the CodeBuild API — stored-state management plus real build e
 | `UpdateProject` | Partial update — only supplied fields are modified |
 | `DeleteProject` | Removes project by name |
 | `BatchGetProjects` | Returns found projects and a `projectsNotFound` list |
-| `ListProjects` | Returns all project names in the region |
+| `ListProjects` | Returns project names in the region, with optional name, creation-time, or last-modified-time sorting |
 
 ### Build Execution
 
@@ -71,6 +71,10 @@ Each `StartBuild` call:
 7. Marks the build complete with `SUCCEEDED`, `FAILED`, or `STOPPED`
 
 Source injection and artifact extraction both use the Docker API's archive copy endpoints — no bind mounts are required. This works correctly when Floci itself runs inside a Docker container (Docker-in-Docker).
+
+### VPC (`vpcConfig`)
+
+CodeBuild runs a build of a project with a `vpcConfig` with a network interface in one of the project's subnets. Floci puts the build container on that VPC's Docker network, at an address leased from the first subnet, before the first phase runs, the way it places EC2 instances, VPC-configured Lambda functions and MWAA environments, so a build reaches a database or anything else in the VPC by its private IP. The container keeps the network it was created on as well. A subnet EC2 does not know, or `FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=false`, leaves it there alone. Security groups are not enforced, as for EC2. While a build runs, `DeleteSubnet` refuses its subnet and `DeleteVpc` its VPC (`DependencyViolation`), as the build's network interface does on AWS; a project's `vpcConfig` alone holds none. `BatchGetBuilds` returns the project's `vpcConfig` on each build.
 
 ## Buildspec Support
 

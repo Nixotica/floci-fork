@@ -40,6 +40,10 @@ Batch uses `floci.services.batch.runner-mode`.
 
 `process` mode is not implemented.
 
+### VPC (`computeResources.subnets`)
+
+AWS Batch runs a job on an instance or Fargate task in the subnets of its queue's compute environment. In `docker` mode, Floci puts the job's container (each node's, for a multi-node job) on that VPC's Docker network, at an address leased from the first subnet of the first compute environment, in the queue's order, that names any, the way it places EC2 instances and VPC-configured Lambda functions, so a job reaches a database or anything else in the VPC by its private IP. A queue of unmanaged compute environments, a subnet EC2 does not know, or `FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=false` leaves the container on its own network. Security groups are not enforced, as for EC2. While a job's container runs, `DeleteSubnet` refuses its subnet and `DeleteVpc` its VPC (`DependencyViolation`); Floci runs no idle instances, so a compute environment's subnets alone hold nothing.
+
 ## Submit Behavior
 
 Supported `SubmitJob` fields:
@@ -103,6 +107,8 @@ does not yet preempt the remaining nodes (see Limitations). `DescribeJobs`/queue
 return one entry for the whole
 job (with `nodeProperties`, no per-node `container`); pass `multiNodeJobId` to `ListJobs` for a
 one-entry-per-node breakdown with each node's own `container` and `nodeProperties.nodeIndex`.
+Use `maxResults` and `nextToken` to page this breakdown, with up to 1,000 nodes per page.
+The final page omits `nextToken`.
 `containerOverrides` and array jobs are not supported on MNP job definitions; use `nodeOverrides`
 instead.
 
@@ -148,7 +154,7 @@ IAM roles, VPC fields, Fargate declarations, log configuration, storage, and res
 ## Limitations
 
 - No IAM enforcement.
-- No VPC/subnet/security-group simulation.
+- Security groups are not enforced, and only `docker` mode places jobs on their VPC's network.
 - No AWS-faithful capacity scheduling.
 - No job dependencies (`dependsOn`).
 - EventBridge input transformers work through the existing EventBridge target input path; full Batch-specific input-transformer parity is not implemented.
@@ -171,5 +177,3 @@ correctness, deliberately deferred):
 - `ListJobs` with `arrayJobId` ignores the `filters` parameter (only `jobStatus` is honored for
   children). This matches AWS's own note that filters don't apply to child jobs, but it means array
   children can't be filtered by `JOB_NAME`/`JOB_DEFINITION`/etc.
-- `ListJobs` with `multiNodeJobId` has no pagination (`maxResults`/`nextToken`); it always returns
-  every node in one response.
